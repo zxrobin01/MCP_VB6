@@ -1,0 +1,2830 @@
+{
+  "tools": [
+    {
+      "name": "ide_state",
+      "description": "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note}; pass cancel_inflight=true to abort the call that is in flight.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cancel_inflight": {
+            "type": "boolean",
+            "description": "TASK-P1-126 (MCP-08): ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case."
+          },
+          "cancel_target": {
+            "type": "string",
+            "description": "Optional: the tool you believe is in flight (informational only - the receipt reports what the add-in actually finds)."
+          }
+        }
+      }
+    },
+    {
+      "name": "current_position",
+      "description": "Where the engine is currently stopped, read from the IDE itself: in break mode {available:true, project, module, proc, line, text, ebMode} with line 1-based inside the module and text the raw source line; in design/run mode {available:false, reason:not_in_break} without raising. The raw selection it read is echoed as selectedLine so the claim can be cross-checked.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_breakpoints",
+      "description": "List the breakpoints this tool injects into source (marker lines ' @mcp-break <id> begin / Debug.Assert False / end') as {component, line, kind, enabled}. The VBIDE object model has no breakpoint API, so IDE-native breakpoints cannot be enumerated and are reported as native:null instead of being guessed.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "ui_text",
+      "description": "Read the accessible text of a window and its subtree. Tries UI Automation first, then MSAA (AccessibleObjectFromWindow), then WM_GETTEXT. Returns {ok:true, source:'uia|msaa|wm_gettext', text:'...'} or {ok:false, reason:'no_accessible_text', evidence:'...'} plus a channels object with each channel's raw return code/error. A negative result is a legitimate delivery: it is reported with reproducible evidence and never fabricated.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "hwnd": {
+            "type": "integer",
+            "description": "Window handle to read (0 or omitted = resolve the first window of this process whose class matches cls)"
+          },
+          "cls": {
+            "type": "string",
+            "description": "Window class name used when hwnd is 0"
+          },
+          "depth": {
+            "type": "integer",
+            "description": "How many child-window levels to include (default 3)"
+          }
+        }
+      }
+    },
+    {
+      "name": "find_gui",
+      "description": "Enumerate the windows of THIS process (top-level windows plus all their children) and filter by keyword/cls/showing. Each hit reports hwnd, cls, text, showing, enabled, rect {l,t,w,h} and path (parent title chain). Read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "keyword": {
+            "type": "string",
+            "description": "Substring to match (case-insensitive) against window text AND window class name; empty or omitted matches everything"
+          },
+          "cls": {
+            "type": "string",
+            "description": "Exact window class name to match; empty or omitted matches every class"
+          },
+          "showing": {
+            "type": "boolean",
+            "description": "true = only visible windows, false = only hidden ones; omitted = no visibility filter"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_project_info",
+      "description": "Get detailed information about the open VB6 project(s): name, paths, type, IDE mode (design/run/break), options (description, help file, startup object, start project), components and references.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "set_project_options",
+      "description": "Change project/IDE options: description, help file/context, startup object, startup project, build output path, active project, read-only mode. startup_object is best-effort: on this build the VBIDE StartUpObject put is rejected for every value, so the response carries startupObjectError + startupObjectWorkaround (edit Startup in the .vbp and reopen) instead of failing the whole call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Project description (VBProject.Description)"
+          },
+          "help_file": {
+            "type": "string",
+            "description": "Help file path (VBProject.HelpFile)"
+          },
+          "help_context_id": {
+            "type": "integer",
+            "description": "Help context id (VBProject.HelpContextID)"
+          },
+          "startup_object": {
+            "type": "string",
+            "description": "Startup object: form name, or Sub Main / (None)"
+          },
+          "start_project": {
+            "type": "string",
+            "description": "Name of the project to make the startup project"
+          },
+          "build_file_name": {
+            "type": "string",
+            "description": "Output path for make_project (VBProject.BuildFileName)"
+          },
+          "active_project": {
+            "type": "string",
+            "description": "Name of the project to make active"
+          },
+          "read_only_mode": {
+            "type": "boolean",
+            "description": "New read-only mode"
+          },
+          "read_only_mode_set": {
+            "type": "boolean",
+            "description": "Set true to apply read_only_mode"
+          }
+        }
+      }
+    },
+    {
+      "name": "open_project",
+      "description": "Open a project file (.vbp) in the IDE (VBProjects.AddFromFile). Without exclusive it is added to the current workspace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path of the .vbp project file to open"
+          },
+          "exclusive": {
+            "type": "boolean",
+            "description": "Open exclusively (replaces current workspace, default: false)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "add_project",
+      "description": "Create a new project in the IDE (VBProjects.Add) or from a template.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Project type: StandardExe, ActiveXExe, ActiveXDll, ActiveXControl",
+            "enum": [
+              "StandardExe",
+              "ActiveXExe",
+              "ActiveXDll",
+              "ActiveXControl"
+            ]
+          },
+          "template_path": {
+            "type": "string",
+            "description": "Optional .vbp template path (VBProjects.AddFromTemplate)"
+          }
+        }
+      }
+    },
+    {
+      "name": "remove_project",
+      "description": "Close (remove) a project from the IDE workspace.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Project name (default: active project)"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_component_list",
+      "description": "List all components (modules/forms/classes) of a project with procedures, kinds, line ranges, dirty state and designer info.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_component_code",
+      "description": "Read the code of a project component from IDE memory. B+C batch: coords defaults to 'ide' (BREAKING - the old behaviour was disk coordinates with the file header prepended); pass coords:'disk' for the previous text/numbering. proc: or symbol: returns just that range (startLine/endLine/text/sha256/coords); an unknown name is a structured ok:false, never an exception.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name (case-insensitive)"
+          },
+          "include_line_numbers": {
+            "type": "boolean",
+            "description": "Prefix each line with its line number"
+          },
+          "coords": {
+            "type": "string",
+            "description": "ide (default) = pure code-pane text, line numbers are IDE lines; disk = prepend the file header (Attribute/VERSION), line numbers are disk lines"
+          },
+          "proc": {
+            "type": "string",
+            "description": "Return only this procedure's range: {startLine,endLine,text,sha256,coords}"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Return only the range of the procedure declaring this identifier (or the single line)"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "replace_code",
+      "description": "Edit a component's code in IDE memory (line based). replace: overwrite start_line..end_line. insert: before start_line. append: after last line. delete: remove range. set: replace the whole module with code. Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name (case-insensitive)"
+          },
+          "operation": {
+            "type": "string",
+            "description": "One of: replace, insert, append, delete, set",
+            "enum": [
+              "replace",
+              "insert",
+              "append",
+              "delete",
+              "set"
+            ]
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "First line for replace/insert/delete (1-based)"
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Last line for replace/delete (inclusive)"
+          },
+          "code": {
+            "type": "string",
+            "description": "New code text; use CRLF or LF line breaks"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional optimistic-concurrency guard: sha256 of the current pane text"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          },
+          "snapshot": {
+            "type": "boolean",
+            "description": "true = write the PRE-EDIT pane text into the project's _undo store before this call writes anything (undo_edit can then restore it); default false = no extra file write. The JSON boolean true is expected; the strings on/yes/1 are also accepted"
+          }
+        },
+        "required": [
+          "name",
+          "operation"
+        ]
+      }
+    },
+    {
+      "name": "add_component",
+      "description": "Create a new component in the active project with optional name and initial code. Standard forms fall back to a generated .frm + AddFile when VBComponents.Add(vbext_ct_MSForm) fails with E_FAIL.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Component type: module, class, form, mdiform, resource, usercontrol, propPage, userdoc, designer",
+            "enum": [
+              "module",
+              "class",
+              "form",
+              "mdiform",
+              "resource",
+              "usercontrol",
+              "propPage",
+              "userdoc",
+              "designer"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Desired component name (default: IDE-generated)"
+          },
+          "code": {
+            "type": "string",
+            "description": "Optional initial code (added via AddFromString)"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      }
+    },
+    {
+      "name": "remove_component",
+      "description": "Remove a component from the project (VBComponents.Remove). Cannot be undone; the IDE will ask about the file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name to remove"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "import_component",
+      "description": "Add an existing source file (or a template) to the project as a component. mode=file COPIES the source into the project directory and binds the component to that COPY (the file you pass is not linked and is verified byte-identical on return): edit the copy, not the original. componentFile and projectDirWrites name the bound copy.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Source file (.bas/.cls/.frm/.ctl/.dsr) or template path"
+          },
+          "mode": {
+            "type": "string",
+            "description": "file (AddFile) or template (AddFromTemplate)",
+            "enum": [
+              "file",
+              "template"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "export_component",
+      "description": "Save a component's source to a file. Designer components (forms/usercontrols) are exported whole via VBComponent.Export (.frm/.frx); other components write their code text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "path": {
+            "type": "string",
+            "description": "Target file path (default: component's current file path)"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "rename_component",
+      "description": "Rename a component in the project (VBComponent.Name).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Current component name"
+          },
+          "new_name": {
+            "type": "string",
+            "description": "New component name"
+          }
+        },
+        "required": [
+          "name",
+          "new_name"
+        ]
+      }
+    },
+    {
+      "name": "reload_component",
+      "description": "Reload a component from THE FILE IT IS BOUND TO on disk (VBComponent.Reload of FileNames(1)) - not necessarily the file you edited: import_component mode=file binds the project-local COPY, so editing the import source then reloading reports success while the code pane keeps the old text. The receipt reports reloaded (the component's real name) plus file (the bound path actually reloaded): compare file with the path you edited. Or edit in-IDE with replace_code / edit_by_anchor / apply_edits.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name to reload from disk"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "add_code",
+      "description": "Append code to a component's code module from a string or a file. Requires code or file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "code": {
+            "type": "string",
+            "description": "Code text to append (CodeModule.AddFromString). Supply code or file - at least one of the two is required"
+          },
+          "file": {
+            "type": "string",
+            "description": "Source file whose BODY is appended: the designer head (VERSION/BEGIN..END or Begin..End, plus the leading Attribute lines) is stripped first, so the code pane never receives a header and the target component is never renamed. Supply code or file - at least one of the two is required"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          }
+        },
+        "required": [
+          "component"
+        ]
+      }
+    },
+    {
+      "name": "create_event_proc",
+      "description": "Create an event procedure stub (CodeModule.CreateEventProc), e.g. Command1_Click. Returns the line it was added at.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name (usually a form/class)"
+          },
+          "object": {
+            "type": "string",
+            "description": "Name of the object raising the event (e.g. Command1)"
+          },
+          "event": {
+            "type": "string",
+            "description": "Event name (e.g. Click)"
+          }
+        },
+        "required": [
+          "component",
+          "object",
+          "event"
+        ]
+      }
+    },
+    {
+      "name": "find_in_component",
+      "description": "Find text inside one component using CodeModule.Find. Returns the match position (start/end line/column).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "target": {
+            "type": "string",
+            "description": "Text to find"
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "Search from line (1-based, default 1)"
+          },
+          "start_col": {
+            "type": "integer",
+            "description": "Search from column (1-based, default 1)"
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Search up to line (default: last line)"
+          },
+          "end_col": {
+            "type": "integer",
+            "description": "Search up to column (default: last column)"
+          },
+          "whole_word": {
+            "type": "boolean",
+            "description": "Whole word match only"
+          },
+          "match_case": {
+            "type": "boolean",
+            "description": "Case sensitive"
+          },
+          "pattern_search": {
+            "type": "boolean",
+            "description": "Use pattern matching"
+          }
+        },
+        "required": [
+          "component",
+          "target"
+        ]
+      }
+    },
+    {
+      "name": "get_codepane",
+      "description": "Get the state of a code pane: current selection (lines/columns), top line, visible line count and view mode.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Optional component whose code pane to query (default: active code pane)"
+          }
+        }
+      }
+    },
+    {
+      "name": "set_codepane",
+      "description": "Change a code pane: set selection/cursor, scroll and/or activate it. There is NO view-mode parameter: VB6's extensibility model exposes CodePane.CodePaneView as READ-ONLY and its command bars carry no view toggle, so an add-in cannot switch between full_module and procedure view; a \\`view\\` argument you pass is reported in ignoredArgs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Optional component whose code pane to change (default: active)"
+          },
+          "selection": {
+            "type": "string",
+            "description": "Selection as startLine,startCol,endLine,endCol (e.g. 1,1,1,1)"
+          },
+          "top_line": {
+            "type": "integer",
+            "description": "Scroll so this line is on top"
+          },
+          "activate": {
+            "type": "boolean",
+            "description": "Bring the code pane to the front (Show)"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_selection",
+      "description": "What is currently selected in the IDE: selected component, active project, active window and cursor position.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "activate_component",
+      "description": "Bring a component to the front: open its code pane or designer window.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "window": {
+            "type": "string",
+            "description": "code (open code pane) or designer (open designer window); default: activate component",
+            "enum": [
+              "code",
+              "designer",
+              "activate"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "list_files",
+      "description": "List files below a directory. Returns relative paths. Skips .git/.svn/.hg/node_modules.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory to list; relative to the project directory when not absolute (default: project directory)"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Semicolon-separated patterns, e.g. *.bas;*.frm (default: *)"
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "Recurse into subdirectories (default: true)"
+          },
+          "max_entries": {
+            "type": "integer",
+            "description": "Maximum number of entries (default: 500)"
+          }
+        }
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a text file from disk (UTF-8 / UTF-16 / ANSI auto-detected) and return its content.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "File path; relative to the project directory when not absolute"
+          },
+          "max_lines": {
+            "type": "integer",
+            "description": "Return only the first N lines (0 = all, default)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "write_file",
+      "description": "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "File path; relative to the project directory when not absolute"
+          },
+          "content": {
+            "type": "string",
+            "description": "Full new content of the file"
+          },
+          "encoding": {
+            "type": "string",
+            "description": "auto (ANSI for VB source files, UTF-8 otherwise), utf-8, ansi or utf-16",
+            "enum": [
+              "auto",
+              "utf-8",
+              "ansi",
+              "utf-16"
+            ]
+          },
+          "create_dirs": {
+            "type": "boolean",
+            "description": "Create missing directories (default: true)"
+          },
+          "backup": {
+            "type": "boolean",
+            "description": "Keep a .bak copy of the previous file (default: true)"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "search_in_files",
+      "description": "Search text or regex across files below a directory. Returns file, line number and line text for each match.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text or regular expression to search for"
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory to search; relative to the project directory when not absolute (default: project directory)"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Semicolon-separated file patterns (default: VB source files)"
+          },
+          "is_regex": {
+            "type": "boolean",
+            "description": "Treat query as a regular expression (default: false)"
+          },
+          "case_sensitive": {
+            "type": "boolean",
+            "description": "Case-sensitive matching (default: false)"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matches (default: 200)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "save_project",
+      "description": "Save the project and all modified components to disk.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Optional .vbp path: an unsaved project is saved there and unsaved components are saved next to it (bas/cls/frm/res by type)."
+          }
+        }
+      }
+    },
+    {
+      "name": "make_project",
+      "description": "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. TASK-P1-132: after a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "output_path": {
+            "type": "string",
+            "description": "Optional output path (sets VBProject.BuildFileName before compiling)"
+          },
+          "route": {
+            "type": "string",
+            "description": "ide (default) = compile inside the VB6 IDE via VBProject.MakeCompiledFile; cli = run an isolated VB6.EXE /make <vbp> /out <log> subprocess, the route that yields a REAL compiler log (the build tool's receipt shape is returned); auto = same as ide here, because make_project always acts on the project the IDE has open."
+          },
+          "out_path": {
+            "type": "string",
+            "description": "route=cli: compiler log path (default %TEMP%\\vb6mcp_build.log)"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "route=cli: bounds ONLY the VB6.EXE /make subprocess (default 180000)"
+          },
+          "allow_host_modal": {
+            "type": "boolean",
+            "description": "Default false. When VB6's own Make Project box is already up, confirming it starts a long host-modal compile that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy until the IDE is restarted. false = leave the box alone and report modal_blocked=true with its hwnd/title/controls instead of clicking it."
+          },
+          "laa": {
+            "type": "boolean",
+            "description": "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\\.vb6mcp.json {\"laa\": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned. WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section."
+          },
+          "diagnose": {
+            "type": "boolean",
+            "description": "TASK-P1-132 (MCP-lead-2), default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure."
+          }
+        }
+      }
+    },
+    {
+      "name": "control_execution",
+      "description": "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "run (start, or continue when already broken) | full_compile | break (pause) | continue | resume (= continue) | step_into | step_over | step_out | run_to_cursor | end | stop (= end) | restart (end then run). Aliases accepted for compatibility: stepinto, stepover, stepout, runtocursor, fullcompile.",
+            "enum": [
+              "run",
+              "full_compile",
+              "break",
+              "continue",
+              "resume",
+              "stop",
+              "step_into",
+              "step_over",
+              "step_out",
+              "run_to_cursor",
+              "end",
+              "restart"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "test_host",
+      "description": "Generate and score the offline test host (T5): writes a host .vbp around the module under test plus an assertions/runner module, or counts PASS/FAIL from the result file of the host. Closes the generate / build / run / score loop that had no tool entry point.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "generate (write the host .vbp) or results (score PASS/FAIL from a result file)",
+            "enum": [
+              "generate",
+              "results"
+            ]
+          },
+          "vbp_path": {
+            "type": "string",
+            "description": "Output .vbp of the generated test host (action=generate)"
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Component name in the generated vbp; defaults to the Attribute VB_Name of the module under test"
+          },
+          "module_under_test": {
+            "type": "string",
+            "description": "Path of the module under test (action=generate)"
+          },
+          "assertions_path": {
+            "type": "string",
+            "description": "Path of the assertions module (action=generate)"
+          },
+          "runner_path": {
+            "type": "string",
+            "description": "Path of the test runner module (action=generate)"
+          },
+          "exe_name": {
+            "type": "string",
+            "description": "ExeName32 for the generated host (default vb6testhost.exe)"
+          },
+          "result_path": {
+            "type": "string",
+            "description": "Result file to score (action=results)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "add_reference",
+      "description": "Add a COM type library reference to the project by GUID or by file path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "guid": {
+            "type": "string",
+            "description": "Type library GUID, e.g. {00020430-0000-0000-C000-000000000046}. Required whenever mode is not file (mode defaults to guid)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Type library file path. Required when mode=file"
+          },
+          "mode": {
+            "type": "string",
+            "description": "guid (AddFromGuid) or file (AddFromFile)",
+            "enum": [
+              "guid",
+              "file"
+            ]
+          },
+          "major": {
+            "type": "integer",
+            "description": "Major version (default: 0)"
+          },
+          "minor": {
+            "type": "integer",
+            "description": "Minor version (default: 0)"
+          }
+        }
+      }
+    },
+    {
+      "name": "remove_reference",
+      "description": "Remove a reference from the project by name or GUID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Reference name (or GUID) to remove, e.g. Scripting"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "get_component_properties",
+      "description": "List the design-time properties of a component (the Properties window content): name, value, number of indices.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name (form/class/control host)"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "set_component_property",
+      "description": "Change a design-time property of a component (Property.Value / IndexedValue).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "property": {
+            "type": "string",
+            "description": "Property name (e.g. Caption)"
+          },
+          "value": {
+            "type": "string",
+            "description": "New value; numbers/booleans are parsed, otherwise treated as string"
+          },
+          "indices": {
+            "type": "string",
+            "description": "Comma-separated indices for indexed properties (up to 4)"
+          }
+        },
+        "required": [
+          "name",
+          "property",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "list_members",
+      "description": "List the public members of a class component (CodeModule.Members) with type, scope, static flag and code location.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name (class module)"
+          }
+        },
+        "required": [
+          "component"
+        ]
+      }
+    },
+    {
+      "name": "set_member_attribute",
+      "description": "Change an attrName of a class member: description, help context, hidden, browsable, UIDefault, data binding flags, category, property page, standard method.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "member": {
+            "type": "string",
+            "description": "Member name"
+          },
+          "attribute": {
+            "type": "string",
+            "description": "Attribute: description, help_context_id, hidden, browsable, ui_default, bindable, default_bind, display_bind, request_edit, category, property_page, standard_method"
+          },
+          "value": {
+            "type": "string",
+            "description": "New value (booleans parsed from true/false/1/0)"
+          }
+        },
+        "required": [
+          "component",
+          "member",
+          "attribute",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "list_windows",
+      "description": "List all IDE windows with caption, kind, visibility, state, position and size.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "control_window",
+      "description": "Control an IDE window: focus, close, show/hide, minimize/maximize/restore, move, resize, rename.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "window": {
+            "type": "string",
+            "description": "Window caption (substring) or 1-based index"
+          },
+          "action": {
+            "type": "string",
+            "description": "activate, close, show, hide, minimize, maximize, restore, move, resize, set_caption",
+            "enum": [
+              "activate",
+              "close",
+              "show",
+              "hide",
+              "minimize",
+              "maximize",
+              "restore",
+              "move",
+              "resize",
+              "set_caption"
+            ]
+          },
+          "caption": {
+            "type": "string",
+            "description": "New caption (read-only in VB6EXT; action accepted but ignored; whenever it is passed, the receipt reports it in ignoredArgs)"
+          },
+          "left": {
+            "type": "integer",
+            "description": "New left coordinate (action=move)"
+          },
+          "top": {
+            "type": "integer",
+            "description": "New top coordinate (action=move)"
+          },
+          "width": {
+            "type": "integer",
+            "description": "New width (action=resize)"
+          },
+          "height": {
+            "type": "integer",
+            "description": "New height (action=resize)"
+          }
+        },
+        "required": [
+          "window",
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "form_designer",
+      "description": "Work with the form designer: info lists controls (name/class/progid/index/selection), props dumps one control's design-time property values (by name or 1-based index), menu_nest nests a VB.Menu item inside another menu item (VB6 has no menu-level property - the tree lives in the .frm indentation, so the form is flushed to disk, the block is re-nested, and the component is reloaded), or applies selection/clipboard operations.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "form": {
+            "type": "string",
+            "description": "Form component name"
+          },
+          "action": {
+            "type": "string",
+            "description": "info, select_all, clear_selection, cut, copy, paste",
+            "enum": [
+              "info",
+              "props",
+              "menu_nest",
+              "select_all",
+              "clear_selection",
+              "cut",
+              "copy",
+              "paste"
+            ]
+          },
+          "control": {
+            "type": "string",
+            "description": "Control NAME (action=props or menu_nest; preferred over index)"
+          },
+          "index": {
+            "type": "integer",
+            "description": "1-based control index (action=props; see form_designer info)"
+          },
+          "parent": {
+            "type": "string",
+            "description": "action=menu_nest: parent VB.Menu name (empty = make it a top-level item again)"
+          }
+        },
+        "required": [
+          "form",
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "add_control",
+      "description": "Add a control to a form at design time (VBControls.Add by ProgID). The response echoes the resolved control name to use with set_control_property/remove_control. The part is PRE-VALIDATED against the project@s registered control parts: VBControls.Add hangs the whole IDE with no dialog and no timeout when the class is not a component of this project, so an unregistered ProgID is refused immediately instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "form": {
+            "type": "string",
+            "description": "Form component name"
+          },
+          "prog_id": {
+            "type": "string",
+            "description": "Control ProgID, e.g. VB.CommandButton"
+          },
+          "name": {
+            "type": "string",
+            "description": "Desired control name (default: the IDE-generated name)"
+          }
+        },
+        "required": [
+          "form",
+          "prog_id"
+        ]
+      }
+    },
+    {
+      "name": "list_component_parts",
+      "description": "Read-only: list the ActiveX control parts this project has registered (its .vbp Object= lines) as {guid, version, path, resolvedPath, exists}. Intrinsic VB.* controls are compiled in, need no declaration and are therefore NOT listed; unknown ProgIDs are not resolved to a part, so no progIds are reported.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "remove_control",
+      "description": "Remove a control from a form at design time (VBControls.Remove). Address it by control name (preferred) or by 1-based index.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "form": {
+            "type": "string",
+            "description": "Form component name"
+          },
+          "index": {
+            "type": "integer",
+            "description": "1-based index of the control (see form_designer info)"
+          },
+          "control": {
+            "type": "string",
+            "description": "Control NAME (preferred over index; see form_designer info)"
+          }
+        },
+        "required": [
+          "form"
+        ]
+      }
+    },
+    {
+      "name": "set_control_property",
+      "description": "Change a design-time property of a control on a form. Address it by control name (preferred) or by 1-based index; the response echoes the resolved control and index.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "form": {
+            "type": "string",
+            "description": "Form component name"
+          },
+          "index": {
+            "type": "integer",
+            "description": "1-based index of the control"
+          },
+          "control": {
+            "type": "string",
+            "description": "Control NAME (preferred over index; see form_designer info)"
+          },
+          "property": {
+            "type": "string",
+            "description": "Design-time property name (e.g. Caption)"
+          },
+          "value": {
+            "type": "string",
+            "description": "New value; numbers/booleans parsed, otherwise string"
+          }
+        },
+        "required": [
+          "form",
+          "property",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "property_bag",
+      "description": "Read/write named values in a project's or component's property bag (ReadProperty/WriteProperty).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "project or component",
+            "enum": [
+              "project",
+              "component"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Component name (target=component)"
+          },
+          "section": {
+            "type": "string",
+            "description": "Section (project property bag only; with target=component it is reported in ignoredArgs)"
+          },
+          "key": {
+            "type": "string",
+            "description": "Key to read or write"
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to write (omit to read): its PRESENCE selects a WRITE; omit it to read"
+          },
+          "has_value": {
+            "type": "boolean",
+            "description": "Explicit write trigger (default false): true writes value even when it is absent or empty. When omitted it is inferred from the presence of value"
+          }
+        },
+        "required": [
+          "target",
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "list_addins",
+      "description": "List all registered add-ins with their connection state.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "set_addin_state",
+      "description": "Load/unload an add-in (AddIn.Connect).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prog_id": {
+            "type": "string",
+            "description": "Add-in ProgID (e.g. VB6MCP.Connect)"
+          },
+          "connect": {
+            "type": "boolean",
+            "description": "True to load/enable, false to unload/disable"
+          }
+        },
+        "required": [
+          "prog_id",
+          "connect"
+        ]
+      }
+    },
+    {
+      "name": "command_bars",
+      "description": "List the IDE menus (CommandBars) or execute a menu command. action=list returns every bar and control with its language-independent identity (id, tag, type, shortcutText, enabled, visible, path). action=execute runs one command, addressed either by caption or by id as \"#746\" / \"id:746\" / a bare number; because VB6 ids are NOT unique, an id-only lookup executes only when EXACTLY ONE ENABLED control matches and otherwise returns a structured id_ambiguous failure with idCandidates - disambiguate with bar= or by appending the caption (\"#746 <caption>\"). The CommandBars model is suspended while a program runs, so use this in design or break state.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "list (all bars and their controls, with id/enabled/visible/path) or execute (run exactly one menu command)",
+            "enum": [
+              "list",
+              "execute"
+            ]
+          },
+          "bar": {
+            "type": "string",
+            "description": "Optional bar filter: a bar name OR a menu path segment (matched as a caption prefix), e.g. \"璋冭瘯\" or \"Debug\""
+          },
+          "control": {
+            "type": "string",
+            "description": "Required for action=execute. A menu command caption (prefix search allowed), or an id as \"#746\" / \"id:746\" / a bare number, optionally \"#746 <caption>\" to disambiguate."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "read_active_dialogs",
+      "description": "Read-only: enumerate the ACTIVE dialogs of THIS VB6 process (default window class #32770) as {hwnd, cls, title, rect, owner, ownerTitle, ownerDisabled, foreground, childCount, buttons[], controls[]}. ownerDisabled=true is the reliable signal that the box is BLOCKING the IDE - a merely visible window is not enough. Enumerates and reads text only; never sends a message.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cls": {
+            "type": "string",
+            "description": "Dialog window class to match (default #32770 = a Windows dialog); \"*\" = every visible top-level window of this process"
+          },
+          "include_children": {
+            "type": "boolean",
+            "description": "Include the child controls and the clickable button list (default true)"
+          },
+          "max": {
+            "type": "integer",
+            "description": "Maximum number of dialogs to return (default: all)"
+          }
+        }
+      }
+    },
+    {
+      "name": "close_active_dialogs",
+      "description": "EXPLICITLY INVOKED ONLY - nothing in this server calls it automatically. Click a SAFE button of an active dialog (default #32770) with the BM_CLICK window message: the caption must be on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist (delete/remove/uninstall/format/overwrite/discard/reset/...). Disabled or non-whitelisted buttons are reported as skipped and are never clicked. SAFETY: before clicking, the dialog BODY (title + every child control's text) is READ; if it names a destructive action the DEFAULT click is REFUSED with reason=dangerous_dialog_body + bodyHit (an explicit button=\"No\" is the escape hatch) and NOTHING is sent. TASK-P1-125 adds a second, independent guard: every path - the dry_run preview included - carries host_modal_risk (none|possible|known) + host_modal_risk_reason + host_modal_risk_class + riskDialogs[], and a box whose button would start a host-modal operation is NOT clicked unless allow_host_modal=true; a Cancel/Close caption is still allowed on such a box, because cancelling cannot start the operation. recovery_hint explains what to do if a write tool then answers reason=busy. Every path returns the same keys: clickedCount, dialogsBefore, dialogsAfter, clicked[].stillExists, skipped[], remaining[].",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "hwnd": {
+            "type": "integer",
+            "description": "Target dialog hwnd (0/omitted = every active dialog)"
+          },
+          "button": {
+            "type": "string",
+            "description": "Only click this button caption (it must still pass the safe whitelist)"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "true = report what WOULD be clicked without sending anything; a dry run returns exactly the same key set as a real click, host_modal_risk included"
+          },
+          "allow_host_modal": {
+            "type": "boolean",
+            "description": "Default false. A dialog whose own button starts a long VB6-modal operation (VB6's Make Project box, detected from its title or from its Save &in: / Save as &type: / File &name: controls) is reported as host_modal_risk=known and is NOT clicked, because the click leaves the host inside a modal loop that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy (busyTool=close_active_dialogs) until the IDE is restarted. Set true to click it anyway."
+          }
+        }
+      }
+    },
+    {
+      "name": "send_window_message",
+      "description": "Send a window message to a hwnd of THIS VB6 process. The parameter is named message (NOT msg: an argument called msg is ignored and the call fails with reason=bad_message - a real caller trap). action=click (BM_CLICK); action=key (WM_KEYDOWN+WM_KEYUP for the vk name/number); action=message takes a NAME (click bm_click wm_command wm_keydown wm_keyup wm_char wm_close wm_mousewheel wm_vscroll wm_syscommand bm_setstate cb_showdropdown em_linescroll) OR A RAW NUMBER such as 0x0111 / 522 / &H20A. SendMessage by default, post=true for PostMessage. HIGH-RISK messages (WM_CLOSE 0x0010 / WM_QUIT 0x0012 / WM_SYSCOMMAND 0x0112) are refused unless confirm=true. MESSAGE ONLY: no memory is written, nothing is injected and no IAT is patched; a hwnd of another process (and HWND_BROADCAST) is refused.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "hwnd": {
+            "type": "integer",
+            "description": "Target window handle - must belong to THIS VB6 process"
+          },
+          "action": {
+            "type": "string",
+            "description": "click | key | message (default message)"
+          },
+          "message": {
+            "type": "string",
+            "description": "action=message: a name (click bm_click wm_command wm_keydown wm_keyup wm_char wm_close wm_mousewheel wm_vscroll wm_syscommand bm_setstate cb_showdropdown em_linescroll) or a number such as 0x0111"
+          },
+          "vk": {
+            "type": "string",
+            "description": "action=key: a VK name (ENTER ESC TAB F1..F12 UP DOWN LEFT RIGHT A..Z 0..9) or a number such as 0x0D"
+          },
+          "wparam": {
+            "type": "string",
+            "description": "wParam (decimal or 0x hex)"
+          },
+          "lparam": {
+            "type": "string",
+            "description": "lParam (decimal or 0x hex)"
+          },
+          "presses": {
+            "type": "integer",
+            "description": "How many times to send it (default 1, max 20)"
+          },
+          "post": {
+            "type": "boolean",
+            "description": "true = PostMessage (async) instead of SendMessage"
+          },
+          "confirm": {
+            "type": "boolean",
+            "description": "action=message ONLY: HIGH-RISK messages (WM_CLOSE 0x0010 / WM_QUIT 0x0012 / WM_SYSCOMMAND 0x0112) are REFUSED with reason=high_risk_message unless confirm=true (default false). Nothing is sent when refused."
+          }
+        },
+        "required": [
+          "hwnd"
+        ]
+      }
+    },
+    {
+      "name": "quit_ide",
+      "description": "Quit the VB6 IDE (VBE.Quit). Unsaved changes are lost - save first!",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "validate_code",
+      "description": "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey (TASK-P1-126/MCP-15), and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name (kind inference + reporting)"
+          },
+          "code": {
+            "type": "string",
+            "description": "Code text to validate (NOT written to the IDE)"
+          },
+          "kind": {
+            "type": "string",
+            "description": "bas|cls|frm (optional; inferred from name)"
+          },
+          "mode": {
+            "type": "string",
+            "description": "off|warn|strict (default warn)"
+          },
+          "baseline": {
+            "type": "string",
+            "description": "TASK-P1-126 (MCP-15): a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new."
+          }
+        },
+        "required": [
+          "code"
+        ]
+      }
+    },
+    {
+      "name": "read_source",
+      "description": "Read a VB6 source file with encoding detection (utf-8/ansi/utf-16le), byte-level sha256 and decoded text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Source file path (relative paths resolve against the project dir)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "check_component",
+      "description": "Lint the current in-IDE text of a component (same diagnostics as validate_code, evaluated on IDE memory).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "build",
+      "description": "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. TASK-P1-132: laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "string",
+            "description": "Project .vbp path (optional; default = active project)"
+          },
+          "defines": {
+            "type": "string",
+            "description": "Comma-separated /d defines, e.g. TESTING=1"
+          },
+          "out_path": {
+            "type": "string",
+            "description": "Build log path (optional)"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Timeout in ms (default 180000)"
+          },
+          "laa": {
+            "type": "boolean",
+            "description": "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted."
+          }
+        }
+      }
+    },
+    {
+      "name": "edit_by_anchor",
+      "description": "Replace one uniquely-matched line by content anchor (no line numbers). Rejects if the anchor is missing or ambiguous. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "anchor": {
+            "type": "string",
+            "description": "Exact line to replace (must match uniquely)"
+          },
+          "new_text": {
+            "type": "string",
+            "description": "Replacement line"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional optimistic-concurrency guard"
+          },
+          "occurrence": {
+            "type": "integer",
+            "description": "1-based index of the hit to use when the anchor repeats; omitted = the anchor must be unique (A-batch rule)"
+          },
+          "match": {
+            "type": "string",
+            "description": "normalized (default: ignore indentation and case) or exact (raw line)"
+          },
+          "scope": {
+            "type": "object",
+            "description": "Optional {proc?, start_line?, end_line?} limiting where the anchor may match"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          },
+          "snapshot": {
+            "type": "boolean",
+            "description": "true = guarantee a PRE-EDIT pane snapshot exists in the project's _undo store (this tool already writes one by default through the write funnel); default false = unchanged. The JSON boolean true is expected; the strings on/yes/1 are also accepted"
+          }
+        },
+        "required": [
+          "name",
+          "anchor",
+          "new_text"
+        ]
+      }
+    },
+    {
+      "name": "apply_edits",
+      "description": "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "edits": {
+            "type": "array",
+            "description": "Array of {op:R|I|D, anchor, text}"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard; whole batch is all-or-nothing"
+          },
+          "match": {
+            "type": "string",
+            "description": "normalized (default) or exact"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          },
+          "snapshot": {
+            "type": "boolean",
+            "description": "true = guarantee a PRE-EDIT pane snapshot exists in the project's _undo store (this tool already writes one by default through the write funnel); default false = unchanged. The JSON boolean true is expected; the strings on/yes/1 are also accepted"
+          }
+        },
+        "required": [
+          "name",
+          "edits"
+        ]
+      }
+    },
+    {
+      "name": "preview_edit",
+      "description": "Return a unified-style diff for a batch of anchor edits without writing anything. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "edits": {
+            "type": "array",
+            "description": "Array of {op:R|I|D, anchor, text}"
+          }
+        },
+        "required": [
+          "name",
+          "edits"
+        ]
+      }
+    },
+    {
+      "name": "write_source",
+      "description": "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Target file path"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text to write (ASCII string literals only for VB files)"
+          },
+          "encoding": {
+            "type": "string",
+            "description": "auto|ansi|utf-8|utf-16le (default auto: VB files -> ansi)"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off = no lint, warn (default) = report diagnostics and still write, strict = refuse the write when a severity=error diagnostic exists",
+            "enum": [
+              "off",
+              "warn",
+              "strict"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "verify",
+      "description": "Aggregate verdict for one component: IDE==DISK + lint diagnostics + optional baseline filter.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "disk_path": {
+            "type": "string",
+            "description": "Optional disk file (default = component file)"
+          },
+          "baseline": {
+            "type": "string",
+            "description": "Optional lint baseline keys (newline separated)"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "inject_trace",
+      "description": "Insert a McpTrace call at the start of a procedure. B+C/TASK-P1-028: the guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen. TASK-P1-129: inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "procedure": {
+            "type": "string",
+            "description": "Procedure to instrument"
+          },
+          "expressions": {
+            "type": "string",
+            "description": "Comma-separated expressions, e.g. x,y"
+          },
+          "id": {
+            "type": "string",
+            "description": "Trace id (also the removal handle)"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "procedure",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "remove_trace",
+      "description": "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-129: it also removes the modMcpTrace component that inject_trace attached automatically - but ONLY while that module still carries the VB6MCP autogen marker; a hand-written modMcpTrace is left alone and the receipt says so.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "id": {
+            "type": "string",
+            "description": "Trace id to remove"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "fault_inject",
+      "description": "Inject a guarded fault (raise/return/delay) at the start of a procedure (#If MCP_FAULT).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "procedure": {
+            "type": "string",
+            "description": "Procedure to fault"
+          },
+          "mode": {
+            "type": "string",
+            "description": "raise|return|delay"
+          },
+          "value": {
+            "type": "string",
+            "description": "Mode payload (return value / delay ms; optional)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Fault id (removal handle)"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "procedure",
+          "mode",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "clear_faults",
+      "description": "Remove a previously injected fault block.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "id": {
+            "type": "string",
+            "description": "Fault id to clear"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "audit_tail",
+      "description": "Return the most recent tool-call audit entries (newest first).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "How many recent entries (default 50)"
+          }
+        }
+      }
+    },
+    {
+      "name": "set_breakpoint",
+      "description": "Inject a persistent Debug.Assert False breakpoint before a uniquely-matched line (auto-omitted in compiled builds). The anchor must be a statement INSIDE a procedure body: a module-level line or a procedure declaration is refused with ok:false, reason:'anchor_outside_procedure' (injecting there puts executable code outside every procedure and the project stops compiling).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "anchor": {
+            "type": "string",
+            "description": "Line to break before (must match uniquely)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Breakpoint id (removal handle)"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "anchor",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "clear_breakpoints",
+      "description": "Remove an injected breakpoint block by id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "id": {
+            "type": "string",
+            "description": "Breakpoint id"
+          },
+          "expected_sha256": {
+            "type": "string",
+            "description": "Optional guard"
+          }
+        },
+        "required": [
+          "name",
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "debug_commands",
+      "description": "Catalog of the VB6 debug commands this server knows, for use with the CommandBars path. Per entry: id (this server's stable command NAME, e.g. step_into - NOT a CommandBar id), keys (shortcut), english (English caption), menuId (the live CommandBar Control.Id, or the measured table value when the control cannot be resolved live), shortcutText, caption (LOCALIZED - the Chinese IDE returns Chinese) and idSource (live|table). It is a FIXED list, not a live probe of the IDE: it carries no menu path and no enabled/visible state. For ids, captions, paths and enabled flags call command_bars action=list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "execution_state",
+      "description": "Win32 execution state of a process: main window, responsive / hung, top-level window count, modal dialog count.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "description": "Target process id (default: the IDE process hosting this add-in)"
+          }
+        }
+      }
+    },
+    {
+      "name": "vba6_probe_plan",
+      "description": "Ordered plan for the VBA6.DLL debug-engine probes (read-only first, writes last) with preconditions. Run only inside the IDE process.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "export_public_api",
+      "description": "Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          }
+        }
+      }
+    },
+    {
+      "name": "check_public_api",
+      "description": "Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[].",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          },
+          "baseline": {
+            "type": "string",
+            "description": "Baseline spec TSV previously returned by export_public_api (its spec field)"
+          }
+        },
+        "required": [
+          "baseline"
+        ]
+      }
+    },
+    {
+      "name": "dependency_graph",
+      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "purity_check",
+      "description": "Purity classification of one component (can it go into an offline test host): reasons such as new / createobject / fileio / apideclare / shell / gui.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          }
+        }
+      }
+    },
+    {
+      "name": "generate_stub",
+      "description": "Generate a compilable stub module from a component: public declarations kept verbatim, public bodies emptied, private members dropped.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Component name"
+          }
+        }
+      }
+    },
+    {
+      "name": "record_fixture",
+      "description": "Record a deterministic sample (fixture) as raw ANSI bytes for later regression comparison.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Fixture file path"
+          },
+          "text": {
+            "type": "string",
+            "description": "Sample text to record"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "compare_fixture",
+      "description": "Compare text against a recorded fixture: same / added / removed / firstDiffLine.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Fixture file path"
+          },
+          "text": {
+            "type": "string",
+            "description": "Current text to compare against the recorded fixture"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "list_lessons",
+      "description": "List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeDisabled": {
+            "type": "boolean",
+            "description": "Include disabled lessons (default false)"
+          }
+        }
+      }
+    },
+    {
+      "name": "add_lesson",
+      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable lesson id (optional; auto custom-N)"
+          },
+          "scenario": {
+            "type": "string",
+            "description": "When this applies"
+          },
+          "trap": {
+            "type": "string",
+            "description": "The pitfall"
+          },
+          "do": {
+            "type": "string",
+            "description": "What to do instead"
+          },
+          "scope": {
+            "type": "string",
+            "description": "all | mcp | vb6 (optional)"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Enabled (default true)"
+          }
+        }
+      }
+    },
+    {
+      "name": "delete_lesson",
+      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Lesson id"
+          }
+        }
+      }
+    },
+    {
+      "name": "export_lessons",
+      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeDisabled": {
+            "type": "boolean",
+            "description": "Include disabled lessons (default false)"
+          }
+        }
+      }
+    },
+    {
+      "name": "import_lessons_md",
+      "description": "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Markdown file to import"
+          },
+          "dryRun": {
+            "type": "boolean",
+            "description": "Parse only, do not write (default false)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "ext_list",
+      "description": "List installed extension packs with enabled state, tool count and file path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "ext_enable",
+      "description": "Enable an extension pack; its tools appear in tools/list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Extension pack name"
+          }
+        }
+      }
+    },
+    {
+      "name": "ext_disable",
+      "description": "Disable an extension pack; its tools disappear from tools/list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Extension pack name"
+          }
+        }
+      }
+    },
+    {
+      "name": "ext_reload",
+      "description": "Rescan mcp_extensions and report pack / enabled-tool counts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "ext_install",
+      "description": "Install an extension pack by copying its JSON into mcp_extensions.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Extension JSON file to install"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "ext_uninstall",
+      "description": "Remove an extension pack (file renamed to .removed).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Extension pack name"
+          }
+        }
+      }
+    },
+    {
+      "name": "project_changes",
+      "description": "Poll the IDE change journal instead of re-reading the whole model: project/component/control add, remove and rename plus component reload, each with a monotonically increasing revision. Keep the last revision and pass it as since on the next call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "integer",
+            "description": "Return only changes with rev > since (0 = everything retained)"
+          },
+          "clear": {
+            "type": "boolean",
+            "description": "Reset the dropped-events counter after reading"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_callstack",
+      "description": "Read the engine's OWN call stack while the program is stopped at a breakpoint: for EVERY frame the project, the MODULE and the PROCEDURE name, indexed 0 (innermost) to count-1 (outermost). Closes the G1 gap (per-frame procedure name) with the same EbGetCallstackFunction call that the IDE's own Call Stack window uses. Requires break mode; otherwise returns broken=false with a note. Implementation note: the call uses the corrected machine-code thunk prototype with the frame index CLAMPED to 0..count-1; the naive ByRef-String declaration of EbGetCallstackFunction is a different, IDE-killing path and is never used.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "max_frames": {
+            "type": "integer",
+            "description": "Maximum frames to return (default 32, cap 128)"
+          }
+        }
+      }
+    },
+    {
+      "name": "vba6_probe",
+      "description": "Call the VBA6.DLL debug engine from inside the IDE process: EbMode / EbGetStepMode / callstack / current function / EbIsValidIdent, or (exec_probe=true) the Immediate-window executor EbExecuteLine. Read-only probes run by default; break-only probes and the executor are gated.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_break_probes": {
+            "type": "boolean",
+            "description": "Also call the break-only probes (EbGetCallstackCount/Function, EbGetCurrentFunction, EbGetDebWndCallstackIndex). Requires a break context."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Run break probes even when EbMode reports no break context (may be unsafe)"
+          },
+          "ident": {
+            "type": "string",
+            "description": "Optional identifier to test with EbIsValidIdent (design time)"
+          },
+          "exec_probe": {
+            "type": "boolean",
+            "description": "Run the Immediate-window executor probe (EbExecuteLine) instead of the standard set. RE round 5: this export (ordinal 147, RVA 0x127065) IS the Immediate-window line executor."
+          },
+          "exec_line": {
+            "type": "string",
+            "description": "Line to execute, e.g. 1+1 or Debug.Print ... (Immediate-window syntax)"
+          },
+          "exec_a2": {
+            "type": "integer",
+            "description": "arg2 (semantics unresolved; values 0/1 are the candidates)"
+          },
+          "exec_a3": {
+            "type": "integer",
+            "description": "arg3 (unresolved)"
+          },
+          "exec_a4": {
+            "type": "integer",
+            "description": "arg4 (mode flag: the epilogue uses setz al, so 0 vs 1 differ)"
+          },
+          "exec_scope": {
+            "type": "boolean",
+            "description": "Set the eval-scope bit (WORD[VBA6+0x17D076] |= 0x100) around the call, the way the IDE's own immediate-window path does, then restore it. This is the cheapest test of whether locals become visible at a breakpoint."
+          },
+          "exec_dump_ctx": {
+            "type": "boolean",
+            "description": "Pass arg2 a 64-byte buffer and dump the first 32 bytes afterwards. WARNING: measured to crash the IDE (AV in VBA6.dll) - arg2 is dereferenced as a structured pointer, so leave it 0 unless the object type is known."
+          },
+          "exec_set_frame": {
+            "type": "boolean",
+            "description": "F-2 (RE round 9): make the breakpoint's frame the current evaluation frame (write dword_global VBA6+0x17D0A4 from the engine+0x2F0 chain's first kind==1 node payload) around the call, then restore. Expected to make locals visible at a breakpoint."
+          },
+          "frame_probe": {
+            "type": "boolean",
+            "description": "F-1: read-only two-state observation - EbMode, dword_global VBA6+0x17D0A4 (evaluation frame), and the chain at engine+0x2F0 with each node's kind/payload. Writes nothing."
+          },
+          "frame_set": {
+            "type": "boolean",
+            "description": "F-3: call the engine's own frame setter sub_FBC3163 (RVA 0x133163) through an executable thunk, with frame_set_a1/frame_set_a2 (default 0/1 = find the named frame). This is the authoritative way to bind the evaluation frame."
+          },
+          "frame_set_a1": {
+            "type": "integer",
+            "description": "F-3 arg1: frame index (default 0)"
+          },
+          "frame_set_a2": {
+            "type": "integer",
+            "description": "F-3 arg2: 1 = walk to the first kind==1 frame (default 1)"
+          },
+          "rva_call": {
+            "type": "string",
+            "description": "Call an INTERNAL function by RVA; optional vb6: prefix targets the HOST image VB6.EXE instead of VBA6.DLL. Call a VBA6 function by RVA (hex, e.g. 0x23EA) through an executable thunk, with rva_argc/rva_a1/rva_a2. Unsafe by nature: the callee must be __stdcall with argc args and clean its own stack."
+          },
+          "rva_argc": {
+            "type": "integer",
+            "description": "Argument count 0..2 (must match the callee's ret N)"
+          },
+          "rva_a1": {
+            "type": "integer",
+            "description": "Argument 1"
+          },
+          "rva_a2": {
+            "type": "integer",
+            "description": "Argument 2"
+          },
+          "worker_call": {
+            "type": "boolean",
+            "description": "DECISIVE (RE round 15): call the real worker sub_FB7317A (RVA 0xE317A) the way the IDE does - __thiscall ecx=engine, 8 stack args, retn 20h. Can crash the IDE if an argument is wrong."
+          },
+          "worker_text": {
+            "type": "string",
+            "description": "Line to evaluate, e.g. an OutputDebugStringA call that prints CStr(n)"
+          },
+          "worker_bstr": {
+            "type": "boolean",
+            "description": "Pass the text as a BSTR (IDE form, default) instead of an ANSI buffer (EbExecuteLine form)"
+          },
+          "worker_set_bit": {
+            "type": "boolean",
+            "description": "Also set WORD[VBA6+0x17D076] |= 0x100 around the call (the IDE path does this)"
+          },
+          "worker_p1": {
+            "type": "integer",
+            "description": "worker stack arg p1 (IDE: 1)"
+          },
+          "worker_p2": {
+            "type": "integer",
+            "description": "worker stack arg p2 (IDE: 1)"
+          },
+          "worker_p3": {
+            "type": "integer",
+            "description": "worker stack arg p3 (IDE: 0; step path: LCID)"
+          },
+          "worker_p4": {
+            "type": "integer",
+            "description": "worker stack arg p4 (IDE: 0; step path: MODULE HANDLE - the prime suspect)"
+          },
+          "worker_p5": {
+            "type": "integer",
+            "description": "worker stack arg p5 (IDE: 1)"
+          },
+          "worker_p6": {
+            "type": "integer",
+            "description": "worker stack arg p6 (IDE: 1)"
+          },
+          "worker_p7": {
+            "type": "integer",
+            "description": "worker stack arg p7 (IDE: 0)"
+          },
+          "worker_p2_engine": {
+            "type": "boolean",
+            "description": "Pass p2 = the engine singleton instead of the IDE's literal 1. RE round-16 搂5 note 2: with p1=0 the worker may dereference p2 as an object, and 1 then crashes."
+          },
+          "mem_dump": {
+            "type": "boolean",
+            "description": "READ-ONLY memory dump for the RE round-17 P-series (locate the ExFrame stack top / check frame offsets). Safe: refuses addresses outside user space."
+          },
+          "mem_rva": {
+            "type": "string",
+            "description": "Address as an RVA (hex, e.g. 0x17D000). Default image is VBA6.DLL; prefix vb6+ to address the HOST image VB6.EXE (e.g. vb6+0x1234) or vba6+ to be explicit. Used when mem_addr is 0"
+          },
+          "mem_addr": {
+            "type": "string",
+            "description": "Absolute address to read (hex, e.g. 0x01234567); takes precedence over mem_rva"
+          },
+          "hosted_expr_srv": {
+            "type": "boolean",
+            "description": "NEW DIRECTION: instantiate VBA6's HOSTED expression service via CreateHostedExprSrv (one of the 317 exports the IDE never imports), then report the object pointer it returns and the first 10 slots of its vtable. Read-mostly: it allocates a 404-byte engine object; nothing is patched."
+          },
+          "wnd_probe": {
+            "type": "boolean",
+            "description": "READ-ONLY, in-process: enumerate the DIRECT CHILDREN (depth exactly 2) of this process's TOP-LEVEL windows and classify both the window procedure and the module that registered the window class (vb6 / vba6 / other). The top-level windows themselves are NEVER listed and grandchildren or deeper are NEVER listed; there are no visibility, owner, rect or style filters (source: Vba6Probe.bas WindowProbeJson). Cross-process GetWindowLong/GCL_HMODULE both return 0, so this probe only works from inside the IDE. WARNING: this is NOT a complete window enumeration - it saw only 27 of the 76 windows that find_gui returned (about 36 percent), so any does-not-exist conclusion about a window or a dialog drawn from wnd_probe is invalid. STRUCTURAL BLIND SPOT: a dialog is normally a TOP-LEVEL #32770 window, which wnd_probe structurally cannot see - use find_gui (all top-level windows plus the whole recursive subtree) to find dialogs or any complete set."
+          },
+          "wnd_max": {
+            "type": "integer",
+            "description": "Maximum windows to report for wnd_probe (default 200, cap 1500)"
+          },
+          "mem_scan": {
+            "type": "boolean",
+            "description": "READ-ONLY byte-wise dword scanner over a live range: reports every offset whose dword lies in [scan_lo, scan_hi], with its alignment. Used to replicate RE round-32's whole-image scan of VB6.EXE for absolute references into the VBA6 engine globals."
+          },
+          "scan_addr": {
+            "type": "string",
+            "description": "Start address for mem_scan (hex, e.g. 0x400000)"
+          },
+          "scan_len": {
+            "type": "integer",
+            "description": "Bytes to scan for mem_scan (max 1048576)"
+          },
+          "scan_lo": {
+            "type": "integer",
+            "description": "Low bound of the dword value range to match (must be non-zero)"
+          },
+          "scan_hi": {
+            "type": "integer",
+            "description": "High bound of the dword value range to match"
+          },
+          "scan_max": {
+            "type": "integer",
+            "description": "Maximum hits to return (default 64, cap 512)"
+          },
+          "export_rvas": {
+            "type": "boolean",
+            "description": "READ-ONLY: resolve the exports the RE names BY NAME through the real PE export table and report each one's true RVA, so any 'function X is at RVA 0xNNNN' claim can be checked in one call."
+          },
+          "engine_items": {
+            "type": "boolean",
+            "description": "READ-ONLY: call EbGetStatusOfItems(buf,72) the way VB6.EXE's command dispatcher does and return the engine's 72-item capability table (hex + list of enabled item ids). No writes."
+          },
+          "cs_fn": {
+            "type": "integer",
+            "description": "Callback-free single-frame probe: call EbGetCallstackFunction(frame, &outA, &outB, &outC, &arg5) with the authoritative IDE prototype (3 out-BSTRs zeroed, arg5 a zeroed writable dword, rc=0 means success). frame must be 0..count-1. Omit or -1 to skip."
+          },
+          "mem_len": {
+            "type": "integer",
+            "description": "Bytes to read, multiple of 4, max 512 (default 64)"
+          }
+        }
+      }
+    },
+    {
+      "name": "project_meta",
+      "description": "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "get (read current values) or set (apply the supplied fields)",
+            "enum": [
+              "get",
+              "set"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "Project .vbp path; defaults to the active project when the IDE is connected"
+          },
+          "major": {
+            "type": "string",
+            "description": "MajorVer"
+          },
+          "minor": {
+            "type": "string",
+            "description": "MinorVer"
+          },
+          "revision": {
+            "type": "string",
+            "description": "RevisionVer"
+          },
+          "auto_increment": {
+            "type": "boolean",
+            "description": "AutoIncrementVer (1 = bump on every build)"
+          },
+          "company_name": {
+            "type": "string",
+            "description": "CompanyName"
+          },
+          "file_description": {
+            "type": "string",
+            "description": "FileDescription"
+          },
+          "product_name": {
+            "type": "string",
+            "description": "ProductName"
+          },
+          "legal_copyright": {
+            "type": "string",
+            "description": "LegalCopyright"
+          },
+          "legal_trademark": {
+            "type": "string",
+            "description": "LegalTrademark"
+          },
+          "comments": {
+            "type": "string",
+            "description": "Comments"
+          },
+          "title": {
+            "type": "string",
+            "description": "Title"
+          },
+          "exe_name": {
+            "type": "string",
+            "description": "ExeName32 (output file name)"
+          },
+          "cond_comp": {
+            "type": "string",
+            "description": "CondComp (conditional compilation arguments, e.g. TESTING=1)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "app_manifest",
+      "description": "Generate or inspect an application manifest next to an exe/dll (UAC requestedExecutionLevel plus DPI awareness). Writes <path>.manifest, which Windows reads automatically for an unembedded external manifest.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "read (show the existing manifest) or write (generate/overwrite it)",
+            "enum": [
+              "read",
+              "write"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The .exe/.dll the manifest belongs to (the file <path>.manifest is used)"
+          },
+          "level": {
+            "type": "string",
+            "description": "UAC level: asInvoker / highestAvailable / requireAdministrator"
+          },
+          "dpi_aware": {
+            "type": "boolean",
+            "description": "Emit dpiAware=true (default true)"
+          },
+          "dpi_awareness": {
+            "type": "string",
+            "description": "Optional 2016 setting: permonitorv2 / permonitor / system"
+          },
+          "ui_access": {
+            "type": "boolean",
+            "description": "requestedExecutionLevel uiAccess (default false)"
+          },
+          "assembly_name": {
+            "type": "string",
+            "description": "assemblyIdentity name (default vb6mcp.app)"
+          }
+        },
+        "required": [
+          "action",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "check_references",
+      "description": "List the active project's references and flag any whose file is missing on disk - the classic missing-reference failure of older VB6 projects. Built-in references (VBA/VBRUN/VB) are always treated as resolved because VB6 reports a synthetic path for them.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_resolved": {
+            "type": "boolean",
+            "description": "Also list references that resolve fine (default false = problems only)"
+          }
+        }
+      }
+    },
+    {
+      "name": "vbg_group",
+      "description": "Read or edit a .vbg project group: list its projects (with existence flags) or add/remove one. Text level, so it works whether or not the IDE has the group open.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "list / add / remove a project in a .vbg project group",
+            "enum": [
+              "list",
+              "add",
+              "remove"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The .vbg project-group file"
+          },
+          "project": {
+            "type": "string",
+            "description": "The .vbp to add or remove (action=add/remove)"
+          }
+        },
+        "required": [
+          "action",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "project_snapshot",
+      "description": "Project-level checkpoint and rollback: copy the .vbp plus every component file into a timestamped folder with a snapshot.json manifest (path, sha256, size per file), then restore any snapshot later. Every overwritten file is backed up as .bak. This is the project-wide counterpart of the component-level snapshot/verify tools.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "create (snapshot the .vbp plus all component files), restore (roll back), or list",
+            "enum": [
+              "create",
+              "restore",
+              "list"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The .vbp to snapshot. Required for action=create and action=list; NOT used by action=restore"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Snapshot directory. Used by action=create as an override (default <project>\\_vb6mcp_snapshots\\<timestamp>); REQUIRED by action=restore (the directory to restore from)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "package_app",
+      "description": "Assemble a delivery folder for a project: the built exe, an external manifest (UAC + per-monitor DPI), dependencies.txt built from the .vbp Reference= lines (with sha256 and MISSING flags), an install.bat that regsvr32s the OCX/DLL dependencies, and a README. Pure file level, so it works while the IDE is closed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The .vbp to package"
+          },
+          "exe_path": {
+            "type": "string",
+            "description": "Built exe/dll; defaults to the ExeName32 of the project"
+          },
+          "out_dir": {
+            "type": "string",
+            "description": "Output folder; defaults to <project>\\_vb6mcp_dist"
+          },
+          "level": {
+            "type": "string",
+            "description": "UAC level for the generated manifest (asInvoker / highestAvailable / requireAdministrator)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "git",
+      "description": "Read-only Git integration: status (porcelain v1 plus branch header), diff (--stat, optionally for one file) and log (oneline). Runs git.exe and returns its captured stdout, so an agent can see what changed before editing or committing. No write commands are exposed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "status (porcelain + branch), diff (--stat, optional file filter) or log (oneline)",
+            "enum": [
+              "status",
+              "diff",
+              "log"
+            ]
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repository directory; defaults to the active project folder"
+          },
+          "file": {
+            "type": "string",
+            "description": "Optional path filter for action=diff"
+          },
+          "max": {
+            "type": "integer",
+            "description": "Number of commits for action=log (default 20)"
+          },
+          "exe": {
+            "type": "string",
+            "description": "Path to git.exe (default: resolved from PATH)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "format_code",
+      "description": "Re-indent a VB6 source file from its block structure (Sub/Function/If/For/Do/Select/With/Type/Enum plus #If and Case/Else). It rewrites leading whitespace ONLY and proves it: if the stripped text would differ on any line it refuses to write. Strings and comments are masked before keyword detection, so keywords inside literals are never mistaken for blocks.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "VB source file to re-indent"
+          },
+          "indent": {
+            "type": "string",
+            "description": "Indent unit (default four spaces; use two spaces or a tab if you prefer)"
+          },
+          "apply": {
+            "type": "boolean",
+            "description": "false (default) = report only; true = rewrite the file (a .bak is not needed: only leading whitespace can change and that is verified before writing)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "rename_symbol",
+      "description": "Rename an identifier (variable, procedure, type) across every component of a project, with a per-file occurrence count and sha256 before/after. String literals and comments are skipped by a lexical scan, and Attribute lines are skipped by default, so a component rename is routed to rename_component instead. dry_run defaults to true; each rewritten file keeps a .bak.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The .vbp whose component files are searched"
+          },
+          "old_name": {
+            "type": "string",
+            "description": "Identifier to rename"
+          },
+          "new_name": {
+            "type": "string",
+            "description": "New identifier (must be a valid VB identifier)"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "true (default) = only report the occurrence counts"
+          },
+          "skip_attributes": {
+            "type": "boolean",
+            "description": "Skip Attribute lines (default true) - module names need rename_component instead"
+          }
+        },
+        "required": [
+          "path",
+          "old_name",
+          "new_name"
+        ]
+      }
+    },
+    {
+      "name": "native_breakpoint",
+      "description": "Toggle a REAL IDE breakpoint (or clear all) through the Debug menu without touching any source file - unlike set_breakpoint, which injects Debug.Assert False into the code. Places the code pane caret first. Captions are matched for English and Chinese IDEs; note that the CommandBars model is suspended while the program runs, so use this in design or break state.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "toggle (Debug menu Toggle Breakpoint at component/line) or clear_all (Clear All Breakpoints)",
+            "enum": [
+              "toggle",
+              "clear_all"
+            ]
+          },
+          "component": {
+            "type": "string",
+            "description": "Component whose code pane holds the line (action=toggle)"
+          },
+          "line": {
+            "type": "integer",
+            "description": "1-based IDE line to place the caret on before toggling (action=toggle)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "workspace_status",
+      "description": "Read-only: list the IDE components that are UNSAVED and the git working tree (branch/ahead/behind/files/diffStat) side by side. Runs only read-only git subcommands and never writes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "Repository directory for the git half (default: the active project folder)"
+          }
+        }
+      }
+    },
+    {
+      "name": "verify_scope",
+      "description": "Read-only: for a set of components report {component, ideEqualsDisk, lintErrors, lintWarnings, firstDiagnostic} with a pass/fail summary; only failing components are listed in detail.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "components": {
+            "type": "array",
+            "description": "Optional component names to check (default: every component of the active project)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Optional disk path override"
+          }
+        }
+      }
+    },
+    {
+      "name": "todo_status",
+      "description": "Read-only: machine-readable todo derived from _bus/tasks/P1 and _bus/reports/P1 (status + title) plus counts; useful for a quick progress snapshot.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp_info",
+      "description": "Read-only version stamp for this server: {ok, product, contract, toolCount, build:{sha256, builtAt}, breaking[], migrations[], changelog[]}. build.sha256 is the SHA-256 of the DLL file on disk, read at call time (never a compile-time literal), so an independent Get-FileHash can be compared with it; builtAt is that file's LastWriteTime. breaking[] lists the contract changes that alter how existing calls must be made. Call this once after initialize to learn which contract the server implements.",
+      "inputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "replace_in_files",
+      "description": "Cross-component literal/regex replace over the components of the OPEN project. Defaults to dry_run=true: nothing is written and the receipt lists every matching component with its hit count and the shas it WOULD produce. With dry_run=false each component is rewritten through one minimal text transaction (per-component atomic) and the receipt reports per-component shaBefore/shaAfter plus a summary. expected_shas[] guards each component: a mismatch makes that component SKIPPED and reported, never written. Failure semantics are honest: on the first failure the tool STOPS, ROLLS BACK the components it already applied to their pre-run text (rolledBack=true) or reports the exact applied set when a rollback is not possible - it never claims atomicity across components.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The .vbp of the OPEN project, or its directory. Any other path is refused: this tool never writes a project the add-in does not own"
+          },
+          "query": {
+            "type": "string",
+            "description": "Literal text, or an ECMAScript-style regex when regex=true"
+          },
+          "replacement": {
+            "type": "string",
+            "description": "Replacement text; with regex=true, $1..$9 refer to capture groups"
+          },
+          "regex": {
+            "type": "boolean",
+            "description": "Treat query as a regular expression (default false = literal)"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Default TRUE: plan only, write nothing. Set false to apply."
+          },
+          "expected_shas": {
+            "type": "array",
+            "description": "Optional per-component guard: [{file, sha256}] where file is a component name or its file path; a mismatch SKIPS that component and reports it (never written)"
+          },
+          "validate": {
+            "type": "string",
+            "description": "off|warn|strict (default warn) - lint gate applied before each write, as in the other write tools"
+          },
+          "max_files": {
+            "type": "integer",
+            "description": "Optional cap on components scanned (default 200, cap 1000) so a large project cannot hang the IDE"
+          }
+        },
+        "required": [
+          "path",
+          "query",
+          "replacement"
+        ]
+      }
+    },
+    {
+      "name": "undo_edit",
+      "description": "Component-level undo of the LAST edit, from snapshots taken before every text write (the pre-write PANE text is stored as UTF-8 in <project>_undo<component>.<timestamp>.txt). Explicit and single-step: it never rolls back automatically and never touches a file on disk. action=list shows the available snapshots; action=restore (default) restores one through the same minimal-write path and reports the sha before/after plus diskUntouched.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Component name; omit to use the component of the most recent snapshot"
+          },
+          "action": {
+            "type": "string",
+            "description": "list = show the available snapshots; restore (default) = restore one",
+            "enum": [
+              "list",
+              "restore"
+            ]
+          },
+          "ts": {
+            "type": "string",
+            "description": "Optional exact snapshot timestamp (see action=list); omit for the most recent"
+          },
+          "to_disk": {
+            "type": "boolean",
+            "description": "Default FALSE: restore changes the component's PANE text only, the file on disk is NEVER touched by default. true is not supported yet and is refused with reason=to_disk_not_supported - use save_project to flush the project."
+          }
+        }
+      }
+    }
+  ]
+}

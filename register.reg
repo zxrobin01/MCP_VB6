@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Microsoft\Visual Basic\6.0\Addins\VB6MCP.Connect]
+"FriendlyName"="VB6 MCP Server"
+"Description"="Exposes the VB6 IDE as an MCP (Model Context Protocol) server over local HTTP"
+"LoadBehavior"=dword:00000003
+"CommandLineSafe"=dword:00000000

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vb6": {
+      "command": "python",
+      "args": ["D:/VBProjects/T3000/MCP_VB6/bridge/mcp_stdio_bridge.py"]
+    }
+  }
+}

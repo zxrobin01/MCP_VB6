@@ -1,0 +1,12 @@
+# VB6 源码与注册表文件必须保持 CRLF（VB6 IDE / regedit 兼容性）
+*.bas text eol=crlf
+*.cls text eol=crlf
+*.frm text eol=crlf
+*.vbp text eol=crlf
+*.reg text eol=crlf
+*.bat text eol=crlf
+
+# 其余文本文件统一 LF
+*.md text eol=lf
+*.py text eol=lf
+*.json text eol=lf

@@ -1,0 +1,27 @@
+VB6MCP
+Copyright 2026 zxrobin01
+
+This product includes software developed as part of the VB6MCP project
+(https://github.com/zxrobin01/MCP_VB6).
+
+Platform prerequisite
+---------------------
+VB6MCP is an add-in for Microsoft Visual Basic 6.0 (VB6) and forms its MCP
+server surface. Using or building it requires a licensed installation of VB6
+owned by the user. No Microsoft binaries, type libraries, designer files or
+other Microsoft components are distributed with this project; the build
+expects the user to supply them from their own VB6 installation (see
+THIRD_PARTY_NOTICES.md).
+
+Non-affiliation
+----------------
+This project is not affiliated with, endorsed by, or sponsored by Microsoft
+Corporation. Visual Basic, VB6, VBA and Windows are trademarks of Microsoft
+Corporation.
+
+Research modules
+----------------
+Parts of this project (the optional Vba6Probe module) interoperate with
+Microsoft's VBA6 debug-engine exports by calling them from inside the host
+IDE process. Those modules are development and diagnostics aids; they are
+documented as such and are not required to use the MCP server surface.
