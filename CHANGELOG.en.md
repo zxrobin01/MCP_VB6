@@ -12,6 +12,10 @@ This file records **source and feature** changes only; packaging, release and ot
 
 ## 2026-10-13
 
+### 13:29 · Cumulative line numbers · operation receipts and refusals · foreground and pane protection · conditional-compilation arguments
+
+**What changed**: component disk line numbers now **accumulate per line** (no longer too low when hidden inline Attribute lines exist); the "delete control" and "open project" receipts now carry a **success flag, before/after counts and the memory-vs-disk difference**, and **refuse structurally** when it is unsafe; tools that touch the caret or a pane now **report and restore the foreground**, and **verify the pane text is unchanged** across the operation; conditional-compilation argument values are **no longer quoted**, and the receipt shows the actual command line.
+**Why**: a low line number can silently edit the wrong line; "looks successful" or "silently ineffective" makes callers misjudge; when the user is typing on the same machine, stealing focus can drop keystrokes into the code pane and corrupt the source; quoting silently disables the conditional-compilation macro.
 ### 10:05 · `remove_trace` no longer removes `modMcpTrace`
 
 **What changed**: `remove_trace` deletes only the injected trace block; it no longer deletes the `modMcpTrace` module.
