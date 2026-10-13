@@ -1,5 +1,5 @@
 @echo off
-rem TASK-P1-103: the registration verdict for the VB6MCP add-in - decided by READING THE
+rem The registration verdict for the VB6MCP add-in - decided by READING THE
 rem REGISTRY, never by regsvr32's exit code.  rc is not evidence here: on this host a bare
 rem `regsvr32` (or a hardcoded C:\Windows\...) can resolve to the STALE second Windows
 rem installation and fail with 0xC0000139 while the caller still sees a stale 0.

@@ -30,7 +30,7 @@
     },
     {
       "name": "ide_start",
-      "description": "Start a VB6 IDE for the given project (.vbp). H1 minimal: needs VB6MCP_AUTOSTART_PROJECT or an explicit project plus a resolvable VB6.EXE; otherwise returns a structured not_implemented with the reason.",
+      "description": "Start a VB6 IDE for the given project (.vbp). Minimal mode: needs VB6MCP_AUTOSTART_PROJECT or an explicit project plus a resolvable VB6.EXE; otherwise returns a structured not_implemented with the reason.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -43,7 +43,7 @@
     },
     {
       "name": "ide_stop",
-      "description": "Stop an IDE instance. H1 only stops instances started by this hub; otherwise returns a structured not_allowed with the reason.",
+      "description": "Stop an IDE instance. It only stops instances started by this hub; otherwise returns a structured not_allowed with the reason.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -59,7 +59,7 @@
     },
     {
       "name": "ide_restart",
-      "description": "TASK-P1-126 (MCP-10): RECOVER a wedged IDE by stopping OUR OWN instance and starting it again on the same project. Sequence: best-effort save_project -> graceful quit_ide -> confirm the process is gone (force kill only if it will not go) -> clear our own instances/<pid>.json registry entry -> start VB6.EXE on the same .vbp -> wait for the new instance -> prove three-way readiness (add-in answers, mcp_info answers, project matches). It NEVER stops an instance below port 8767: 8766 belongs to an EXTERNAL process on this machine (discipline 107). Every path returns the same key set: {ok,restarted,stoppedPid,newPid,port,project,targetSource,ownership,refused_reason,stopConfirmed,saveAttempted,saveOk,registryCleared,lockCleared,three_way_ok,threeWay,vb6Exe,vb6ExeSource,waitMs,instances,steps,note}.",
+      "description": "RECOVER a wedged IDE by stopping OUR OWN instance and starting it again on the same project. Sequence: best-effort save_project -> graceful quit_ide -> confirm the process is gone (force kill only if it will not go) -> clear our own instances/<pid>.json registry entry -> start VB6.EXE on the same .vbp -> wait for the new instance -> prove three-way readiness (add-in answers, mcp_info answers, project matches). It NEVER stops an instance below port 8767: 8766 belongs to an EXTERNAL process on this machine (discipline 107). Every path returns the same key set: {ok,restarted,stoppedPid,newPid,port,project,targetSource,ownership,refused_reason,stopConfirmed,saveAttempted,saveOk,registryCleared,lockCleared,three_way_ok,threeWay,vb6Exe,vb6ExeSource,waitMs,instances,steps,note}.",
       "inputSchema": {
         "type": "object",
         "properties": {

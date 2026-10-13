@@ -54,7 +54,7 @@ neither see the project open in the IDE nor click that "Make Project" dialog. Th
 fills that gap.
 
 **The approach**: rather than building another editor, **turn the VB6 IDE itself into an MCP
-server**. Load one add-in and the IDE exposes 111 tools: read/search/edit code, static
+server**. Load one add-in and the IDE exposes 114 tools: read/search/edit code, static
 checking, anchor-based editing with safe transactions, compilation, run and single-step,
 dialog handling, form and project metadata, snapshots and rollback, packaging. **Because the
 tools live inside the IDE process**, they can do what an out-of-process approach cannot:
@@ -91,7 +91,7 @@ MCP_VB6/
 |-- McpServer.cls          MCP/JSON-RPC dispatch + HTTP routing
 |-- HttpConn.cls           HTTP/1.1 request buffering and parsing (keep-alive supported)
 |-- ServerForm.frm         hidden form hosting the Winsock listener + port-probe timer
-|-- CodeTools.cls          the 111 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
+|-- CodeTools.cls          the 114 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
 |-- JsonLib.bas            zero-dependency JSON parser/serializer
 |-- Utf8.bas               UTF-8/ANSI/UTF-16 conversion (kernel32 APIs)
 |-- Util.bas               logging, port file
@@ -167,20 +167,20 @@ type: sse     url: http://127.0.0.1:8766/sse
 }
 ```
 
-To check the whole chain:
+To check the whole chain (**needs the VB6 IDE open with the add-in loaded** - this is not an offline self-check):
 
 ```
 python tests/smoke_test.py --port 8766
 ```
 
-## 4. Tool list (111 tools)
+## 4. Tool list (114 tools)
 
 > The authoritative list is `docs/TOOL_CATALOG.md` (exported from a running add-in via
 > `tools/list`); the offline baseline is `tools/schema_baseline.json`, and
-> `tools/check_live_tools.py` compares the live face against that baseline.
+> `tools/check_live_tools.py docs/tools_schema.json` compares the shipped snapshot against that baseline.
 
 The table below covers the original 45 tools (the complete VBIDE object-model part). The other
-66 were added later for syntax gating / edit safety / compile authority / snapshot consistency
+69 were added later for syntax gating / edit safety / compile authority / snapshot consistency
 / test hosting / runtime observation / debug control / VBA6 probing / governance
 (`validate_code`, `check_component`, `read_source`, `write_source`, `edit_by_anchor`,
 `apply_edits`, `preview_edit`, `build`, `verify`, `inject_trace`, `remove_trace`,
@@ -323,6 +323,37 @@ allow python through.
 -> No: the add-in depends on the VBIDE object model, so it must run with the IDE. The usual
 practice is to leave VB6 running in the background.
 
+**Can I type in the IDE on the same machine while an agent is driving it?**
+-> **No.** This is a rule, not advice: while a tool drives the IDE it moves the caret, scrolls,
+opens panes, and some actions bring their window to the foreground (`control_window{action:"activate"}`;
+`native_breakpoint` first moves the caret to the target line). **Your keystrokes go to whatever window
+has the foreground at that moment** - this project has seen a real incident where the user typed during
+an agent operation, the keystrokes landed in the code pane, and a stray line of characters appeared in
+the source (typed by the keystrokes, not written by a tool). To edit by hand on the same machine, stop
+the agent first, or use another machine / another instance.
+
+Write-class tools therefore carry guards (all of them visible in the receipts):
+
+- **Post-write read-back assertions**: editing tools already carry `expected_sha256` / `sha256Before` /
+  `sha256After`; the breakpoint and window tools that do **not** write text (`native_breakpoint` /
+  `control_window` / `set_codepane`) now also hash the code-pane text before and after and require the
+  two to be equal - a difference turns the receipt into `{ok:false, reason:"paneTextMismatch"}` with the
+  line-level differences (`paneDiffLines`). When the pane cannot be read it is reported as
+  `paneAssertion:"notApplicable"`, never as a pass.
+- `set_member_attribute` reads the member attribute back after writing (`readback` / `applied`); note
+  that this is the **in-memory** value - whether it lands on disk as an `Attribute` line is decided by
+  VB6 when the component is saved.
+- **Focus safety**: `native_breakpoint` / `control_window` receipts carry `foregroundBefore` /
+  `foregroundAfter` / `foregroundTookFocus`, and any non-`activate` action gives the foreground back to
+  the window that had it. The value is reported **live**: it is a valid non-zero handle in an interactive
+  session and may read `0` on a locked or non-interactive desktop, in which case it is reported as-is -
+  the tool never steals focus to obtain it, and send-input capability is never inferred from a
+  window-station name.
+- **Breakpoints have no third route** (stated in the receipt): VB6 has **no breakpoint API**, the Debug
+  menu items act on the **caret**, and the other route (`set_breakpoint`) **writes text** marker blocks.
+  `native_breakpoint` therefore **compensates**: it puts the caret back where it was (`cursorRestored`).
+  `breakpointWithoutCursorMove:false` is the machine-readable mark of that fact.
+
 ## 9. Protocol notes
 
 - Implements the MCP core: `initialize` / `ping` / `tools/list` / `tools/call` / notifications.
@@ -357,6 +388,21 @@ practice is to leave VB6 running in the background.
   `open_project` - that was a **VB6 process crash**, triggered by a `.vbp` referencing component
   files that no longer exist on disk. See section 10 of the internal known-limitations document.
 
+**What is deliberately NOT provided (a refusal by design, not a defect)**: this add-in has **no**
+channel that writes `.vbp`-level project properties into the IDE's in-memory project model, and
+**no** channel that reloads an already-open project from disk in place. The only mechanism that
+could do the latter was measured to raise `59999` and leave the workspace with **zero projects**,
+so it is never attempted: `open_project` answers a disk-vs-memory divergence with a **structured
+refusal** (`ok:false` + `reason` + `reloadNotAttempted:true` + `sideEffects:"none: ..."`) instead
+of a silent no-op. To adopt the disk copy, call `remove_project` and then `open_project`
+yourself. The project options the VBIDE model does expose (description, help file/context,
+startup project, build output path, active project, read-only mode) are writable through
+`set_project_options`; what this build cannot set (e.g. `startup_object`) comes back as a
+structured `startupObjectError` plus a `startupObjectWorkaround`, never as a silent no-op.
+`.vbp`-level keys the object model does not expose (the version resource and friends) are
+written to the **file** by `project_meta{action:"set"}` (with a `.bak` and a post-write
+sha256) - they are not injected into IDE memory.
+
 ---
 
 ## What is `modMcpTrace` for, and is it required?
@@ -374,8 +420,8 @@ practice is to leave VB6 running in the background.
 **5. When its *reference* is added or removed**:
 
 - **Added**: on the first injection when the project does not contain it (see 4).
-- **Removed**: **the new version never removes it automatically** (`TASK-P1-149`). `remove_trace` deletes only **that id's injected block** and always keeps `modMcpTrace`; the receipt states `moduleRemoved:false` / `moduleLeftInPlace:true` / `moduleRemoveReason:"kept_by_design"` (or `module_absent` when the project has no such component), and `moduleRemoveNote` carries the two reasons below plus the manual-removal steps.
-- **The old behaviour is withdrawn (and why)**: `TASK-P1-129` used to have `remove_trace` take an auto-generated `modMcpTrace` out of the project as well (`moduleRemoveReason:"removed_autogen_module"`). That branch has been **deleted**, because (a) you may have added your own code to an auto-generated module and deleting the module would have destroyed that code, and (b) other `@mcp-trace` blocks may still exist elsewhere, so with the module gone those calls could no longer find `McpTrace`/`McpTraceOn` and **the project would stop compiling**.
+- **Removed**: **the new version never removes it automatically**. `remove_trace` deletes only **that id's injected block** and always keeps `modMcpTrace`; the receipt states `moduleRemoved:false` / `moduleLeftInPlace:true` / `moduleRemoveReason:"kept_by_design"` (or `module_absent` when the project has no such component), and `moduleRemoveNote` carries the two reasons below plus the manual-removal steps.
+- **The old behaviour is withdrawn (and why)**: an earlier version used to have `remove_trace` take an auto-generated `modMcpTrace` out of the project as well (`moduleRemoveReason:"removed_autogen_module"`). That branch has been **deleted**, because (a) you may have added your own code to an auto-generated module and deleting the module would have destroyed that code, and (b) other `@mcp-trace` blocks may still exist elsewhere, so with the module gone those calls could no longer find `McpTrace`/`McpTraceOn` and **the project would stop compiling**.
 - **Removing it by hand**: first confirm that **no** `@mcp-trace` block remains anywhere in the project, then call `remove_component{name:"modMcpTrace"}` yourself. Note that `VBComponents.Remove` only removes the component from the PROJECT - it **does not delete the .bas file on disk** (the receipt reports the bound path as `moduleFileOnDisk`).
 - **Where the log goes**: tracing is enabled by environment variables of the VB6 process - `MCP_TRACE_ON=1` or `MCP_TRACE_FILE=<path>`; the default sink is `%TEMP%\mcp_trace.jsonl`. A write failure is recorded in `MCP_TRACE_ERR_FILE` (default `%TEMP%\mcp_trace_err.log`) instead of being swallowed.
 - **No other tool needs it**: editing, checking, compiling, running, breakpoints, dialogs, forms, snapshots and packaging are all independent of it.
@@ -442,7 +488,7 @@ compilation or runtime; if you genuinely need the content of one of them, open a
 explaining what for.
 
 `docs/tools_schema.json` (the tool-face contract) and `tools/schema_baseline.json` (the frozen
-baseline) **are** included, so the gate scripts under `tools/` run out of the box.
+baseline) **are** included, so the offline gate scripts under `tools/` (`check_schema_baseline`, `check_hub_alignment`, `check_live_tools docs/tools_schema.json`) run out of the box; the live audit (`mcp_strict_audit`) and `tests/smoke_test.py` need a running IDE.
 
 ## Contributing
 

@@ -957,7 +957,7 @@ Private Function TgModuleEn() As String
         "'   removes both the injected blocks and this module.", _
         "' ===========================================================================", _
         "", _
-        "' TASK-P1-031: a trace sink is only useful if it can actually be written, and a", _
+        "' A trace sink is only useful if it can actually be written, and a", _
         "' silent failure here is worse than no trace at all. This module now (1) creates", _
         "' the sink directory, (2) falls back to %TEMP% when the configured sink is not", _
         "' usable, (3) NEVER hides a write failure - it appends it to MCP_TRACE_ERR_FILE", _
@@ -1023,7 +1023,7 @@ Private Function TgModuleEn() As String
         "' MkDir only makes ONE level, so walk the path and create every missing level.", _
         "' NB: the variable must NOT be called 'dir' - VB6 is case-insensitive and would", _
         "' shadow the built-in Dir$, turning 'Dir$(dir, vbDirectory)' into an array access", _
-        "' (measured: compile error 'Expected array', TASK-P1-031).", _
+        "' (measured: compile error 'Expected array').", _
         "Private Function EnsureDir(ByVal dirPath As String) As Boolean", _
         "    On Error Resume Next", _
         "    EnsureDir = False", _
@@ -1060,7 +1060,7 @@ Private Function TgModuleEn() As String
         "    err.Clear", _
         "End Sub", _
         "", _
-        "' TASK-P1-028: the injected guard calls this instead of relying on ""#If MCP_TRACE"".", _
+        "' The injected guard calls this instead of relying on ""#If MCP_TRACE"".", _
         "' A compile-time #If only takes effect when the project is LOADED with that CondComp;", _
         "' a runtime check has no such load-order dependency.", _
         "'   ON  when MCP_TRACE_ON=1  or MCP_TRACE_FILE is set"), vbCrLf)
@@ -1183,7 +1183,7 @@ Private Function TgModuleZh() As String
         "'   不再需要追踪时，用 MCP 工具 remove_trace 可以一并移除插入块与本模块。", _
         "' ===========================================================================", _
         "", _
-        "' TASK-P1-031: a trace sink is only useful if it can actually be written, and a", _
+        "' A trace sink is only useful if it can actually be written, and a", _
         "' silent failure here is worse than no trace at all. This module now (1) creates", _
         "' the sink directory, (2) falls back to %TEMP% when the configured sink is not", _
         "' usable, (3) NEVER hides a write failure - it appends it to MCP_TRACE_ERR_FILE", _
@@ -1249,7 +1249,7 @@ Private Function TgModuleZh() As String
         "' MkDir only makes ONE level, so walk the path and create every missing level.", _
         "' NB: the variable must NOT be called 'dir' - VB6 is case-insensitive and would", _
         "' shadow the built-in Dir$, turning 'Dir$(dir, vbDirectory)' into an array access", _
-        "' (measured: compile error 'Expected array', TASK-P1-031).", _
+        "' (measured: compile error 'Expected array').", _
         "Private Function EnsureDir(ByVal dirPath As String) As Boolean", _
         "    On Error Resume Next", _
         "    EnsureDir = False", _
@@ -1286,7 +1286,7 @@ Private Function TgModuleZh() As String
         "    err.Clear", _
         "End Sub", _
         "", _
-        "' TASK-P1-028: the injected guard calls this instead of relying on ""#If MCP_TRACE"".", _
+        "' The injected guard calls this instead of relying on ""#If MCP_TRACE"".", _
         "' A compile-time #If only takes effect when the project is LOADED with that CondComp;", _
         "' a runtime check has no such load-order dependency.", _
         "'   ON  when MCP_TRACE_ON=1  or MCP_TRACE_FILE is set", _

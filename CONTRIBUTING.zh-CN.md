@@ -47,21 +47,34 @@ tools\verify_registration.bat VB6MCP.dll
 
 ## 三、开 PR 之前请先跑这些检查
 
-这些就是本项目真正使用的门禁。全部离线、只读：
+这些就是本项目真正使用的门禁。
+
+**离线、只读**（不需要 IDE、不需要构建，只读仓库里的文件）：
 
 ```bat
-python tools\check_schema_baseline.py      :: 工具 schema 与冻结基线一致
-python tools\check_hub_alignment.py       :: 宿主面与插件面一致
-python tools\check_live_tools.py          :: 实际工具清单与声明的面一致
-python tools\mcp_strict_audit.py          :: 对整个工具面做严格审计
-python tools\gen_hub_snapshot.py          :: 重新生成 bridge/hub_schema.generated.json
-tools\verify_registration.bat VB6MCP.dll  :: 插件注册自检
+rem 仓库内快照与冻结基线一致
+python tools\check_schema_baseline.py
+rem 宿主面与插件面一致
+python tools\check_hub_alignment.py
+rem 仓库内快照与冻结基线交叉比对
+python tools\check_live_tools.py docs\tools_schema.json
 ```
+
+**需要活着的 IDE**（你自己的实例，端口 **8767 及以上**——永不用 8766）：
+
+```bat
+rem 对整个工具面做严格审计 —— 需要活着的 IDE
+python tools\mcp_strict_audit.py --url http://127.0.0.1:8767/mcp
+rem 端到端冒烟测试 —— 需要活着的 IDE
+python tests\smoke_test.py --port 8767
+```
+
+`tools\verify_registration.bat VB6MCP.dll`（见第二节）是读注册表，需要先构建出 DLL。
 
 对工具面的改动必须是**有意的**：冻结件是 `tools/schema_baseline.json`、`docs/tools_schema.json`、
 `bridge/hub_schema.generated.json`、`bridge/hub_tools.json` 与 `docs/CONTRACTS.md`。如果你的改动是
 有意的，就在**同一个提交**里更新它们并在说明里写清；否则 `check_schema_baseline.py` 会失败——
-**这是设计如此**。
+**这是设计如此**。注意 `python tools\gen_hub_snapshot.py` 会**改写冻结件**（`bridge/hub_schema.generated.json`），所以它属于那次有意的改动，不属于上面的只读检查。
 
 ## 四、测试
 
@@ -74,6 +87,9 @@ tools\verify_registration.bat VB6MCP.dll  :: 插件注册自检
 * **源码编码**：VB6 的 `.bas`/`.cls`/`.frm` 以 **ANSI（中文 Windows 上是 GBK）** 存放。
   不要把它们转成 UTF-8——VB6 会把其中的非 ASCII 字符串字面量弄乱。
 * **源码或文本文件里绝不允许出现 NUL 字节**。我们的一部分工具会因此拒绝处理。
+* **VB6 源码单行有硬上限：1023 个字符。** 更长的行会编译失败（实测：1023 能编译，1028 报语法错误）。
+  长单引号字符串请用 ` & _` 续行拆开——字符串的值不变。★编译器报「第 N 行语法错误」时，还要看 N
+  及其之后的行：对**续行语句**，VB6 报的是**语句起始行**，所以被报的那一行可能看起来完全正常。
 * **版本号是有承载意义的**。包版本在 `bridge/hub_tools.json`，契约版本在 `docs/CONTRACTS.md`；
   **不要**为了让构建看起来更新而改动它们。
 * **每一份回执都必须诚实**。工具做不到某事时，必须给出**机器可读的原因**，而不是悄悄降级。

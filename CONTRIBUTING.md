@@ -45,22 +45,36 @@ tools\verify_registration.bat VB6MCP.dll
 
 ## 3. Run the checks before you open a pull request
 
-These are the gates this project actually uses. All of them are offline and read-only:
+These are the gates this project actually uses.
+
+**Offline and read-only** (no IDE and no build needed - they read the files in the tree):
 
 ```bat
-python tools\check_schema_baseline.py      :: tool schema identical to the frozen baseline
-python tools\check_hub_alignment.py       :: hub face and add-in face agree
-python tools\check_live_tools.py          :: live tool list matches the declared face
-python tools\mcp_strict_audit.py          :: strict audit over the whole tool surface
-python tools\gen_hub_snapshot.py          :: regenerate bridge/hub_schema.generated.json
-tools\verify_registration.bat VB6MCP.dll  :: add-in registration self-check
+rem shipped snapshot vs the frozen baseline
+python tools\check_schema_baseline.py
+rem hub face and add-in face agree
+python tools\check_hub_alignment.py
+rem declared snapshot vs the frozen baseline
+python tools\check_live_tools.py docs\tools_schema.json
 ```
+
+**Needs a live IDE** (your own instance, port **8767 or above** - never 8766):
+
+```bat
+rem strict audit over the live tool surface - needs a running IDE
+python tools\mcp_strict_audit.py --url http://127.0.0.1:8767/mcp
+rem end-to-end smoke test - needs a running IDE
+python tests\smoke_test.py --port 8767
+```
+
+`tools\verify_registration.bat VB6MCP.dll` (section 2) is a registry read, so it needs the DLL
+you just built.
 
 A change to the tool surface must be **deliberate**: the frozen artifacts are
 `tools/schema_baseline.json`, `docs/tools_schema.json`, `bridge/hub_schema.generated.json`,
 `bridge/hub_tools.json` and `docs/CONTRACTS.md`. If your change is intended, update them in
 the same commit and say so in the description; `check_schema_baseline.py` will fail otherwise
-— that is by design.
+— that is by design. Note that `python tools\gen_hub_snapshot.py` **rewrites a frozen artifact** (`bridge/hub_schema.generated.json`), so it belongs to that deliberate step and is not one of the read-only checks above.
 
 ## 4. Testing
 
@@ -74,6 +88,11 @@ the same commit and say so in the description; `check_schema_baseline.py` will f
 * **Source encoding:** VB6 `.bas`/`.cls`/`.frm` files are stored as ANSI (GBK on a Chinese
   Windows). Do not convert them to UTF-8 — VB6 will garble non-ASCII string literals.
 * **Never ship a NUL byte** in a source or text file. Some of our tooling refuses it.
+* **VB6 source lines have a hard limit of 1023 characters.** A longer line is a compile error
+  (measured: 1023 characters compiles, 1028 fails). Split a long single-quoted string with
+  ` & _` continuations - the string value is unchanged. When the compiler reports a syntax error
+  at line N, also look at N and the lines after it: for a **continued statement** VB6 reports the
+  line where the statement **starts**, so the reported line can look innocent.
 * **Version numbers are load-bearing.** `bridge/hub_tools.json` carries the package
   version and the contract version lives in `docs/CONTRACTS.md`; do not edit either just to
   make a build look newer.

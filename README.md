@@ -44,7 +44,7 @@ AI 编程助手已经能很好地处理现代语言，却**够不到 VB6**：它
 也点不了那个「生成工程」对话框。本项目就是补这个缺口。
 
 **做法**：不另造编辑器，而是**把 VB6 IDE 本身变成一个 MCP 服务器**——加载一个插件，IDE
-就对外提供 111 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
+就对外提供 114 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
 弹窗处理、窗体与项目元数据、快照与回滚、打包。**因为工具就住在 IDE 进程里**，它能做
 进程外方案做不到的事：真的去点那个对话框、真的按运行、真的读断点处的局部变量。
 
@@ -76,7 +76,7 @@ MCP_VB6/
 ├─ McpServer.cls          MCP/JSON-RPC 协议分发 + HTTP 路由
 ├─ HttpConn.cls           HTTP/1.1 请求缓冲与解析（支持 keep-alive）
 ├─ ServerForm.frm         隐藏窗体，承载 Winsock 监听 + 端口探测定时器
-├─ CodeTools.cls          111 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
+├─ CodeTools.cls          114 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
 ├─ JsonLib.bas            零依赖 JSON 解析/序列化
 ├─ Utf8.bas               UTF-8/ANSI/UTF-16 转换（kernel32 API）
 ├─ Util.bas               日志、端口文件
@@ -147,18 +147,18 @@ Cursor 可直接连 HTTP 端点，无需桥接器：
 }
 ```
 
-验证链路是否打通：
+验证链路是否打通（需要**先打开 VB6 IDE 并加载插件**；这不是离线自检）：
 
 ```
 python tests/smoke_test.py --port 8766
 ```
 
-## 四、工具列表（111 个）
+## 四、工具列表（114 个）
 
 > 权威清单见 **`docs/TOOL_CATALOG.md`**（由运行中的 add-in 经 `tools/list` 导出），
-> 离线基线为 `tools/schema_baseline.json`，可用 `tools/check_live_tools.py` 做在线/基线比对。
+> 离线基线为 `tools/schema_baseline.json`，可用 `tools/check_live_tools.py docs/tools_schema.json` 做离线交叉比对。
 
-下表为最初 45 个工具（完整 VBIDE 对象模型部分）；其余 50 个为后续新增的
+下表为最初 45 个工具（完整 VBIDE 对象模型部分）；其余 69 个为后续新增的
 语法门禁 / 编辑安全 / 编译权威 / 快照一致性 / 测试宿主 / 运行时观测 / 调试控制 /
 VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` · `write_source` ·
 `edit_by_anchor` · `apply_edits` · `preview_edit` · `build` · `verify` · `inject_trace` ·
@@ -310,6 +310,8 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 **把工作区丢成 0 个工程**，紧接着再 `AddFromFile` 仍然失败 ⇒ 工具**不会为了刷新而摧毁工作区**，回执带 `reloadNotAttempted:true` 与说明。
 要采用磁盘版本，请自己走 `remove_project` → `open_project`。
 
+★**明确不提供的能力（按设计拒绝，不是缺陷）**：本插件**没有**「把 `.vbp` 层面的工程属性写进 IDE 内存」或「原地重载一个已打开的工程」的通道 —— 唯一能实现后者的机制就是上面那条会毁工作区的路径，所以它**从不尝试**：一旦「磁盘与内存不一致」，回执就是**结构化拒绝**（`ok:false` + `reason` + `reloadNotAttempted:true` + `sideEffects:"none: ..."`），而不是静默 no-op。**能**写进 IDE 的工程选项（描述、帮助文件/上下文、启动工程、编译输出路径、活动工程、只读模式）由 `set_project_options` 提供；该构建做不到的（如 `startup_object`）回**结构化的** `startupObjectError` + `startupObjectWorkaround`，**不会假装成功**。`.vbp` 层面的版本资源等键由 `project_meta{action:"set"}` 写**文件**（带 `.bak` 与写入后 sha256），不会注入到 IDE 内存。
+
 **`coords:"disk"` 的行号为什么不是连续的？**
 → 因为 VBA6 会把**成员 Attribute 行**（形如 `Attribute Foo.VB_UserMemId = -4`）留在磁盘上、却**不显示在代码窗格里**。
 磁盘行号因此是**逐行累计**出来的（`diskLine = ideLine + headerLines + 该行之上被隐藏的 Attribute 行数`），
@@ -368,8 +370,8 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 **⑤ 什么情况会添加／移除它的「引用」**：
 
 - **添加**：首次注入且工程内没有该模块时（见 ④）。
-- **移除**：**新版不再自动移除**（`TASK-P1-149`）。`remove_trace` 只删除**该 id 的注入块**，`modMcpTrace` **一律保留**；回执如实给出 `moduleRemoved:false` · `moduleLeftInPlace:true` · `moduleRemoveReason:"kept_by_design"`（工程里根本没有该模块时为 `module_absent`），并由 `moduleRemoveNote` 写明下面两条理由与手动移除指引。
-- **旧行为已废除（及原因）**：`TASK-P1-129` 曾让 `remove_trace` 顺带删除**带自动生成标记**的 `modMcpTrace`（`moduleRemoveReason:"removed_autogen_module"`）。该分支已**删除**，因为：(a) 用户可能在自动生成的模块里加了自己的代码，删模块会把那些代码一起毁掉；(b) 工程别处可能仍有 `@mcp-trace` 注入块，模块一旦被删，那些调用找不到 `McpTrace`/`McpTraceOn`，**工程将编译不过**。
+- **移除**：**新版不再自动移除**。`remove_trace` 只删除**该 id 的注入块**，`modMcpTrace` **一律保留**；回执如实给出 `moduleRemoved:false` · `moduleLeftInPlace:true` · `moduleRemoveReason:"kept_by_design"`（工程里根本没有该模块时为 `module_absent`），并由 `moduleRemoveNote` 写明下面两条理由与手动移除指引。
+- **旧行为已废除（及原因）**：早期版本曾让 `remove_trace` 顺带删除**带自动生成标记**的 `modMcpTrace`（`moduleRemoveReason:"removed_autogen_module"`）。该分支已**删除**，因为：(a) 用户可能在自动生成的模块里加了自己的代码，删模块会把那些代码一起毁掉；(b) 工程别处可能仍有 `@mcp-trace` 注入块，模块一旦被删，那些调用找不到 `McpTrace`/`McpTraceOn`，**工程将编译不过**。
 - **需要手动清理时**：先确认全工程**没有** `@mcp-trace` 残留，再自行调用 `remove_component{name:"modMcpTrace"}`。注意 `VBComponents.Remove` 只从工程里移除组件，**不会删除磁盘上的 .bas 文件**（回执用 `moduleFileOnDisk` 如实标注它绑定在哪）。
 - **日志落点**：追踪由 VB6 进程的环境变量控制 —— `MCP_TRACE_ON=1` 或 `MCP_TRACE_FILE=<路径>` 打开；默认写 `%TEMP%\mcp_trace.jsonl`。写失败记到 `MCP_TRACE_ERR_FILE`（默认 `%TEMP%\mcp_trace_err.log`），不会静默吞掉。
 - **其它工具都不需要它**：编辑、检查、编译、运行、断点、弹窗、窗体、快照、打包，全部与它无关。
@@ -431,7 +433,7 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 编译与运行；如果你确实需要其中某一篇的内容，请开一个 issue 说明用途。
 
 docs/tools_schema.json（工具面契约）与 tools/schema_baseline.json（冻结基线）已包含在本源码包中，
-因此 tools/ 下的门禁脚本可以直接运行。
+因此 tools/ 下的离线门禁脚本可以直接运行（`check_schema_baseline` / `check_hub_alignment` / `check_live_tools docs/tools_schema.json`）；需要活 IDE 的 `mcp_strict_audit` 与 `smoke_test` 要先把 VB6 跑起来。
 
 ## 如何参与
 

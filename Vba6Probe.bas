@@ -190,6 +190,15 @@ End Function
 Private Function B(ByVal v As Boolean) As String
     If v Then B = "true" Else B = "false"
 End Function
+' R13: the uniform probe-failure envelope. ok=false + failureKind + reason are added to
+' FAILURE paths only; every successful probe answer stays byte-identical to before.
+Private Function FailErr(ByVal s As String, ByVal kind As String, ByVal reason As String) As String
+    FailErr = s & "," & Q("ok") & ":false," & Q("failureKind") & ":" & Q(kind) & "," & Q("reason") & ":" & Q(reason) & "}"
+End Function
+
+Private Function FailSkip(ByVal s As String, ByVal kind As String, ByVal reason As String) As String
+    FailSkip = s & "," & Q("ok") & ":false," & Q("failureKind") & ":" & Q(kind) & "," & Q("reason") & ":" & Q(reason) & "}"
+End Function
 
 Private Sub AddEnt(ByRef s As String, ByVal id As String, ByVal fn As String, ByVal arity As Long, ByVal pre As String, ByVal ro As Boolean, ByVal note As String)
     If Len(s) > 1 Then s = s & ","
@@ -281,7 +290,7 @@ Public Function CallFrameSetterJson(ByVal a1 As Long, ByVal a2 As Long) As Strin
     hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     s = "{"
     If hMod = 0 Then
-        CallFrameSetterJson = s & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        CallFrameSetterJson = FailErr(s & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     target = hMod + &H133163
@@ -289,7 +298,7 @@ Public Function CallFrameSetterJson(ByVal a1 As Long, ByVal a2 As Long) As Strin
     s = s & "," & Q("a1") & ":" & CStr(a1) & "," & Q("a2") & ":" & CStr(a2)
     mem = VirtualAlloc(0, 64, &H1000, &H40)
     If mem = 0 Then
-        CallFrameSetterJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        CallFrameSetterJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     ' push a2
@@ -334,19 +343,19 @@ Public Function CallRvaJson(ByVal rva As Long, ByVal argc As Long, ByVal a1 As L
     If hMod = 0 Then hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     s = "{"
     If hMod = 0 Then
-        CallRvaJson = s & Q("error") & ":" & Q("module not loaded") & "}"
+        CallRvaJson = FailErr(s & Q("error") & ":" & Q("module not loaded"), "not_loaded", "module not loaded")
         Exit Function
     End If
     target = hMod + rva
     s = s & Q("rva") & ":" & Q("0x" & Hex$(rva)) & "," & Q("target") & ":" & CStr(target)
     s = s & "," & Q("argc") & ":" & CStr(argc)
     If argc < 0 Or argc > 2 Then
-        CallRvaJson = s & "," & Q("error") & ":" & Q("argc must be 0..2") & "}"
+        CallRvaJson = FailErr(s & "," & Q("error") & ":" & Q("argc must be 0..2"), "arg_out_of_range", "argc must be 0..2")
         Exit Function
     End If
     mem = VirtualAlloc(0, 64, &H1000, &H40)
     If mem = 0 Then
-        CallRvaJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        CallRvaJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     p = 0
@@ -396,14 +405,14 @@ Public Function WorkerCallJson(ByVal text As String, ByVal asBstr As Boolean, By
     hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     s = "{"
     If hMod = 0 Then
-        WorkerCallJson = s & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        WorkerCallJson = FailErr(s & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     engine = 0
     CopyMemory engine, hMod + &H17D15C, 4
     s = s & Q("engine") & ":" & CStr(engine)
     If engine = 0 Then
-        WorkerCallJson = s & "," & Q("called") & ":false," & Q("skipped") & ":" & Q("engine singleton is 0") & "}"
+        WorkerCallJson = FailSkip(s & "," & Q("called") & ":false," & Q("skipped") & ":" & Q("engine singleton is 0"), "engine_zero", "engine singleton is 0")
         Exit Function
     End If
     worker = hMod + &HE317A
@@ -427,7 +436,7 @@ Public Function WorkerCallJson(ByVal text As String, ByVal asBstr As Boolean, By
     s = s & "," & Q("textPtr") & ":" & CStr(tp) & "," & Q("asBstr") & ":" & B(asBstr)
     mem = VirtualAlloc(0, 512, &H1000, &H40)
     If mem = 0 Then
-        WorkerCallJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        WorkerCallJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     ' the writable dword p0 points at lives at mem+400 (the worker may rewrite it)
@@ -498,7 +507,7 @@ Public Function EngineItemsJson() As String
     s = "{"
     hMod = Vba6Base()
     If hMod = 0 Then
-        EngineItemsJson = s & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        EngineItemsJson = FailErr(s & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     fn = GetProcAddress(hMod, "EbGetStatusOfItems")
@@ -511,7 +520,7 @@ Public Function EngineItemsJson() As String
     mem = VirtualAlloc(0, 128, &H1000, &H40)
     code = VirtualAlloc(0, 64, &H1000, &H40)
     If mem = 0 Or code = 0 Then
-        EngineItemsJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        EngineItemsJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     ' push len ; push buf ; mov eax,fn ; call eax ; ret 16   (callee retn 8)
@@ -578,7 +587,7 @@ Public Function CallstackFunctionJson(ByVal frameIndex As Long) As String
     s = "{"
     hMod = Vba6Base()
     If hMod = 0 Then
-        CallstackFunctionJson = s & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        CallstackFunctionJson = FailErr(s & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     fn = GetProcAddress(hMod, "EbGetCallstackFunction")
@@ -596,13 +605,13 @@ Public Function CallstackFunctionJson(ByVal frameIndex As Long) As String
     Call EbGetCallstackCount(cnt)
     s = s & "," & Q("callstackCount") & ":" & CStr(cnt)
     If cnt <= 0 Or frameIndex < 0 Or frameIndex > cnt - 1 Then
-        CallstackFunctionJson = s & "," & Q("skipped") & ":" & Q("frame index out of range; the engine was NOT called") & "}"
+        CallstackFunctionJson = FailSkip(s & "," & Q("skipped") & ":" & Q("frame index out of range; the engine was NOT called"), "arg_out_of_range", "frame index out of range; the engine was NOT called")
         Exit Function
     End If
     mem = VirtualAlloc(0, 64, &H1000, &H40)
     code = VirtualAlloc(0, 64, &H1000, &H40)
     If mem = 0 Or code = 0 Then
-        CallstackFunctionJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        CallstackFunctionJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     ' the IDE's first line: all three out-slots AND arg5 start at zero
@@ -810,7 +819,7 @@ Public Function ExportRvasJson() As String
     s = "{"
     s = s & Q("vba6Base") & ":" & CStr(hMod)
     If hMod = 0 Then
-        ExportRvasJson = s & "," & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        ExportRvasJson = FailErr(s & "," & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     s = s & "," & Q("exports") & ":["
@@ -843,23 +852,33 @@ Public Function MemScanJson(ByVal addr As Long, ByVal scanLen As Long, ByVal lo 
     ' (measured: it silently indexed the buffer and printed the first byte).
     Dim buf() As Byte
     Dim hits As String, s As String
+    Dim lenReq As Long, lenClamped As Boolean, lenDefaulted As Boolean
+    Dim hitsReq As Long, hitsClamped As Boolean, hitsDefaulted As Boolean
     s = "{"
+    lenReq = scanLen
+    hitsReq = maxHits
     If scanLen <= 0 Then scanLen = &H10000
+    lenDefaulted = (lenReq <= 0)
     If scanLen > &H100000 Then scanLen = &H100000
+    lenClamped = (lenReq > &H100000)
     If maxHits <= 0 Then maxHits = 64
+    hitsDefaulted = (hitsReq <= 0)
     If maxHits > 512 Then maxHits = 512
+    hitsClamped = (hitsReq > 512)
     s = s & Q("addr") & ":" & CStr(addr) & "," & Q("len") & ":" & CStr(scanLen)
+    s = s & "," & Q("lenRequested") & ":" & CStr(lenReq) & "," & Q("lenDefaulted") & ":" & B(lenDefaulted) & "," & Q("lenClamped") & ":" & B(lenClamped)
+    s = s & "," & Q("maxHits") & ":" & CStr(maxHits) & "," & Q("maxHitsRequested") & ":" & CStr(hitsReq) & "," & Q("maxHitsDefaulted") & ":" & B(hitsDefaulted) & "," & Q("maxHitsClamped") & ":" & B(hitsClamped)
     s = s & "," & Q("lo") & ":" & CStr(lo) & "," & Q("hi") & ":" & CStr(hi)
     If addr < &H10000 Or addr > &H7FFFFFFF Then
-        MemScanJson = s & "," & Q("error") & ":" & Q("address looks invalid; refusing to read") & "}"
+        MemScanJson = FailErr(s & "," & Q("error") & ":" & Q("address looks invalid; refusing to read"), "address_invalid", "address looks invalid; refusing to read")
         Exit Function
     End If
     If lo = 0 Then
-        MemScanJson = s & "," & Q("error") & ":" & Q("lo must be non-zero, every zero dword would match") & "}"
+        MemScanJson = FailErr(s & "," & Q("error") & ":" & Q("lo must be non-zero, every zero dword would match"), "arg_out_of_range", "lo must be non-zero, every zero dword would match")
         Exit Function
     End If
     If IsBadReadPtr(addr, scanLen) <> 0 Then
-        MemScanJson = s & "," & Q("error") & ":" & Q("range is not fully readable") & "}"
+        MemScanJson = FailErr(s & "," & Q("error") & ":" & Q("range is not fully readable"), "not_readable", "range is not fully readable")
         Exit Function
     End If
     ReDim buf(scanLen - 1)
@@ -1026,7 +1045,7 @@ Public Function HostedExprSrvJson() As String
     s = "{"
     hMod = Vba6Base()
     If hMod = 0 Then
-        HostedExprSrvJson = s & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        HostedExprSrvJson = FailErr(s & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     fn = GetProcAddress(hMod, "CreateHostedExprSrv")
@@ -1039,7 +1058,7 @@ Public Function HostedExprSrvJson() As String
     mem = VirtualAlloc(0, 64, &H1000, &H40)
     code = VirtualAlloc(0, 64, &H1000, &H40)
     If mem = 0 Or code = 0 Then
-        HostedExprSrvJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        HostedExprSrvJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     ' out slot at +0, saved-esp slot at +4
@@ -1100,7 +1119,7 @@ Public Function MemDumpJson(ByVal rva As Long, ByVal addr As Long, ByVal length 
     If hMod = 0 Then hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     s = "{"
     If hMod = 0 Then
-        MemDumpJson = s & Q("error") & ":" & Q("module not loaded") & "}"
+        MemDumpJson = FailErr(s & Q("error") & ":" & Q("module not loaded"), "not_loaded", "module not loaded")
         Exit Function
     End If
     If addr <> 0 Then
@@ -1112,16 +1131,20 @@ Public Function MemDumpJson(ByVal rva As Long, ByVal addr As Long, ByVal length 
     s = s & "," & Q("rva") & ":" & Q("0x" & Hex$(rva))
     s = s & "," & Q("target") & ":" & CStr(target)
     If target < &H10000 Or target > &H7FFFFFFF Then
-        MemDumpJson = s & "," & Q("error") & ":" & Q("address looks invalid; refusing to read") & "}"
+        MemDumpJson = FailErr(s & "," & Q("error") & ":" & Q("address looks invalid; refusing to read"), "address_invalid", "address looks invalid; refusing to read")
         Exit Function
     End If
     ' measured: 0x00100000 passes the numeric check and still kills the IDE
     If IsBadReadPtr(target, 4) <> 0 Then
-        MemDumpJson = s & "," & Q("error") & ":" & Q("address is not readable; refusing to read") & "}"
+        MemDumpJson = FailErr(s & "," & Q("error") & ":" & Q("address is not readable; refusing to read"), "not_readable", "address is not readable; refusing to read")
         Exit Function
     End If
+    Dim lenReq As Long, lenClamped As Boolean, lenDefaulted As Boolean
+    lenReq = length
     If length <= 0 Then length = 64
+    lenDefaulted = (lenReq <= 0)
     If length > 512 Then length = 512
+    lenClamped = (lenReq > 512)
     length = (length \ 4) * 4
     If length = 0 Then length = 4
     ReDim b(length - 1)
@@ -1138,6 +1161,7 @@ Public Function MemDumpJson(ByVal rva As Long, ByVal addr As Long, ByVal length 
         dwo = dwo & "{" & Q("off") & ":" & Q("0x" & Hex$(i * 4)) & "," & Q("d") & ":" & CStr(v) & "," & Q("hex") & ":" & Q("0x" & Hex$(v)) & "}"
     Next
     s = s & "," & Q("len") & ":" & CStr(length)
+    s = s & "," & Q("lenRequested") & ":" & CStr(lenReq) & "," & Q("lenDefaulted") & ":" & B(lenDefaulted) & "," & Q("lenClamped") & ":" & B(lenClamped)
     s = s & "," & Q("hex") & ":" & Q(hexs)
     s = s & "," & Q("dwords") & ":[" & dwo & "]"
     MemDumpJson = s & "}"
@@ -1160,7 +1184,7 @@ Public Function FrameStateJson() As String
     s = s & Q("ebMode") & ":" & CStr(EbMode())
     s = s & "," & ModuleInfoJson()
     If hMod = 0 Then
-        FrameStateJson = s & "," & Q("error") & ":" & Q("VBA6.DLL not loaded") & "}"
+        FrameStateJson = FailErr(s & "," & Q("error") & ":" & Q("VBA6.DLL not loaded"), "not_loaded", "VBA6.DLL not loaded")
         Exit Function
     End If
     engine = 0
@@ -1359,7 +1383,7 @@ Public Function ExecLineJson(ByVal line As String, ByVal a2 As Long, ByVal a3 As
     s = "{"
     s = s & Q("moduleBase") & ":" & CStr(hMod)
     If hMod = 0 Then
-        ExecLineJson = s & "," & Q("called") & ":false," & Q("skipped") & ":" & Q("VBA6.DLL is not loaded") & "}"
+        ExecLineJson = FailSkip(s & "," & Q("called") & ":false," & Q("skipped") & ":" & Q("VBA6.DLL is not loaded"), "not_loaded", "VBA6.DLL is not loaded")
         Exit Function
     End If
     engineA = 0
@@ -1369,9 +1393,8 @@ Public Function ExecLineJson(ByVal line As String, ByVal a2 As Long, ByVal a3 As
     s = s & "," & Q("engineAt17D15C") & ":" & CStr(engineA)
     s = s & "," & Q("engineAt17D0F4") & ":" & CStr(engineB)
     If engineA = 0 Then
-        s = s & "," & Q("called") & ":false"
-        s = s & "," & Q("skipped") & ":" & Q("engine singleton at VBA6+0x17D15C is 0 (host has not initialised it); EbExecuteLine would dereference null")
-        ExecLineJson = s & "}"
+        s = s & "," & Q("called") & ":false
+        ExecLineJson = FailSkip(s & "," & Q("skipped") & ":" & Q("engine singleton at VBA6+0x17D15C is 0 (host has not initialised it); EbExecuteLine would dereference null"), "engine_zero", "engine singleton at VBA6+0x17D15C is 0 (host has not initialised it); EbExecuteLine would dereference null")
         Exit Function
     End If
     wBefore = 0
@@ -1524,8 +1547,7 @@ Public Function ProbeRunJson(ByVal runBreakProbes As Boolean, ByVal force As Boo
 
     If Not doBreak Then
         s = s & "," & Q("breakProbes") & ":false"
-        s = s & "," & Q("skipped") & ":" & Q(why)
-        ProbeRunJson = s & "}"
+        ProbeRunJson = FailSkip(s, "refused_by_design", why)
         Exit Function
     End If
 
@@ -1681,7 +1703,7 @@ Public Function CallRvaArgsJson(ByVal rva As Long, ByVal argsCsv As String, Opti
     If hMod = 0 Then hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     s = "{"
     If hMod = 0 Then
-        CallRvaArgsJson = s & Q("error") & ":" & Q("module not loaded") & "}"
+        CallRvaArgsJson = FailErr(s & Q("error") & ":" & Q("module not loaded"), "not_loaded", "module not loaded")
         Exit Function
     End If
     target = hMod + rva
@@ -1701,7 +1723,7 @@ Public Function CallRvaArgsJson(ByVal rva As Long, ByVal argsCsv As String, Opti
     s = s & "]"
     mem = VirtualAlloc(0, 256, &H1000, &H40)
     If mem = 0 Then
-        CallRvaArgsJson = s & "," & Q("error") & ":" & Q("VirtualAlloc failed") & "}"
+        CallRvaArgsJson = FailErr(s & "," & Q("error") & ":" & Q("VirtualAlloc failed"), "alloc_failed", "VirtualAlloc failed")
         Exit Function
     End If
     p = 0

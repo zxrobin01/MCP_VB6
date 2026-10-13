@@ -1,12 +1,12 @@
 """Generate bridge/hub_schema.generated.json from docs/tools_schema.json.
 
-Rule (内部独立宿主方案 §8 rule 1): the hub tool face is GENERATED, never
+Rule: the hub tool face is GENERATED, never
 hand-written.  This is the single producer; docs/TOOL_CATALOG.md rides the same pipeline,
 so any contract-driven tool-surface change reaches the hub automatically.
 
 contractVersion is EXTRACTED from docs/CONTRACTS.md (the newest row of the 版本记录 table),
 NOT inferred from the tool count: contracts v1.3.1/v1.3.2 changed the version without
-changing the tool count, so count-matching under-reported the contract (TASK-P3-025).  The
+changing the tool count, so count-matching under-reported the contract.  The
 declared tool count is used only as a CROSS-CHECK and a mismatch is reported loudly
 (`versionToolCountMismatch`) instead of silently picking one of the two.
 
@@ -81,7 +81,7 @@ def contract_version(contract_path, tool_count):
 
 def instructions_of(root):
     """Pull the contract's fixed instructions block (and its BREAKING list) out of
-    docs/CONTRACTS.md so the hub never hand-writes version/breaking prose (plan §8 rule 1)."""
+    docs/CONTRACTS.md so the hub never hand-writes version/breaking prose."""
     p = os.path.join(root, 'docs', 'CONTRACTS.md')
     try:
         t = open(p, encoding='utf-8', errors='replace').read()

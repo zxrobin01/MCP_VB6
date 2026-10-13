@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// bridge/vb6mcp_hub.mjs - standalone stdio MCP hub for VB6MCP (H1 + TASK-P3-023).
+// bridge/vb6mcp_hub.mjs - standalone stdio MCP hub for VB6MCP.
 //
 // Zero-dependency Node MCP server.  It is the single DSH-facing entry point and it does
 // NOT need any VB6 IDE to be running:
@@ -28,11 +28,11 @@ const HUBCFG = path.join(HERE, 'hub_tools.json');
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOLS[0];
 const SERVER = { name: 'vb6mcp-hub', version: '0.1.0' };
-// Latency budget (TASK-P3-027): the DSH client must get initialize/tools/list in <1s.
+// Latency budget: the DSH client must get initialize/tools/list in <1s.
 const DISCOVERY_TTL_MS = 15000;     // cached (re-validated) discovery is reused for this long
 const DISCOVERY_BUDGET_MS = 500;    // hard cap on one discovery pass
 const PROBE_TIMEOUT_MS = 250;       // per-RPC cap for the fast scan path
-// TASK-P3-033: forwarded calls may legitimately be LONG (a whole-module get_component_code
+// Forwarded calls may legitimately be LONG (a whole-module get_component_code
 // took 22.8s directly).  The budget is configurable and a timeout is reported explicitly.
 const FORWARD_TIMEOUT_MS = parseInt(process.env.VB6MCP_FORWARD_TIMEOUT_MS || '120000', 10);
 const IDLE_FLUSH_MS = 600;          // a complete-but-unterminated request is flushed after this
@@ -43,11 +43,11 @@ const LIST_GRACE_MS = 400;          // discovery must never push a response towa
 // add-in over /rpc and only uses /mcp (best effort) for the instructions banner.
 const ADDIN_RPC_PATH = process.env.VB6MCP_ADDIN_PATH || '/rpc';
 const FACE_CACHE = path.join(HERE, 'hub_face_cache.json');
-// TASK-P3-031: the add-in's instructions banner is fetched from /mcp, which can take seconds
+// The add-in's instructions banner is fetched from /mcp, which can take seconds
 // on a busy add-in - so it is BEST EFFORT and never on the discovery critical path.  The
 // first discovery returns without it (the hub then labels the downgrade), later ones carry it.
 const instructionsCache = {};
-// TASK-P3-030 instrumentation: VB6MCP_HUB_DEBUG=1 traces every discovery decision to stderr
+// Instrumentation: VB6MCP_HUB_DEBUG=1 traces every discovery decision to stderr
 // (stderr is never the MCP channel, so this cannot corrupt a response).
 const DEBUG = process.env.VB6MCP_HUB_DEBUG === '1';
 function dbg() {
@@ -126,7 +126,7 @@ function candidatePorts(listening) {
 // ONE netstat for the whole scan (it used to run once per candidate port: the main
 // reason initialize took ~9s).  Returns { port: [pid, ...] } for LISTENING sockets.
 function netstatPath() {
-  // TASK-P1-106 (discipline 29): NEVER guess C:\Windows here.  On this host SystemRoot is
+  // NEVER guess C:\Windows here.  On this host SystemRoot is
   // B:\Windows and C:\Windows is a stale second installation whose 32-bit binaries fail
   // with 0xC0000139, so inventing a drive is worse than degrading to a PATH lookup.  Only
   // authoritative Windows-directory env vars may be used; when neither is set we say so and
@@ -161,7 +161,7 @@ function withTimeout(p, ms) {
   return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { rej(new Error('timeout')); }, ms); })]);
 }
 
-// H2: the add-in registers itself at %TEMP%\vb6mcp\instances\<pid>.json.  We read that
+// The add-in registers itself at %TEMP%\vb6mcp\instances\<pid>.json.  We read that
 // directory first (authoritative) and keep the port scan as a FALLBACK, always labelling
 // which one found an instance.  Stale entries are REPORTED, never deleted (other people's
 // files, and a live restart may still be writing).
@@ -173,7 +173,7 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (e) {
     // Only ESRCH means "no such process"; EPERM/anything else means the process exists but we
-    // may not signal it (TASK-P3-030: the old version treated everything but EPERM as dead).
+    // may not signal it (the old version treated everything but EPERM as dead).
     const alive = !!(e && e.code && e.code !== 'ESRCH');
     if (DEBUG) dbg('pidAlive pid=' + pid + ' threw=' + (e && e.code) + ' -> ' + alive);
     return alive;
@@ -241,7 +241,7 @@ async function probe(port, knownProject, pids) {
     } catch (e) { }
   }
   // Best-effort banner from the MCP face; /rpc does not implement initialize.  Fetched in the
-  // BACKGROUND so a slow /mcp cannot keep the instance "pending" (TASK-P3-031).
+  // BACKGROUND so a slow /mcp cannot keep the instance "pending".
   const instructions = instructionsCache[port] || null;
   if (!instructions) {
     rpc(port, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
@@ -258,7 +258,7 @@ async function discoverBounded() {
   let scanTruncated = false;
   // The registry is the PRIORITY path: it is a handful of small files, so it is never cut
   // off by the budget (cutting it off could hide a live IDE and mislabel the face).
-  // TASK-P3-036: the "who owns this port" judgement lives in ONE place (scanRegistry); this
+  // The "who owns this port" judgement lives in ONE place (scanRegistry); this
   // function must never re-implement it (the old first-wins seenPorts rule is gone).
   const scan = await scanRegistry(listening);
   dbg('discoverBounded: registry dir=' + scan.dir + ' entries=' + scan.entries + ' live=' + scan.live.length + ' stale=' + scan.stale.length);
@@ -272,7 +272,7 @@ async function discoverBounded() {
     if (!it) {
       stale.push({ file: c.registryFile, pid: c.pid, port: c.port, reason: 'registry_port_not_mcp_probe_failed' });
       // Terminal, explicit state: the probe ran and failed -> not pending any more, the tool
-      // count stays UNKNOWN (null), never a misleading 0 (TASK-P3-031/032).
+      // count stays UNKNOWN (null), never a misleading 0.
       if (idx0 >= 0) insts[idx0] = Object.assign({}, insts[idx0], { pending: false, probeStatus: 'failed', probeReason: 'probe_failed_or_timeout' });
       continue;
     }
@@ -295,7 +295,7 @@ async function discoverBounded() {
       if (it) {
         insts.push(Object.assign({}, it, { discoveredBy: 'portscan', registryFile: null, pending: false, probeStatus: 'ok' }));
       } else {
-        // TASK-P3-032: the port IS listening, so the instance exists even if the probe fails -
+        // The port IS listening, so the instance exists even if the probe fails -
         // report it (unknown face) instead of silently dropping it.
         insts.push({ port: port, pid: pids[0], pids: pids, project: null, discoveredBy: 'portscan', registryFile: null,
                      pending: false, probeStatus: 'failed', probeReason: 'probe_failed_or_timeout' });
@@ -324,12 +324,12 @@ async function discover() {
   if (discovery.promise) return discovery.promise;
   discovery.promise = discoverBounded().then(function (d) {
     discovery = { at: Date.now(), data: d, promise: null };
-    // TASK-P3-029: never persist a fallback/empty result as the authoritative face.
+    // Never persist a fallback/empty result as the authoritative face.
     if (d && d.instances && d.instances.length) { try { saveFaceCache(d); } catch (e) { } }
     return d;
   }).catch(function (e) {
     discovery.promise = null;
-    // TASK-P3-036 hardening (S suggestion): a FAILED discovery must never fabricate an empty
+    // Hardening (S suggestion): a FAILED discovery must never fabricate an empty
     // face that looks authoritative.  If we already have a resolved face, keep it and mark it;
     // otherwise return the empty face but say why.
     const prev = discovery.data;
@@ -363,7 +363,7 @@ function pickTarget(insts, target) {
     const hit = insts.filter(function (i) { return String(i.pid) === s || (i.project && i.project === s) || String(i.port) === s; });
     if (hit.length === 1) return { ok: true, ...hit[0], selectedBy: (explicit ? 'explicit_target' : 'effective_default') };
     if (hit.length > 1) return { ok: false, conflict: true, message: 'target "' + s + '" matches several instances: ' + hit.map(function (i) { return i.port + '/' + i.pid; }).join(',') };
-    // REQ-20261009-048: a STALE DEFAULT (ide_target pointing at a project that is gone) must
+    // A STALE DEFAULT (ide_target pointing at a project that is gone) must
     // never veto the live instances - that made every implicit call fail with no_ide_running
     // while the only live IDE was right there.
     if (explicit) {
@@ -376,7 +376,7 @@ function pickTarget(insts, target) {
   return { ok: false, ambiguous: true, message: 'several instances online and no target set: ' + desc() + ' -- set _target (pid|project|port) or ide_target' };
 }
 
-// TASK-P3-030 (6): explicit _target can address the add-in WITHOUT discovery - if the target
+// Explicit _target can address the add-in WITHOUT discovery - if the target
 // is a listening port (or a pid in the registry, or a project name), forward straight to it.
 // This is the temporary route when discovery is blind but the IDE is reachable.
 async function directTarget(target) {
@@ -399,7 +399,7 @@ async function directTarget(target) {
   return null;
 }
 
-// TASK-P3-036: an explicit target may only address a registry entry that scanRegistry()
+// An explicit target may only address a registry entry that scanRegistry()
 // considers the OWNER of its port.  Matching raw files would let a stale file (its pid recycled
 // by a live process, the port listening because another instance owns it) hijack _target.
 async function ownerBy(pred) {
@@ -417,7 +417,7 @@ async function ownerOfPort(port) {
 function bodyOf(obj, ide, contract, note) {
   const o = Object.assign({}, obj);
   if (!o.mcp) o.mcp = mcp(SERVER.version, contract);
-  // H2/TASK-P3-024 (4): never overwrite an `ide` the add-in already reported.
+  // (4): never overwrite an `ide` the add-in already reported.
   if (ide && !o.ide) o.ide = ide;
   if (note) {
     if (typeof note === 'string') { if (!o.targetNote) o.targetNote = note; }
@@ -466,7 +466,7 @@ async function cachedDiscovery() {
   if (!c) { dbg('cachedDiscovery: no face cache file'); return null; }
   const checked = [];
   for (const i of c.instances) {
-    // TCP-only: no netstat on a response path (TASK-P3-033)
+    // TCP-only: no netstat on a response path
     const okp = pidAlive(i.pid) && await isListening(i.port, null);
     if (okp) checked.push(i);
   }
@@ -475,11 +475,11 @@ async function cachedDiscovery() {
   return { instances: checked, conflicts: c.conflicts || [], staleRegistry: c.staleRegistry || [],
            registryDir: c.registryDir, registryUnreadable: false, scanTruncated: false, fromFaceCache: true };
 }
-// TASK-P3-029: EXISTENCE must not depend on the MCP probe.  A registry entry whose pid is
+// EXISTENCE must not depend on the MCP probe.  A registry entry whose pid is
 // alive AND whose port is listening is a live IDE, full stop - the probe only enriches it
 // (project / liveToolDefs / instructions).  This is what makes ide_list/initialize report
 // faceSource=live + discoveredBy=registry even when the add-in is slow to answer.
-// SINGLE SOURCE OF TRUTH for "which registry entry owns a port" (TASK-P3-036).
+// SINGLE SOURCE OF TRUTH for "which registry entry owns a port".
 // Every consumer (discoverBounded / registryCandidates / directTarget / ide_list / faceState)
 // must go through here - two implementations of this judgement is exactly the defect the card
 // describes (discoverBounded used to keep the FIRST entry read, so an unrelated live pid that
@@ -502,7 +502,7 @@ async function scanRegistry(listening) {
     if (!alive) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'pid_dead' }); continue; }
     if (!listeningNow) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'port_not_listening' }); continue; }
     const prev = seen[e.port];
-    // The LOSER goes to staleRegistry, never the winner (TASK-P3-036 criterion 2).
+    // The LOSER goes to staleRegistry, never the winner.
     if (prev && !(String(e.startedAt || '') > String(prev.at || ''))) {
       stale.push({ file: base, pid: e.pid, port: e.port, reason: 'duplicate_port_in_registry' });
       continue;
@@ -549,7 +549,7 @@ async function resolveDiscovery(d) {
 async function faceState(d) {
   d = await resolveDiscovery(d);
   // A cached/persisted face must NEVER freeze a dead instance: re-validate pid + port here,
-  // on every request, before it is reported (TASK-P3-029/030/031).
+  // on every request, before it is reported.
   if (d.instances && d.instances.length) {
     const alive = [];
     for (const i of d.instances) {
@@ -568,7 +568,7 @@ async function faceState(d) {
     diff = { onlyInSnapshot: onlySnap, onlyInLive: onlyLive, aligned: onlySnap.length === 0 && onlyLive.length === 0 };
   }
   return {
-    // TASK-P3-029: existence comes from the registry (pid alive + port listening), NOT from
+    // Existence comes from the registry (pid alive + port listening), NOT from
     // whether the MCP probe has answered yet.  A pending probe is still a live IDE.
     faceSource: d.instances.length ? 'live' : 'snapshot',
     contractVersion: snap.contractVersion,
@@ -586,7 +586,7 @@ async function faceState(d) {
       version: i.version || null, dllSha256: i.dllSha256 || null, pending: !!i.pending
     }; }),
     conflicts: d.conflicts,
-    // TASK-P3-036 observability: WHY this face looks the way it does - how many registry
+    // Observability: WHY this face looks the way it does - how many registry
     // entries were read, how many were credible, and the stale reasons by kind.
     registrySummary: {
       entries: (d.instances || []).length + (d.staleRegistry || []).length,
@@ -608,12 +608,12 @@ async function faceState(d) {
   };
 }
 
-// TASK-P1-127 (R4): ONE VB6.EXE resolver shared by every hub entry point, sourced from
-// the same places the scaffold (内部工作区) uses. P1-126
+// ONE VB6.EXE resolver shared by every hub entry point, sourced from
+// the same places the local launcher tooling uses.
 // consulted ONLY VB6MCP_VB6EXE and %ProgramFiles(x86)%, so on this host
 // (ProgramFiles(x86)=B:) ide_restart answered vb6_exe_not_found by default while the
-// scaffold happily resolved C:\Program Files (x86)\Microsoft Visual Studio\VB98\VB6.EXE.
-// Order: the scaffold's known paths first, then both ProgramFiles flavours, then the
+// the local launcher happily resolved C:\Program Files (x86)\Microsoft Visual Studio\VB98\VB6.EXE.
+// Order: the launcher's known paths first, then both ProgramFiles flavours, then the
 // standard App Paths registry entry (name-agnostic, so no install value name is guessed).
 const VB6_EXE_CANDIDATES = [
   { p: 'C:\\Program Files (x86)\\Microsoft Visual Studio\\VB98\\VB6.EXE', s: 'known_install_path' },
@@ -664,12 +664,12 @@ async function hubTool(name, args) {
   }
   if (name === 'ide_start') {
     const project = (args && args.project) || process.env.VB6MCP_AUTOSTART_PROJECT;
-    // TASK-P1-127 (R4): the same resolver ide_restart uses, so BOTH hub starters accept
-    // any VB6.EXE the scaffold would accept (known install paths + both ProgramFiles
+    // The same resolver ide_restart uses, so BOTH hub starters accept
+    // any VB6.EXE the launcher would accept (known install paths + both ProgramFiles
     // flavours + the standard App Paths registry entry), not only the env override.
     const rStartExe = resolveVb6Exe();
     const exe = rStartExe.exe;
-    if (!project) return textResult({ ok: false, reason: 'not_implemented', message: 'H1 does not auto-start without a project: pass project or set VB6MCP_AUTOSTART_PROJECT' }, snap.contractVersion);
+    if (!project) return textResult({ ok: false, reason: 'not_implemented', message: 'ide_start does not auto-start without a project: pass project or set VB6MCP_AUTOSTART_PROJECT' }, snap.contractVersion);
     if (!exe) return textResult({ ok: false, reason: 'vb6_exe_not_found', vb6Exe: '', vb6ExeSource: '', vb6ExeTried: rStartExe.tried, message: 'no VB6.EXE was resolvable; set VB6MCP_VB6EXE or install VB6. Tried: ' + rStartExe.tried.join(' | ') }, snap.contractVersion);
     if (!fs.existsSync(project)) return textResult({ ok: false, reason: 'project_not_found', project: project }, snap.contractVersion);
     const child = spawn(exe, [project], { detached: true, stdio: 'ignore' });
@@ -680,13 +680,13 @@ async function hubTool(name, args) {
   }
   if (name === 'ide_stop') {
     const pid = args && args.pid;
-    if (!pid) return textResult({ ok: false, reason: 'not_implemented', message: 'H1 requires an explicit pid and only stops hub-started instances' }, snap.contractVersion);
-    if (!startedByHub.has(pid)) return textResult({ ok: false, reason: 'not_allowed', message: 'pid ' + pid + ' was not started by this hub (H1 safety rule); not stopping it' }, snap.contractVersion);
+    if (!pid) return textResult({ ok: false, reason: 'not_implemented', message: 'ide_stop requires an explicit pid and only stops hub-started instances' }, snap.contractVersion);
+    if (!startedByHub.has(pid)) return textResult({ ok: false, reason: 'not_allowed', message: 'pid ' + pid + ' was not started by this hub; not stopping it' }, snap.contractVersion);
     try { process.kill(pid); startedByHub.delete(pid); invalidateDiscovery(); return textResult({ ok: true, stopped: pid }, snap.contractVersion); }
     catch (e) { return textResult({ ok: false, reason: 'kill_failed', message: String(e && e.message || e) }, snap.contractVersion); }
   }
   if (name === 'ide_restart') {
-    // TASK-P1-126 (MCP-10): the executable recovery for a wedged IDE. It only ever
+    // The executable recovery for a wedged IDE. It only ever
     // touches OUR OWN instance (instances listening on port >= 8767; 8766 belongs to a
     // foreign process on this machine and is NEVER stopped), and EVERY path answers with
     // the same key set (discipline 98).
@@ -730,7 +730,7 @@ async function hubTool(name, args) {
     out.stoppedPid = target.pid;
     out.project = target.project || wantProject;
     out.port = target.port;
-    // TASK-P1-127 (R4): resolve VB6.EXE through the SHARED resolver above, so the
+    // Resolve VB6.EXE through the SHARED resolver above, so the
     // recovery tool works by default and names the source it used.
     const rExe = resolveVb6Exe();
     out.vb6ExeTried = rExe.tried;
@@ -740,8 +740,8 @@ async function hubTool(name, args) {
       out.note = 'no VB6.EXE was resolvable (set VB6MCP_VB6EXE, or install VB6); tried: ' + rExe.tried.join(' | ');
       return textResult(out, snap.contractVersion);
     }
-    // TASK-P1-126 (MCP-10): choose the add-in's port pin BEFORE anything is stopped, so a
-    // failure here cannot leave the IDE down. The scaffold pins the port through the
+    // Choose the add-in's port pin BEFORE anything is stopped, so a
+    // failure here cannot leave the IDE down. The launcher pins the port through the
     // VB6MCP_PORT environment variable (acceptance = reverse lookup), and 8766 is NEVER a
     // candidate (discipline 99/107).
     for (let pp = 8767; pp <= 8796; pp++) {
@@ -755,7 +755,7 @@ async function hubTool(name, args) {
       out.note = 'no free port was found in 8767..8796, so NOTHING was stopped and the IDE is untouched (an instance on 8766 is never ours).';
       return textResult(out, snap.contractVersion);
     }
-    // TASK-P1-126: spawn() must receive a real .vbp PATH, never a project NAME, and the
+    // spawn() must receive a real .vbp PATH, never a project NAME, and the
     // registry entry is written BEFORE the project is loaded - the first live run passed
     // the name "VB6MCP" and the new IDE therefore opened no project at all. So the path
     // is resolved (caller arg > registry projectPath > bounded re-read of the registry)
@@ -973,7 +973,7 @@ function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 async function handle(line) {
   let req;
   try { req = JSON.parse(line); } catch (e) {
-    // TASK-P3-028 (2): a request we cannot parse gets an explicit JSON-RPC parse error.
+    // A request we cannot parse gets an explicit JSON-RPC parse error.
     // Returning silently would hang any client that has no read timeout.
     let bad = null;
     const m = /"id"\s*:\s*("?[^",}\s]+"?)/.exec(line);
@@ -1012,7 +1012,7 @@ let inFlight = 0;
 let stdinEnded = false;
 let idleTimer = null;
 function maybeExit() {
-  // TASK-P3-027/028: never process.exit() here - that truncates responses that have not been
+  // Never process.exit() here - that truncates responses that have not been
   // flushed yet (a finite pipe got 0 bytes).  Setting exitCode lets the loop drain stdout,
   // and we only arm it once every in-flight request has answered.
   if (stdinEnded && inFlight === 0) process.exitCode = 0;
@@ -1031,7 +1031,7 @@ function consumeLines() {
     if (line.trim()) dispatch(line);
   }
 }
-// TASK-P3-028 (idle fallback): a client that never appends '\n' must not hang forever.  If
+// Idle fallback: a client that never appends '\n' must not hang forever.  If
 // the buffer holds COMPLETE JSON and nothing new arrives for IDLE_FLUSH_MS, treat it as one
 // line.  The timer is reset by every data chunk and unref'd so it never holds the process.
 function armIdleFlush() {
@@ -1049,7 +1049,7 @@ function armIdleFlush() {
   }, IDLE_FLUSH_MS);
   if (idleTimer.unref) idleTimer.unref();
 }
-// TASK-P3-028 (1)+(2): when stdin ends, whatever is left is HANDLED - parsed as a request, or
+// When stdin ends, whatever is left is HANDLED - parsed as a request, or
 // answered with an explicit JSON-RPC parse error.  Silence is what hangs a client forever.
 function flushResidual(reason) {
   const rem = buf.trim();

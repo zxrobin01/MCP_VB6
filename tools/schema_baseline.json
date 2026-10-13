@@ -8,7 +8,7 @@
         "properties": {
           "cancel_inflight": {
             "type": "boolean",
-            "description": "TASK-P1-126 (MCP-08): ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case."
+            "description": "ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case."
           },
           "cancel_target": {
             "type": "string",
@@ -16,7 +16,7 @@
           },
           "release_inflight": {
             "type": "boolean",
-            "description": "TASK-P1-168 (C / defect #10): FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate."
+            "description": "FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate."
           },
           "release_min_held_ms": {
             "type": "integer",
@@ -739,7 +739,7 @@
     },
     {
       "name": "make_project",
-      "description": "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. TASK-P1-132: after a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).",
+      "description": "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -765,11 +765,11 @@
           },
           "laa": {
             "type": "boolean",
-            "description": "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\\.vb6mcp.json {\"laa\": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned. WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section."
+            "description": "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\\.vb6mcp.json {\"laa\": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned. WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section."
           },
           "diagnose": {
             "type": "boolean",
-            "description": "TASK-P1-132 (MCP-lead-2), default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure."
+            "description": "default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure."
           }
         }
       }
@@ -1307,7 +1307,7 @@
     },
     {
       "name": "close_active_dialogs",
-      "description": "EXPLICITLY INVOKED ONLY - nothing in this server calls it automatically. Click a SAFE button of an active dialog (default #32770) with the BM_CLICK window message: the caption must be on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist (delete/remove/uninstall/format/overwrite/discard/reset/...). Disabled or non-whitelisted buttons are reported as skipped and are never clicked. SAFETY: before clicking, the dialog BODY (title + every child control's text) is READ; if it names a destructive action the DEFAULT click is REFUSED with reason=dangerous_dialog_body + bodyHit (an explicit button=\"No\" is the escape hatch) and NOTHING is sent. TASK-P1-125 adds a second, independent guard: every path - the dry_run preview included - carries host_modal_risk (none|possible|known) + host_modal_risk_reason + host_modal_risk_class + riskDialogs[], and a box whose button would start a host-modal operation is NOT clicked unless allow_host_modal=true; a Cancel/Close caption is still allowed on such a box, because cancelling cannot start the operation. recovery_hint explains what to do if a write tool then answers reason=busy. Every path returns the same keys: clickedCount, dialogsBefore, dialogsAfter, clicked[].stillExists, skipped[], remaining[].",
+      "description": "EXPLICITLY INVOKED ONLY - nothing in this server calls it automatically. Click a SAFE button of an active dialog (default #32770) with the BM_CLICK window message: the caption must be on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist (delete/remove/uninstall/format/overwrite/discard/reset/...). Disabled or non-whitelisted buttons are reported as skipped and are never clicked. SAFETY: before clicking, the dialog BODY (title + every child control's text) is READ; if it names a destructive action the DEFAULT click is REFUSED with reason=dangerous_dialog_body + bodyHit (an explicit button=\"No\" is the escape hatch) and NOTHING is sent. A second, independent guard: every path - the dry_run preview included - carries host_modal_risk (none|possible|known) + host_modal_risk_reason + host_modal_risk_class + riskDialogs[], and a box whose button would start a host-modal operation is NOT clicked unless allow_host_modal=true; a Cancel/Close caption is still allowed on such a box, because cancelling cannot start the operation. recovery_hint explains what to do if a write tool then answers reason=busy. Every path returns the same keys: clickedCount, dialogsBefore, dialogsAfter, clicked[].stillExists, skipped[], remaining[].",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1387,7 +1387,7 @@
     },
     {
       "name": "validate_code",
-      "description": "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey (TASK-P1-126/MCP-15), and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).",
+      "description": "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1409,7 +1409,7 @@
           },
           "baseline": {
             "type": "string",
-            "description": "TASK-P1-126 (MCP-15): a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new."
+            "description": "a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new."
           }
         },
         "required": [
@@ -1451,7 +1451,7 @@
     },
     {
       "name": "build",
-      "description": "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. TASK-P1-132: laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.",
+      "description": "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1473,7 +1473,7 @@
           },
           "laa": {
             "type": "boolean",
-            "description": "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted."
+            "description": "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted."
           }
         }
       }
@@ -1656,7 +1656,7 @@
     },
     {
       "name": "inject_trace",
-      "description": "Insert a McpTrace call at the start of a procedure. B+C/TASK-P1-028: the guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen. TASK-P1-129: inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).",
+      "description": "Insert a McpTrace call at the start of a procedure. The guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen; inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1690,7 +1690,7 @@
     },
     {
       "name": "remove_trace",
-      "description": "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-149: the modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=\"kept_by_design\" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.",
+      "description": "Remove a previously injected trace block; sha256 returns to the pre-injection value. The modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=\"kept_by_design\" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1864,6 +1864,13 @@
             "description": "Target process id (default: the IDE process hosting this add-in)"
           }
         }
+      }
+    },
+    {
+      "name": "desktop_probe",
+      "description": "Read the LIVE desktop/interactivity state of the process that hosts the add-in: {ok, windowStation, desktop, sessionId, interactive, canSendInput, foregroundHwnd, foregroundReadable, probeBasis, note}. Every value is MEASURED on each call (GetProcessWindowStation + GetUserObjectInformationW(UOI_NAME) + GetThreadDesktop + OpenInputDesktop + GetForegroundWindow + IsWindow + ProcessIdToSessionId, all inside the add-in process; the input-desktop handle it opens is closed again). The foreground/desktop state is reported as a LIVE structured value: foregroundHwnd can be 0 on a non-interactive or locked desktop and that is reported as-is. The probe never steals focus to obtain it (no SetForegroundWindow) and never derives send-input capability from a window-station name: this add-in delivers input as PostMessage(WM_KEYDOWN/WM_KEYUP/WM_MOUSEWHEEL) to windows of its OWN process, measured to deliver while ANOTHER process owns the foreground. If any of those APIs cannot be called, or returns no handle, the tool answers ok:false + failureKind=api_unavailable + failedApi + apiError + apiErrorText + measured:false instead of a zero-filled picture, and the desktop{} block on the input-family receipts carries measured:false as well. A missing Alias clause on a Declare surfaces here as VB error 453 rather than as zeros. Read-only.",
+      "inputSchema": {
+        "type": "object"
       }
     },
     {
@@ -2199,6 +2206,10 @@
           "exec_line": {
             "type": "string",
             "description": "Line to execute, e.g. 1+1 or Debug.Print ... (Immediate-window syntax)"
+          },
+          "exec_line_file": {
+            "type": "string",
+            "description": "Path to a UTF-8/ANSI text file whose text is used as exec_line. Mutually exclusive with exec_line; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding."
           },
           "exec_a2": {
             "type": "integer",
@@ -2747,7 +2758,7 @@
     },
     {
       "name": "todo_status",
-      "description": "Read-only: machine-readable todo derived from _bus/tasks/P1 and _bus/reports/P1 (status + title) plus counts; useful for a quick progress snapshot.",
+      "description": "READ-ONLY task-board snapshot. Scans an OPTIONAL in-repo task folder (tasks/ + reports/ Markdown) and returns {taskCount, openTasks, tasks[], reportCount, reports[], readOnly}. A missing task folder is a normal result (0 tasks), not an error.",
       "inputSchema": {
         "type": "object"
       }
@@ -2836,13 +2847,17 @@
     },
     {
       "name": "immediate_eval",
-      "description": "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:\"value_not_parsed\"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards.",
+      "description": "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:\"value_not_parsed\"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).",
       "inputSchema": {
         "type": "object",
         "properties": {
           "expression": {
             "type": "string",
             "description": "Expression to evaluate in the ACTIVE project's immediate context, e.g. 1/4 or UCase$(\"ab\"). It is evaluated exactly ONCE."
+          },
+          "expression_file": {
+            "type": "string",
+            "description": "Path to a UTF-8/ANSI text file whose text is used as expression. Mutually exclusive with expression; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding."
           },
           "timeout_ms": {
             "type": "integer",
@@ -2856,13 +2871,17 @@
     },
     {
       "name": "immediate_run",
-      "description": "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open.",
+      "description": "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open. The statement body may also be supplied through code_file (mutually exclusive with code).",
       "inputSchema": {
         "type": "object",
         "properties": {
           "code": {
             "type": "string",
             "description": "One or more statements to run, e.g. Debug.Print 1+1 or x = 5: Debug.Print x. A CR/LF in the input is joined with a colon and a space; each statement-boundary Debug.Print is redirected into the sink."
+          },
+          "code_file": {
+            "type": "string",
+            "description": "Path to a UTF-8/ANSI text file whose text is used as code. Mutually exclusive with code; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding."
           },
           "timeout_ms": {
             "type": "integer",
@@ -2876,7 +2895,7 @@
     },
     {
       "name": "ide_quiet_mode",
-      "description": "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:\"activate\"} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the foreground handle could not be READ (it is 0 here) - never read that as \"the focus was left alone\". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.",
+      "description": "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:\"activate\"} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour. The foreground/desktop state is reported as a LIVE structured value (see desktop_probe): the handle can be 0 on a non-interactive or locked desktop and that is reported as-is, so foregroundReadable=false means the handle could not be read - never read that as \"the focus was left alone\". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.",
       "inputSchema": {
         "type": "object",
         "properties": {

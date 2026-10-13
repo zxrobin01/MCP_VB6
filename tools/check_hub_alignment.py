@@ -1,6 +1,6 @@
 """Machine-check that the hub tool face matches the frozen tool face.
 
-TASK-P3-020 (内部独立宿主方案 §8 rule 3).  Makes "someone forgot to
+Makes "someone forgot to
 regenerate the hub snapshot" fail loudly instead of drifting silently.
 
 Checks:

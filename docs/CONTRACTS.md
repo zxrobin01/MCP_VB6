@@ -7,24 +7,25 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 
 ## 版本记录
 
-> **改契约的必做一步（TASK-P1-042）**：本表新增/变更版本后，**必须同步 add-in 的唯一常量**
+> **改契约的必做一步**：本表新增/变更版本后，**必须同步 add-in 的唯一常量**
 > `Util.bas` 的 `VB6MCP_CONTRACT_VERSION` —— 它同时供 `initialize.instructions` 首行、
 > `mcp_info.contract` 与每次 `tools/call` 的 `mcp` 戳使用。**禁止在别处再硬编码契约版本**：
 > 横幅必须是**永不陈旧的自称**（与 `BUILT` 戳同理；hub 转发**活体**横幅，不一致会直接暴露给用户）。
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| **v1.9.0** | 2026-10-13 | **工具面扩容 + 卡死可恢复**（TASK-P1-164 A / TASK-P1-168 B+C）。Tool face: **add-in 111 -> 114**（新增 `immediate_eval` / `immediate_run` / `ide_quiet_mode`），hub 5 -> 5，DSH-facing total 116 -> 119。**Add-in CHANGED** = `ide_state`（新增 `release_inflight` / `release_min_held_ms`；正文**恒带** `release{}` 固定键集）；只读回执仅在**发生过强释**后才追加 `gate*` 键；`ide_quiet_mode` ON 时**每次** `tools/call` 正文带 `quiet{...,advisory}`、`control_window{action:activate}` 回执带 `quietModeSuppressedFocus`。**纯增量**：quiet OFF / 未强释路径的既有回执逐字节不变。DELIBERATE, S-authorized re-freeze（四冻件全变）。 |
-| **v1.8.0** | 2026-10-12 | P1 fix pack (TASK-P1-126). Tool face: add-in 111 -> 111, hub 4 -> 5 (new `ide_restart`), DSH-facing total 115 -> 116. Add-in CHANGED = `replace_code` (replace/delete now REQUIRE `expected_sha256`; the refusal returns `currentSha256`), `validate_code` (+optional `baseline`; every diagnostic gains `proc`/`procOffset`/`fingerprint`/`stableKey`; always-present `baseline_diff`), `ide_state` (+`cancel_inflight`/`cancel_target`; every read-only receipt gains `inflight{}`). Behaviour fixes with no schema change: PRE-WRITE block-pairing refusal in replace_code/add_code/apply_edits/edit_by_anchor; multi-line (block) anchor + duplicate-anchor hits + procedure first/last echo in edit_by_anchor; close_active_dialogs emits ONE key set on dry_run and real clicks; build/make_project stop publishing an EMPTY digest and re-read logs in their own encoding. DELIBERATE, S-authorized re-freeze. |
-| **v1.7.0** | 2026-10-09 | **版本号补齐（additive，不改工具面 ⇒ 免重冻）**：为 `TASK-P1-087` 给 `replace_code` / `apply_edits` / `edit_by_anchor` 新增的**可选** `snapshot`（`type=boolean`，**默认 off ⇒ 默认行为不变**，跨构建 A/B `ab_differences=0` 为证）补上契约版本号与迁移条目 ⇒ **工具数不变（111 → 111）**；对应冻结件 sha **`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE`**（== `docs/tools_schema.json`，本卡**不再重冻**）；`mcp_info.breaking` 本版**不新增条目**（非破坏性），迁移说明见 **§9** |
+| **v1.10.0** | 2026-10-13 | **BATCH-1：能力簇落地 + 描述标签中性化**。Tool face: **add-in 114 -> 115**（新增只读 `desktop_probe`），hub 5 -> 5，DSH-facing total **119 -> 120**。**ADDED** = `desktop_probe`（只读：进程的实时窗口站/桌面/sessionId/可交互性/前台状态；**fail-closed** ⇒ 任一 API 失败即 `ok:false` + `failureKind:"api_unavailable"`）。**CHANGED（12）** = `build` / `close_active_dialogs` / `ide_quiet_mode` / `ide_state` / `immediate_eval` / `immediate_run` / `inject_trace` / `make_project` / `remove_trace` / `todo_status` / `validate_code` / `vba6_probe`：其中 10 个只改**描述文本**（内部标签中性化，行为与回执不变），`ide_state` 与 `vba6_probe` 描述未变、只加参数。**新增参数（3，纯增量）** = `vba6_probe.exec_line_file` / `immediate_eval.expression_file` / `immediate_run.code_file`。**R13 失败信封**：`vba6_probe` 七类 `failureKind`（`not_loaded` / `alloc_failed` / `arg_out_of_range` / `address_invalid` / `not_readable` / `engine_zero` / `refused_by_design`），`immediate_*` 的 `exec_error` 包装新增两类（`channel_error` / `statement_raised`），且 `immediate_*` **自身**的 `exec_error` **刻意不带** `failureKind`。**修复**：静默截断改为结构化（`lenRequested` / `lenClamped`、`maxHits*`）；`arg_out_of_range` 取代裸 VB 溢出。**未落地**：`immediate_window_text`（R1 NO-GO ⇒ 不加该工具）。**D1 有界残留**：`todo_status` 保留功能性自动发现（仓库内**可选任务文件夹**）并新增环境变量 `VB6MCP_TASKS_DIR` 覆盖；契约与公开面不再出现该目录名。DELIBERATE, S-authorized re-freeze（四冻件全变；hub 快照随之重生成）。 |
+| **v1.9.0** | 2026-10-13 | **工具面扩容 + 卡死可恢复**。Tool face: **add-in 111 -> 114**（新增 `immediate_eval` / `immediate_run` / `ide_quiet_mode`），hub 5 -> 5，DSH-facing total 116 -> 119。**Add-in CHANGED** = `ide_state`（新增 `release_inflight` / `release_min_held_ms`；正文**恒带** `release{}` 固定键集）；只读回执仅在**发生过强释**后才追加 `gate*` 键；`ide_quiet_mode` ON 时**每次** `tools/call` 正文带 `quiet{...,advisory}`、`control_window{action:activate}` 回执带 `quietModeSuppressedFocus`。**纯增量**：quiet OFF / 未强释路径的既有回执逐字节不变。DELIBERATE,S-authorized re-freeze（四冻件全变）。|
+| **v1.8.0** | 2026-10-12 | P1 fix pack. Tool face: add-in 111 -> 111,hub 4 -> 5 (new `ide_restart`),DSH-facing total 115 -> 116. Add-in CHANGED = `replace_code` (replace/delete now REQUIRE `expected_sha256`; the refusal returns `currentSha256`),`validate_code` (+optional `baseline`; every diagnostic gains `proc`/`procOffset`/`fingerprint`/`stableKey`; always-present `baseline_diff`),`ide_state` (+`cancel_inflight`/`cancel_target`; every read-only receipt gains `inflight{}`). Behaviour fixes with no schema change: PRE-WRITE block-pairing refusal in replace_code/add_code/apply_edits/edit_by_anchor; multi-line (block) anchor + duplicate-anchor hits + procedure first/last echo in edit_by_anchor; close_active_dialogs emits ONE key set on dry_run and real clicks; build/make_project stop publishing an EMPTY digest and re-read logs in their own encoding. DELIBERATE,S-authorized re-freeze. |
+| **v1.7.0** | 2026-10-09 | **版本号补齐（additive，不改工具面 ⇒ 免重冻）**：为 `replace_code` / `apply_edits` / `edit_by_anchor` 新增的**可选** `snapshot`（`type=boolean`，**默认 off ⇒ 默认行为不变**，跨构建 A/B `ab_differences=0` 为证）补上契约版本号与迁移条目 ⇒ **工具数不变（111 → 111）**；对应冻结件 sha **`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE`**（== `docs/tools_schema.json`，本卡**不再重冻**）；`mcp_info.breaking` 本版**不新增条目**（非破坏性），迁移说明见 **§9** |
 | **v1.6.0** | 2026-10-09 | **工具面扩容**：新增 `replace_in_files`（跨组件字面/正则替换，`dry_run` 默认 true）与 `undo_edit`（组件级显式单步撤销；写入前把 pane 文本快照到 `<工程>\_undo\`）⇒ **109 → 111，必须显式重冻**；同一次重冻并落地 `send_window_message` 的**描述补全 + 高危消息护栏**（新增参数 `confirm` ⇒ 本版 `CHANGED=send_window_message`）；另**登记**（不改 schema）`add_component{type:"form"}` 改由 IDE 自建 + `createdVia`/`ideRouteNote`、`control_execution.mode` 的 12 值 enum、以及两条工具面局限（`command_bars{list}` 不含 Add-Ins 弹层；`AddFromTemplate` 窗体模板路线本机不可用） |
 | v1.0.0（隐含） | 2026-09-21 | 既有 96 个工具（此前只有 live 快照与冻结基线，没有书面契约） |
 | **v1.5.0** | 2026-10-09 | **消息型窗口原语 + 可选滚轮 + 写入回执的相位/分块字段**：新增 `read_active_dialogs`（只读）/ `close_active_dialogs`（**只显式调用**）/ `send_window_message`（**只发窗口消息**），**106 → 109，必须显式重冻**；`command_bars` 在**既有 `control` 参数内**接受 `#<id>` 寻址（**不改 inputSchema**）；写入回执新增 `hunks` 与相位字段（**纯增量**，见下）；可选代码窗滚轮（env/注册表，**默认关**，**不新工具、不改 schema**） |
 | **v1.4.0** | 2026-10-09 | **OCX 防挂死**：`add_control` 预校验（未登记部件 ⇒ `control_part_not_registered`，绝不进入会挂死的调用）+ 新只读工具 `list_component_parts`（**105 → 106，需显式重冻**） |
 | **v1.3.2** | 2026-10-09 | **结构化错误号**（响应侧，无需重冻）：失败回执增可选 `vbErrorCode`/`hresult`（8 位 hex）/`errorLine`；`mcp_info` 可增 `errorDecoding`/`errorTableEntries` |
-| **v1.3.1** | 2026-10-08 | **H2 多 IDE 归属确定化**：`SO_EXCLUSIVEADDRUSE` + 动态端口 + 实例注册（`%TEMP%\vb6mcp\instances\<pid>.json`）+ 响应正文 `ide:{pid,project,port}`（不触 inputSchema、无需重冻；不变式不变） |
+| **v1.3.1** | 2026-10-08 | **多 IDE 归属确定化**：`SO_EXCLUSIVEADDRUSE` + 动态端口 + 实例注册（`%TEMP%\vb6mcp\instances\<pid>.json`）+ 响应正文 `ide:{pid,project,port}`（不触 inputSchema、无需重冻；不变式不变） |
 | **v1.3.0** | 2026-10-08 | **版本变更可见化**：新增只读 `mcp_info`（104 -> 105）+ `initialize.instructions` 固定版块 + 每次 `tools/call` 正文带 `mcp:{product,contract}` 版本戳 + 产品版本 0.2.0 -> 0.3.0 |
-| **v1.2.0** | 2026-10-08 | **工具加固**（从真实工程实战反推，`REQ-20261008-001`）：α 回执诚实性（纯增量）+ β 行为加固（**破坏性**）+ γ 输入参数（触 inputSchema）+ δ 3 个新工具；分 A 批（α+β）与 B+C 批（γ+δ）两次落地，见下节 |
+| **v1.2.0** | 2026-10-08 | **工具加固**（从真实工程实战反推）：α 回执诚实性（纯增量）+ β 行为加固（**破坏性**）+ γ 输入参数（触 inputSchema）+ δ 3 个新工具；分 A 批（α+β）与 B+C 批（γ+δ）两次落地，见下节 |
 | ~~v1.1.0~~ **v1.1.0（含勘误）** | 2026-09-22 | **新增 5 个只读工具**：`ide_state` / `current_position` / `list_breakpoints` / `find_gui` / `ui_text`（96 → 101）；另有 1 条非 schema 变更（断点态写权限错误的 `reason`，见下） |
 
 ## v1.1.0 新增工具
@@ -54,7 +55,7 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 - 语义：**只在当前进程内**（VB6 IDE 进程）枚举顶层窗口与子控件；`keyword` 为 contains 匹配。
 - 只读。用途：定位对话框/菜单/弹窗文本。
 
-### 5. `ui_text`（G3 未闭环的 UI 观测方向，REQ-20260921-018 / R47 方向2）
+### 5. `ui_text`（G3 未闭环的 UI 观测方向，/ R47 方向2）
 - 参数：`hwnd`（可空）、`cls`（可空，取第一个匹配）、`depth`（默认 3）。
 - 返回：`{ok:true, source:"uia|msaa|wm_gettext", text:"..."}` 或 `{ok:false, reason:"no_accessible_text", evidence:"<可复现负向证据>"}`。
 - 语义：读取指定窗口及其子树的**可访问文本**；优先 UI Automation，回退 MSAA（`AccessibleObjectFromWindow`），再回退 `WM_GETTEXT`。
@@ -66,9 +67,9 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 断点态下**写源码类**工具（`set_breakpoint` / `clear_breakpoints` / `apply_edits` / `write_source` 等）返回的裸
 VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_mode"` 与恢复建议（先 `end` 退出断点态）。
 
-**v1.1.0 勘误 2（2026-10-08，TASK-P1-019 真机实测）**：**运行态**写源码同样会被拒（裸 `拒绝的权限`），追加值为 `reason:"ide_busy_in_run_mode"` + `ideState`。属**新增取值**（不改既有值语义）。
+**v1.1.0 勘误 2（2026-10-08，真机实测）**：**运行态**写源码同样会被拒（裸 `拒绝的权限`），追加值为 `reason:"ide_busy_in_run_mode"` + `ideState`。属**新增取值**（不改既有值语义）。
 
-**v1.1.0 勘误 3（2026-10-09，TASK-P1-073 源码复核）**：§3 的语义里「`set_breakpoint` / `native_breakpoint` 写进源码的标记行」**不成立**。
+**v1.1.0 勘误 3（2026-10-09，源码复核）**：§3 的语义里「`set_breakpoint` / `native_breakpoint` 写进源码的标记行」**不成立**。
 实现（`CodeTools.cls` `ToolListBreakpoints`，只扫描 `' @mcp-break <id> begin` 标记行）⇒ **只有 `set_breakpoint` 注入的断点会被列出**；
 `native_breakpoint` 走 Debug 菜单的 toggle，**不写任何源码标记**，因此**不会**出现在 `injected[]` 里。
 正确口径：`list_breakpoints` 只枚举 **set_breakpoint 注入物**；**IDE 原生断点全局不可枚举** ⇒ 一律 `native:null` + `note`（description 早已如此，本次只修契约正文）。
@@ -76,7 +77,7 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 ## v1.2.0 工具加固（从真实工程实战反推）
 
-来源：`现场反馈记录（内部文档）`、`工具加固计划（内部文档）`、`REQ-20261008-001`。
+来源：`现场反馈记录（内部文档）`、`工具加固计划（内部文档）`。
 **两批落地**：**A 批 = α + β**（不改 inputSchema，只加响应字段 + 改两处默认行为）；**B+C 批 = γ + δ**（改 inputSchema + 新增工具）。
 每批都必须走：实现 → `维护者的契约导出脚本` → `check_schema_baseline.py`（**必须先看到 `schema_changes≠0` 才准重冻**）→ `--freeze` → `check_live_tools.py`（ORDER_MATCH=True）→ `mcp_strict_audit.py`（strict_failures=0）→ P4 独立复测。
 
@@ -90,7 +91,7 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 | `build` / `make_project` / `verify` | `artifactPath` / `artifactMtime` / `artifactChanged` / `artifactLockedHint`；`ok:true` 但产物未变化时 `verdict:"compiled-no-artifact-change"` | 编译成功 ≠ 产物已更新（被锁场景） |
 | 编辑类 | `diskSha256` / `paneSha256` / `onDisk` | 自证「报的哈希是盘上还是代码窗格」 |
 | `edit_by_anchor`（拒绝时） | `hits: [{line, proc, text}]` | 锚点不唯一时列出候选，而不是只说 `anchor not unique (N)` |
-| `preview_edit` | `diff` + `hunks[{kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}]` + `contextLines`（默认 3）+ `contextApplied` + `algorithm` + 可选 `algorithmNote` + `lineDelta` | ★**勘误（TASK-P1-075 / F7）**：本行旧文写「diff 仍是**前后缀裁剪**」**与实现不符** —— `preview_edit` 走 `EditTxn.DiffPlan` 的**逐行 LCS**（行级 LCS + hunk 分组 + 默认 3 行上下文），且 `diff` 与 `hunks` **同源**（contract invariant 8，二者不可能互相矛盾）；`algorithm` 如实报 `lcs` / `fallback-too-large`（输入过大时降级，回执带 `algorithmNote` 明说）/ `none`。纯预览，**不写盘也不写 IDE** |
+| `preview_edit` | `diff` + `hunks[{kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}]` + `contextLines`（默认 3）+ `contextApplied` + `algorithm` + 可选 `algorithmNote` + `lineDelta` | ★**勘误（F7）**：本行旧文写「diff 仍是**前后缀裁剪**」**与实现不符** —— `preview_edit` 走 `EditTxn.DiffPlan` 的**逐行 LCS**（行级 LCS + hunk 分组 + 默认 3 行上下文），且 `diff` 与 `hunks` **同源**（contract invariant 8，二者不可能互相矛盾）；`algorithm` 如实报 `lcs` / `fallback-too-large`（输入过大时降级，回执带 `algorithmNote` 明说）/ `none`。纯预览，**不写盘也不写 IDE** |
 
 ### A 批 · β 行为加固（**破坏性**，调用方必须知情）
 
@@ -126,13 +127,13 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 7. `validate:"strict"` 的拒绝必须发生在**写入之前**（IDE 与磁盘都不变），并附 `diagnostics[]`。
 8. `preview_edit` 的 diff 在 B+C 批替换为**行级 LCS + hunk 分组**；替换前（A 批）必须在 description 里写明其算法局限。
 
-### v1.2.0 A 批落地勘误与裁定（2026-10-08，TASK-P1-020 真机实测；S 裁定）
+### v1.2.0 A 批落地勘误与裁定（2026-10-08，真机实测；S 裁定）
 
 - **勘误 1（断言被证伪）**：本契约与判据里的「`.bas` 的 header=0」**不成立**。VB6（连 `import_component` 在内）会往 `.bas` 写 `Attribute VB_Name` 行 —— **代码窗格没有、文件有**，故实测 `headerOffset=1`；只有**手工写成、文件内无 Attribute 行**的 `.bas` 才是 0。`.frm` 实测 17。
 - **勘误 2（`default` 语义）**：见上表 α-1 —— `default` 是**每工具如实标注**，不是全局 `ide`。
 - **裁定 1（`get_component_code` 响应改 JSON 信封）**：**接受**。理由：α 表要求该响应带 `coords`，裸文本无法承载字段；P1 已证 `text` 字段与改动前**字节逐一相同**（含 `include_line_numbers` 的编号）。列入迁移说明：调用方需从 `result.text` 取文本（旧的裸文本响应不再返回）。
 - **裁定 2（`resolved` 字段）**：**接受**为 α 的组成部分（`coords.resolved`）。窗格首行在磁盘上找不到时（例如刚在首行插入）必须 `false` 且注明不可信，**不得**把回落值当精确值。
-### v1.2.0 落地补记 · 缺陷批次（2026-10-08，TASK-P1-021/022/023；同一棵树 101 工具，DLL `8795F5B7…` @18:57:26）
+### v1.2.0 落地补记 · 缺陷批次（2026-10-08，；同一棵树 101 工具，DLL `8795F5B7…` @18:57:26）
 
 缺陷修复带来的**行为与描述变化**（`dump` 显示 `CHANGED=set_breakpoint,set_project_options`，已显式重冻）：
 
@@ -144,10 +145,10 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 **S 记：流程偏差（如实记录）** —— 本批的契约条目**未能在实现之前写进本文件**（缺陷批次直接从「立卡」走到了「落地」）。事后补记如上，事实口径已与实现一致。**规则照旧**：此后任何工具集/描述/参数/行为变化，必须**先**写契约广播、**再**实现；B+C 批（γ+δ）按此执行。
 
-- **裁定 3（两个既存缺陷）**：**都立卡**（`write_file` 不截断 = 数据完整性级；`SetCompText` 写后多一行 = 「回执行数撒谎」的机制本体）。另 TASK-P1-019 §7 报出的 3 条既存缺陷（`set_breakpoint` 允许过程外锚点导致编译失败、`set_project_options(Sub Main)` 失败、`onDisk` 抖动）一并立卡。
-- **裁定 4（失败响应的 `coords`）**（2026-10-08，TASK-P4-023 提出）：**任何含行号的响应都必须带 `coords`**，包括**失败**响应（`range_beyond_end`/`inside_continuation`/`anchor_not_found`/`anchor_outside_procedure` 等）：其中 `requestedRange`/`appliedRange`/`hits[].line`/`countOfLines` 的行号一律按 `coords.default` 解释。无行号的失败（如纯 `reason`+`evidence`）可不带。
-- **口径 5（`textSha256` 不是文件哈希）**（2026-10-08，TASK-P4-023）：`get_component_code` 的 `textSha256` 是**返回文本**的哈希（文件末尾 CRLF 等差异会让它与 `read_source` 的字节 sha256 不同）。判据里不得把两者当同一个值比对；要文件哈希请用 `read_source`。
-- **勘误 3（`.frm` 的 headerOffset 不是常量）**（2026-10-08，TASK-P4-024 实测）：**工具生成**的 `.frm` headerOffset=**17**；**手写**的 `.frm` = **16** 且 `coords.resolved:false`（窗格首行在盘上定位不到）。故 `17` 是「工具生成布局」的性质，**不是** `.frm` 的通用常量；判据里不得写死 `.frm=17`。同理 `.bas`：含 `Attribute` 行=1、手工无 Attribute=0。
+- **裁定 3（两个既存缺陷）**：**都立卡**（`write_file` 不截断 = 数据完整性级；`SetCompText` 写后多一行 = 「回执行数撒谎」的机制本体）。另有 §7 报出的 3 条既存缺陷（`set_breakpoint` 允许过程外锚点导致编译失败、`set_project_options(Sub Main)` 失败、`onDisk` 抖动）一并立卡。
+- **裁定 4（失败响应的 `coords`）**（2026-10-08，提出）：**任何含行号的响应都必须带 `coords`**，包括**失败**响应（`range_beyond_end`/`inside_continuation`/`anchor_not_found`/`anchor_outside_procedure` 等）：其中 `requestedRange`/`appliedRange`/`hits[].line`/`countOfLines` 的行号一律按 `coords.default` 解释。无行号的失败（如纯 `reason`+`evidence`）可不带。
+- **口径 5（`textSha256` 不是文件哈希）**（2026-10-08）：`get_component_code` 的 `textSha256` 是**返回文本**的哈希（文件末尾 CRLF 等差异会让它与 `read_source` 的字节 sha256 不同）。判据里不得把两者当同一个值比对；要文件哈希请用 `read_source`。
+- **勘误 3（`.frm` 的 headerOffset 不是常量）**（2026-10-08，实测）：**工具生成**的 `.frm` headerOffset=**17**；**手写**的 `.frm` = **16** 且 `coords.resolved:false`（窗格首行在盘上定位不到）。故 `17` 是「工具生成布局」的性质，**不是** `.frm` 的通用常量；判据里不得写死 `.frm=17`。同理 `.bas`：含 `Attribute` 行=1、手工无 Attribute=0。
 
 ## v1.3.0 版本变更可见化（避免调用方按旧思路调用）
 
@@ -164,8 +165,9 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 ### 1. `instructions` 版块（首行必须可一行读完）
 ```text
-PRODUCT vb6-mcp <semver>  CONTRACT v1.9.0  TOOLS 114  BUILT <sha256 前 8 位>
+PRODUCT vb6-mcp <semver>  CONTRACT v1.10.0  TOOLS 115  BUILT <sha256 前 8 位>
 BREAKING (read before calling):
+- v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind="api_unavailable" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)
 - v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)
 - v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted
 - v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s
@@ -202,7 +204,7 @@ BREAKING (read before calling):
 - **不变式**：`tools/list` 结果键仍**恰为** `{tools}`；`tools/call` 结果键仍**恰为** `{content,isError}`；版本戳只出现在正文里。
 
 
-## v1.3.1 H2：多 IDE 归属确定化（传输侧硬化 + 响应侧 `ide` 回显）
+## v1.3.1 多 IDE 归属确定化（传输侧硬化 + 响应侧 `ide` 回显）
 
 ### 背景（当前缺陷）
 add-in 用 `SO_REUSEADDR` 绑 8766 ⇒ 两个 IDE 都能绑上、**端口归属未定义**；hub 只能扫端口「猜」目标。
@@ -217,7 +219,7 @@ add-in 用 `SO_REUSEADDR` 绑 8766 ⇒ 两个 IDE 都能绑上、**端口归属�
 #
 ## v1.3.2 结构化错误号（响应侧；采纳 P2 的 R60–R71 研究）
 
-### 背景（静态层已具备条件，见 `REP-TASK-P2-009` 的 R60–R71）
+### 背景（静态层已具备条件，见 的 R60–R71）
 - `sub_FA9A05A`（**321 xref**）= 全局 **HRESULT → VB 错误码** 转换器：`if (a1>=0) return 0;`，否则按 facility 分流 + **85 项二分表**（`dword_FA9A0E0` RVA `0xA0E0`，步长 8B，终止 `[84] 0xFFFFFFFF→440`）；未命中 ⇒ `dwMessageId = 原始 HRESULT`。
 - 错误号在 `word_FC0D18A`；描述两条路（全局 ANSI `word_FC0D18C`，或 `sub_FBC53CD(号)` 按号现造）；行/列由 `sub_FB8749A` **两阶段解析**（位置全局 `word_FC0D188` / `dword_FC0D190` / `word_FC0D194-198`）。
 - **消费方**：(a) 回执错误诊断（VB 码 → HRESULT → 根因类别；如 429 覆盖 **6** 个不同 HRESULT）；(b) 失败模式归因；(c) **测试断言可用数值码，跨中英文 IDE 稳定**；(d) 知识沉淀。
@@ -236,14 +238,14 @@ add-in 用 `SO_REUSEADDR` 绑 8766 ⇒ 两个 IDE 都能绑上、**端口归属�
 
 ### 勘误/落地补记（2026-10-09，真机实测后）
 
-- **`hresult` 在本工具面下不可实现 ⇒ 永不出现**：`dwMessageId`（VA `0x0FC0D10C`）会被 **IDE 自己消费并清零**（`sub_FBC53CD`），采样是竞态；且只读实测显示**弹着 `#32770` 时三处采样全为 0**（连 `word_FC0D18A` 都不含 VB6 自己显示的 429）⇒ 按「只在可判定时出现」的不变式，该字段**永不出现**（证据：`REP-TASK-P2-011` / `REP-TASK-P4-033`）。
-- **`errorLine` 已撤回实现**：在 add-in 内**裸读**引擎位置全局（`RtlMoveMemory`）曾**导致 IDE 进程死亡**（A/B 实证，`REP-TASK-P1-039`，已记 FAQ §19）；是否属「**绝对 VA 被再次加基准**」的混淆待判定 ⇒ 在判定与正确地址下复测之前，该字段**不实现**。
+- **`hresult` 在本工具面下不可实现 ⇒ 永不出现**：`dwMessageId`（VA `0x0FC0D10C`）会被 **IDE 自己消费并清零**（`sub_FBC53CD`），采样是竞态；且只读实测显示**弹着 `#32770` 时三处采样全为 0**（连 `word_FC0D18A` 都不含 VB6 自己显示的 429）⇒ 按「只在可判定时出现」的不变式，该字段**永不出现**（证据： /）。
+- **`errorLine` 已撤回实现**：在 add-in 内**裸读**引擎位置全局（`RtlMoveMemory`）曾**导致 IDE 进程死亡**（A/B 实证，，已记 FAQ §19）；是否属「**绝对 VA 被再次加基准**」的混淆待判定 ⇒ 在判定与正确地址下复测之前，该字段**不实现**。
 - **`vbErrorCode` 是唯一已交付字段**：仅来自 add-in 自身的 `Err.Number`（在 `CallTool` 的 Fail 入口**一次性**读取并 `Err.Clear`）；我们自己发的结构化拒绝**没有**该字段（合法缺失）。
 - **有模态框时引擎错误全局一律不可用**：替代来源按可靠度 —— **对话框 Static 文本（`find_gui` + `ui_text`）> `vb6mcp.log`/工具回执 > `<Component>.log`**；引擎全局（含 `word_FC0D18A`）在有模态框时 **❌**（见 FAQ §15.3）。
 
 ## v1.4.0 OCX 控件部件：防挂死 + 只读清单（**+1 工具 ⇒ 必须显式重冻 105→106**）
 
-### 背景（根因已由真机钉死，`TASK-P1-026`）
+### 背景（根因已由真机钉死）
 把某个 OCX 当「控件部件」用时，若该部件**未登记进工程**（`.vbp` 无对应 `Object=` 行），`VBControls.Add(ProgID)` 会进入 **VBIDE 内部静默等待**：**不弹任何对话框**（五格 ProgID 矩阵新增窗口数全 0）、**整条 UI 线程被占**（第二个客户端的 `ide_state`/`get_project_info` 双双 5s 超时）、观测 **683s 不返回**、审计零行、无 `<form>.log`；**触发与 OCX 是否注册无关**（虚构 `Foo.Bar.Baz` 同样挂死；CLSID 已注册的 `MSComDlg.CommonDialog` 也挂死），正向对照 `VB.CommandButton` 3s 成功。⇒ **进程内不可修复**（单线程 STA 无法中断已阻塞调用）。另：**手写 `.vbp` 的 `Object=` 行在本机不成立**（`open_project` 正常但重开后工程 components 为空、窗体不加载）。
 
 ### 内容
@@ -257,7 +259,7 @@ add-in 用 `SO_REUSEADDR` 绑 8766 ⇒ 两个 IDE 都能绑上、**端口归属�
 
 ### 书面边界（必须写进文档）
 - **进程内无法中断**已阻塞的 `VBControls.Add` ⇒ 修法只有**预防**（预校验）与**文档化绕过**（已挂死时：终止并重启该 IDE 实例）；
-- ★ 「让 OCX 成为控件部件」的正规途径，在**现有工具面下已证不可行**（`TASK-P1-041`，只读探路）：
+- ★ 「让 OCX 成为控件部件」的正规途径，在**现有工具面下已证不可行**（只读探路）：
   - 菜单项**可触发**（`command_bar=Toolbox`、**command id 746**，但 `command_bars execute` **只能按题注**匹配 —— 该工具没有 id 参数）；
   - 触发后打开 `#32770 «Components»`；其**列表项不通过 `WM_GETTEXT` 暴露**（`ui_text` 只读到外框元素 ⇒ 读不到 ListBox 项）；
   - **缺三个原语**：**对话框列表项枚举/选择**（`LB_GETTEXT`/`LB_SETCURSEL` 或 MSAA/UIA）· **按 hwnd 点按或发送按键**（`control_window` 只认与语言无关的类型名，标题与 `#32770` 均被拒）· **合成鼠标**（连已知坐标也点不了）；
@@ -265,7 +267,7 @@ add-in 用 `SO_REUSEADDR` 绑 8766 ⇒ 两个 IDE 都能绑上、**端口归属�
 
 ### 版本关系
 v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可同批也可分两批**；若分两批，先 v1.3.2 再 v1.4.0。
-## v1.5.0 消息型窗口原语（TASK-P1-069）+ 写入回执的分块/相位字段（TASK-P1-068 / TASK-P1-070）+ 可选代码窗滚轮（TASK-P1-067）
+## v1.5.0 消息型窗口原语 + 写入回执的分块/相位字段 + 可选代码窗滚轮
 
 > 本版是**纯增量**：**不改**任何既有工具的 inputSchema、不删/不改任何既有回执键的语义。
 
@@ -282,10 +284,10 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 ### 2. `command_bars` 支持按 id（**不改 inputSchema**）
 
 - 复用**既有** `control` 参数：`"#746"` / `"id:746"` / 裸数字 = 按 id；
-- ★VB6 的 CommandBar **Id 不唯一**（`TASK-P1-006`：仅 id=746 就覆盖 986 个节点）⇒ id 路径**只在恰好一个 Enabled 控件命中时执行**；0 个命中或 ≥2 个命中都**结构化拒绝**（后者回执带候选 `bar>caption` 列表，用 `bar=` 或题注再收窄）。**拒绝猜**是设计，不是缺陷；
+- ★VB6 的 CommandBar **Id 不唯一**（仅 id=746 就覆盖 986 个节点）⇒ id 路径**只在恰好一个 Enabled 控件命中时执行**；0 个命中或 ≥2 个命中都**结构化拒绝**（后者回执带候选 `bar>caption` 列表，用 `bar=` 或题注再收窄）。**拒绝猜**是设计，不是缺陷；
 - 回执新增 `byId` / `id` /（歧义时）`idCandidates`。
 
-### 3. 写入回执：`hunks`（TASK-P1-068，**纯增量字段**）
+### 3. 写入回执：`hunks`（**纯增量字段**）
 
 - 所有走最小写入的写工具回执在 `writeCalls`/`writeMs` 旁**新增整数 `hunks`**；
 - **口径（不变式重新界定）**：
@@ -293,22 +295,22 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
   - **hunk 路径**：`writeCalls = 2 x hunks`（每个 hunk 至多 1 次 DeleteLines + 至多 1 次 InsertLines）；
   - **`hunks <= MAX_HUNKS = 16`**；超过上限（或任一 hunk 超过「最小跨度单块」规模）则**回退单块最小化**，回执以 `hunks = 1` 体现；
   - `writeMs` **窗口未变**（仍是该次写的最外层计时）。
-- **观测（仅现象，未作机制定论）**：写入耗时对**块规模**呈超线性（历史实测 1/50/500/5,000/26,999 行 ⇒ 0/15/31/844/21,593 ms 量级）；该现象在 `TASK-P1-070` 的分相 / 双因素矩阵判定前，**不得**写成「慢在 COM」或「慢在我们」的结论。
+- **观测（仅现象，未作机制定论）**：写入耗时对**块规模**呈超线性（历史实测 1/50/500/5,000/26,999 行 ⇒ 0/15/31/844/21,593 ms 量级）；该现象在 的分相 / 双因素矩阵判定前，**不得**写成「慢在 COM」或「慢在我们」的结论。
 
-### 4. 写入回执：相位字段（TASK-P1-070，**纯增量字段**）
+### 4. 写入回执：相位字段（**纯增量字段**）
 
 - 报 `writeMs` 的写工具回执新增：`diffMs` / `joinMs` / `delMs` / `insMs` / `maxBlockLines` / `phaseNote`；
 - **语义（`phaseNote` 逐字写在回执里）**：`diffMs` = hunk 生成 + 校验；`joinMs` = 我方其余准备（切行、公共前后缀扫描、块数组构建、Join）；`delMs`/`insMs` = **在 CodeModule 调用内部**的时间；`maxBlockLines` = 单次 CodeModule 调用交给引擎的最大行数；
-- ★这些是**一次调用的区间测量**，**不构成因果结论**；归属判定属 `TASK-P1-070`，其真机矩阵结论落定前本节**不写机制**。
+- ★这些是**一次调用的区间测量**，**不构成因果结论**；归属判定属 ，其真机矩阵结论落定前本节**不写机制**。
 
-### 5. 可选代码窗滚轮（TASK-P1-067）—— **不是工具、不改 schema**
+### 5. 可选代码窗滚轮—— **不是工具、不改 schema**
 
 - **默认关闭**。开关：环境变量 `VB6MCP_WHEEL=1`（`true/on/yes` 亦可）或注册表 `HKCU\Software\VB6MCP\Wheel`；`VB6MCP_WHEEL_LINES`（1..50，默认 3）调每格行数；
 - 实现 = **子类化本进程的代码窗窗口**（class `VbaWindow`，`SetWindowLongW(GWLP_WNDPROC)` + `CallWindowProcW`），把 `WM_MOUSEWHEEL` 翻译成 `WM_VSCROLL`；★**绝不安装键盘钩子、绝不安装全局钩子（含 WH_MOUSE）**；
 - 行为：仅当**指针位于该代码窗矩形内**时生效（`Ctrl` = 翻页，`Shift` = 3 倍行数，不改光标与选择）；窗体设计器 / 其它窗格不受影响；
 - 卸载：`OnDisconnection` 恢复原窗口过程（**仅当该窗口当前过程仍是我们的** —— 若第三方插件在我们之后子类化，则**保留链条、只停用**，并在回执里如实记 deferred）；**同一 hwnd 重复扫描不会堆叠**；
 - 详细开关 / 行为 / 与第三方插件共存说明见 `内部已知限制与 FAQ` §34。
-- ★**更正（TASK-P1-067 终修，2026-10-09；上一条的「翻译成 `WM_VSCROLL`」已过期，**追加**更正、不改 schema）**：实测 `WM_VSCROLL` 对准**真代码窗**的 `SB_LINEDOWN×2 / SB_PAGEDOWN / SB_LINEUP×2` **5/5 不动**；现改为**在进程内直接设该窗格的 `CodePane.TopLine`**（读回值进回执），并且**只子类化标题能映射到 `CodePane.Window.Caption` 的窗口**（立即 / 监视 / 本地窗口同属 `VbaWindow` 类，按标题过滤并列入 `ide_state.wheel.skipped[]`）。on 臂 / 默认关 / 多实例 / 卸载退出码 0 的真机证据见 FAQ §34.6。
+- ★**更正（终修，2026-10-09；上一条的「翻译成 `WM_VSCROLL`」已过期，**追加**更正、不改 schema）**：实测 `WM_VSCROLL` 对准**真代码窗**的 `SB_LINEDOWN×2 / SB_PAGEDOWN / SB_LINEUP×2` **5/5 不动**；现改为**在进程内直接设该窗格的 `CodePane.TopLine`**（读回值进回执），并且**只子类化标题能映射到 `CodePane.Window.Caption` 的窗口**（立即 / 监视 / 本地窗口同属 `VbaWindow` 类，按标题过滤并列入 `ide_state.wheel.skipped[]`）。on 臂 / 默认关 / 多实例 / 卸载退出码 0 的真机证据见 FAQ §34.6。
 
 ### 6. 本版不变式
 
@@ -316,33 +318,33 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 - **既有 106 个工具的 inputSchema 零改动**；本版**只新增**三个工具；
 - 门禁四件套：**pre-freeze 必须能看到** `ADDED=read_active_dialogs,close_active_dialogs,send_window_message`，`--freeze` 后 `schema_changes=0`、`ORDER_MATCH=True`、`strict_failures=0`、`check_hub_alignment` 0 失败（hub 快照同步重生成）。
 
-### v1.5.0 非 schema 增量（2026-10-09，TASK-P1-077）：工程目录写入边界 + 写入清单 `projectDirWrites`
+### v1.5.0 非 schema 增量（2026-10-09）：工程目录写入边界 + 写入清单 `projectDirWrites`
 
 - **不改任何 inputSchema、不加参数、不改任何 description** ⇒ `tools/list` 仍 **109**、`schema_changes=0`、**无需重冻**；
-- 三个会写工程目录的写工具的**回执恒带 `projectDirWrites`**：本次调用**实际写到磁盘的文件绝对路径数组**（写序、去重）；**没有写任何文件时是空数组 `[]`（字段恒在）**。★**限定（P4-051 独立复测指出，P1-089 补正）**：「恒在」只对**非拒绝回执**成立 —— **结构化拒绝**（`GuardReject` / 预校验路径）由**另一条**回执构建器产生，**不带** `projectDirWrites`。
-  口径：`import_component` = 工程局部副本（P1-056 契约）；`add_component` = 仅 `type:"form"` 走表单回退时非空，其余一律 `[]`；`save_project` = 本次写入的工程文件 + 组件文件
+- 三个会写工程目录的写工具的**回执恒带 `projectDirWrites`**：本次调用**实际写到磁盘的文件绝对路径数组**（写序、去重）；**没有写任何文件时是空数组 `[]`（字段恒在）**。★**限定（独立复测指出，补正）**：「恒在」只对**非拒绝回执**成立 —— **结构化拒绝**（`GuardReject` / 预校验路径）由**另一条**回执构建器产生，**不带** `projectDirWrites`。
+ 口径：`import_component` = 工程局部副本（契约）；`add_component` = 仅 `type:"form"` 走表单回退时非空，其余一律 `[]`；`save_project` = 本次写入的工程文件 + 组件文件
   （是「工程目录内」的**超集**：绑定在工程目录之外的组件文件也会列出 ⇒ 任何写入都不会藏在字段名后面）；
 - **无工程目录（没有工程 / 工程从未存盘）⇒ 前置拒绝、零副作用**：`import_component` 与 `add_component {type:"form"}` 回
   `ok:false reason:"project_dir_unavailable"`（字段 `suggestedAction` / `detail` / `sideEffects:"none"`）；`save_project` 仍按其正常职责工作并把 `projectDirWrites` 置 `[]`；
-- ★**旧的两个回退已删除**：`FreeImportPath` 的 `App.Path` 与表单回退的 `%TEMP%`/`C:`。旧行为会把导入产物写成 **`<产品目录>\Module1.bas`**（P1-071 物证 `内部工作区`；本卡改前实测复现）
+- ★**旧的两个回退已删除**：`FreeImportPath` 的 `App.Path` 与表单回退的 `%TEMP%`/`C:`。旧行为会把导入产物写成 **`<产品目录>\Module1.bas`**（物证 `内部工作区`；本卡改前实测复现）
   或 `%TEMP%\Fm1.frm`（本卡改前实测），即写到**工程之外**；
 - 环境开关 `VB6MCP_ALLOW_PROJECTDIR_WRITES`（**不是工具参数**）：`0`/`false`/`no`/`off` ⇒ 表单回退回 `ok:false reason:"project_dir_write_not_allowed"`；
   未设或 `1`/`true`/`yes`/`on` ⇒ 允许（`add_component` 的显式 `type:"form"` 请求即 opt-in）；
 - 详述与改前/改后实测：`内部已知限制与 FAQ` §37。
 
-### 非 schema 说明（2026-10-09，TASK-P1-073）：F4 勘误 / F6 不存在的工具 / 写入回执字段覆盖清单
+### 非 schema 说明（2026-10-09）：F4 勘误 / F6 不存在的工具 / 写入回执字段覆盖清单
 
 - **F4 已勘误**（见上文 **v1.1.0 勘误 3**）：`list_breakpoints` 只枚举 **`set_breakpoint` 注入物**（`' @mcp-break` 标记行）；`native_breakpoint` 不写源码标记 ⇒ **不会**出现；IDE 原生断点一律 `native:null`。
 - **F6 / `read_monitor` 不存在**：109 工具面**没有** `read_monitor`。查 IDE **Message Monitor** 的现有手段只有 `show_message_monitor`（**打开**窗口）+ `find_gui` / `ui_text`（读窗口文本）+ `read_active_dialogs`/`close_active_dialogs`/`send_window_message`（模态框原语）。
   ⇒ **能开窗、能读文本，但没有「结构化条目 + severity 过滤 + 条数上限」的读取接口**。研究草稿 `内部工作区`（含建议 description/inputSchema/验收）**留档、未实现**（新增工具须 109→110 全量重冻；S 裁定暂不做）。详见 FAQ §39。
-- **写入回执字段覆盖清单**（`writeMs` / `writeCalls` / `hunks` / 相位字段；语义见本版 §3、§4 与 FAQ §35。★本表只是把 TASK-P1-075 的覆盖范围**登记**进契约，**不改任何 schema**）：
+- **写入回执字段覆盖清单**（`writeMs` / `writeCalls` / `hunks` / 相位字段；语义见本版 §3、§4 与 FAQ §35。★本表只是把 的覆盖范围**登记**进契约，**不改任何 schema**）：
 
 | 工具 / 分支 | `writeMs` | `writeCalls` | `hunks` | 相位字段（`diffMs/joinMs/delMs/insMs/maxBlockLines/phaseNote`） |
 |---|---|---|---|---|
 | `replace_code` op=replace（最小写入） | ✅ | ✅ | ✅（单块/回退 = 1；hunk 路径 = 2×hunks） | ✅ |
 | `replace_code` op=set 的**退化路径** | ✅ | ✅ | ✅（=1） | ✅ |
-| `replace_code` op=insert / append / delete（TASK-P1-075） | ✅ | ✅（0 或 1） | ✅（=1） | ❌（该分支无相位字段） |
-| `add_code`（TASK-P1-075） | ✅ | ✅（=1） | ✅（=1） | ❌ |
+| `replace_code` op=insert / append / delete | ✅ | ✅（0 或 1） | ✅（=1） | ❌（该分支无相位字段） |
+| `add_code` | ✅ | ✅（=1） | ✅（=1） | ❌ |
 | `edit_by_anchor` / `apply_edits` | ✅ | ✅ | ✅ | ✅ |
 | `set_breakpoint` / `clear_breakpoints` / 其余注入类写路径 | ✅ | ✅ | ✅ | ✅ |
 | `preview_edit`（**只预览、不写**） | ❌ | ❌ | ✅（与 `diff` 同源） | ❌ |
@@ -360,11 +362,11 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 2. 新工具一律**只读**，不得有副作用。
 3. 契约变更必须走 `contract` 广播（主卡 + 确认卡 + 版本递增），并**显式重冻** `tools/schema_baseline.json`；
    重冻前 `check_schema_baseline.py` 必须先报出 `schema_changes≠0`（证明变更可见），重冻后才回到 0。
-**v1.5.0 勘误（2026-10-09，TASK-P1-075 / F7）**：§A 批 `preview_edit` 一行原写「**本批不改算法**：diff 仍是**前后缀裁剪**」——与实现不符：`preview_edit` 早已走 `EditTxn.DiffPlan` 的**逐行 LCS**（行级 LCS + hunk 分组 + `contextLines` 默认 3），且 `diff` 与 `hunks` **同源**（contract invariant 8），回执另有 `algorithm`（`lcs` / `fallback-too-large` / `none`）与可选 `algorithmNote`。已把该行改成与实际一致；属**同一版本内的事实勘误**，不递增版本、不改任何 inputSchema/返回字段名或工具行为。工具 description 早已写明 LINE-LEVEL LCS（`CodeTools.cls` 源码注释同），因此**本次不涉及任何描述变更、无需重冻**（`schema_changes=0`）。
+**v1.5.0 勘误（2026-10-09，/ F7）**：§A 批 `preview_edit` 一行原写「**本批不改算法**：diff 仍是**前后缀裁剪**」——与实现不符：`preview_edit` 早已走 `EditTxn.DiffPlan` 的**逐行 LCS**（行级 LCS + hunk 分组 + `contextLines` 默认 3），且 `diff` 与 `hunks` **同源**（contract invariant 8），回执另有 `algorithm`（`lcs` / `fallback-too-large` / `none`）与可选 `algorithmNote`。已把该行改成与实际一致；属**同一版本内的事实勘误**，不递增版本、不改任何 inputSchema/返回字段名或工具行为。工具 description 早已写明 LINE-LEVEL LCS（`CodeTools.cls` 源码注释同），因此**本次不涉及任何描述变更、无需重冻**（`schema_changes=0`）。
 
-**v1.1.0 勘误（2026-09-22，TASK-P1-017 真机实测）**：§1 `ide_state` 的 `ebMode` 原写 `0|2`，实测 **run 态 = 1**（design=0 / run=1 / break=2，原样透传 `Vba6Probe.IdeEbMode()`，未做映射）。已在 §1 更正为 `0|1|2`；属**同一版本内的事实勘误**，不递增版本、不改任何工具的参数名或返回字段名。`内部已知限制与 FAQ` 里「EbMode 只返回 0 或 2」的旧说法同步勘误。
+**v1.1.0 勘误（2026-09-22，真机实测）**：§1 `ide_state` 的 `ebMode` 原写 `0|2`，实测 **run 态 = 1**（design=0 / run=1 / break=2，原样透传 `Vba6Probe.IdeEbMode()`，未做映射）。已在 §1 更正为 `0|1|2`；属**同一版本内的事实勘误**，不递增版本、不改任何工具的参数名或返回字段名。`内部已知限制与 FAQ` 里「EbMode 只返回 0 或 2」的旧说法同步勘误。
 
-## v1.6.0 工具面扩容（TASK-P1-076）：`replace_in_files` + `undo_edit`（**109 → 111，必须显式重冻**）
+## v1.6.0 工具面扩容：`replace_in_files` + `undo_edit`（**109 → 111，必须显式重冻**）
 
 > 授权：用户裁定（2026-10-09）「可以扩展工具面」。本版**同一次重冻**落地两个新工具与 `send_window_message` 的**描述补全 + 高危消息护栏**（后者新增参数 `confirm` ⇒ 本版 `CHANGED=send_window_message`，如实记录）。
 
@@ -385,14 +387,14 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 
 ### 3. `send_window_message`：描述补全 + 高危消息护栏（本版 `CHANGED`）
 
-- 入参名是 **`message`**（**不是 `msg`**）：写成 `msg` ⇒ 参数为空 ⇒ `reason:"bad_message"`（P1-079 的实测症状，PLAN §7 已 A/B/C/D 四项对照）；`message` 同时收**名字**与**原始数字**（`0x0111` / `522` / `&H20A`）
+- 入参名是 **`message`**（**不是 `msg`**）：写成 `msg` ⇒ 参数为空 ⇒ `reason:"bad_message"`（的实测症状，PLAN §7 已 A/B/C/D 四项对照）；`message` 同时收**名字**与**原始数字**（`0x0111` / `522` / `&H20A`）
 - ★**新增 `confirm`（boolean，默认 false）**：`WM_CLOSE(0x0010)` / `WM_QUIT(0x0012)` / `WM_SYSCOMMAND(0x0112)` 默认**拒绝**（`ok:false, reason:"high_risk_message", confirmRequired:true`，**什么都不发**）；仅 `confirm=true` 才发（回执带 `highRiskConfirmed:true`）。其余消息行为**不变**。
 
 ### 4. 随本版一并登记（**不改工具面**）
 
-- `add_component{type:"form"}`：窗体**改由 IDE 自身**创建（TASK-P1-084，见 FAQ §41）；回执新增 `createdVia`（`ide_dialog`|`synthesized`）与兜底时的 `ideRouteNote`；IDE 路线 `projectDirWrites` 为 `[]`，耗时约 **3.5–4.9 s**
-- `control_execution.mode` 的 `enum` 已在 v1.5.0（TASK-P1-073 描述级重冻）落到实现真正接受的 **12 个值**（含 `resume`/`stop`/`stepinto`/`stepover`/`stepout`/`runtocursor`/`fullcompile` 兼容别名）—— 本版仅**登记**，不改 schema
-- ★**工具面局限（登记）**：① `command_bars{action:"list"}` **不含 Add-Ins 弹层**（这些菜单项只能 execute-by-caption 或按 id 触达）；② `AddFromTemplate` 的**窗体模板路线在本机不可用**（`editsec\templates` 与 VB6 `Template\Forms` 都没有普通窗体模板 `.frm`），且它会把组件绑定到模板文件本身（TASK-P1-056 同类隐患）⇒ **不实现**（S 裁定）
+- `add_component{type:"form"}`：窗体**改由 IDE 自身**创建（见 FAQ §41）；回执新增 `createdVia`（`ide_dialog`|`synthesized`）与兜底时的 `ideRouteNote`；IDE 路线 `projectDirWrites` 为 `[]`，耗时约 **3.5–4.9 s**
+- `control_execution.mode` 的 `enum` 已在 v1.5.0（描述级重冻）落到实现真正接受的 **12 个值**（含 `resume`/`stop`/`stepinto`/`stepover`/`stepout`/`runtocursor`/`fullcompile` 兼容别名）—— 本版仅**登记**，不改 schema
+- ★**工具面局限（登记）**：① `command_bars{action:"list"}` **不含 Add-Ins 弹层**（这些菜单项只能 execute-by-caption 或按 id 触达）；② `AddFromTemplate` 的**窗体模板路线在本机不可用**（本仓库的模板目录与 VB6 `Template\Forms` 都没有普通窗体模板 `.frm`），且它会把组件绑定到模板文件本身（同类隐患）⇒ **不实现**（S 裁定）
 
 ### 5. 不变式与冻结（本版复核）
 
@@ -401,7 +403,7 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 - 冻结：`docs/tools_schema.json` 与 `tools/schema_baseline.json` = **111**；hub 快照 = 111 + 4 hub-only = **115**；`hub_alignment_failures=0`
 - pre-freeze 实测：`ADDED=replace_in_files,undo_edit` / `CHANGED=send_window_message`（`REMOVED=none`）—— 与卡面预期 `CHANGED=none` 的差异源于**同一次重冻并入了第三项的 `confirm` 参数与描述补全**，如实记录
 
-### 6. v1.6.0 之后的非 schema 增量（TASK-P1-085，构建 4F19D1A5…）
+### 6. v1.6.0 之后的非 schema 增量（构建 4F19D1A5…）
 
 **`_undo` 快照并入 `projectDirWrites`（可枚举写入一致性）** —— 不改工具面、不改 inputSchema、**不重冻**：
 
@@ -409,11 +411,11 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 - **何时写**：任何**经单块/多 hunk 文本写入通道**（`SetCompTextMinimal`）的写工具，在**改动 pane 之前**写一份；与其它工程目录写入**共用同一把门禁** `VB6MCP_ALLOW_PROJECTDIR_WRITES`（`0/false/no/off` ⇒ 不写、也不列出）。
 - **可枚举性（本增量）**：产生快照的那一次调用的回执，其 `projectDirWrites` **列出本次实际写出的快照文件绝对路径**（写序、去重、**仅在文件确实落盘时列出**）。覆盖：`replace_code` / `apply_edits` / `edit_by_anchor` / `inject_trace` / `remove_trace` / `fault_inject` / `clear_faults` / `set_breakpoint` / `clear_breakpoints` / `replace_in_files` / `undo_edit`（以及本来就带该字段的 `add_component` / `import_component` / `save_project`）。**没有写入时是空数组 `[]`，字段恒在。**
 - **与「不碰盘上源码」的关系**：快照文件在**我们自己的快照区**，**不改动任何 `.bas/.cls/.frm`**；`undo_edit` 默认只恢复 **pane**（`diskUntouched:true`），要落盘仍须 `save_project`。
-- **实现口径**：该字段是**本次顶层调用**的写入清单 —— 清单在**唯一工具漏斗 `CallTool`** 里按调用重置（避免跨调用继承，与 TASK-P1-078 同一纪律）。
+- **实现口径**：该字段是**本次顶层调用**的写入清单 —— 清单在**唯一工具漏斗 `CallTool`** 里按调用重置（避免跨调用继承，与 同一纪律）。
 
 ---
 
-### 7. v1.6.0 之后的非 schema 增量（TASK-P1-086，构建 12F8D5FE…）
+### 7. v1.6.0 之后的非 schema 增量（构建 12F8D5FE…）
 
 **回执可观测性与开销可见性（F1 诊断上限 / F2 回退标注 / F3 回执尾部计时 / F4 add_code 区间）** —— 不改工具面、不改 inputSchema、**不重冻**（`schema_changes=0`、冻结件 sha `9CEA9D1F…` 不变）：
 
@@ -428,17 +430,17 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
   - `receiptBytes` = **客户端收到的 `content[0].text` 的 UTF-8 字节数**（含 dispatcher 注入的 `mcp/ide` 戳）。**可外部证伪**：实测每一例都满足 `len(content[0].text.encode('utf-8')) == receiptBytes`（A/B/C/S + `edit_by_anchor` + `apply_edits`）。
   - ★**传输时间不可测**：JSON-RPC 信封、HTTP/socket、hub 转发、客户端解析全部在 add-in **之外**，`totalMs` / `serializeMs` / `receiptBytes` 都**不覆盖**它们。
   - 适用范围：**所有已经带 `totalMs` 的回执根**（`replace_code` / `add_code` / `ChangeResult2` 全家 / `set_breakpoint`·`clear_breakpoints` / `replace_in_files` / `verify_scope`）。**写拒绝回执**（`StrictRefusal`，本就无 `totalMs`）**不带**这两键 —— 这是有意的口径边界。
-- **F4 `add_code` 已满足（无源码改动）**：`add_code` **自 TASK-P1-054 起**就把 `targetLine` 传为**追加行的物理行号**（`LintPackForEdit(predicted, kind, cm.CountOfLines, LineCount(cur)+1)`），因此大模块上**不**是整模块 lint。真机（12F8D5FE，27,000 行**过程化**模块，自有夹具）：`add_code` 回执 `lintScope:"region"`、`lintMs=172`、`diagnosticsTotal=0`、**磁盘未变**。P1-074 第 4 条「`add_code` 永远 `targetLine=0`」系**源码误读**：其**效果**在当轮的**无过程**夹具上确实成立（无可归属过程 ⇒ 回退整模块），但**机制不是** `targetLine=0`。
+- **F4 `add_code` 已满足（无源码改动）**：`add_code` **自 起**就把 `targetLine` 传为**追加行的物理行号**（`LintPackForEdit(predicted,kind,cm.CountOfLines,LineCount(cur)+1)`），因此大模块上**不**是整模块 lint。真机（12F8D5FE，27,000 行**过程化**模块，自有夹具）：`add_code` 回执 `lintScope:"region"`、`lintMs=172`、`diagnosticsTotal=0`、**磁盘未变**。第 4 条「`add_code` 永远 `targetLine=0`」系**源码误读**：其**效果**在当轮的**无过程**夹具上确实成立（无可归属过程 ⇒ 回退整模块），但**机制不是** `targetLine=0`。
 - **实测开销（同一夹具、同一调用：A = 27,005 行的「模块级编辑」场景）**：墙钟 **11,244 → 1,019 ms**；`content[0].text` **2,690,816 → 30,872 B**（**87×**）；`lintMs` **3,812 → 672 ms**（差的 3,140 ms 是**上限之前**为 27,005 条诊断逐个 `CreateObject` 的开销，被 F1 一并消除）；`diagnosticsTotal=27,005`、`lintTruncated=true`、`lintScope=whole`、`lintFallback=no_procedure_contains_line`；`lintSummary` 与改前**逐位相同**。键集合差异 = **纯新增**（A 场景 +7 键、B/C/S +5 键，`REMOVED=none`）。
 ---
 
-### 8. v1.6.0 之后的**参数增量**（TASK-P1-087，构建 `4F661FE1…`）：opt-in `snapshot` + `undo_edit` 结构化
+### 8. v1.6.0 之后的**参数增量**（构建 `4F661FE1…`）：opt-in `snapshot` + `undo_edit` 结构化
 
 > 本卡**触 `inputSchema`**（三个最热编辑工具各新增一个**可选**参数）⇒ **已显式重冻**（`python 维护者的契约导出脚本（未随源发布） --freeze`）。
 > 冻结件 sha：**`9CEA9D1F9A699703…` → `1EE3BFA9E917AB6E…`**（`tools/schema_baseline.json` == `docs/tools_schema.json`）。
 > pre-freeze 实测：`ADDED=none` / `REMOVED=none` / `CHANGED=apply_edits,edit_by_anchor,replace_code`（`schema_changes=3`）—— ★脚本按**字母序**输出 CHANGED，**集合与卡面预期完全相同**。
 > post：`schema_changes=0`、`ORDER_MATCH=True`、`live_tool_changes=0`、`strict_failures=0`、`tools/list` 键恰 `{tools}` 且 **111**（新增的是**参数**不是工具 ⇒ 数量不变）、hub face **111 + 4 hub-only = 115**、`hub_alignment=0`。
-> ★**本卡未改版本号**（仍 `v1.6.0`，`Util.bas` 常量未动）：卡面只授权「一次显式重冻」⇒ 如实登记。★版本号已由后续 **`TASK-P1-089` 补齐为 `v1.7.0`**（见 **§9**）。
+> ★**本卡未改版本号**（仍 `v1.6.0`，`Util.bas` 常量未动）：卡面只授权「一次显式重冻」⇒ 如实登记。★版本号已由后续版本补齐为 `v1.7.0`（见 **§9**）。
 
 #### 8.1 新参数 `snapshot`（boolean，默认 `false` = off）
 
@@ -476,9 +478,9 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 
 ---
 
-### 9. v1.7.0（TASK-P1-089）：版本号补齐 + 迁移条目（additive，**免重冻**）
+### 9. v1.7.0：版本号补齐 + 迁移条目（additive，**免重冻**）
 
-> 本版**不改工具面**：`tools/schema_baseline.json` == `docs/tools_schema.json` == **`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE`**（P1-087 已重冻的那一份，**本卡不再重冻**）；工具数 **111** 不变。
+> 本版**不改工具面**：`tools/schema_baseline.json` == `docs/tools_schema.json` == **`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE`**（已重冻的那一份，**本卡不再重冻**）；工具数 **111** 不变。
 > 变更内容 = **仅版本号与文档**：`Util.bas` 的 `VB6MCP_CONTRACT_VERSION` = `v1.7.0`（单源常量；`initialize.contractVersion` / 每次响应的 `mcp` 戳 / `mcp_info.contract` / instructions 首行都读它）+ hub 的 `contractVersion`（由本文件的版本记录表经 `tools/gen_hub_snapshot.py` 生成）。
 
 #### 9.1 迁移条目（如实：additive）
@@ -506,7 +508,7 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 
 ---
 
-### 10. v1.7.0 之后的非 schema 增量（TASK-P1-079）：VB6 菜单里的 MCP 设置界面
+### 10. v1.7.0 之后的非 schema 增量：VB6 菜单里的 MCP 设置界面
 
 **不改工具面**（无新工具、不改任何 `inputSchema`/描述）⇒ `tools/list` 仍 **111**、`schema_changes=0`、**不重冻**（冻结件 `1EE3BFA9…` 不变）。
 
@@ -538,12 +540,12 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 
 ---
 
-### 11. v1.7.0 之后的**描述级重冻**（TASK-P1-096）：`close_active_dialogs` 补破坏性正文护栏
+### 11. v1.7.0 之后的**描述级重冻**：`close_active_dialogs` 补破坏性正文护栏
 
 > **本版如实定为 additive/changed（仅描述变更）**：只改 `close_active_dialogs` 的 **description**，
 > **不改任何 inputSchema、不增删工具、不改任何回执字段或取值** ⇒ 工具数仍 **111**、`tools/call` 顶层键仍恰为 `{content,isError}`。
-> ★**契约版本不递增**（仍 **v1.7.0**）：与 `TASK-P1-073`（描述级重冻、版本不递增，S 已验收）同一先例；
-> 本卡授权只有「**一次显式重冻**」。若日后要求版本递增，按 `TASK-P1-089` 对 `P1-087` 的处置补一条
+> ★**契约版本不递增**（仍 **v1.7.0**）：与描述级重冻（版本不递增，S 已验收）同一先例；
+> 本卡授权只有「**一次显式重冻**」。若日后要求版本递增，按既定处置补一条
 > `v1.7.1` 即可（一处常量 + 一行版本表）。
 > ★**冻结件已更新（旧 → 新）**：`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE` →
 > **`043B242862F88743C871C7274C4DF99E8E696598BC85314BC1B5C82C3B4B6B2B`**
@@ -556,7 +558,7 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 
 #### 11.1 变更内容（`close_active_dialogs` 的 description：464 → 858 字符）
 
-行为实现体在 `TASK-P1-092`（构建 `d4f12489…`）就已落地；本卡把**当时只写在实现与契约正文里**的护栏
+行为实现体在构建 `d4f12489…` 时就已落地；本卡把**当时只写在实现与契约正文里**的护栏
 补进**工具描述**（此前调用方**看不到**）：
 
 1. **点击前先读对话框正文** = 标题 + **每个子控件的文本**；
@@ -570,7 +572,7 @@ v1.3.2（响应侧，无需重冻）与 v1.4.0（+1 工具，需重冻）**可�
 #### 11.2 与 v1.5.0 条目表的关系（**不篡改历史**）
 
 v1.5.0 的工具表里 `close_active_dialogs` 那一行只写了「安全白名单 + 危险按钮黑名单」。
-**按钮级判定至今仍然成立**，但它**不足以描述** P1-092 之后的**正文级**护栏
+**按钮级判定至今仍然成立**，但它**不足以描述** 之后的**正文级**护栏
 （真实事故：破坏性动词在 STATIC 正文里，按钮只有 `Yes`/`No`/`Help`）⇒ 以**本节**为准；
 v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）。
 
@@ -587,7 +589,7 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 `内部已知限制与 FAQ` **§47**（护栏用法 + ★两条新事实：**VB6 按 AddIns 名降序枚举** ⇒
 坏条目排在 `VB6MCP.Connect` **之后**会「**弹框先出、8766 起不来**」；该弹框的 `Yes` 会**整条删除**注册项、
 且 `LoadBehavior` 是 **VB6 自己**置 0 的）。
-### 12. v1.7.0 之后的非 schema 增量（TASK-P1-100 / P1-101 / P1-104）：失败语义迁移 + `preview_edit` 与 `apply_edits` 解析对齐
+### 12. v1.7.0 之后的非 schema 增量：失败语义迁移 + `preview_edit` 与 `apply_edits` 解析对齐
 
 > 本节**不改 `inputSchema`、不改工具面** ⇒ 工具仍 **111**、契约版本仍 **v1.7.0**、冻结件 **`043b2428…`** 未变（免重冻）。
 > 变更全部在**响应侧语义**与**解析语义**；实现证据见 `内部证据`。
@@ -596,18 +598,18 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 
 | # | 触发 | 旧回执（迁移前） | 新回执（现在） | 卡 |
 |---|---|---|---|---|
-| 1 | **组件名不存在**（`FindComponent` 未命中） | `isError:true`、`reason:"unexpected_error"`、`vbErrorCode:-2147221484` | `isError:false`、`reason:"component_not_found"`（**不带 `vbErrorCode`**）；附 `triedComponent` / `componentCount` / `availableComponents` / `nearMatches` / `trimmedMatch` / `whitespaceCollapsedMatch` / `lookupIsCaseInsensitive` / `caseDifferenceIsNotTheCause` | `TASK-P1-101` |
-| 2 | `preview_edit` 锚点 0 命中 / 命中 >1 / `op` 不是 R/I/D / `edits` 为空 | `isError:true`、`reason:"unexpected_error"`、`vbErrorCode:-2147221420` | `isError:false`、`reason` = `anchor_not_found` / `anchor_not_unique` / `unknown_op` / `edits_required` | `TASK-P1-100` |
+| 1 | **组件名不存在**（`FindComponent` 未命中） | `isError:true`、`reason:"unexpected_error"`、`vbErrorCode:-2147221484` | `isError:false`、`reason:"component_not_found"`（**不带 `vbErrorCode`**）；附 `triedComponent` / `componentCount` / `availableComponents` / `nearMatches` / `trimmedMatch` / `whitespaceCollapsedMatch` / `lookupIsCaseInsensitive` / `caseDifferenceIsNotTheCause` | |
+| 2 | `preview_edit` 锚点 0 命中 / 命中 >1 / `op` 不是 R/I/D / `edits` 为空 | `isError:true`、`reason:"unexpected_error"`、`vbErrorCode:-2147221420` | `isError:false`、`reason` = `anchor_not_found` / `anchor_not_unique` / `unknown_op` / `edits_required` | |
 | 3 | `apply_edits` 锚点不解析 / `op` 非法 | 原本就是结构化回执（`ok:false` + `reason`） | **未变** | — |
 
 - **影响面（实测口径）**：第 1 类由**共享 helper**（`FindComponent` 的 `+20` 出口）产生 ⇒ **37 个调用点 / 41 个工具**（`内部证据`）。
   ★卡面原写「37 调用点 / ~25 工具」，**实测修正为 41 个工具**（同一 helper 被 4 个工具在多条路径上复用）。
-- ★**成功路径与其它既有拒绝路径零影响**：跨臂差分实测 **22/22 逐字节不变**（`TASK-P1-101`）；`TASK-P1-104` 在本卡构建上**复测同样 22/22**（见 12.3）。
+- ★**成功路径与其它既有拒绝路径零影响**：跨臂差分实测 **22/22 逐字节不变**；在本卡构建上**复测同样 22/22**（见 12.3）。
 - ★**需要改判的调用方**：把 `reason:"unexpected_error"` + `vbErrorCode:-2147221484` 当「未知内部错误」重试/上报的脚本，改为按
   `reason:"component_not_found"` 分支；`availableComponents` / `nearMatches` 已给可用名与近似名。
   ★**不要**按大小写去排查 —— 该查找用 `LCase$` 比较，**大小写差异永远不触发**该拒绝（回执里 `lookupIsCaseInsensitive` / `caseDifferenceIsNotTheCause` 明说）。
 
-#### 12.2 `preview_edit` 与 `apply_edits` **共用同一解析**（`TASK-P1-104`，缺陷修复）
+#### 12.2 `preview_edit` 与 `apply_edits` **共用同一解析**（缺陷修复）
 
 - **问题（同会话实测，`内部证据内部对照数据`）**：同一输入下两工具**方向相反**地分歧 ——
   per-op `match:"exact"`：preview **成功** vs apply **`anchor_not_found`**；per-op `occurrence:2`：preview **`anchor_not_unique`** vs apply **成功并写入**。
@@ -643,7 +645,7 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | 槽位 `VB6MCP.dll` sha | == `build.status` 的 declared sha |
 ---
 
-### 13. v1.7.0 之后的 **schema 变更**（TASK-P1-109，构建 `B764F07D…`）：`check_public_api.baseline` 声明为必填
+### 13. v1.7.0 之后的 **schema 变更**（构建 `B764F07D…`）：`check_public_api.baseline` 声明为必填
 
 > 本卡**触 `inputSchema`**（`check_public_api` 由「无 `required` 键」变为 `required:["baseline"]`）
 > ⇒ **已显式重冻**（`python 维护者的契约导出脚本（未随源发布） --freeze`）。
@@ -660,13 +662,13 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | 111 个工具里 **56 个**显式声明了 `required`，`check_public_api` 是漏网之一；对照 `read_file` **有** `required:["path"]` | `docs/tools_schema.json:614–630`（`read_file`）/ 全文 `required` 键共 56 处 |
 | 源码：`Set pCa("baseline") = Prop(...)`，随后 **`SchemaWith(pCa)`**（**没有** `Req(...)`） | `CodeTools.cls` 旧件（`ffcb27ad`）**841–847**，尤其 **847** |
 | 源码：工具描述写着 *against a **frozen spec***；实现**强制**非空 baseline | `CodeTools.cls` **846** / **12132–12133**（旧行号） |
-| 分类器**已经**把该条件当作调用方输入校验：`reason:"required_argument_missing"` + `argument:"baseline"` | `CodeTools.cls` **1463–1464**（TASK-P1-108 `ClassifiedRefusalJson`） |
+| 分类器**已经**把该条件当作调用方输入校验：`reason:"required_argument_missing"` + `argument:"baseline"` | `CodeTools.cls` **1463–1464**（`ClassifiedRefusalJson`） |
 | `CONTRACTS.md` / `内部已知限制与 FAQ` **都没有**任何文字承诺 `baseline` 可选（0 命中） | 文档检索 |
 | `docs/TOOL_CATALOG.md:99` 描述同样是 *Compare the current component public API against a frozen spec* | 生成物 |
 
 **裁定：声明必填。** 理由：① 该工具**唯一**功能就是「与冻结 spec 比对」，没有 spec 就没有比对对象；
 ② 「接受缺省 baseline」必须**发明一个成功语义**（空 baseline ⇒ 当前所有公开成员都被报成 `added[]`），
-这正是本项目列为缺陷的**误导性成功**（同族 D-1107-04/05）；③ 该做法还要**删掉** TASK-P1-108 刚落地的
+这正是本项目列为缺陷的**误导性成功**（同族 D-1107-04/05）；③ 该做法还要**删掉** 刚落地的
 分类（`required_argument_missing`）；④ **行为不变**——缺 `baseline` 以前被拒、现在仍被拒，**只有声明**移动。
 
 #### 13.2 与既有行为的差分（零行为变更）
@@ -710,9 +712,9 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | 槽位 `VB6MCP.dll` sha | == `build.status` declared（`B764F07D…`） |
 | `docs/TOOL_CATALOG.md` | **未变**（`525A9809…`） |
 
-### 14. v1.7.0 之后的 **schema 变更**（TASK-P1-112 + TASK-P1-113，构建 `E4A7C124…`）：`property_bag.has_value` 声明 + 9 条 required/条件声明（**两卡合并为一次显式重冻**）
+### 14. v1.7.0 之后的 **schema 变更**（构建 `E4A7C124…`）：`property_bag.has_value` 声明 + 9 条 required/条件声明（**两卡合并为一次显式重冻**）
 
-> 两卡**都触 `inputSchema`**，按 TASK-P1-112 / TASK-P1-113 的授权**合并为一次显式重冻**
+> 两卡**都触 `inputSchema`**，按这两卡的授权**合并为一次显式重冻**
 > （`python 维护者的契约导出脚本（未随源发布） --freeze`）。
 > 冻结件 sha：**`2D4503C0FC923645E06D8FDBECA1B25A70B5BC7413A5993C50DFE5915FAE3903`
 > → `6808B1DB7F2FE9546A20DFA4900F544CFDA6AFBE28ACB9007624018A434CF97D`**
@@ -722,10 +724,10 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 > / `schema_changes=10`（rc=1）；post-freeze：`schema_changes=0` ✅。
 > `docs/TOOL_CATALOG.md` **逐字节未变**（`525A9809…`）—— 本版**没有**改动任何**工具级 description**。
 > ★**契约版本号仍 `v1.7.0`**：两卡只授权「一次显式重冻」，**未**授权版本递增
-> （与 TASK-P1-087 / TASK-P1-109 同一处置；若 S 要求递增，请派版本卡）。
+> （与既定处置相同；若 S 要求递增，请派版本卡）。
 > ★**级联（纪律 42）**：**此后所有卡的「冻结件不得变」一律以 `6808B1DB…` 为准**（旧 `2D4503C0…` 已结案）。
 
-#### 14.1 TASK-P1-112 方向裁定：**让文档化的 `value` 生效**（不是删 `value`，也不是只声明 `has_value`）
+#### 14.1 方向裁定：**让文档化的 `value` 生效**（不是删 `value`，也不是只声明 `has_value`）
 
 | 证据 | 位置 |
 |---|---|
@@ -741,7 +743,7 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 **行为差分（真机实测）**：`{target:"component",name:"mb",key:"k1112a",value:"7"}` 旧 = 静默 READ（回 `value:""`）
 → 新 = `{wrote:true,component:"mb",key:"k1112a"}`，**随后回读 `value:"7"`** —— 文档化的输入不再被忽略。
 
-#### 14.2 TASK-P1-113：8 条「声明与实现不符」逐条复核（每条给 schema 位置 + 实现行号 + 实际强制行为）
+#### 14.2 8 条「声明与实现不符」逐条复核（每条给 schema 位置 + 实现行号 + 实际强制行为）
 
 | # | 工具.`键` | 旧 schema | 实现行号 | **实际强制行为（真机）** | 判定 | 本次改动 |
 |---|---|---|---|---|---|---|
@@ -753,7 +755,7 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | 6 | `project_snapshot.path` | 无 `required` | **6163**（create）/ **6174**（list）要 `path`；**6169**（restore）要 `dir` 而**不要** `path` | **按 action** | **JSON-Schema 无法表达条件必填 ⇒ 由 property 描述声明条件**（真机两侧都断言） | `path`/`dir` 描述改写（`required` 保持 `["action"]`） |
 | 7 | `add_reference.guid` | 无 `required` | **6597–6603**：`mode="file"` ⇒ 要 `path`；**否则**（默认 `guid`）⇒ 要 `guid` | **按 mode** | 同上 ⇒ 描述声明条件 | `guid`/`path` 描述改写 |
 | 8 | `add_code` 的 `code`/`file` | `required:["component"]` | **4990** `Err.Raise … "code or file is required"`（**先查 component**） | **二选一** | 同上 ⇒ 描述声明条件（`ArgNameOf` 对含 `or` 的消息**故意不回 `argument`**） | `code`/`file` 描述改写 |
-| 9 | `import_lessons_md.path`（判据 (3)，P1-109 §13.3 已登记） | 无 `required` | dispatch **2236** 空 `path` ⇒ 旧回 `{ok:false,error}` **无 reason** | **无条件** | **应声明 + 补 reason** | `required:[] → ["path"]`；回执补 `reason/argument/message/suggestedAction/sideEffects`（**保留 `error`**） |
+| 9 | `import_lessons_md.path`（判据 (3)，§13.3 已登记） | 无 `required` | dispatch **2236** 空 `path` ⇒ 旧回 `{ok:false,error}` **无 reason** | **无条件** | **应声明 + 补 reason** | `required:[] → ["path"]`；回执补 `reason/argument/message/suggestedAction/sideEffects`（**保留 `error`**） |
 
 ★**判定方法学**：结论**一律来自真机缺参**（§14.3），静态调用图只用于**生成候选**。
 ★**6 个静态候选已判假阳性、不再处理**（`export_component`/`git`/`list_files`/`project_meta`/`search_in_files`/`verify_scope` —— 有默认值或工程目录兜底，声明可选**正确**）。
@@ -785,7 +787,7 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | 槽位 `VB6MCP.dll` sha | == `build.status` declared（`E4A7C124…`） |
 | `docs/TOOL_CATALOG.md` | **未变**（`525A9809…`） |
 
-### 15. v1.7.0 之后的 **schema 变更**（TASK-P1-114，构建 `8F6C0522…`）：`set_codepane.view` 删声明 + `caption`/`section` 回审计（**一次显式重冻**）
+### 15. v1.7.0 之后的 **schema 变更**（构建 `8F6C0522…`）：`set_codepane.view` 删声明 + `caption`/`section` 回审计（**一次显式重冻**）
 
 > 本卡授权**一次**显式重冻（`python 维护者的契约导出脚本（未随源发布） --freeze`）。
 > 冻结件 sha：**`6808B1DB7F2FE9546A20DFA4900F544CFDA6AFBE28ACB9007624018A434CF97D`（106,571 B）
@@ -794,8 +796,8 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 > pre-freeze 实测（**先看到变化才准重冻**，§1 流程）：`ADDED=none` / `REMOVED=none` /
 > **`CHANGED=control_window,property_bag,set_codepane`** / `schema_changes=3`（rc=1）；post-freeze：`schema_changes=0` ✅。
 > `docs/TOOL_CATALOG.md` **变了**（`525A9809… → D44C5ED1…`）：本版**改了工具级 description**
-> （删掉 `set_codepane` 的 "switch view mode"）—— 这一点与 P1-112/113（catalog 未变）不同。
-> ★**契约版本仍 `v1.7.0`**：本卡只授权一次重冻，**未**授权版本递增（与 P1-087 / P1-109 / P1-112+113 同一处置）。
+> （删掉 `set_codepane` 的 "switch view mode"）—— 这一点与 112/113（catalog 未变）不同。
+> ★**契约版本仍 `v1.7.0`**：本卡只授权一次重冻，**未**授权版本递增（与 v1.7.0 内各次重冻同一处置）。
 > ★**级联（纪律 42）**：此后所有卡的「冻结件不得变」一律以 **`871FE832…`** 为准（旧 `6808B1DB…` 已结案）。
 
 #### 15.1 裁定总表
@@ -850,8 +852,8 @@ v1.5.0 原文**保留不动**（改写/删除历史条目等于篡改记录）�
 | `mcp_info` | `build.sha256/builtAt/path`（`build.readAt` / `ide.pid` / `wheel.skipped[].hwnd` 已被并集规则归一） | ✅ 构建身份；`build.path` 还**自证加载的是哪一条臂**（`…arm\VB6MCP.old1114.dll` vs `…new1114.dll`） |
 | `eq_addins` | `.addins[3].guid`：`{D5629954-6CAC-452F-A503-50CEB9B111F9}`（旧构建 CLSID）vs `{EB6F878B-15C8-49C3-B47C-B62B03F35B69}`（新构建 CLSID） | ✅ 构建身份（纪律 28：每个构建注册**构建专属 CLSID**） |
 
-★**所有成功臂与所有既有拒绝逐字节不变**：`eq_*` · `ref_*`（7 条既有拒绝）· `ud_*`（P1-113 的 8 条缺参拒绝）·
-P1-112 的 `property_bag` value/has_value 回归臂 —— 全部 SAME。
+★**所有成功臂与所有既有拒绝逐字节不变**：`eq_*` · `ref_*`（7 条既有拒绝）· `ud_*`（8 条缺参拒绝）·
+的 `property_bag` value/has_value 回归臂 —— 全部 SAME。
 
 #### 15.5 判据 (5)：全工具面扫描（口径 + 命中；**只列出不修**）
 
@@ -882,15 +884,15 @@ P1-112 的 `property_bag` value/has_value 回归臂 —— 全部 SAME。
 clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 ---
 
-### 16. v1.7.0 之后的 **描述级重冻 + 响应侧字段**（TASK-P1-119，构建 `AB1F2057…`）：`reload_component` / `import_component` 的「绑定文件」语义与回执如实性
+### 16. v1.7.0 之后的 **描述级重冻 + 响应侧字段**（构建 `AB1F2057…`）：`reload_component` / `import_component` 的「绑定文件」语义与回执如实性
 
 > 本节改 **两个工具的 `description`**（触 schema ⇒ **一次显式重冻**，S 预先授权）+ **`reload_component` 的三个响应字段**（响应侧，不触 schema）。
 > 工具面仍 **111**、契约版本仍 **v1.7.0**（未递增）；`inputSchema` 的**结构与属性名集合未变**（`scope_diff_1119.txt` 证明唯一差异是 description 文本）。
 
-#### 16.1 语义（用户最容易踩的坑，来自 `TASK-P1-115` 的稳定复现）
+#### 16.1 语义（用户最容易踩的坑，来自一次稳定复现）
 
 * `import_component{mode:"file"}` **把源文件复制进工程目录**并把组件绑定到**那个副本**（源文件**不被链接**，返回时校验其 sha256 未变）。
-* `reload_component{name}` 重载的是**组件绑定的文件**（`VBComponent.FileNames(1)`）—— **不是「你刚改的那个文件」**。改导入源再 reload ⇒ **回执照样成功，而代码窗格保持旧内容**（`TASK-P1-115` H 臂 3/3；`TASK-P1-119` 在新夹具 `P119R` 上复现 3/3）。
+* `reload_component{name}` 重载的是**组件绑定的文件**（`VBComponent.FileNames(1)`）—— **不是「你刚改的那个文件」**。改导入源再 reload ⇒ **回执照样成功，而代码窗格保持旧内容**（H 臂 3/3；在新夹具 `P119R` 上复现 3/3）。
 
 #### 16.2 变更（`CHANGED` 恰为 2 个工具）
 
@@ -931,17 +933,17 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 ★**级联（纪律 42/58）**：基线自此为 **`C9C96324…`**；此后各卡判据中「冻结件不得变」**一律以该 sha 为准**。
 ---
 
-### 17. 【追加记录 · append-only】`TASK-P1-117` 的描述级重冻与 `wnd_probe` 语义补登（2026-10-10 补）
+### 17. 【追加记录 · append-only】描述级重冻与 `wnd_probe` 语义补登（2026-10-10 补）
 
-> ★**本节是迟到的补登**：`TASK-P1-117` 当时**没有**在本文里留条目（`内部证据` 写的「迁移条目正本见 `docs/CONTRACTS.md` §15」实际指向的是 `TASK-P1-114` 的 §15）⇒ 由 `TASK-P1-120` 按纪律 12（已验收件只追加、不篡改）在此**追加**；内容全部取自该卡**已验收**的报告与证据，**未改动任何已验收产物**。
+> ★**本节是迟到的补登**：当时**没有**在本文里留条目（`内部证据` 写的「迁移条目正本见 `docs/CONTRACTS.md` §15」实际指向的是另一节的 §15）⇒ 按纪律 12（已验收件只追加、不篡改）在此**追加**；内容全部取自该卡**已验收**的报告与证据，**未改动任何已验收产物**。
 
 #### 17.1 变更（该卡唯一一次显式重冻；改的是 `vba6_probe` 的**参数级**描述）
 
 * **`CHANGED` 恰为 1 项**：`vba6_probe` 的 `inputSchema.properties.wnd_probe.description`，**264 → 949 字符**；`added=[]` / `removed=[]`，顶层键相同、`inputSchema` 属性名集合相同、唯一差异是该描述（`scope_diff_1117.txt`）。
 * 描述写定的**语义**：「**本进程顶层窗的直接子窗（深度恰好 2）**；顶层窗自身与孙及更深**永不入列**；无可见性 / owner / rect / style 过滤」+ **NOT a complete window enumeration**（覆盖率 **27/76 ≈ 36 %**）+ **STRUCTURAL BLIND SPOT**（对话框通常是顶层 `#32770` ⇒ 找对话框用 `find_gui`）+ 源码出处 `Vba6Probe.bas` 的 `WindowProbeJson`（L937-1004）。
-* ★该语义在 `TASK-P4-061` 被**升级为实测精确等式**（见 §55 的更正段）：`wnd_probe` 报的集合 **==** 宿主侧独立枚举算出的 `{depth == 1}`（27 == 27，双向差集皆空）。
+* ★该语义在 被**升级为实测精确等式**（见 §55 的更正段）：`wnd_probe` 报的集合 **==** 宿主侧独立枚举算出的 `{depth == 1}`（27 == 27，双向差集皆空）。
 
-#### 17.2 指纹与不变式（`TASK-P1-117` 实测）
+#### 17.2 指纹与不变式（实测）
 
 | 项 | 旧 → 新 |
 |---|---|
@@ -956,15 +958,15 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 
 * 证据：`内部证据{内部窗口探针说明,gates1117.txt,内部回执,scope_diff_1117.txt,内部工具面快照}`。
 * ★**环境事实**：入场时 `build.bat` 因**外部实例（pid 19784 / 8766）加载了我们的 add-in 并锁住交付 DLL** 而报「权限被拒绝」⇒ 用「**改名挪走 + 同字节复制回槽位**」重建（★**未 kill 外部实例**）；该配方后来固化为**纪律 60**。
-* ★**级联（纪律 42/58）**：该卡的基线为 `FAC01EC70…`；★该值已被 `TASK-P1-119` 再次变更，**当前基线见 §16**（`C9C96324…`）。
+* ★**级联（纪律 42/58）**：该卡的基线为 `FAC01EC70…`；★该值已被后续重冻再次变更，**当前基线见 §16**（`C9C96324…`）。
 ---
 
-### 18. `TASK-P1-120`：`find_gui` 集合稳定性修复（D-1118-01）—— ★**零 schema 变更、零重冻**
+### 18. `find_gui` 集合稳定性修复（D-1118-01）—— ★**零 schema 变更、零重冻**
 
 > 本节**不改 `inputSchema`、不改工具面、不改任何描述** ⇒ 工具仍 **111**、契约仍 **v1.7.0**、冻结件 **`C9C96324…`（108,019 B）跑前 == 跑后**、hub 快照 **`6EA40C0C…`（111,116 B）未变**、`hub_alignment=0` ⇒ ★**免重冻**（S 预先授权的第三次重冻**未使用**）。
 > ★理由：`find_gui` 的**现有**描述本来就是「*Enumerate the windows of THIS process (top-level windows plus all their children)…*」—— **那正是修好之后的行为**，改前的实现做不到自己声明的事。
 
-#### 18.1 缺陷（D-1118-01，来源 `TASK-P1-118`）
+#### 18.1 缺陷（D-1118-01）
 
 `WinProbe.bas` 的 `FindGuiJson`（以及同模式的 `UiFindByClass`）在子窗阶段**把 `m_fgHwnd` 同时当「源列表」与「目的缓冲」**：`m_fgCount` 在进入子窗循环前被归零，而 `FgCollect` 从**索引 0** 起写同一个数组 ⇒ **第 1 次迭代后源列表即被子窗覆盖**，后续迭代取到的已不是原顶层窗。可观测后果三条：
 
@@ -981,7 +983,7 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 | 3 | `FindGuiJson` 发出循环增加**按 hwnd 唯一**（内联 O(n²)，n ≤ 1600，不引新依赖；边界先判后取） | ★**唯一性由构造保证**，不靠运气 |
 | 4 | `UiFindByClass`（`ui_text` 的按类找窗助手）改为同一套快照遍历 | ★同类模式一并修（纪律 64） |
 
-#### 18.3 改后同口径对照（同一夹具、同一步骤、复用 `TASK-P1-118` 的原脚本）
+#### 18.3 改后同口径对照（同一夹具、同一步骤、复用当时的原脚本）
 
 | 阶段 | findGuiN | 唯一 hwnd | 重复附加项 | `wnd_probe` n | 覆盖率 | 过滤假否定 |
 |---|---|---|---|---|---|---|
@@ -1016,7 +1018,7 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 * ★**级联：无**（冻结件与 hub 未变，工具数与契约未变）。
 * ★**遗留边界（不是缺陷）**：子窗聚合仍受 `FG_MAX = 800` 上限约束（实测本夹具 70 / 95 窗，远未触及）。
 
-### 19. `v1.9.0`：`ide_quiet_mode`（A）+ `immediate_eval`/`immediate_run`（B）+ `ide_state{release_inflight}` 与卡死自愈（C）—— TASK-P1-164 / TASK-P1-168
+### 19. `v1.9.0`：`ide_quiet_mode`（A）+ `immediate_eval`/`immediate_run`（B）+ `ide_state{release_inflight}` 与卡死自愈（C）—— 两项
 
 > 基线（本版之前，实测）：**add-in 111 工具 / contract v1.8.0 / DLL `79609DBC…`（2,568,192 B）**。
 > 本版：**add-in 114 工具 / contract v1.9.0 / DLL `158BB063D6ED4A91…`（2,637,824 B）**，**四冻件全部重冻**。
@@ -1026,7 +1028,7 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 - 返回：`{ok, quietMode, previousQuietMode, changed, since, ttlMs, quietExpiresAt, expiresInMs, suppressedFocusCount, foregroundBefore, foregroundAfter, foregroundTookFocus, foregroundReadable, advisory, suppressedPoints, note}`。
 - 语义（ON）：**`control_window{action:"activate"}` 不调 `Window.SetFocus`**（该回执带 `quietModeSuppressedFocus:true` + `suppressedAction` + `quietModeNote`，**其余动作照做**）；且**每次** `tools/call` 正文带 `quiet{quietMode, since, ttlMs, quietExpiresAt, expiresInMs, suppressedFocusCount, advisory, note}`，`advisory` = 「quiet mode is ON - do not type in this IDE while an agent is driving it」。
 - `native_breakpoint` 是 **Debug 菜单命令**，**无法在不激活 IDE 的前提下发出** ⇒ 安静模式只能在那里**交还前台**（回执 `quietModeSuppressedFocus:false` + `quietModeForegroundRestored`），**如实标注**，不谎称抑制。
-- ★**不得用 0/0 声称「没抢前台」**：本机 `GetForegroundWindow()` 恒返回 **0**（非交互窗口站）⇒ `foregroundReadable=false` 只表示**读不到**；判据必须写成 `fgAfter == fgBefore`（**值可为 0**）**且** `quietModeSuppressedFocus:true`。
+- ★**不得用 0/0 声称「没抢前台」**：前台值是**实时读出**的 —— 交互会话里 `GetForegroundWindow()` 返回**有效非零句柄**；**锁屏/非交互桌面**上它可能是 **0**，此时 `foregroundReadable=false` 只表示**那一次读不到**（如实回报，不猜）。判据必须写成 `fgAfter == fgBefore`（**值可为 0**）**且** `quietModeSuppressedFocus:true`；工具**绝不抢焦点**去取该值，也**绝不**用窗口站名字推断「能否发送输入」。
 - 分类为**只读**（只改插件自身状态）⇒ 写类在飞时**仍可被服务**。
 - ★**quiet OFF ⇒ 逐字节回到 v1.8.0**：不抑制、不加 `quiet{}`。
 
@@ -1035,7 +1037,7 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 - `immediate_run{code, timeout_ms=5000}` ⇒ 同形状；`output`/`outputTrimmed` 只含**本次**打印的文本；**语句边界**的 `Debug.Print` 被内部改写到 sink（`debugPrintRewrites` 如实计数）。
 - ★**调用方不再需要写 `Open`/`Print #`/`Close`**：工具内部把值/输出经**私有临时文件**带出（`%TEMP%\vb6mcp_im\*.tmp`，读完即删，`sinkDeleted` 回读证明）。
 - ★**解析失败必须如实结构化**：`{ok:false, reason:"value_not_parsed"}` + 原始 `output`/`outputTrimmed`，**不许猜**；引擎拒行时 `reason:"engine_refused_line"`（带 `ret`/`retHex`）。
-- ★**实测通道事实**（本轮真机，原始回执在 `docs/evidence/TASK-P1-168/`）：
+- ★**实测通道事实**（本轮真机，原始回执在 未随源发布的内部证据）：
   `Open "…" For Output As #511: Print #511, 1+1: Close #511` = `ret=0`（sink `" 2 "`）；
   `v511 = 3/4: Print #511, TypeName(v511) & "|" & v511: Close #511` = `Double|0.75`；
   **`On Error Resume Next`（单独或冒号连写）被拒 `ret=40036`**；**行内 CR/LF 亦被拒 `ret=40036`** ⇒ 多语句以「冒号 + 空格」连接，`?` 简写与 `_` 续行**不支持**。
@@ -1043,7 +1045,7 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 - ★既有 `vba6_probe{exec_probe}` 与既有回执**逐字节不变**（本版未改其实现）。
 
 #### 19.3 C · 缺陷 #10：单飞闸门可强释 + 卡死自愈
-- **实测根因**（本机 v1.8.0 构建，原始回执 `docs/evidence/TASK-P1-168/`）：抛错语句使 `EbExecuteLine` **不返回**，IDE 弹出**它自己的模态框**（`read_active_dialogs` 报 `ownerDisabled=true`，正文「实时错误 '13': 类型不匹配」），`m_mutBusy` 不再释放 ⇒ 此后**所有写类调用**一律 `{ok:false, reason:"busy"}`，而**只读仍被服务**（`ide_state` 19 ms 应答）。★**把模态框点掉后闸门自行恢复**（实测：`set_codepane` 立刻不再 busy）⇒ 根因是那个模态框，不是「线程楔死」。
+- **实测根因**（本机 v1.8.0 构建，原始回执 未随源发布的内部证据）：抛错语句使 `EbExecuteLine` **不返回**，IDE 弹出**它自己的模态框**（`read_active_dialogs` 报 `ownerDisabled=true`，正文「实时错误 '13': 类型不匹配」），`m_mutBusy` 不再释放 ⇒ 此后**所有写类调用**一律 `{ok:false,reason:"busy"}`，而**只读仍被服务**（`ide_state` 19 ms 应答）。★**把模态框点掉后闸门自行恢复**（实测：`set_codepane` 立刻不再 busy）⇒ 根因是那个模态框，不是「线程楔死」。
 - **强释入口**：**`ide_state{release_inflight:true, release_min_held_ms?}`**（默认阈值 60000）—— **当且仅当**在飞调用**年龄 > 阈值**时才动手；只读 ⇒ 卡死期间**仍可被服务**。
 - **回执 `release{}`（固定键集，每条 ide_state 都有）**：`{attempted, released, releasedTool, releasedKind, heldMs, minHeldMs, retryAfterMs, depthBefore, depthAfter, targetDepth, mutBusyBefore, abandonedSeq, reason, gateReleaseCount, statementInterrupted:false, timeoutMsEnforcedBy:"gate_age_threshold", note, recoveryAction, recoveryHint}`。
   `released:true` 时 `note` 明写「**被阻塞的调用仍在 IDE 内运行；闸门是被强释的；它做的事没有被撤销；没有语句被打断**」。
@@ -1058,3 +1060,47 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 - `tools/list` 结果键仍**恰为** `{tools}`；`tools/call` 结果键仍**恰为** `{content,isError}`；版本戳仍只在正文里。
 - **四冻件（本版全部重冻）**：`docs/tools_schema.json` == `tools/schema_baseline.json` = **`B0C18528845DFB58…`**（123,357 B，114 工具）；`bridge/hub_schema.generated.json` = **`2AC4036B2F619B12…`**（127,021 B）；`docs/CONTRACTS.md` = 本文件。
 - **产品版本 `0.3.0` 不变**（本版只改契约面，不改产品语义版本）。
+
+---
+
+## v1.10.0 · BATCH-1 变更记录（2026-10-13）
+
+> hub 快照的 `contractVersion` 取自 `## 版本记录` 的**最新行**；`initialize.instructions` 的横幅取自 `## v1.3.0` 的 text 代码块 —— 两者都已随本版更新（`CONTRACT v1.10.0` / `TOOLS 115`）。
+
+**工具面**：add-in **114 -> 115**（新增只读 `desktop_probe`），hub 5 -> 5，DSH-facing total **119 -> 120**。
+
+### ADDED
+- `desktop_probe`（只读）：报告承载 add-in 的进程的**实时**窗口站 / 桌面 / sessionId / 可交互性 / 前台状态与取证依据；**fail-closed** —— 任一 API 失败即 `ok:false` + `failureKind:"api_unavailable"`，绝不猜。前台值是**实时读出**的：交互会话里非零，锁屏/非交互桌面可能为 0（如实回报）；工具**不抢焦点**去取它，也**不**用窗口站名字推断「能否发送输入」。
+
+### CHANGED（12 个；其中 10 个只改描述文本）
+`build` · `close_active_dialogs` · `ide_quiet_mode` · `ide_state` · `immediate_eval` · `immediate_run` · `inject_trace` · `make_project` · `remove_trace` · `todo_status` · `validate_code` · `vba6_probe`
+- **10 个**只做**描述文本中性化**：去掉描述里的内部任务号 / 内部目录标签；**行为与回执字段不变**。
+- `ide_state` 与 `vba6_probe` 的**描述未变**，只新增参数（见下）。
+
+### 新增参数（3，纯增量：缺省时不改变任何既有行为）
+| 工具 | 新增参数 |
+|---|---|
+| `vba6_probe` | `exec_line_file` |
+| `immediate_eval` | `expression_file` |
+| `immediate_run` | `code_file` |
+
+### R13 结构化失败信封
+- `vba6_probe` 七类 `failureKind`：`not_loaded` / `alloc_failed` / `arg_out_of_range` / `address_invalid` / `not_readable` / `engine_zero` / `refused_by_design`；
+- `immediate_eval` / `immediate_run` 的 `exec_error` 包装新增两类：`channel_error` / `statement_raised`；
+- ★**刻意的例外**：`immediate_*` **自身**的 `exec_error` **不带** `failureKind`（那是引擎侧原始错误，不属于本信封的判定）。
+
+### 修复
+- **静默截断 -> 结构化**：请求长度与实际截断都回报（`lenRequested` / `lenClamped`，以及 `maxHits*` 一族）；
+- **`arg_out_of_range`** 取代裸 VB 溢出：越界参数现在是结构化 `failureKind`，不再是一句 VB 运行时错误。
+
+### 未落地（如实）
+- **`immediate_window_text` 未创建**：R1 判定 **NO-GO**（MSAA 只暴露窗格**标题**，读不到正文）⇒ 工具面**不加**该工具；该缺口保持公开、可追踪，而不是承诺。
+
+### D1 有界残留（`todo_status`）
+- `todo_status` 的**功能性自动发现**保留：它在仓库里自动发现一个**可选的任务文件夹**，并用其中的任务/报告标题生成机器可读的 todo；
+- 新增环境变量 **`VB6MCP_TASKS_DIR`** 覆盖该路径（显式给出时优先）；
+- 契约与公开面**不再出现该内部目录名**：描述只说「自动发现的任务文件夹 + 环境变量覆盖」。
+
+### 不变式
+- `tools/list` 结果键仍**恰为** `{tools}`；`tools/call` 结果键仍**恰为** `{content,isError}`；版本戳仍只在正文里。
+- 四冻件在本版**全部重冻**；产品版本仍 **0.3.0**（本版只改契约面）。

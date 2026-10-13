@@ -4,13 +4,18 @@
 
 User-visible changes: what changed and **why**. One rule: only what can be verified from the code or the history; unverifiable history stays unwritten. No names of unopened external products, no private project names, no maintainer machine paths appear here.
 
-**Current: product `0.3.0` · contract `v1.8.0`** - the product version comes from `Util.bas` (echoed by `initialize` and `mcp_info`); the contract version is the compatibility contract of the tool face and receipts (it rises when tools are added/removed or descriptions change; `mcp_info.breaking[]` / `migrations[]` list changes that alter how you must call). This repository ships **source only**: build `VB6MCP.dll` yourself with `build.bat`. Separately, the `.vbp` project file carries its own `1.0.0` version resource, unrelated to the two above.
+**Current: product `0.3.0` · contract `v1.10.0` · tool face: 115 tools** - the product version comes from `Util.bas` (echoed by `initialize` and `mcp_info`); the contract version is the compatibility contract of the tool face and receipts (it rises when tools are added/removed or descriptions change; `mcp_info.breaking[]` / `migrations[]` list changes that alter how you must call). This repository ships **source only**: build `VB6MCP.dll` yourself with `build.bat`. Separately, the `.vbp` project file carries its own `1.0.0` version resource, unrelated to the two above.
 
 This file records **source and feature** changes only; packaging, release and other infrastructure work is out of scope.
 
 ---
 
 ## 2026-10-13
+
+### 16:26 · Tool face 114 -> 115 · live desktop state · long code can come from a file · one failure envelope
+
+**What changed**: added a read-only tool **`desktop_probe`** that reports the **live** desktop state of the process hosting the add-in (window station / desktop / session / foreground) and **refuses honestly** (`ok:false` + `failureKind`) when an API cannot be read, instead of returning a zero-filled picture; `vba6_probe` / `immediate_eval` / `immediate_run` each gained one **optional** "read it from a file" parameter (`exec_line_file` / `expression_file` / `code_file`); `vba6_probe` failures now use a **uniform envelope** (`ok` / `failureKind` / `reason`) and report the **requested vs clamped length**, and an out-of-range argument is a structured `arg_out_of_range` instead of a raw overflow; `ui_text` gives clearer diagnostics when a self-drawn panel cannot be read; **internal labels were purged from the public tool descriptions**.
+**Why**: the desktop / session state had **no tool at all**, so callers could only guess; long or quote-heavy code was regularly broken by command-line length and quoting rules; without a uniform failure reason a caller cannot tell "bad argument" from "engine unavailable"; internal labels in descriptions put unverifiable text on the public surface. A previously reported claim that the foreground value "always reads 0 on this machine" was **disproved by measurement** and is corrected everywhere: desktop state is now reported as a **live value**, and send-input capability is **never** inferred from a window-station name. Note that the **Immediate-window body text still cannot be read** (that pane exposes no readable body), so **no** tool was added for it and the limitation stays documented.
 
 ### 15:08 · Compilation no longer hangs · tighter defaults in the snapshot and audit scripts
 

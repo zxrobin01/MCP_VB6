@@ -275,6 +275,24 @@ Private m_mgTimedOut As Boolean
 Private m_mgResolvedMs As Long
 Private m_mgAllowHostModal As Boolean
 
+' ---- R2 + R12: desktop / interactivity probe (read-only) -------------------
+' These are the ONLY new Win32 entry points added for desktop_probe. They READ the
+' window-station / desktop / foreground state of THIS process and close the
+' input-desktop handle they open. No process memory is read or written, no thread
+' is created and nothing is injected - the TASK-P1-069 memory discipline still holds.
+Private Declare Function WoGetProcessWindowStation Lib "user32" Alias "GetProcessWindowStation" () As Long
+Private Declare Function WoGetUserObjectInformationW Lib "user32" Alias "GetUserObjectInformationW" (ByVal hObj As Long, ByVal nIndex As Long, ByVal pvInfo As Long, ByVal nLength As Long, ByRef lpnLengthNeeded As Long) As Long
+Private Declare Function WoGetThreadDesktop Lib "user32" Alias "GetThreadDesktop" (ByVal dwThreadId As Long) As Long
+Private Declare Function WoOpenInputDesktop Lib "user32" Alias "OpenInputDesktop" (ByVal dwFlags As Long, ByVal fInherit As Long, ByVal dwDesiredAccess As Long) As Long
+Private Declare Function WoCloseDesktop Lib "user32" Alias "CloseDesktop" (ByVal hDesktop As Long) As Long
+Private Declare Function WoProcessIdToSessionId Lib "kernel32" Alias "ProcessIdToSessionId" (ByVal dwProcessId As Long, ByRef pSessionId As Long) As Long
+Private Declare Function WoGetCurrentThreadId Lib "kernel32" Alias "GetCurrentThreadId" () As Long
+
+Private Const WO_UOI_NAME As Long = 2
+Private Const WO_DESKTOP_READOBJECTS As Long = &H1
+Private Const WO_DESKTOP_WRITEOBJECTS As Long = &H80
+Private Const WO_DESKTOP_SWITCHDESKTOP As Long = &H100
+
 ' =====================================================================
 ' small helpers
 ' =====================================================================
@@ -931,7 +949,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     root("dryRun") = dryRun
     root("explicitCall") = True
     root("allowHostModal") = allowHostModal
-    root("policy") = "clicks ONLY buttons whose caption is on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist; the click is the BM_CLICK window message (a WM_COMMAND fallback is sent only if the button still exists). TASK-P1-125 adds a second, independent guard: a dialog that would start a LONG host-modal operation (VB6's Make Project box) is reported as host_modal_risk=known and is NOT clicked unless allow_host_modal=true."
+    root("policy") = "clicks ONLY buttons whose caption is on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist; the click is the BM_CLICK window message (a WM_COMMAND fallback is sent only if the button still exists). A second, independent guard: a dialog that would start a LONG host-modal operation (VB6's Make Project box) is reported as host_modal_risk=known and is NOT clicked unless allow_host_modal=true."
     ' TASK-P1-125 (discipline 98): the same key set on EVERY path. Without these
     ' defaults a refusal-only key (hostModalGuard / refusedCount / bodyGuard) and the
     ' note vanished from the success path, so a caller could not rely on the shape.
@@ -1703,7 +1721,7 @@ Public Function WoModalGuardReceipt() As Object
         ses = "none: no blocking dialog was seen inside the budget"
     End If
     root("modalSideEffects") = ses
-    root("modalNote") = "the guard is driven by the watchdog tick (ServerForm.tmrWatch -> WheelTick), the only channel the host's own modal loop still dispatches (TASK-P1-084). It is a bounded SAFETY NET, not a proof: modalDetected=false means no blocking box was seen within modalWaitMs, NOT that none existed."
+    root("modalNote") = "the guard is driven by the watchdog tick (ServerForm.tmrWatch -> WheelTick), the only channel the host's own modal loop still dispatches. It is a bounded SAFETY NET, not a proof: modalDetected=false means no blocking box was seen within modalWaitMs, NOT that none existed."
     Set WoModalGuardReceipt = root
     Err.Clear
 End Function
@@ -2285,7 +2303,7 @@ Public Function WheelStateObj() As Object
     d("lastTopError") = m_whTopErr
     d("pendingScroll") = m_whPendOn
     d("pendingScrollResult") = m_whPendResult
-    d("topLineSpace") = "TASK-P1-067: lastTopLineBefore/After are VBIDE CodePane.TopLine (1-based) read back around the scroll; -1 means NO VALUE and the reason is in lastTopStatus/lastTopError: pane_not_found = the title resolved to no CodePane (forwarded untouched), pane_not_writable_in_break = the pane WAS resolved but the IDE refused the TopLine read/write (real VB error in lastTopError; the scroll is retried outside the window procedure by the timer - see pendingScroll/pendingScrollResult). The old EM_GETFIRSTVISIBLELINE channel is gone from these two fields because the code pane exposes no RichEdit20A child on this IDE (it read -1 and was never the behaviour oracle). paneTopLineNow is the ActiveCodePane.TopLine stamped by CodeTools."
+    d("topLineSpace") = "lastTopLineBefore/After are VBIDE CodePane.TopLine (1-based) read back around the scroll; -1 means NO VALUE and the reason is in lastTopStatus/lastTopError: pane_not_found = the title resolved to no CodePane (forwarded untouched), pane_not_writable_in_break = the pane WAS resolved but the IDE refused the TopLine read/write (real VB error in lastTopError; the scroll is retried outside the window procedure by the timer - see pendingScroll/pendingScrollResult). The old EM_GETFIRSTVISIBLELINE channel is gone from these two fields because the code pane exposes no RichEdit20A child on this IDE (it read -1 and was never the behaviour oracle). paneTopLineNow is the ActiveCodePane.TopLine stamped by CodeTools."
     d("lastReason") = m_whLastReason
     d("reason") = WheelReason()
     ' TASK-P1-157: hooked[] keeps its P1-067 meaning (the subclassed CODE PANES only).
@@ -2333,7 +2351,7 @@ Public Function WheelStateObj() As Object
     d("fastAttachTicks") = m_whFastTicks
     d("attachRuns") = m_whAttachRuns
     d("lastAttachMsAgo") = IIf(m_whFastLastAt = 0, -1, WoGetTickCount() - m_whFastLastAt)
-    d("attachNote") = "TASK-P1-157: hooked[] lists the subclassed CODE PANES (P1-067 semantics). attached[] lists EVERY subclassed window (the Immediate/Watch/Locals windows are subclassed too now, and are forwarded untouched at message time). attachDecisions[] says why each VbaWindow of the last pass was or was not hooked. fastAttachTicks/attachRuns show the COM-free attach timer that closes the gap between a pane being created and the 5 s watchdog scan."
+    d("attachNote") = "hooked[] lists the subclassed CODE PANES. attached[] lists EVERY subclassed window (the Immediate/Watch/Locals windows are subclassed too now, and are forwarded untouched at message time). attachDecisions[] says why each VbaWindow of the last pass was or was not hooked. fastAttachTicks/attachRuns show the COM-free attach timer that closes the gap between a pane being created and the 5 s watchdog scan."
     Set WheelStateObj = d
 End Function
 
@@ -2787,4 +2805,235 @@ Public Function WoFrontRestore(ByVal h As Long) As Boolean
     ' Returns True only when SetForegroundWindow reported success - never claims silently.
     If h = 0 Then Exit Function
     WoFrontRestore = (WoSetForegroundWindow(h) <> 0)
+End Function
+
+' =====================================================================
+' R2 + R12: the live desktop / input-channel probe. READ-ONLY.
+'   Every value is MEASURED on every call from inside THIS process. Nothing is
+'   inferred from the window-station NAME, and canSendInput is NOT derived from
+'   GetForegroundWindow()==0: this add-in delivers input as PostMessage
+'   (WM_KEYDOWN / WM_KEYUP / WM_MOUSEWHEEL) to windows of its OWN process, measured
+'   to deliver while ANOTHER process owns the foreground. The handle OpenInputDesktop
+'   opens is closed again before returning.
+' =====================================================================
+Private Function WoNz(ByVal s As String) As String
+    Dim i As Long
+    i = InStr(1, s, vbNullChar)
+    If i = 0 Then WoNz = s Else WoNz = Left$(s, i - 1)
+End Function
+
+Private Function WoUserObjectNameOf(ByVal hObj As Long, ByRef outName As String, ByRef errNo As Long, ByRef errTx As String) As Boolean
+    Dim buf As String
+    Dim need As Long
+    Dim rc As Long
+    WoUserObjectNameOf = False
+    outName = ""
+    errNo = 0
+    errTx = ""
+    If hObj = 0 Then Exit Function
+    On Error Resume Next
+    Err.Clear
+    buf = String$(512, vbNullChar)
+    need = 0
+    rc = WoGetUserObjectInformationW(hObj, WO_UOI_NAME, StrPtr(buf), 512, need)
+    If rc = 0 And Err.Number = 0 And need > 0 And need <= 4096 Then
+        buf = String$(need, vbNullChar)
+        rc = WoGetUserObjectInformationW(hObj, WO_UOI_NAME, StrPtr(buf), need, need)
+    End If
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Then Exit Function
+    If rc = 0 Then Exit Function
+    outName = WoNz(buf)
+    WoUserObjectNameOf = True
+End Function
+
+' R2/R12: the input-desktop probe. FAIL-CLOSED: it reports what the API actually did, including
+' the VB error when the call could not be made at all (a Declare missing its Alias clause raises
+' VB error 453 here). A zero handle with NO error is a genuine live negative (no interactive
+' input desktop), not a failure.
+Private Function WoInputDesktopProbe(ByRef hRet As Long, ByRef errNo As Long, ByRef errTx As String) As Boolean
+    WoInputDesktopProbe = False
+    hRet = 0
+    errNo = 0
+    errTx = ""
+    On Error Resume Next
+    Err.Clear
+    hRet = WoOpenInputDesktop(0, 0, WO_DESKTOP_READOBJECTS Or WO_DESKTOP_WRITEOBJECTS Or WO_DESKTOP_SWITCHDESKTOP)
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Then Exit Function
+    If hRet <> 0 Then
+        WoInputDesktopProbe = True
+        Call WoCloseDesktop(hRet)
+    End If
+End Function
+
+' Minimal JSON string escaping for raw API text carried in a refusal.
+Private Function WoJsonQ(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, "\", "\\")
+    t = Replace(t, Chr$(34), "\" & Chr$(34))
+    t = Replace(t, vbCrLf, " ")
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    WoJsonQ = Chr$(34) & t & Chr$(34)
+End Function
+
+' FAIL-CLOSED refusal for the desktop probe. No desktop/interactivity value is ever reported as a
+' measurement unless its API actually answered; this shape is returned INSTEAD of a zero-filled
+' picture that a caller could mistake for real values.
+Private Function WoDesktopFailJson(ByVal d As Object, ByVal apiName As String, ByVal errNo As Long, ByVal errTx As String, ByVal returnedZero As Boolean) As String
+    Dim why As String
+    d("ok") = False
+    d("failureKind") = "api_unavailable"
+    d("failedApi") = apiName
+    d("apiError") = errNo
+    d("apiErrorText") = errTx
+    d("measured") = False
+    If returnedZero Then d("returnedZeroHandle") = True
+    If errNo <> 0 Then
+        why = "VB error " & CStr(errNo) & " (" & errTx & ")"
+    Else
+        why = "the API returned a null handle with no error"
+    End If
+    d("reason") = "the desktop probe could not obtain " & apiName & ": " & why
+    d("note") = "FAIL-CLOSED: no desktop/interactivity value is reported unless its API answered, so this refusal is returned instead of a zero-filled picture. A Declare whose Alias clause is missing raises VB error 453 here."
+    WoDesktopFailJson = JsonStringify(d)
+End Function
+
+' R12: the desktop{} fragment spliced into the input-family receipts. FAIL-CLOSED: when the
+' input-desktop API cannot be called, the fragment says measured:false and carries the raw error
+' instead of claiming a capability value.
+Public Function WoDesktopFieldsJson() As String
+    Dim hInput As Long
+    Dim errNo As Long
+    Dim errTx As String
+    Dim interactive As Boolean
+    Dim flagTxt As String
+    interactive = WoInputDesktopProbe(hInput, errNo, errTx)
+    flagTxt = "false"
+    If interactive Then flagTxt = "true"
+    If errNo <> 0 Then
+        WoDesktopFieldsJson = Chr$(34) & "desktop" & Chr$(34) & ":{" & Chr$(34) & "interactive" & Chr$(34) & ":false," & Chr$(34) & "canSendInput" & Chr$(34) & ":false," & _
+            Chr$(34) & "measured" & Chr$(34) & ":false," & Chr$(34) & "failureKind" & Chr$(34) & ":" & Chr$(34) & "api_unavailable" & Chr$(34) & "," & Chr$(34) & "apiError" & Chr$(34) & ":" & CStr(errNo) & "," & _
+            Chr$(34) & "apiErrorText" & Chr$(34) & ":" & WoJsonQ(errTx) & "," & Chr$(34) & "note" & Chr$(34) & ":" & WoJsonQ("the input-desktop API could not be called, so no input-capability value is claimed and measured is false") & "}"
+        Exit Function
+    End If
+    WoDesktopFieldsJson = Chr$(34) & "desktop" & Chr$(34) & ":{" & Chr$(34) & "interactive" & Chr$(34) & ":" & flagTxt & "," & Chr$(34) & "canSendInput" & Chr$(34) & ":" & flagTxt & "," & Chr$(34) & "measured" & Chr$(34) & ":true}"
+End Function
+
+' R12 / R2: the desktop_probe tool body.
+' R12 / R2: the desktop_probe tool body. FAIL-CLOSED: each API is called with its own error trap
+' and its result is checked; any failure returns ok:false + failureKind + the raw VB error instead
+' of a zero-filled success. OpenInputDesktop returning 0 WITHOUT an error is a genuine live
+' negative (no interactive input desktop) and is reported as such.
+Public Function WoDesktopJson() As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim hWinSta As Long, hDesk As Long, hInput As Long
+    Dim winstaName As String, desktopName As String
+    Dim errNo As Long, errTx As String
+    Dim fg As Long, fgIsWin As Long
+    Dim sid As Long, sidOk As Long
+    Dim interactive As Boolean, fgReadable As Boolean
+    Dim flagTxt As String
+    d("tool") = "desktop_probe"
+    d("probeBasis") = "GetProcessWindowStation + GetUserObjectInformationW(UOI_NAME) + GetThreadDesktop(GetCurrentThreadId) + OpenInputDesktop + GetForegroundWindow + IsWindow + ProcessIdToSessionId, each called with its own error trap; a value is only reported as measured when its API actually answered"
+    On Error Resume Next
+    Err.Clear
+    hWinSta = WoGetProcessWindowStation()
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Or hWinSta = 0 Then
+        WoDesktopJson = WoDesktopFailJson(d, "GetProcessWindowStation", errNo, errTx, (hWinSta = 0))
+        Exit Function
+    End If
+    If Not WoUserObjectNameOf(hWinSta, winstaName, errNo, errTx) Then
+        WoDesktopJson = WoDesktopFailJson(d, "GetUserObjectInformationW(UOI_NAME) on the window station", errNo, errTx, False)
+        Exit Function
+    End If
+    On Error Resume Next
+    Err.Clear
+    hDesk = WoGetThreadDesktop(WoGetCurrentThreadId())
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Or hDesk = 0 Then
+        WoDesktopJson = WoDesktopFailJson(d, "GetThreadDesktop(GetCurrentThreadId)", errNo, errTx, (hDesk = 0))
+        Exit Function
+    End If
+    If Not WoUserObjectNameOf(hDesk, desktopName, errNo, errTx) Then
+        WoDesktopJson = WoDesktopFailJson(d, "GetUserObjectInformationW(UOI_NAME) on the thread desktop", errNo, errTx, False)
+        Exit Function
+    End If
+    sid = 0
+    On Error Resume Next
+    Err.Clear
+    sidOk = WoProcessIdToSessionId(WoGetCurrentProcessId(), sid)
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Or sidOk = 0 Then
+        WoDesktopJson = WoDesktopFailJson(d, "ProcessIdToSessionId(GetCurrentProcessId)", errNo, errTx, (sidOk = 0))
+        Exit Function
+    End If
+    On Error Resume Next
+    Err.Clear
+    fg = WoGetForegroundWindow()
+    errNo = Err.Number
+    errTx = Err.Description
+    Err.Clear
+    On Error GoTo 0
+    If errNo <> 0 Then
+        WoDesktopJson = WoDesktopFailJson(d, "GetForegroundWindow", errNo, errTx, False)
+        Exit Function
+    End If
+    fgIsWin = 0
+    If fg <> 0 Then
+        On Error Resume Next
+        Err.Clear
+        fgIsWin = WoIsWindow(fg)
+        errNo = Err.Number
+        errTx = Err.Description
+        Err.Clear
+        On Error GoTo 0
+        If errNo <> 0 Then
+            WoDesktopJson = WoDesktopFailJson(d, "IsWindow(foregroundHwnd)", errNo, errTx, False)
+            Exit Function
+        End If
+    End If
+    interactive = WoInputDesktopProbe(hInput, errNo, errTx)
+    If errNo <> 0 Then
+        WoDesktopJson = WoDesktopFailJson(d, "OpenInputDesktop", errNo, errTx, False)
+        Exit Function
+    End If
+    fgReadable = (fg <> 0 And fgIsWin <> 0)
+    flagTxt = "false"
+    If interactive Then flagTxt = "true"
+    d("ok") = True
+    d("measured") = True
+    d("windowStation") = winstaName
+    d("windowStationHandle") = hWinSta
+    d("desktop") = desktopName
+    d("desktopHandle") = hDesk
+    d("sessionId") = sid
+    d("sessionIdOk") = (sidOk <> 0)
+    d("interactive") = interactive
+    d("canSendInput") = interactive
+    d("inputDesktopOk") = interactive
+    d("inputDesktopHandle") = hInput
+    d("foregroundHwnd") = fg
+    d("foregroundIsWindow") = (fgIsWin <> 0)
+    d("foregroundReadable") = fgReadable
+    d("note") = "every value above was returned by the API named in probeBasis and nothing was defaulted; this shape is only emitted after ALL of those APIs answered. interactive/canSendInput are LIVE values re-measured on every call and are NOT derived from the window-station name nor from GetForegroundWindow()==0. This add-in delivers input as PostMessage(WM_KEYDOWN/WM_KEYUP/WM_MOUSEWHEEL) to windows of its OWN process, measured to deliver while ANOTHER process owns the foreground. OpenInputDesktop returning 0 with no error is a genuine live negative and is shown by inputDesktopOk/inputDesktopHandle."
+    WoDesktopJson = JsonStringify(d)
 End Function

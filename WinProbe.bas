@@ -88,9 +88,9 @@ Private Declare Function UiGetWindow Lib "user32" Alias "GetWindow" (ByVal h As 
 ' while the variable stays Nothing, even for a standard Button that certainly has an
 ' IAccessible. So the channel asks for a raw pointer and copies it into the object
 ' slot itself; that is the only form that worked.
-Private Declare Function UiAccessibleObjectFromWindow Lib "oleacc" (ByVal hwnd As Long, ByVal dwId As Long, riid As Any, ByRef ppvObject As Long) As Long
+Private Declare Function UiAccessibleObjectFromWindow Lib "oleacc" Alias "AccessibleObjectFromWindow" (ByVal hwnd As Long, ByVal dwId As Long, riid As Any, ByRef ppvObject As Long) As Long
 Private Declare Sub UiCopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByRef dest As Any, ByRef src As Any, ByVal n As Long)
-Private Declare Function UiIIDFromString Lib "ole32" (ByVal lpsz As Long, ByRef lpiid As UIT_GUID) As Long
+Private Declare Function UiIIDFromString Lib "ole32" Alias "IIDFromString" (ByVal lpsz As Long, ByRef lpiid As UIT_GUID) As Long
 
 Private Const UiGW_CHILD As Long = 5
 Private Const UiGW_HWNDNEXT As Long = 2
@@ -509,6 +509,8 @@ Public Function UiTextJson(ByVal hwnd As Long, ByVal cls As String, ByVal depth 
         d("ok") = False
         d("reason") = "no_accessible_text"
         d("evidence") = "no window of this process matched hwnd=" & CStr(hwnd) & " cls=" & cls
+        d("selfDrawnPanel") = False
+        d("unsupportedReason") = "target_unresolved: no window of this process matched hwnd=" & CStr(hwnd) & " cls=" & cls
         Set d("channels") = chan
         UiTextJson = JsonStringify(d)
         Exit Function
@@ -659,6 +661,36 @@ Public Function UiTextJson(ByVal hwnd As Long, ByVal cls As String, ByVal depth 
             "; msaaHr=0x" & Hex$(msaaHr) & " (" & msaaDetail & ")" & _
             "; wm_gettext scanned " & CStr(hn) & " window(s), 0 returned non-empty text"
     End If
+    ' R1: the structured, machine-readable verdict. selfDrawnPanel is the shape in which the
+    ' only readable text is the window caption and no accessibility object exists; the basis
+    ' (the channels that were tried and what each returned) is carried in unsupportedReason so
+    ' a negative result cannot be mistaken for a channel failure.
+    Dim msaaObjPresent As Boolean
+    Dim uiaObjOk As Boolean
+    Dim rootText As String
+    Dim selfDrawn As Boolean
+    Dim unsup As String
+    msaaObjPresent = (pAcc <> 0 And Not (acc Is Nothing))
+    uiaObjOk = Not (uiaObj Is Nothing)
+    rootText = ""
+    unsup = ""
+    selfDrawn = False
+    If src = "wm_gettext" Then rootText = UiWmGetText(target)
+    If Len(src) = 0 Then
+        selfDrawn = (hitN = 0)
+        unsup = "no_accessible_text: uia=" & uiaDetail & "; msaa=" & msaaDetail & "; wm_gettext scanned " & CStr(hn) & " window(s), " & CStr(hitN) & " returned non-empty text"
+    ElseIf src = "wm_gettext" Then
+        If hitN = 1 And Len(Trim$(rootText)) > 0 Then
+            selfDrawn = True
+            unsup = "self_drawn_panel: the only WM_GETTEXT hit is the window caption and neither UIA nor MSAA exposed an accessible object; no body-text channel is available (heuristic basis: caption-only WM_GETTEXT + no accessible object, not a proof about the pane buffer)"
+        End If
+    End If
+    d("selfDrawnPanel") = selfDrawn
+    d("unsupportedReason") = unsup
+    d("uiaObjectCreated") = uiaObjOk
+    d("msaaObjectPresent") = msaaObjPresent
+    d("wmGetTextWindows") = hn
+    d("wmGetTextNonEmpty") = hitN
     Set d("channels") = chan
     UiTextJson = JsonStringify(d)
 End Function

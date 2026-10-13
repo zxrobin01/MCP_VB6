@@ -149,6 +149,8 @@ Private Const QUIET_ADVISORY As String = "quiet mode is ON - do not type in this
 ' generated line closes it first, so the handle is idempotent even after a failed line.
 Private Const IM_SINK_MAX_BYTES As Long = 65536
 Private Const IM_FILE_NUM As Long = 511
+' R14: cap for a *_file text input; a larger file is refused instead of read.
+Private Const INPUT_FILE_MAX_BYTES As Long = 65536
 ' TASK-P1-125: ToolBuild chooses the in-IDE route itself when the project is the
 ' one the IDE holds, and ToolMakeProject route=cli delegates to ToolBuild - this
 ' override breaks the cycle and pins the in-IDE path once it has been chosen.
@@ -245,9 +247,9 @@ Public Function BuildToolsListResult() As Object
     ' inflight{...} (spliced in SealedReceipt) and cancel{...}.
     Dim pIs As Object
     Set pIs = CreateObject("Scripting.Dictionary")
-    Set pIs("cancel_inflight") = Prop("boolean", "TASK-P1-126 (MCP-08): ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case.")
+    Set pIs("cancel_inflight") = Prop("boolean", "ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case.")
     Set pIs("cancel_target") = Prop("string", "Optional: the tool you believe is in flight (informational only - the receipt reports what the add-in actually finds).")
-    Set pIs("release_inflight") = Prop("boolean", "TASK-P1-168 (C / defect #10): FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate.")
+    Set pIs("release_inflight") = Prop("boolean", "FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate.")
     Set pIs("release_min_held_ms") = Prop("integer", "The age threshold for release_inflight, in ms (default 60000). The gate is NOT touched while the in-flight call is younger than this, so a healthy long call keeps the single-flight guarantee.")
     tools.Add MakeTool("ide_state", _
         "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to abort the call that is in flight, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000).", _
@@ -551,12 +553,12 @@ Public Function BuildToolsListResult() As Object
     Set pMake("out_path") = Prop("string", "route=cli: compiler log path (default %TEMP%\vb6mcp_build.log)")
     Set pMake("timeout_ms") = Prop("integer", "route=cli: bounds ONLY the VB6.EXE /make subprocess (default 180000)")
     Set pMake("allow_host_modal") = Prop("boolean", "Default false. When VB6's own Make Project box is already up, confirming it starts a long host-modal compile that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy until the IDE is restarted. false = leave the box alone and report modal_blocked=true with its hwnd/title/controls instead of clicking it.")
-    Set pMake("laa") = Prop("boolean", "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned." & _
+    Set pMake("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned." & _
             " WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section.")
-    Set pMake("diagnose") = Prop("boolean", "TASK-P1-132 (MCP-lead-2), default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure.")
+    Set pMake("diagnose") = Prop("boolean", "default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure.")
     tools.Add MakeTool("make_project", _
         "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}." & _
-        " TASK-P1-132: after a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).", _
+        " After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).", _
         SchemaWith(pMake))
 
     Dim pExec As Object
@@ -779,7 +781,7 @@ Public Function BuildToolsListResult() As Object
     tools.Add MakeTool("close_active_dialogs", _
         "EXPLICITLY INVOKED ONLY - nothing in this server calls it automatically. Click a SAFE button of an active dialog (default #32770) with the BM_CLICK window message: the caption must be on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist (delete/remove/uninstall/format/overwrite/discard/reset/...). Disabled or non-whitelisted buttons are reported as skipped and are never clicked. " _
         & "SAFETY: before clicking, the dialog BODY (title + every child control's text) is READ; if it names a destructive action the DEFAULT click is REFUSED with reason=dangerous_dialog_body + bodyHit (an explicit button=""No"" is the escape hatch) and NOTHING is sent. " _
-        & "TASK-P1-125 adds a second, independent guard: every path - the dry_run preview included - carries host_modal_risk (none|possible|known) + host_modal_risk_reason + host_modal_risk_class + riskDialogs[], and a box whose button would start a host-modal operation is NOT clicked unless allow_host_modal=true; a Cancel/Close caption is still allowed on such a box, because cancelling cannot start the operation. recovery_hint explains what to do if a write tool then answers reason=busy. Every path returns the same keys: clickedCount, dialogsBefore, dialogsAfter, clicked[].stillExists, skipped[], remaining[].", _
+        & "A second, independent guard: every path - the dry_run preview included - carries host_modal_risk (none|possible|known) + host_modal_risk_reason + host_modal_risk_class + riskDialogs[], and a box whose button would start a host-modal operation is NOT clicked unless allow_host_modal=true; a Cancel/Close caption is still allowed on such a box, because cancelling cannot start the operation. recovery_hint explains what to do if a write tool then answers reason=busy. Every path returns the same keys: clickedCount, dialogsBefore, dialogsAfter, clicked[].stillExists, skipped[], remaining[].", _
         SchemaWith(pDlgClose))
 
     Dim pSend As Object
@@ -807,9 +809,9 @@ Public Function BuildToolsListResult() As Object
     Set pVal("code") = Prop("string", "Code text to validate (NOT written to the IDE)")
     Set pVal("kind") = Prop("string", "bas|cls|frm (optional; inferred from name)")
     Set pVal("mode") = Prop("string", "off|warn|strict (default warn)")
-    Set pVal("baseline") = Prop("string", "TASK-P1-126 (MCP-15): a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new.")
+    Set pVal("baseline") = Prop("string", "a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new.")
     tools.Add MakeTool("validate_code", _
-        "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey (TASK-P1-126/MCP-15), and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).", _
+        "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).", _
         SchemaWith(pVal, Req("code")))
 
     Dim pRs As Object
@@ -832,9 +834,9 @@ Public Function BuildToolsListResult() As Object
     Set pB("defines") = Prop("string", "Comma-separated /d defines, e.g. TESTING=1")
     Set pB("out_path") = Prop("string", "Build log path (optional)")
     Set pB("timeout_ms") = Prop("integer", "Timeout in ms (default 180000)")
-    Set pB("laa") = Prop("boolean", "TASK-P1-132 (A10), default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted.")
+    Set pB("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted.")
     tools.Add MakeTool("build", _
-        "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. TASK-P1-132: laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.", _
+        "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.", _
         SchemaWith(pB))
 
     Dim pEba As Object
@@ -905,7 +907,7 @@ Public Function BuildToolsListResult() As Object
     Set pIt("id") = Prop("string", "Trace id (also the removal handle)")
     Set pIt("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("inject_trace", _
-        "Insert a McpTrace call at the start of a procedure. B+C/TASK-P1-028: the guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen. TASK-P1-129: inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).", _
+        "Insert a McpTrace call at the start of a procedure. The guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen; inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).", _
         SchemaWith(pIt, Req("name", "procedure", "id")))
 
     Dim pRt As Object
@@ -914,7 +916,7 @@ Public Function BuildToolsListResult() As Object
     Set pRt("id") = Prop("string", "Trace id to remove")
     Set pRt("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("remove_trace", _
-        "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-149: the modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=""kept_by_design"" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.", _
+        "Remove a previously injected trace block; sha256 returns to the pre-injection value. The modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=""kept_by_design"" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.", _
         SchemaWith(pRt, Req("name", "id")))
 
     Dim pFi As Object
@@ -976,6 +978,12 @@ Public Function BuildToolsListResult() As Object
     tools.Add MakeTool("execution_state", _
         "Win32 execution state of a process: main window, responsive / hung, top-level window count, modal dialog count.", _
         SchemaWith(pEs))
+
+    ' ---- R2 + R12: live desktop / input-channel probe (read-only) ----
+    tools.Add MakeTool("desktop_probe", _
+        "Read the LIVE desktop/interactivity state of the process that hosts the add-in: {ok, windowStation, desktop, sessionId, interactive, canSendInput, foregroundHwnd, foregroundReadable, probeBasis, note}. Every value is MEASURED on each call (GetProcessWindowStation + GetUserObjectInformationW(UOI_NAME) + GetThreadDesktop + OpenInputDesktop + GetForegroundWindow + IsWindow + ProcessIdToSessionId, all inside the add-in process; the input-desktop handle it opens is closed again). The foreground/desktop state is reported as a LIVE structured value: foregroundHwnd can be 0 on a non-interactive or locked desktop and that is reported as-is. The probe never steals focu" & _
+        "s to obtain it (no SetForegroundWindow) and never derives send-input capability from a window-station name: this add-in delivers input as PostMessage(WM_KEYDOWN/WM_KEYUP/WM_MOUSEWHEEL) to windows of its OWN process, measured to deliver while ANOTHER process owns the foreground. If any of those APIs cannot be called, or returns no handle, the tool answers ok:false + failureKind=api_unavailable + failedApi + apiError + apiErrorText + measured:false instead of a zero-filled picture, and the desktop{} block on the input-family receipts carries measured:false as well. A missing Alias clause on a Declare surfaces here as VB error 453 rather than as zeros. Read-only.", _
+        SchemaWith(Nothing))
 
     Dim pVp As Object
     Set pVp = CreateObject("Scripting.Dictionary")
@@ -1145,6 +1153,7 @@ Public Function BuildToolsListResult() As Object
     Set pVb("ident") = Prop("string", "Optional identifier to test with EbIsValidIdent (design time)")
     Set pVb("exec_probe") = Prop("boolean", "Run the Immediate-window executor probe (EbExecuteLine) instead of the standard set. RE round 5: this export (ordinal 147, RVA 0x127065) IS the Immediate-window line executor.")
     Set pVb("exec_line") = Prop("string", "Line to execute, e.g. 1+1 or Debug.Print ... (Immediate-window syntax)")
+    Set pVb("exec_line_file") = Prop("string", "Path to a UTF-8/ANSI text file whose text is used as exec_line. Mutually exclusive with exec_line; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding.")
     Set pVb("exec_a2") = Prop("integer", "arg2 (semantics unresolved; values 0/1 are the candidates)")
     Set pVb("exec_a3") = Prop("integer", "arg3 (unresolved)")
     Set pVb("exec_a4") = Prop("integer", "arg4 (mode flag: the epilogue uses setz al, so 0 vs 1 differ)")
@@ -1362,7 +1371,7 @@ Public Function BuildToolsListResult() As Object
         SchemaWith(pVs))
 
     tools.Add MakeTool("todo_status", _
-        "Read-only: machine-readable todo derived from _bus/tasks/P1 and _bus/reports/P1 (status + title) plus counts; useful for a quick progress snapshot.", _
+        "READ-ONLY task-board snapshot. Scans an OPTIONAL in-repo task folder (tasks/ + reports/ Markdown) and returns {taskCount, openTasks, tasks[], reportCount, reports[], readOnly}. A missing task folder is a normal result (0 tasks), not an error.", _
         SchemaWith(Nothing))
 
     ' ---- contract v1.3.0 (TASK-P1-030): machine-readable version identity ----
@@ -1402,17 +1411,19 @@ Public Function BuildToolsListResult() As Object
     Dim pImE As Object
     Set pImE = CreateObject("Scripting.Dictionary")
     Set pImE("expression") = Prop("string", "Expression to evaluate in the ACTIVE project's immediate context, e.g. 1/4 or UCase$(""ab""). It is evaluated exactly ONCE.")
+    Set pImE("expression_file") = Prop("string", "Path to a UTF-8/ANSI text file whose text is used as expression. Mutually exclusive with expression; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding.")
     Set pImE("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout - the add-in cannot preempt a statement.")
     tools.Add MakeTool("immediate_eval", _
-        "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards.", _
+        "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).", _
         SchemaWith(pImE, Req("expression")))
 
     Dim pImR As Object
     Set pImR = CreateObject("Scripting.Dictionary")
     Set pImR("code") = Prop("string", "One or more statements to run, e.g. Debug.Print 1+1 or x = 5: Debug.Print x. A CR/LF in the input is joined with a colon and a space; each statement-boundary Debug.Print is redirected into the sink.")
+    Set pImR("code_file") = Prop("string", "Path to a UTF-8/ANSI text file whose text is used as code. Mutually exclusive with code; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding.")
     Set pImR("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout.")
     tools.Add MakeTool("immediate_run", _
-        "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open.", _
+        "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open. The statement body may also be supplied through code_file (mutually exclusive with code).", _
         SchemaWith(pImR, Req("code")))
 
     Dim pQm As Object
@@ -1420,7 +1431,8 @@ Public Function BuildToolsListResult() As Object
     Set pQm("on") = Prop("boolean", "true = turn quiet mode ON (the add-in stops taking the user's foreground and every receipt carries a quiet{} block with an advisory); false = turn it OFF and restore the previous behaviour byte for byte.")
     Set pQm("ttl_ms") = Prop("integer", "Optional lifetime in ms (default 600000 = 10 minutes). The mode expires by itself once the TTL passes; the TTL is re-evaluated on every read.")
     tools.Add MakeTool("ide_quiet_mode", _
-        "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:""activate""} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the foreground handle could not be READ (it is 0 here) - never read that as ""the focus was left alone"". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.", _
+        "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:""activate""} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE" & _
+        " while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour. The foreground/desktop state is reported as a LIVE structured value (see desktop_probe): the handle can be 0 on a non-interactive or locked desktop and that is reported as-is, so foregroundReadable=false means the handle could not be read - never read that as ""the focus was left alone"". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.", _
         SchemaWith(pQm, Req("on")))
 
     Set BuildToolsListResult = root
@@ -1590,7 +1602,7 @@ Private Function QuietJson() As String
     d("expiresInMs") = m_quietTtlMs - (GetTickCount() - m_quietSince)
     d("suppressedFocusCount") = m_quietSuppressed
     d("advisory") = QUIET_ADVISORY
-    d("note") = "while this mode is ON the add-in does not call Window.SetFocus (control_window{action:""activate""}) and gives the foreground back after any menu-driven action (native_breakpoint). foregroundReadable=false means the foreground handle could not be READ in this window station (it is 0 here) - that is NOT evidence that the focus was left alone."
+    d("note") = "while this mode is ON the add-in does not call Window.SetFocus (control_window{action:""activate""}) and gives the foreground back after any menu-driven action (native_breakpoint). foregroundReadable=false means the foreground handle could not be READ; the foreground/desktop state is a LIVE value that can be 0 on a non-interactive or locked desktop and is reported as-is - that is NOT evidence that the focus was left alone."
     QuietJson = JsonStringify(d)
 End Function
 
@@ -1887,7 +1899,7 @@ Private Function ClassifiedRefusalJson(ByVal tool As String, ByVal failMsg As St
         Set d("allowedComponentTypes") = ctypes
     End If
     d("suggestedAction") = SuggestedActionFor(reason)
-    d("classifiedBy") = "TASK-P1-108 ClassifiedRefusalJson (message family + native VB/COM code allowlist)"
+    d("classifiedBy") = "ClassifiedRefusalJson (message family + native VB/COM code allowlist)"
     d("sideEffects") = "none: the call was refused before completing its effect; this is a CLASSIFIED refusal, not an unexpected VB runtime error"
     ' TASK-P1-046 rule preserved: vbErrorCode only for a NATIVE error, never for our own
     ' vbObjectError+N guard raises.
@@ -2145,7 +2157,7 @@ Private Function BusyRejectResult(ByVal name As String, ByVal busyTool As String
         d("readonly_serviceable") = False
         d("readonly_serviceable_note") = "in THIS case a READ-ONLY call is refused as well, because it arrived at depth>0 through the same message-pump point while a call was already in flight (measured live: read_active_dialogs got exactly this receipt). Retry from a fresh call once the in-flight one returns."
     End If
-    d("readonly_tools_note") = "read-only TOOLS are not gated by m_mutBusy when they arrive at depth 0, so they keep answering while a WRITE is in flight (MCP-09, measured on the A-side: ide_state answered in 16 ms while a write was busy). This does NOT make writes available: a WRITE is refused while ANY call is in flight through a message-pump point, INCLUDING a read-only outer call (A-side measured: busyTool='validate_code (outer call, in flight since 141 ms ago)'). inflight_tool / inflight_kind / inflight_since_ms say who is in flight and whether it is a read or a write."
+    d("readonly_tools_note") = "read-only TOOLS are not gated by m_mutBusy when they arrive at depth 0, so they keep answering while a WRITE is in flight (measured on the A-side: ide_state answered in 16 ms while a write was busy). This does NOT make writes available: a WRITE is refused while ANY call is in flight through a message-pump point, INCLUDING a read-only outer call (A-side measured: busyTool='validate_code (outer call, in flight since 141 ms ago)'). inflight_tool / inflight_kind / inflight_since_ms say who is in flight and whether it is a read or a write."
     d("write_refused_because") = "a call is already in flight through this add-in's message pump: serving a second call there would interleave two mutations (or two readers), so it is refused instead of run"
     d("inflight_cancel") = "not available: this add-in cannot abort a call that is already running inside the host. See recovery_hint."
     d("recovery_hint") = "1) WAIT - a normal call returns within its own timeout, after which this refusal clears itself (in flight " & CStr(ms \ 1000) & "s so far). 2) INSPECT WITHOUT WRITING - call read_active_dialogs (read-only) to see whether the host is blocked on a modal box (ownerDisabled=true). 3) IF inflight_since_ms KEEPS GROWING past that call's own timeout, the HOST is inside a modal loop (a clicked button opened VB6's own modal): the add-in cannot interrupt it, so restart the IDE - end the VB6 process, then start it again on the same .vbp; the add-in re-attaches on load and nothing in the project directory is lost."
@@ -2211,7 +2223,7 @@ Private Function InflightJson() As String
         d("gateReleaseReason") = m_gateReleasedReason
         d("gateReleaseNote") = "the gate was force-released for a call that never came back; that call is STILL RUNNING inside the IDE, so a write issued now can interleave with it. Dismiss the host modal (close_active_dialogs) to let it finish."
     End If
-    d("note") = "read-only calls ARE served while a WRITE is in flight (MCP-09); a WRITE is refused while ANY call is in flight through the message pump (MCP-08). A read served while a write is in flight can observe a mid-mutation snapshot, which is why active=true and kind=write are reported with it."
+    d("note") = "read-only calls ARE served while a WRITE is in flight; a WRITE is refused while ANY call is in flight through the message pump. A read served while a write is in flight can observe a mid-mutation snapshot, which is why active=true and kind=write are reported with it."
     InflightJson = JsonStringify(d)
     Err.Clear
 End Function
@@ -2806,15 +2818,17 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "ide_quiet_mode"
             outText = ToolIdeQuietMode(JsonGetBool(args, "on", False), JsonGetLong(args, "ttl_ms"))
         Case "immediate_eval"
-            outText = ToolImmediateEval(JsonGetStr(args, "expression"), JsonGetLong(args, "timeout_ms", 5000))
+            outText = ToolImmediateEval(JsonGetStr(args, "expression"), JsonGetStr(args, "expression_file"), JsonGetLong(args, "timeout_ms", 5000))
         Case "immediate_run"
-            outText = ToolImmediateRun(JsonGetStr(args, "code"), JsonGetLong(args, "timeout_ms", 5000))
+            outText = ToolImmediateRun(JsonGetStr(args, "code"), JsonGetStr(args, "code_file"), JsonGetLong(args, "timeout_ms", 5000))
         Case "current_position"
             outText = ToolCurrentPosition()
         Case "list_breakpoints"
             outText = ToolListBreakpoints()
         Case "ui_text"
             outText = WinProbe.UiTextJson(JsonGetLong(args, "hwnd"), JsonGetStr(args, "cls"), JsonGetLong(args, "depth"))
+        Case "desktop_probe"
+            outText = WinOps.WoDesktopJson()
         Case "find_gui"
             outText = ToolFindGui(args)
         Case "execution_state"
@@ -2832,7 +2846,12 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
                 outText = Vba6Probe.WindowProbeJson(JsonGetLong(args, "wnd_max", 200))
             ElseIf JsonGetBool(args, "mem_scan", False) Then
                 ' RE round-32: replicate the whole-image scan over LIVE memory
-                outText = Vba6Probe.MemScanJson(ParseHexOrLong(JsonGetStr(args, "scan_addr")), JsonGetLong(args, "scan_len"), JsonGetLong(args, "scan_lo"), JsonGetLong(args, "scan_hi"), JsonGetLong(args, "scan_max"))
+                Dim r13Addr As Long, r13Over As Boolean
+                If Not TryParseHexOrLong(JsonGetStr(args, "scan_addr"), r13Addr, r13Over) Then
+                    outText = ArgRangeJson("vba6_probe", "scan_addr", JsonGetStr(args, "scan_addr"), r13Over)
+                Else
+                    outText = Vba6Probe.MemScanJson(r13Addr, JsonGetLong(args, "scan_len"), JsonGetLong(args, "scan_lo"), JsonGetLong(args, "scan_hi"), JsonGetLong(args, "scan_max"))
+                End If
             ElseIf JsonGetBool(args, "export_rvas", False) Then
                 ' RE round-25/26: verify every claimed RVA by name lookup
                 outText = Vba6Probe.ExportRvasJson()
@@ -2851,7 +2870,15 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
                 r23Rva = Vba6Probe.ResolveRvaSpec(r23Spec, r23Which)
                 r23Mod = 0
                 If r23Which = "vb6" Then r23Mod = Vba6Probe.HostBase()
-                outText = Vba6Probe.MemDumpJson(r23Rva, ParseHexOrLong(JsonGetStr(args, "mem_addr")), JsonGetLong(args, "mem_len"), r23Mod)
+                Dim r13AddrRaw As String, r13Addr2 As Long, r13Over2 As Boolean
+                r13AddrRaw = JsonGetStr(args, "mem_addr")
+                If Len(r13AddrRaw) = 0 Then
+                    outText = Vba6Probe.MemDumpJson(r23Rva, 0, JsonGetLong(args, "mem_len"), r23Mod)
+                ElseIf Not TryParseHexOrLong(r13AddrRaw, r13Addr2, r13Over2) Then
+                    outText = ArgRangeJson("vba6_probe", "mem_addr", r13AddrRaw, r13Over2)
+                Else
+                    outText = Vba6Probe.MemDumpJson(r23Rva, r13Addr2, JsonGetLong(args, "mem_len"), r23Mod)
+                End If
             ElseIf JsonGetBool(args, "worker_call", False) Then
                 outText = Vba6Probe.WorkerCallJson(JsonGetStr(args, "worker_text"), JsonGetBool(args, "worker_bstr", True), JsonGetLong(args, "worker_p1", 1), JsonGetLong(args, "worker_p2", 1), JsonGetLong(args, "worker_p3", 0), JsonGetLong(args, "worker_p4", 0), JsonGetLong(args, "worker_p5", 1), JsonGetLong(args, "worker_p6", 1), JsonGetLong(args, "worker_p7", 0), JsonGetBool(args, "worker_set_bit", False), JsonGetBool(args, "worker_p2_engine", False))
             ElseIf Len(JsonGetStr(args, "rva_call")) > 0 Then
@@ -2970,6 +2997,15 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
             ' extension library dispatch (returns empty when the name is not ours)
             outText = Extensions.Dispatch(name, args)
             If Len(outText) = 0 Then Err.Raise vbObjectError + 100, "CodeTools", "Unknown tool: " & name
+    ' R12: the live desktop{} block on the input-family receipts (measured, never inferred).
+    ' send_window_message is NOT refused on a non-interactive desktop: its PostMessage path
+    ' was measured to deliver while another process owned the foreground.
+    Select Case name
+    Case "send_window_message", "activate_component", "native_breakpoint"
+        If Len(outText) > 0 Then outText = JsonPrependMembers(outText, WinOps.WoDesktopFieldsJson())
+    Case "set_codepane"
+        If JsonGetBool(args, "activate", False) And Len(outText) > 0 Then outText = JsonPrependMembers(outText, WinOps.WoDesktopFieldsJson())
+    End Select
     End Select
     item("text") = StampMcp(SealedReceipt(name, outText))
     content.Add item
@@ -3838,7 +3874,22 @@ End Sub
 ' first) and the gate backstop around ONLY the exec_probe branch, then merges the guard
 ' receipt into the reply. The probe body itself is UNCHANGED, so a clean probe still
 ' returns byte-identically and no existing successful caller can change behaviour.
+' R14: the probe line may come from a file instead of inline text.
 Private Function ToolVba6ExecProbe(ByVal args As Object) As String
+    Dim fIn As String, fBytes As Long, fTxt As String, fErr As String
+    Dim encName As String
+    If Not ResolveTextInput("vba6_probe", "exec_line", JsonGetStr(args, "exec_line"), JsonGetStr(args, "exec_line_file"), fTxt, fErr, fIn, fBytes, encName) Then
+        ToolVba6ExecProbe = fErr
+        Exit Function
+    End If
+    If Len(fIn) > 0 Then args("exec_line") = fTxt
+    Dim res As String
+    res = ToolVba6ExecProbeCore(args)
+    If Len(fIn) > 0 Then res = AppendInputFileEcho(res, fIn, fBytes, encName)
+    ToolVba6ExecProbe = res
+End Function
+
+Private Function ToolVba6ExecProbeCore(ByVal args As Object) As String
     Dim res As String
     On Error Resume Next
     ' Only the exec_probe branch hands a line to EbExecuteLine; the other probe branches
@@ -3846,7 +3897,7 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
     If Not JsonGetBool(args, "exec_probe", False) Then
         Err.Clear
         On Error GoTo 0
-        ToolVba6ExecProbe = ToolVba6ExecProbeBody(args)
+        ToolVba6ExecProbeCore = ToolVba6ExecProbeBody(args)
         Exit Function
     End If
     On Error GoTo 0
@@ -3861,13 +3912,13 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
     Dim frag As String
     frag = ModalGuardFragment()
     If Len(frag) = 0 Then
-        ToolVba6ExecProbe = res
+        ToolVba6ExecProbeCore = res
         Exit Function
     End If
     Dim merged As String
     merged = JsonPrependMembers(res, frag)
     If merged <> res Then
-        ToolVba6ExecProbe = merged
+        ToolVba6ExecProbeCore = merged
         Exit Function
     End If
     ' The guard fields could NOT be merged because the probe's answer was not a plain
@@ -3882,7 +3933,7 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
     d("raw") = res
     d("note") = "the exec probe's answer was not a plain non-empty JSON object, so the modal-guard fields could not be merged into it in place. The probe's own answer is carried verbatim in raw, and the guard receipt is in the modal* fields."
     Call MergeModalGuard(d)
-    ToolVba6ExecProbe = JsonStringify(d)
+    ToolVba6ExecProbeCore = JsonStringify(d)
 End Function
 
 Private Function ToolVba6ExecProbeBody(ByVal args As Object) As String
@@ -3911,6 +3962,7 @@ Private Function ToolVba6ExecProbeBody(ByVal args As Object) As String
         Set d = CreateObject("Scripting.Dictionary")
         d("ok") = False
         d("reason") = "exec_error"
+        d("failureKind") = "channel_error"
         d("tool") = "vba6_probe"
         d("probe") = "exec_probe"
         Dim e As Object
@@ -3944,6 +3996,7 @@ Private Function ToolVba6ExecProbeBody(ByVal args As Object) As String
     Set addd = CreateObject("Scripting.Dictionary")
     addd("ok") = False
     addd("reason") = "exec_error"
+    addd("failureKind") = "statement_raised"
     addd("transportReasonSpace") = transportNote
     Dim e2 As Object
     Set e2 = CreateObject("Scripting.Dictionary")
@@ -3963,6 +4016,7 @@ Private Function ToolVba6ExecProbeBody(ByVal args As Object) As String
         Set d3 = CreateObject("Scripting.Dictionary")
         d3("ok") = False
         d3("reason") = "exec_error"
+    d3("failureKind") = "statement_raised"
         d3("tool") = "vba6_probe"
         d3("probe") = "exec_probe"
         Dim e3 As Object
@@ -4131,17 +4185,162 @@ Private Function ImCountLines(ByVal s As String) As Long
     ImCountLines = UBound(Split(t, vbLf)) + 1
 End Function
 
-Private Function ToolImmediateEval(ByVal expression As String, ByVal timeoutMs As Long) As String
+' =====================================================================
+' R14: file-fed inputs. A caller that cannot safely embed a long or
+' quote-heavy string may name a FILE instead; the file text becomes the
+' inline value. Inline and file are mutually exclusive, and every rejection
+' is structured - never a silent fallback.
+' =====================================================================
+Private Function ReadInputFileText(ByVal p As String, ByRef content As String, ByRef nBytes As Long, ByRef encName As String, ByRef errReason As String, ByRef errDetail As String) As Boolean
+    ReadInputFileText = False
+    content = ""
+    nBytes = 0
+    encName = ""
+    errReason = ""
+    errDetail = ""
+    Dim b() As Byte
+    On Error Resume Next
+    Err.Clear
+    If Len(Dir$(p)) = 0 Then
+        errReason = "input_file_not_found"
+        errDetail = p
+        Exit Function
+    End If
+    nBytes = FileLen(p)
+    If Err.Number <> 0 Then
+        Err.Clear
+        errReason = "input_file_unreadable"
+        errDetail = p
+        Exit Function
+    End If
+    If nBytes > INPUT_FILE_MAX_BYTES Then
+        errReason = "input_file_too_large"
+        errDetail = "size=" & CStr(nBytes) & " cap=" & CStr(INPUT_FILE_MAX_BYTES)
+        Exit Function
+    End If
+    Encoding.ReadAllBytesTo p, b
+    If Err.Number <> 0 Then
+        Err.Clear
+        errReason = "input_file_unreadable"
+        errDetail = p
+        Exit Function
+    End If
+    If Encoding.ByteCount(b) > 0 Then
+        encName = Encoding.DetectEncoding(b)
+        Encoding.DecodeBytes b, encName, content
+        If Err.Number <> 0 Then
+            Err.Clear
+            errReason = "input_file_decode_failed"
+            errDetail = encName
+            Exit Function
+        End If
+    End If
+    On Error GoTo 0
+    ReadInputFileText = True
+End Function
+
+Private Function ResolveTextInput(ByVal toolName As String, ByVal paramName As String, ByVal inlineVal As String, ByVal fileVal As String, ByRef outText As String, ByRef errJson As String, ByRef inputFile As String, ByRef inputBytes As Long, ByRef inputEncoding As String) As Boolean
+    ResolveTextInput = False
+    outText = ""
+    errJson = ""
+    inputFile = ""
+    inputBytes = 0
+    inputEncoding = ""
+    Dim d As Object
+    If Len(fileVal) > 0 And Len(inlineVal) > 0 Then
+        Set d = CreateObject("Scripting.Dictionary")
+        d("ok") = False
+        d("tool") = toolName
+        d("reason") = "both_inline_and_file"
+        d(paramName) = inlineVal
+        d(paramName & "_file") = fileVal
+        d("note") = "pass EITHER " & paramName & " OR " & paramName & "_file, not both; nothing was executed"
+        errJson = JsonStringify(d)
+        Exit Function
+    End If
+    If Len(fileVal) > 0 Then
+        Dim reason As String, detail As String, enc As String, content As String, n As Long
+        If Not ReadInputFileText(fileVal, content, n, enc, reason, detail) Then
+            Set d = CreateObject("Scripting.Dictionary")
+            d("ok") = False
+            d("tool") = toolName
+            d("reason") = reason
+            d("path") = fileVal
+            If Len(detail) > 0 Then d("detail") = detail
+            d("note") = "nothing was executed"
+            errJson = JsonStringify(d)
+            Exit Function
+        End If
+        outText = content
+        inputFile = fileVal
+        inputBytes = n
+        inputEncoding = enc
+        ResolveTextInput = True
+        Exit Function
+    End If
+    outText = inlineVal
+    ResolveTextInput = True
+End Function
+
+' Merge the file-input echo into an ALREADY-BUILT JSON object. When the answer is
+' not a plain object the answer is returned unchanged: the probe evidence outranks
+' the echo, and a missing echo is never disguised as success.
+Private Function AppendInputFileEcho(ByVal jsonText As String, ByVal inputFile As String, ByVal inputBytes As Long, ByVal inputEncoding As String) As String
+    AppendInputFileEcho = jsonText
+    If Len(inputFile) = 0 Then Exit Function
+    If Len(jsonText) = 0 Then Exit Function
+    If Left$(Trim$(jsonText), 1) <> "{" Then Exit Function
+    Dim d As Object
+    Dim frag As String
+    Set d = CreateObject("Scripting.Dictionary")
+    d("inputFile") = inputFile
+    d("inputBytes") = inputBytes
+    d("inputEncoding") = inputEncoding
+    frag = JsonStringify(d)
+    If Len(frag) < 3 Then Exit Function
+    frag = Mid$(frag, 2, Len(frag) - 2)
+    AppendInputFileEcho = JsonPrependMembers(jsonText, frag)
+End Function
+
+Private Function ToolImmediateEval(ByVal expression As String, ByVal expressionFile As String, ByVal timeoutMs As Long) As String
+    Dim txt As String
+    Dim errJson As String
+    Dim fIn As String
+    Dim fBytes As Long
+    Dim fEnc As String
+    If Not ResolveTextInput("immediate_eval", "expression", expression, expressionFile, txt, errJson, fIn, fBytes, fEnc) Then
+        ToolImmediateEval = errJson
+        Exit Function
+    End If
     Dim o As Object
-    Set o = ImExecuteImmediate("eval", expression, timeoutMs)
-    o("expression") = expression
+    Set o = ImExecuteImmediate("eval", txt, timeoutMs)
+    o("expression") = txt
+    If Len(fIn) > 0 Then
+        o("inputFile") = fIn
+        o("inputBytes") = fBytes
+        o("inputEncoding") = fEnc
+    End If
     ToolImmediateEval = JsonStringify(o)
 End Function
 
-Private Function ToolImmediateRun(ByVal code As String, ByVal timeoutMs As Long) As String
+Private Function ToolImmediateRun(ByVal code As String, ByVal codeFile As String, ByVal timeoutMs As Long) As String
+    Dim txt As String
+    Dim errJson As String
+    Dim fIn As String
+    Dim fBytes As Long
+    Dim fEnc As String
+    If Not ResolveTextInput("immediate_run", "code", code, codeFile, txt, errJson, fIn, fBytes, fEnc) Then
+        ToolImmediateRun = errJson
+        Exit Function
+    End If
     Dim o As Object
-    Set o = ImExecuteImmediate("run", code, timeoutMs)
-    o("code") = code
+    Set o = ImExecuteImmediate("run", txt, timeoutMs)
+    o("code") = txt
+    If Len(fIn) > 0 Then
+        o("inputFile") = fIn
+        o("inputBytes") = fBytes
+        o("inputEncoding") = fEnc
+    End If
     ToolImmediateRun = JsonStringify(o)
 End Function
 
@@ -4340,7 +4539,7 @@ Private Function ToolIdeQuietMode(ByVal enable As Boolean, ByVal ttlMs As Long) 
     d("foregroundReadable") = (fgB <> 0 Or fgA <> 0)
     d("advisory") = IIf(nowOn, QUIET_ADVISORY, "")
     d("suppressedPoints") = "control_window{action:""activate""} skips Window.SetFocus while quiet mode is ON (that receipt carries quietModeSuppressedFocus:true). native_breakpoint CANNOT be issued without activating the IDE - it is a Debug-menu command - so quiet mode can only give the foreground BACK there (quietModeForegroundRestored)."
-    d("note") = "quiet OFF restores the pre-v1.9.0 behaviour byte for byte: no SetFocus is suppressed and no quiet{} block is added to any receipt. foregroundReadable=false means GetForegroundWindow() returned 0 in this window station (it does here) - that must NOT be read as the focus was left alone."
+    d("note") = "quiet OFF restores the pre-v1.9.0 behaviour byte for byte: no SetFocus is suppressed and no quiet{} block is added to any receipt. foregroundReadable=false means GetForegroundWindow() returned 0; that happens on a non-interactive or locked desktop and is reported as-is - it must NOT be read as the focus was left alone."
     ToolIdeQuietMode = JsonStringify(d)
 End Function
 
@@ -7209,8 +7408,9 @@ Private Function ToolActivateComponent(ByVal name As String, ByVal window As Str
     root("foregroundBefore") = fgBefore
     root("foregroundAfter") = fgAfter
     root("foregroundTookFocus") = (fgAfter <> fgBefore)
-    ' TASK-P1-164 (A): 0 means the handle could not be READ in this window station - it is
-    ' NEVER evidence that the focus was left alone.
+    ' TASK-P1-164 (A): foregroundReadable is a LIVE measurement; 0 means no foreground
+    ' handle could be read (e.g. a locked or non-interactive desktop) and it is NEVER
+    ' evidence that the focus was left alone.
     root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
     If quietOn Then
         root("quietModeSuppressedFocus") = False
@@ -10739,6 +10939,62 @@ Private Function ParseHexOrLong(ByVal s As String) As Long
     ParseHexOrLong = v
 End Function
 
+' R13: the overflow-safe twin of ParseHexOrLong. The historic parser multiplied into a Long
+' and raised VB error 6 (overflow) for any value above 0x7FFFFFFF, which surfaced as an
+' unstructured unexpected_error instead of a refusal. This one parses into a Double and
+' REPORTS the overflow (False + overflow=True) instead of wrapping the value.
+Private Function TryParseHexOrLong(ByVal s As String, ByRef outVal As Long, ByRef overflow As Boolean) As Boolean
+    Dim t As String
+    Dim i As Long
+    Dim ch As String
+    Dim d As Double
+    TryParseHexOrLong = False
+    outVal = 0
+    overflow = False
+    t = Trim$(s)
+    If Len(t) = 0 Then
+        TryParseHexOrLong = True
+        Exit Function
+    End If
+    If LCase$(Left$(t, 2)) = "0x" Then t = Mid$(t, 3)
+    If LCase$(Right$(t, 1)) = "h" Then t = Left$(t, Len(t) - 1)
+    If LCase$(Left$(t, 3)) = "&#x" Then t = Mid$(t, 4)
+    If Len(t) = 0 Then
+        TryParseHexOrLong = True
+        Exit Function
+    End If
+    d = 0
+    For i = 1 To Len(t)
+        ch = LCase$(Mid$(t, i, 1))
+        If ch >= "0" And ch <= "9" Then
+            d = d * 16 + (Asc(ch) - Asc("0"))
+        ElseIf ch >= "a" And ch <= "f" Then
+            d = d * 16 + (Asc(ch) - Asc("a") + 10)
+        End If
+        If d > 2147483647# Then
+            overflow = True
+            Exit Function
+        End If
+    Next
+    outVal = CLng(d)
+    TryParseHexOrLong = True
+End Function
+
+' R13: the structured out-of-range refusal (replaces a raw VB overflow).
+Private Function ArgRangeJson(ByVal toolName As String, ByVal fieldName As String, ByVal raw As String, ByVal overflowed As Boolean) As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("tool") = toolName
+    d("failureKind") = "arg_out_of_range"
+    d("reason") = "the " & fieldName & " value is out of range for a 32-bit signed probe address"
+    d("field") = fieldName
+    d("value") = raw
+    d("overflow") = overflowed
+    d("note") = "nothing was read or executed; the value is parsed without wrapping, so anything above 0x7FFFFFFF is refused instead of being silently reinterpreted"
+    ArgRangeJson = JsonStringify(d)
+End Function
+
 Private Function ParseVariantValue(ByVal s As String) As Variant
     Dim t As String
     t = Trim$(s)
@@ -11046,7 +11302,7 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
     If quietSuppressed Then
         root("quietModeSuppressedFocus") = True
         root("suppressedAction") = "control_window{action:""activate""}: Window.SetFocus was NOT called because ide_quiet_mode is ON"
-        root("quietModeNote") = "quiet mode is ON: this action did NOT ask for the foreground. The window was resolved and every other part of the action was performed. NOTE: foregroundBefore/foregroundAfter can both be 0 in this window station - foregroundReadable=false says the handle could not be READ, not that the focus was left alone."
+        root("quietModeNote") = "quiet mode is ON: this action did NOT ask for the foreground. The window was resolved and every other part of the action was performed. NOTE: foregroundBefore/foregroundAfter are LIVE values and can both be 0 on a non-interactive or locked desktop - foregroundReadable=false says the handle could not be READ, not that the focus was left alone."
     End If
     If Len(pAssertComp) = 0 Then
         root("paneAssertionTarget") = "no code pane could be matched to the addressed window (tried hwnd identity, then exact caption equality), so the assertion is reported as notApplicable - never as a pass"
@@ -14584,7 +14840,7 @@ Private Function BaselineDiffDict(ByVal baselineText As String, ByVal arr As Obj
     d("addedCount") = added.Count
     d("removedCount") = removed.Count
     d("unchangedCount") = unchanged
-    d("note") = "added[] are diagnostics that are NOT in the baseline; a baseline diagnostic that only MOVED is not added (that was MCP-15: inserting 74 lines made 11 pre-existing false positives look new)."
+    d("note") = "added[] are diagnostics that are NOT in the baseline; a baseline diagnostic that only MOVED is not added (inserting 74 lines made 11 pre-existing false positives look new)."
     Set BaselineDiffDict = d
 End Function
 
@@ -16326,7 +16582,7 @@ End Sub
 
 Private Function NotePreviewOpKeys() As String
     NotePreviewOpKeys = "preview_edit honours the DECLARED per-op keys {op, anchor, text} plus a per-op match and occurrence - the " & _
-        "SAME set apply_edits honours. Since TASK-P1-104 both tools resolve through one pipeline (one norm index, ResolveAnchor, the " & _
+        "SAME set apply_edits honours. Both tools resolve through one pipeline (one norm index, ResolveAnchor, the " & _
         "beta-2 continuation guard), so a preview taken here predicts the write those tools perform. A per-op scope is read by NO tool " & _
         "at all (BuildOps never looks at the key), so it had no effect: the anchor was resolved over the WHOLE module. For a " & _
         "range-limited edit use edit_by_anchor, which declares match/occurrence/scope."
@@ -16468,7 +16724,7 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
         root("ignoredArgs") = Array("match")
         root("ignoredArgsNote") = "preview_edit has no top-level `match` parameter; the argument you passed was IGNORED, so this " & _
             "preview describes the DEFAULT (normalized) matching for every op that does not carry its own per-op match - a per-op " & _
-            "match/occurrence IS honoured (TASK-P1-104). apply_edits and edit_by_anchor DO honour the top-level match, so a preview " & _
+            "match/occurrence IS honoured. apply_edits and edit_by_anchor DO honour the top-level match, so a preview " & _
             "taken here with match=" & Trim$(matchMode) & " can still disagree with the write those tools perform."
     End If
     ToolPreviewEdit = JsonStringify(root)
@@ -16684,7 +16940,7 @@ Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByV
     extra("condCompRequired") = False
     extra("condCompNote") = "the emitted guard is a RUNTIME check, so it does not depend on the project's CondComp. A '#If MCP_TRACE' block would be COMPILE-TIME: the VBIDE object model does not expose CondComp and project_meta edits the .vbp text, so an already-loaded project keeps its old in-memory CondComp and the block is compiled out (measured)."
     extra("moduleRequired") = "modMcpTrace"
-    extra("moduleHint") = "inject_trace ATTACHES modMcpTrace automatically when the project does not have it (TASK-P1-129): the module source is embedded in the add-in, the header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the running VB6.EXE version resource, else English), and the attachment is VERIFIED by re-reading the component list. Nothing has to be imported by hand. remove_trace removes the module again together with the injected blocks."
+    extra("moduleHint") = "inject_trace ATTACHES modMcpTrace automatically when the project does not have it: the module source is embedded in the add-in, the header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the running VB6.EXE version resource, else English), and the attachment is VERIFIED by re-reading the component list. Nothing has to be imported by hand. remove_trace removes the module again together with the injected blocks."
     extra("modulePresentBefore") = modInfo("modulePresentBefore")
     extra("moduleAutoAttached") = modInfo("moduleAutoAttached")
     extra("moduleAttachAction") = modInfo("moduleAttachAction")
@@ -16720,7 +16976,7 @@ Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByV
         extra("moduleMissingAdvice") = "modMcpTrace is STILL missing after the automatic attach attempt, so the injected guard cannot compile: VB6 will raise a MODAL compile-error dialog (measured: Compile error / Sub or Function not defined) that blocks end and remove_trace. moduleAttachAction/moduleAttachError say why the attach failed - the failure is reported, never silently downgraded."
         extra("readyToTrace") = False
     End If
-    extra("enableHint") = "set MCP_TRACE_ON=1 (or MCP_TRACE_FILE=<path>) in the environment of the VB6 process BEFORE starting it; McpTraceOn() reads the environment at call time. THREE preconditions are checked in this same receipt: (1) modulePresent - inject_trace attaches modMcpTrace automatically (TASK-P1-129) and verifies it, so a false here means the attach FAILED (see moduleAttachError) and the guard cannot compile; (2) sinkDirWritable/sinkAdvice - the sink directory must be creatable (the generated module MkDirs it, else falls back to %TEMP%\mcp_trace.jsonl and logs the reason to MCP_TRACE_ERR_FILE); (3) readyToTrace - true only when both hold."
+    extra("enableHint") = "set MCP_TRACE_ON=1 (or MCP_TRACE_FILE=<path>) in the environment of the VB6 process BEFORE starting it; McpTraceOn() reads the environment at call time. THREE preconditions are checked in this same receipt: (1) modulePresent - inject_trace attaches modMcpTrace automatically and verifies it, so a false here means the attach FAILED (see moduleAttachError) and the guard cannot compile; (2) sinkDirWritable/sinkAdvice - the sink directory must be creatable (the generated module MkDirs it, else falls back to %TEMP%\mcp_trace.jsonl and logs the reason to MCP_TRACE_ERR_FILE); (3) readyToTrace - true only when both hold."
     extra("shipNote") = "the injected blocks call McpTrace/McpTraceOn, which are defined in modMcpTrace: if you keep the calls and build/ship an EXE or DLL, that module must be compiled into it. remove_trace removes the injected blocks AND the auto-attached module."
     extra("runtimeCost") = "with the runtime guard the call is always compiled: one boolean check per traced line"
     ' TASK-P1-059: the segmented timing the card requires (read/predict/lint/write + write count).
@@ -18279,8 +18535,16 @@ Private Function ToolTodoStatus() As String
     Dim tasks As Object, reps As Object
     Set tasks = New Collection
     Set reps = New Collection
-    CollectMd base & "\_bus\tasks\P1", tasks
-    CollectMd base & "\_bus\reports\P1", reps
+    Dim tdir As String
+    tdir = Environ$("VB6MCP_TASKS_DIR")
+    If Len(tdir) > 0 And Right$(tdir, 1) = "\" Then tdir = Left$(tdir, Len(tdir) - 1)
+    If Len(tdir) > 0 Then
+        CollectMd tdir & "\tasks", tasks
+        CollectMd tdir & "\reports", reps
+    Else
+        CollectMd base & "\_bus\tasks\P1", tasks
+        CollectMd base & "\_bus\reports\P1", reps
+    End If
     Dim openN As Long, i As Long
     openN = 0
     For i = 1 To tasks.Count
@@ -18295,7 +18559,7 @@ Private Function ToolTodoStatus() As String
     root("reportCount") = reps.Count
     Set root("reports") = reps
     root("readOnly") = True
-    root("note") = "read-only: _bus/tasks/P1 and _bus/reports/P1 are scanned for status + title"
+    root("note") = "read-only: Markdown files under the task folder's tasks/ and reports/ subfolders are scanned for status + title; the task folder is auto-discovered from the project tree, or set VB6MCP_TASKS_DIR to point at it explicitly"
     ToolTodoStatus = JsonStringify(root)
 End Function
 
@@ -19282,11 +19546,14 @@ Private Function BreakingList() As Object
         "add_component(type=form): the form is now created by the IDE ITSELF through its own Add Form command, not by a .frm we synthesize", _
         "the receipt carries createdVia: ide_dialog | synthesized (plus ideRouteNote on the fallback) and projectDirWrites is [] on the IDE route; the call waits for the add-in watchdog to press the IDE's own modal confirm button, so it takes about 3.5-4.9 s instead of milliseconds. The synthesized fallback still exists, now with LinkTopic = the component name and the IDE's real default geometry (3015/120/465/4560)")
     c.Add BreakingEntry("v1.6.0", _
-        "recorded tool-face limitations: command_bars{list} does NOT enumerate the Add-Ins popup (only execute-by-caption or by id reaches those items), and the AddFromTemplate form route is unavailable on this machine (no plain form template exists in editsec\templates or the VB6 Template\Forms folder) and was deliberately NOT implemented", _
+        "recorded tool-face limitations: command_bars{list} does NOT enumerate the Add-Ins popup (only execute-by-caption or by id reaches those items), and the AddFromTemplate form route is unavailable on this machine (no plain form template exists in the source templates folder or the VB6 Template\Forms folder) and was deliberately NOT implemented", _
         "reach the settings entry with command_bars{action:""execute"",control:""VB6 MCP Settings...""}; create forms with add_component(type=form) as usual")
     c.Add BreakingEntry("v1.9.0", _
         "three tools were added - immediate_eval / immediate_run / ide_quiet_mode - and ide_state gained release_inflight / release_min_held_ms plus a release{} block (add-in 111 -> 114)", _
         "purely additive for existing callers: no existing tool lost a parameter, and no existing receipt changed on the quiet-OFF / no-release path. ide_state now ALWAYS carries a release{} block with a fixed key set (the same discipline as cancel{}), and read-only receipts gain gate* keys ONLY after a forced release has actually happened")
+    c.Add BreakingEntry("v1.10.0", _
+        "+1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=""api_unavailable"" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)", _
+        "purely additive for existing callers: no existing parameter was removed and no existing receipt changed. The 3 new parameters are OPTIONAL (absent = current behaviour) and desktop_probe is a new READ-ONLY tool. The 10 description-only changes are internal label text and change no behaviour and no receipt field. vba6_probe now reports a 7-value failureKind (not_loaded / alloc_failed / arg_out_of_range / address_invalid / not_readable / engine_zero / refused_by_design) and the immediate_* exec_error wrappers add channel_error / statement_raised")
     ' TASK-P1-089 (contract v1.7.0): the snapshot parameter added by TASK-P1-087 is
     ' ADDITIVE - it is optional and defaults to off, so no existing call changes behaviour
     ' (cross-build A/B over the shared call sequence: 0 differences). This version therefore
@@ -19311,7 +19578,7 @@ Private Function MigrationsList() As Object
     c.Add "v1.7.0: the frozen tool face was re-frozen once for that additive parameter - tools/schema_baseline.json == docs/tools_schema.json (sha256 1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE); the tool count is unchanged at 111, and mcp_info.breaking gains NO v1.7.0 entry because nothing in this version breaks a caller"
     c.Add "v1.9.0: immediate_eval / immediate_run run statements in the ACTIVE project's immediate context and carry the VALUE and the PRINTED text out through a private temp file - no Immediate-window pane read, and no Open/Print/Close for the caller. A statement that RAISES still blocks the IDE (On Error is REFUSED on this channel with ret=40036 - measured), so timeout_ms is a GATE-AGE threshold and NOT a hard timeout; immediate_* ARM that release, so the NEXT tool call heals the session by itself, and ide_state{release_inflight:true, release_min_held_ms} forces the gate open on demand"
     c.Add "v1.9.0: ide_state{release_inflight:true} FORCE-RELEASES the single-flight gate of a call that never came back. The receipt reports {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false} and says the blocked call is STILL RUNNING; the abandoned frame's unwind is swallowed exactly once, so the depth can never be decremented twice. release_min_held_ms (default 60000) keeps a HEALTHY long call from losing the guarantee"
-    c.Add "v1.9.0: ide_quiet_mode{on,ttl_ms} is a session-level switch. While ON, control_window{action:""activate""} does NOT call Window.SetFocus (the receipt says quietModeSuppressedFocus:true) and EVERY tools/call receipt carries quiet{...,advisory}. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the handle could not be READ (it is 0 here) - never read that as the focus having been left alone"
+    c.Add "v1.9.0: ide_quiet_mode{on,ttl_ms} is a session-level switch. While ON, control_window{action:""activate""} does NOT call Window.SetFocus (the receipt says quietModeSuppressedFocus:true) and EVERY tools/call receipt carries quiet{...,advisory}. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the handle could not be READ (a LIVE value that can be 0 on a locked or non-interactive desktop) - never read that as the focus having been left alone"
     Set MigrationsList = c
 End Function
 
@@ -19327,6 +19594,7 @@ Private Function ChangelogList() As Object
     c.Add "v1.8.0 replace_code{replace|delete} requires expected_sha256 (breaking for line-number callers; the refusal returns currentSha256); validate_code baseline + proc/procOffset/fingerprint/stableKey + baseline_diff; ide_state cancel_inflight + inflight{} on every read-only receipt; PRE-WRITE block pairing refusal in replace_code / add_code / apply_edits / edit_by_anchor; multi-line (block) anchors + duplicate-anchor hits + process-scope echo in edit_by_anchor; close_active_dialogs emits one key set on dry_run AND real clicks; add-in 107 + hub 5 = 112 tools (hub ide_restart added); contract v1.7.0 -> v1.8.0"
     c.Add "v1.7.0 optional snapshot parameter (default off) on replace_code / apply_edits / edit_by_anchor + undo_edit structured no_snapshot_for_component; additive, tool count stays 111, frozen tool face re-frozen once (1EE3BFA9...)"
     c.Add "v1.9.0 three tools: ide_quiet_mode (A - foreground safety: SetFocus suppressed, quiet{} + advisory on every receipt), immediate_eval / immediate_run (B - value and printed output carried out through a private temp file, so no pane read and no Open/Print/Close for the caller; an unparseable sink is a structured value_not_parsed); ide_state{release_inflight, release_min_held_ms} + release{} and an ARMED self-healing release (C / defect #10 - the single-flight gate is force-releasable); add-in tool count 111 -> 114; contract v1.8.0 -> v1.9.0"
+    c.Add "v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=""api_unavailable"" when an API fails); +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file); 12 tool DESCRIPTIONS neutralized (internal labels only - no behaviour change); vba6_probe 7-value structured failure envelope + immediate_* exec_error channel_error / statement_raised; add-in tool count 114 -> 115 (hub 5, DSH-facing total 119 -> 120); contract v1.9.0 -> v1.10.0"
     Set ChangelogList = c
 End Function
 
@@ -19637,7 +19905,7 @@ Private Function McpReasonJson(ByVal tagged As String, ByVal toolName As String,
             If UBound(parts) >= 2 Then d("cancelledKind") = parts(2)
             d("cancelledByTool") = m_cancelByTool
             d("cancelAgeMs") = GetTickCount() - m_cancelAt
-            d("note") = "the in-flight call stopped at its own pump point because a re-entrant READ-ONLY call asked it to (MCP-08). Its own sideEffects/undoSnapshots report any partial work; nothing outside what it had already done was touched."
+            d("note") = "the in-flight call stopped at its own pump point because a re-entrant READ-ONLY call asked it to. Its own sideEffects/undoSnapshots report any partial work; nothing outside what it had already done was touched."
             d("suggestedAction") = "re-read the component/pane state before retrying, because the aborted call may have completed part of its work. To stop a call blocked inside a HOST modal loop (where none of our pump points run) use the hub tool ide_restart."
         Case "anchor_not_found", "anchor_not_unique", "unknown_op"
             ' TASK-P1-100: an anchor that does not resolve - and an op outside R/I/D - is CALLER
@@ -19888,7 +20156,7 @@ Private Sub EnsureTraceModule(ByRef info As Object)
     info("ideMenuLanguageSource") = uiWhy
     info("commentLanguage") = lang
     info("commentLanguageSource") = langSrc
-    info("commentLanguageRule") = "UI-first (TASK-P1-129 final ruling): the IDE's own UI language wins when it can be read; otherwise the running VB6.EXE version resource; otherwise English."
+    info("commentLanguageRule") = "UI-first (final ruling): the IDE's own UI language wins when it can be read; otherwise the running VB6.EXE version resource; otherwise English."
     Dim code As String
     code = TraceGen.TraceModuleSource(lang)
     info("moduleCodeLines") = (Len(code) - Len(Replace(code, vbCrLf, ""))) \ 2 + 1
@@ -19956,9 +20224,9 @@ Private Sub ReportTraceModuleKept(ByRef info As Object)
     manual = " To remove it yourself: confirm that NO '@mcp-trace' block remains anywhere in the project (search for the marker), then call remove_component with name='modMcpTrace'. remove_trace never does this for you."
     If TraceGen.IsAutogenTraceModule(ComponentPaneText(comp)) Then
         info("moduleAutogenMarker") = True
-        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN (TASK-P1-149); the previous automatic removal (reason removed_autogen_module) was withdrawn because (a) you may have added your own code to this auto-generated module and deleting it would have destroyed that code, and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling once the module was gone." & manual
+        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN; the previous automatic removal (reason removed_autogen_module) was withdrawn because (a) you may have added your own code to this auto-generated module and deleting it would have destroyed that code, and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling once the module was gone." & manual
     Else
-        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN (TASK-P1-149). It does not carry the VB6MCP autogen marker, so it is treated as YOUR module - and even an auto-generated one is never removed now, because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn." & manual
+        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN. It does not carry the VB6MCP autogen marker, so it is treated as YOUR module - and even an auto-generated one is never removed now, because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn." & manual
     End If
     Dim boundFile As String
     boundFile = ""
