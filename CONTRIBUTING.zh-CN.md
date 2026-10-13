@@ -78,8 +78,9 @@ tools\verify_registration.bat VB6MCP.dll  :: 插件注册自检
   **不要**为了让构建看起来更新而改动它们。
 * **每一份回执都必须诚实**。工具做不到某事时，必须给出**机器可读的原因**，而不是悄悄降级。
   这是本项目最重要的一条规矩；以诚实换取更好看的绿灯状态的 PR 会被拒绝。
-* **不要提交** `VB6MCP.dll`、构建日志、`*.before*`/`*.after*` 备份、内部工作区（`_bus/`、`re_work/`、
-  `docs/evidence/`）或一次性的 `tests/fix_round*.py` 考古脚本；`.gitignore` 已经覆盖了它们。
+* **不要提交** `VB6MCP.dll`、构建日志、`*.before*`/`*.after*` 备份 —— 公开的 `.gitignore` 已经覆盖
+  这些**通用**产物。维护者的私有工作目录与一次性脚本不属于公开树，请勿随 PR 提交；它们只在维护者
+  本地通过 `.git/info/exclude` 排除，**不在**公开发布的 `.gitignore` 里。
 
 ## 六、报告缺陷
 

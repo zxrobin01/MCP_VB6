@@ -1,61 +1,32 @@
-# VB6 构建产物
+# Public .gitignore - generic build products and scratch files only.
+# Maintainer-internal working directories are deliberately NOT listed here:
+# they live in the local .git/info/exclude, which never ships with the repository.
+
+# Build products
 VB6MCP.dll
 VB6MCP.exp
 VB6MCP.lib
-build.log
 *.exe
 *.ocx
 *.oca
 *.vbw
+*.log
+build.status
 
-# 编译/运行临时文件
-__pycache__/
-*.pyc
+# Generic backups / scratch
 *.bak
 *.tmp
+*.before*
+*.after*
+*.post*
 
-# 测试用的本地拷贝
-tests/_msaddndr.dll
+# Python
+__pycache__/
+*.pyc
 
-# battery 测试运行产物（一次性测试工程）
-_test_proj.vbp
-_test_proj.vbw
-_test_export.bas
-_mcp_test.txt
-_mcp_test.txt.bak
-Form1.frm
-Form1.frx
-TestMod1.bas
-TestModRenamed.bas
-TestCls1.cls
-*.vbg
-
-# 编辑器
+# Editor / OS noise
 *.scc
 *.vssscc
 *.vspscc
 Thumbs.db
 Desktop.ini
-
-# --- 开源准备（2026-10-12）：备份/中间态一律不入库 ---
-*.before*
-*.after*
-*.post*
-*.bak
-
-# 内部工作区（不随源发布）
-_bus/
-re_work/
-integration/
-_backup_premerge/
-docs/evidence/
-
-# 一次性考古/补丁脚本与外来转储
-tests/fix_round*.py
-*1108.json
-
-# 构建产物与本地环境
-*.log
-build.status
-build.status.before*
-*.bak_*

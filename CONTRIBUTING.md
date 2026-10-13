@@ -81,9 +81,11 @@ the same commit and say so in the description; `check_schema_baseline.py` will f
   machine-readable reason instead of silently degrading. This is the single most important
   rule in this project, and pull requests that trade honesty for a greener status will be
   rejected.
-* **Do not commit** `VB6MCP.dll`, build logs, `*.before*`/`*.after*` backups, the internal
-  workspaces (`_bus/`, `re_work/`, `docs/evidence/`) or the one-off `tests/fix_round*.py`
-  archaeology scripts; `.gitignore` already covers them.
+* **Do not commit** `VB6MCP.dll`, build logs or `*.before*`/`*.after*` backups - the published
+  `.gitignore` already covers those generic artifacts. The maintainer's private working directories
+  and one-off scratch scripts are not part of the public tree: keep them out of your pull request.
+  Note that those are excluded only in the maintainer's local checkout (`.git/info/exclude`), not in
+  the published `.gitignore`.
 
 ## 6. Reporting a bug
 
