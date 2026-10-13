@@ -12,6 +12,10 @@ This file records **source and feature** changes only; packaging, release and ot
 
 ## 2026-10-13
 
+### 15:08 · Compilation no longer hangs · tighter defaults in the snapshot and audit scripts
+
+**What changed**: the modal guard now **restarts its deadline whenever it sees a box**, and the compile path's deadline covers the **whole call** => compilation no longer hangs but returns a structured result (the IDE box is dismissed with a safe button); the tool-face snapshot script now **writes no file by default**, and the strict audit script **requires an explicit target** and **refuses the machine's reserved port**.
+**Why**: while compiling, the IDE pops its own "Make Project" box, and that box appears **later than the guard deadline** => the call never returned; the snapshot script used to **overwrite the contract baseline** by default; the audit script's default target happened to be the **machine's reserved port**.
 ### 14:50 · Breakpoint line pre-check · modal safety guard
 
 **What changed**: before toggling a breakpoint the tool now **checks whether that line allows it** (if not it **refuses structurally** instead of triggering the IDE error box); added a **modal safety guard** - when a call is blocked by a modal box the IDE itself popped up, it **clicks only safe buttons** and **reports honestly** (the box content, which button was clicked, elapsed time, side effects).
