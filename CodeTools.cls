@@ -6893,13 +6893,37 @@ Private Function ToolSetCodePane(ByVal component As String, ByVal selection As S
         applied.Add "view-ignored"
         ignoredView = True
     End If
+    ' TASK-P1-164 (A) close-out: activate=True SHOWS the pane, which can raise the IDE's
+    ' own window. Same class as activate_component / native_breakpoint: cannot be
+    ' suppressed (it IS the request), so quiet mode compensates.
+    Dim fgBefore As Long
+    Dim fgAfter As Long
+    Dim quietOn As Boolean
     If activate Then
+        fgBefore = WoFrontHwnd()
         cp.Show
         applied.Add "activated"
     End If
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("component") = cp.CodeModule.Name
+    If activate Then
+        fgAfter = WoFrontHwnd()
+        quietOn = QuietActive()
+        If quietOn And fgAfter <> fgBefore Then
+            WoFrontRestore fgBefore
+            fgAfter = WoFrontHwnd()
+        End If
+        root("foregroundBefore") = fgBefore
+        root("foregroundAfter") = fgAfter
+        root("foregroundTookFocus") = (fgAfter <> fgBefore)
+        root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+        If quietOn Then
+            root("quietModeSuppressedFocus") = False
+            root("quietModeForegroundRestored") = (fgAfter = fgBefore)
+            root("quietModeNote") = "quiet mode is ON. activate=True SHOWS the pane - that is the request - so it was not suppressed; the foreground was taken and then GIVEN BACK (foregroundTookFocus / quietModeForegroundRestored say which). A call WITHOUT activate does not report these fields at all."
+        End If
+    End If
     Set root("applied") = applied
     If ignoredView Then
         root("ignoredArgs") = Array("view")
@@ -6957,6 +6981,13 @@ End Function
 Private Function ToolActivateComponent(ByVal name As String, ByVal window As String) As String
     Dim comp As VBIDE.VBComponent
     Set comp = FindComponent(name)
+    ' TASK-P1-164 (A) close-out / issue #7: this tool's PURPOSE is to put a VBIDE window on
+    ' screen, and doing that can raise the IDE's own top-level window - measured on the live
+    ' IDE as a foreground CHANGE. It is the same class as native_breakpoint: it cannot be
+    ' suppressed (showing the window IS the request), so quiet mode COMPENSATES by putting
+    ' the user's window back afterwards, and says so instead of claiming a suppression.
+    Dim fgBefore As Long
+    fgBefore = WoFrontHwnd()
     Select Case LCase$(window)
         Case "code"
             Dim cm As VBIDE.CodeModule
@@ -6968,10 +6999,32 @@ Private Function ToolActivateComponent(ByVal name As String, ByVal window As Str
         Case Else
             comp.Activate
     End Select
+    Dim fgAfter As Long
+    fgAfter = WoFrontHwnd()
+    Dim quietOn As Boolean
+    quietOn = QuietActive()
+    Dim quietRestored As Boolean
+    quietRestored = False
+    If quietOn And fgAfter <> fgBefore Then
+        WoFrontRestore fgBefore
+        fgAfter = WoFrontHwnd()
+        quietRestored = (fgAfter = fgBefore)
+    End If
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("component") = comp.Name
     root("window") = window
+    root("foregroundBefore") = fgBefore
+    root("foregroundAfter") = fgAfter
+    root("foregroundTookFocus") = (fgAfter <> fgBefore)
+    ' TASK-P1-164 (A): 0 means the handle could not be READ in this window station - it is
+    ' NEVER evidence that the focus was left alone.
+    root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+    If quietOn Then
+        root("quietModeSuppressedFocus") = False
+        root("quietModeForegroundRestored") = quietRestored
+        root("quietModeNote") = "quiet mode is ON. Showing a VBIDE window is this tool's whole purpose, so the action was NOT suppressed: the foreground was taken and then GIVEN BACK (foregroundTookFocus / quietModeForegroundRestored say which). This is the same compensation rule as native_breakpoint."
+    End If
     ToolActivateComponent = JsonStringify(root)
 End Function
 

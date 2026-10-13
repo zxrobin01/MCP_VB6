@@ -52,6 +52,17 @@ Private Declare Function WoGetWindowThreadProcessId Lib "user32" Alias "GetWindo
 Private Declare Function WoGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 Private Declare Function WoGetTickCount Lib "kernel32" Alias "GetTickCount" () As Long
 
+' ---- TASK-P1-157 (wheel #1): the fast attach timer --------------------------
+' A Win32 timer OWNED BY THIS MODULE. Measured on the live IDE: the watchdog that used
+' to be the ONLY driver of WheelScan runs at tmrWatch.Interval = 5000 in steady state
+' (measured 2 scans / 10 s), so a code pane opened after the last scan stayed
+' un-subclassed for up to ~5 s and the user's wheel went nowhere. The fast attach only
+' ever calls Win32 (EnumWindows / EnumChildWindows / GetWindowText / SetWindowLong) -
+' NO VBIDE call at all - which is exactly what makes it legal to run from a timer
+' callback (a WndProc must never do COM here).
+Private Declare Function WoSetTimer Lib "user32" Alias "SetTimer" (ByVal hWnd As Long, ByVal nIDEvent As Long, ByVal uElapse As Long, ByVal lpTimerFunc As Long) As Long
+Private Declare Function WoKillTimer Lib "user32" Alias "KillTimer" (ByVal hWnd As Long, ByVal nIDEvent As Long) As Long
+
 
 ' ---- TASK-P1-079: registry access for the settings path --------------------
 ' WScript.Shell (COM) RegWrite FAILED inside this add-in process - measured with a diagnostic
@@ -194,6 +205,25 @@ Private m_whPendPages As Long
 Private m_whPendTries As Long
 Private m_whPendResult As String
 Private m_whLastPaneCaption As String
+' TASK-P1-157 (A/E): per-hook classification. TRUE = the caption table identified this
+' window as a code pane on some scan. hooked[] keeps its P1-067 meaning (code panes
+' only); EVERY subclassed window is listed in the new attached[].
+Private m_whIsPane(0 To WHEEL_MAX - 1) As Boolean
+' TASK-P1-157 (B/E): the fast attach timer plus the per-window decision list of the
+' last attach pass (why each VbaWindow was or was not hooked).
+Private m_whFastId As Long
+Private m_whFastIn As Boolean
+Private m_whFastTicks As Long
+Private m_whFastLastAt As Long
+Private m_whAttachRuns As Long
+Private m_whDecHwnd(0 To WHEEL_SKIP_MAX - 1) As Long
+Private m_whDecTitle(0 To WHEEL_SKIP_MAX - 1) As String
+Private m_whDecDecision(0 To WHEEL_SKIP_MAX - 1) As String
+Private m_whDecCount As Long
+Private Const WHEEL_FAST_MS As Long = 250
+' TASK-P1-157: WheelScan and the fast attach BOTH use the WoScan* scratch arrays, and
+' WheelScan runs COM (which can pump). One flag keeps them from clobbering each other.
+Private m_woScanBusy As Boolean
 
 ' ---- TASK-P1-084: armed, one-shot CONFIRM of a modal WE opened ---------------
 ' Why this lives here and not in the caller: the IDE's own Add Form modal runs
@@ -1783,11 +1813,18 @@ Public Function WheelStateObj() As Object
     d("targetHwnd") = 0
     d("targetTitle") = ""
     d("targetCaption") = ""
-    If m_whCount > 0 Then
-        d("targetHwnd") = m_whHwnd(0)
-        d("targetTitle") = m_whTitle(0)
-        d("targetCaption") = m_whTitle(0)
-    End If
+    ' TASK-P1-157: the FIRST CODE PANE, not merely the first attached window (the fast
+    ' attach now subclasses the Immediate/Watch/Locals windows too, and P1-067 reads
+    ' target* as "which CODE PANE is armed" - a non-pane window must never appear here).
+    Dim ti As Long
+    For ti = 0 To m_whCount - 1
+        If m_whIsPane(ti) Then
+            d("targetHwnd") = m_whHwnd(ti)
+            d("targetTitle") = m_whTitle(ti)
+            d("targetCaption") = m_whTitle(ti)
+            Exit For
+        End If
+    Next
     d("skippedCount") = m_whSkipCount
     d("lastPaneCaption") = m_whLastPaneCaption
     Dim mc As Object
@@ -1844,8 +1881,16 @@ Public Function WheelStateObj() As Object
     d("topLineSpace") = "TASK-P1-067: lastTopLineBefore/After are VBIDE CodePane.TopLine (1-based) read back around the scroll; -1 means NO VALUE and the reason is in lastTopStatus/lastTopError: pane_not_found = the title resolved to no CodePane (forwarded untouched), pane_not_writable_in_break = the pane WAS resolved but the IDE refused the TopLine read/write (real VB error in lastTopError; the scroll is retried outside the window procedure by the timer - see pendingScroll/pendingScrollResult). The old EM_GETFIRSTVISIBLELINE channel is gone from these two fields because the code pane exposes no RichEdit20A child on this IDE (it read -1 and was never the behaviour oracle). paneTopLineNow is the ActiveCodePane.TopLine stamped by CodeTools."
     d("lastReason") = m_whLastReason
     d("reason") = WheelReason()
+    ' TASK-P1-157: hooked[] keeps its P1-067 meaning (the subclassed CODE PANES only).
+    ' attached[] is the new, complete list of every subclassed window with its role, and
+    ' attachDecisions[] (option E) says why each VbaWindow seen in the last pass was or
+    ' was not hooked - so a missing hook can never again look like a missing window.
     Dim hs As Object
     Set hs = New Collection
+    Dim att As Object
+    Set att = New Collection
+    Dim paneN As Long
+    paneN = 0
     For i = 0 To m_whCount - 1
         Dim he As Object
         Set he = CreateObject("Scripting.Dictionary")
@@ -1853,9 +1898,35 @@ Public Function WheelStateObj() As Object
         he("cls") = WoCls(m_whHwnd(i))
         he("title") = WoText(m_whHwnd(i))
         he("caption") = m_whTitle(i)
-        hs.Add he
+        he("isCodePane") = m_whIsPane(i)
+        att.Add he
+        If m_whIsPane(i) Then
+            hs.Add he
+            paneN = paneN + 1
+        End If
     Next
     Set d("hooked") = hs
+    Set d("attached") = att
+    d("attachedCount") = m_whCount
+    d("codePaneHookedCount") = paneN
+    Dim ds As Object
+    Set ds = New Collection
+    Dim di As Long
+    For di = 0 To m_whDecCount - 1
+        Dim de As Object
+        Set de = CreateObject("Scripting.Dictionary")
+        de("hwnd") = m_whDecHwnd(di)
+        de("title") = m_whDecTitle(di)
+        de("decision") = m_whDecDecision(di)
+        ds.Add de
+    Next
+    Set d("attachDecisions") = ds
+    d("fastAttachIntervalMs") = WHEEL_FAST_MS
+    d("fastAttachId") = m_whFastId
+    d("fastAttachTicks") = m_whFastTicks
+    d("attachRuns") = m_whAttachRuns
+    d("lastAttachMsAgo") = IIf(m_whFastLastAt = 0, -1, WoGetTickCount() - m_whFastLastAt)
+    d("attachNote") = "TASK-P1-157: hooked[] lists the subclassed CODE PANES (P1-067 semantics). attached[] lists EVERY subclassed window (the Immediate/Watch/Locals windows are subclassed too now, and are forwarded untouched at message time). attachDecisions[] says why each VbaWindow of the last pass was or was not hooked. fastAttachTicks/attachRuns show the COM-free attach timer that closes the gap between a pane being created and the 5 s watchdog scan."
     Set WheelStateObj = d
 End Function
 
@@ -1877,7 +1948,7 @@ End Function
 ' WheelScan). The caption is stored next to the hwnd because it IS the key the
 ' scroll needs - and it is read here, in the scan, never inside the WndProc
 ' (enumeration/COM in a window procedure is a re-entrancy hazard).
-Private Sub WheelHook(ByVal h As Long, ByVal cap As String)
+Private Sub WheelHook(ByVal h As Long, ByVal cap As String, Optional ByVal isPane As Boolean = False)
     On Error Resume Next
     If h = 0 Then Exit Sub
     If Len(cap) = 0 Then Exit Sub
@@ -1894,6 +1965,9 @@ Private Sub WheelHook(ByVal h As Long, ByVal cap As String)
     m_whHwnd(m_whCount) = h
     m_whPrev(m_whCount) = prev
     m_whTitle(m_whCount) = cap
+    ' TASK-P1-157: remember WHETHER the table classified this window as a code pane,
+    ' so hooked[] can keep the P1-067 meaning while attached[] shows everything.
+    m_whIsPane(m_whCount) = isPane
     m_whCount = m_whCount + 1
     m_whInstalled = True
 End Sub
@@ -1941,29 +2015,31 @@ Private Sub WheelConsider(ByVal h As Long, ByVal caps As Object)
     Dim cap As String
     cap = WoText(h)
     If WheelCaptionMapped(cap, caps) Then
-        ' TASK-P1-130: this add-in HAS positively identified a code pane at least once.
-        ' ONLY that arms the empty-table fallback below (see m_whEverVerified).
         m_whEverVerified = True
-        WheelHook h, cap
+        WheelMarkPane h
+        WheelHook h, cap, True
+        WheelDecide h, cap, "classified_code_pane"
     ElseIf Len(cap) > 0 And m_whEverVerified And WheelTableEmpty(caps) Then
-        ' TASK-P1-130: the table is empty AND we already know what a code pane looks like
-        ' here -> hook it any way. TASK-P1-132 (D-130-01) settles what happens next, and the
-        ' receipt says which case it was: the pane could not be resolved at all ->
-        ' lastReason "pane_not_found" (the wheel is forwarded untouched, no pane scrolls);
-        ' the pane WAS resolved but the IDE refused the TopLine read/write ->
-        ' "pane_not_writable_in_break", carrying the real VB error in lastTopError, and the
-        ' scroll is retried OUTSIDE this window procedure by the timer (see
-        ' pendingScroll/pendingScrollResult); a successful scroll is "handled_lines".
-        ' The Immediate/Watch/Locals windows still behave exactly as before, because the
-        ' only fallback that can map a window onto the ACTIVE pane requires the window
-        ' title to actually CONTAIN that pane's component name.
-        WheelHook h, cap
+        WheelMarkPane h
+        WheelHook h, cap, True
+        WheelDecide h, cap, "empty_table_fallback"
+    ElseIf Len(cap) > 0 Then
+        ' TASK-P1-157 (A): the caption table NO LONGER GATES THE HOOK. Measured on the
+        ' live IDE: a code pane opened after the last scan is absent from the table until
+        ' the next scan, and this scan is the only thing that hooks a window - so gating
+        ' on the table meant a brand-new pane was never subclassed while the user scrolled
+        ' (msgSeen did NOT move, so (i) "not attached", not (ii) "resolve failed").
+        ' The window is subclassed regardless; the classification stays where it belongs
+        ' - at message time - and WheelHandle still forwards anything that does not
+        ' resolve to a CodePane untouched, so P1-067 is preserved.
+        WheelHook h, cap, False
+        WheelDecide h, cap, "hooked_unclassified"
     Else
         WheelSkip h, cap, "not_a_code_pane"
+        WheelDecide h, cap, "skip_empty_text"
     End If
     Err.Clear
 End Sub
-
 Private Sub WheelSkip(ByVal h As Long, ByVal cap As String, ByVal why As String)
     If m_whSkipCount >= WHEEL_SKIP_MAX Then Exit Sub
     m_whSkipHwnd(m_whSkipCount) = h
@@ -1971,6 +2047,115 @@ Private Sub WheelSkip(ByVal h As Long, ByVal cap As String, ByVal why As String)
     m_whSkipTitle(m_whSkipCount) = cap
     m_whSkipReason(m_whSkipCount) = why
     m_whSkipCount = m_whSkipCount + 1
+End Sub
+
+' =====================================================================
+' TASK-P1-157 (wheel #1): the FAST, COM-FREE attach pass.
+'   Why it exists: the only driver of WheelScan is the watchdog
+'   (ServerForm.tmrWatch, Interval = 5000 in steady state - measured 2 scans / 10 s) plus
+'   the HTTP message pump. A code pane opened after the last scan was therefore NOT
+'   subclassed when the user's wheel arrived, and WM_MOUSEWHEEL never reached us at all.
+'   Measured on the live IDE before this fix: a new pane's msgSeen did NOT move (i), and
+'   the caption table DID list it again on the next scan (1 -> 2 -> 3) - so the defect was
+'   the moment the hook was established, not a permanently incomplete table.
+'   This pass enumerates and subclasses only: no VBIDE call, no COM, no allocation that
+'   can raise. Classification stays at message time (WheelHandle) and in WheelScan.
+' =====================================================================
+Public Sub WheelAttachAll()
+    On Error Resume Next
+    If m_woScanBusy Then Exit Sub
+    WheelAttachPass
+    Err.Clear
+End Sub
+
+Private Sub WheelAttachPass()
+    On Error Resume Next
+    If Not m_whEnabled Then Exit Sub
+    m_whAttachRuns = m_whAttachRuns + 1
+    m_whFastLastAt = WoGetTickCount()
+    Dim tops() As Long, nTops As Long, t As Long, k As Long
+    WoScanTops
+    nTops = m_woCount
+    If nTops > WO_MAX Then nTops = WO_MAX
+    ReDim tops(0 To nTops)
+    For t = 0 To nTops - 1
+        tops(t) = m_woHwnd(t)
+    Next
+    For t = 0 To nTops - 1
+        Dim h As Long
+        h = tops(t)
+        If h <> 0 Then
+            If LCase$(WoCls(h)) = "vbawindow" Then WheelAttachOne h
+            WoScanKids h
+            For k = 0 To m_woCount - 1
+                If LCase$(WoCls(m_woHwnd(k))) = "vbawindow" Then WheelAttachOne m_woHwnd(k)
+            Next
+        End If
+    Next
+    Err.Clear
+End Sub
+
+' Hook ONE window if it can carry the wheel. A window is refused only when we cannot even
+' NAME it (empty caption) or when the hook table is full - NEVER because the caption
+' table did not list it (that was exactly the TASK-P1-157 defect).
+Private Sub WheelAttachOne(ByVal h As Long)
+    On Error Resume Next
+    Dim cap As String
+    cap = WoText(h)
+    If Len(cap) = 0 Then
+        WheelDecide h, cap, "skip_empty_text"
+        Exit Sub
+    End If
+    If WheelHooked(h) Then Exit Sub
+    If m_whCount >= WHEEL_MAX Then
+        WheelDecide h, cap, "skip_hook_table_full"
+        Exit Sub
+    End If
+    WheelHook h, cap, False
+    WheelDecide h, cap, "hooked_by_fast_attach"
+    Err.Clear
+End Sub
+
+Private Sub WheelDecide(ByVal h As Long, ByVal cap As String, ByVal decision As String)
+    If m_whDecCount >= WHEEL_SKIP_MAX Then Exit Sub
+    m_whDecHwnd(m_whDecCount) = h
+    m_whDecTitle(m_whDecCount) = cap
+    m_whDecDecision(m_whDecCount) = decision
+    m_whDecCount = m_whDecCount + 1
+End Sub
+
+' Upgrade an ALREADY hooked window to "this is a code pane". Needed because the fast
+' attach can hook a pane before the scan that builds the caption table has run.
+Private Sub WheelMarkPane(ByVal h As Long)
+    Dim i As Long
+    For i = 0 To m_whCount - 1
+        If m_whHwnd(i) = h Then m_whIsPane(i) = True
+    Next
+End Sub
+
+' TASK-P1-157 (B): the SetTimer callback. The OS calls it from the IDE's message loop,
+' so it must never raise and must never touch the VBIDE object model - which is why the
+' fast attach is COM-free by construction.
+Public Sub WheelTimerProc(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
+    On Error Resume Next
+    m_whFastTicks = m_whFastTicks + 1
+    If m_whEnabled Then WheelAttachAll
+    Err.Clear
+End Sub
+
+Private Sub WheelStartFast()
+    On Error Resume Next
+    If Not m_whEnabled Then Exit Sub
+    If m_whFastId <> 0 Then Exit Sub
+    m_whFastId = WoSetTimer(0, 0, WHEEL_FAST_MS, AddressOf WheelTimerProc)
+    Err.Clear
+End Sub
+
+Private Sub WheelStopFast()
+    On Error Resume Next
+    If m_whFastId <> 0 Then WoKillTimer 0, m_whFastId
+    m_whFastId = 0
+    Err.Clear
 End Sub
 
 ' Drop entries whose window is gone, then hook every code pane that is not yet
@@ -2008,6 +2193,14 @@ Public Sub WheelScan()
     End If
     m_whCapsCount = 0
     If Not m_whCaps Is Nothing Then m_whCapsCount = m_whCaps.Count
+    ' TASK-P1-157 (A): subclass EVERY VbaWindow first, table or no table. The decision is
+    ' kept out of the hook: an unclassified window is forwarded untouched at message time.
+    m_woScanBusy = True
+    ' TASK-P1-157: the decision list belongs to the SCAN (the pass that classifies), not to
+    ' the fast pass - a fast pass over an already-hooked set decides nothing and would wipe
+    ' the list, which made the option-E diagnostic come back empty on the live IDE.
+    m_whDecCount = 0
+    WheelAttachPass
     Dim tops() As Long, nTops As Long, t As Long
     WoScanTops
     nTops = m_woCount
@@ -2029,6 +2222,7 @@ Public Sub WheelScan()
         End If
     Next
     m_whLastScan = WoGetTickCount()
+    m_woScanBusy = False
     Err.Clear
 End Sub
 
@@ -2108,7 +2302,10 @@ Public Sub WheelInit()
             If CLng(Val(s)) >= 1 And CLng(Val(s)) <= 50 Then m_whLines = CLng(Val(s))
         End If
     End If
-    If m_whEnabled Then WheelScan
+    If m_whEnabled Then
+        WheelScan
+        WheelStartFast
+    End If
     Err.Clear
 End Sub
 
@@ -2119,6 +2316,9 @@ End Sub
 Public Function WheelShutdownJson() As String
     On Error Resume Next
     m_whEnabled = False
+    ' TASK-P1-157: kill OUR timer before anything else - a callback that arrives after the
+    ' hook table is gone must find m_whEnabled = False (it is checked first).
+    WheelStopFast
     Dim restored As Long, deferred As Long, i As Long, cur As Long
     restored = 0
     deferred = 0
