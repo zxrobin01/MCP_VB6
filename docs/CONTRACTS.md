@@ -14,6 +14,7 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v1.9.0** | 2026-10-13 | **工具面扩容 + 卡死可恢复**（TASK-P1-164 A / TASK-P1-168 B+C）。Tool face: **add-in 111 -> 114**（新增 `immediate_eval` / `immediate_run` / `ide_quiet_mode`），hub 5 -> 5，DSH-facing total 116 -> 119。**Add-in CHANGED** = `ide_state`（新增 `release_inflight` / `release_min_held_ms`；正文**恒带** `release{}` 固定键集）；只读回执仅在**发生过强释**后才追加 `gate*` 键；`ide_quiet_mode` ON 时**每次** `tools/call` 正文带 `quiet{...,advisory}`、`control_window{action:activate}` 回执带 `quietModeSuppressedFocus`。**纯增量**：quiet OFF / 未强释路径的既有回执逐字节不变。DELIBERATE, S-authorized re-freeze（四冻件全变）。 |
 | **v1.8.0** | 2026-10-12 | P1 fix pack (TASK-P1-126). Tool face: add-in 111 -> 111, hub 4 -> 5 (new `ide_restart`), DSH-facing total 115 -> 116. Add-in CHANGED = `replace_code` (replace/delete now REQUIRE `expected_sha256`; the refusal returns `currentSha256`), `validate_code` (+optional `baseline`; every diagnostic gains `proc`/`procOffset`/`fingerprint`/`stableKey`; always-present `baseline_diff`), `ide_state` (+`cancel_inflight`/`cancel_target`; every read-only receipt gains `inflight{}`). Behaviour fixes with no schema change: PRE-WRITE block-pairing refusal in replace_code/add_code/apply_edits/edit_by_anchor; multi-line (block) anchor + duplicate-anchor hits + procedure first/last echo in edit_by_anchor; close_active_dialogs emits ONE key set on dry_run and real clicks; build/make_project stop publishing an EMPTY digest and re-read logs in their own encoding. DELIBERATE, S-authorized re-freeze. |
 | **v1.7.0** | 2026-10-09 | **版本号补齐（additive，不改工具面 ⇒ 免重冻）**：为 `TASK-P1-087` 给 `replace_code` / `apply_edits` / `edit_by_anchor` 新增的**可选** `snapshot`（`type=boolean`，**默认 off ⇒ 默认行为不变**，跨构建 A/B `ab_differences=0` 为证）补上契约版本号与迁移条目 ⇒ **工具数不变（111 → 111）**；对应冻结件 sha **`1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE`**（== `docs/tools_schema.json`，本卡**不再重冻**）；`mcp_info.breaking` 本版**不新增条目**（非破坏性），迁移说明见 **§9** |
 | **v1.6.0** | 2026-10-09 | **工具面扩容**：新增 `replace_in_files`（跨组件字面/正则替换，`dry_run` 默认 true）与 `undo_edit`（组件级显式单步撤销；写入前把 pane 文本快照到 `<工程>\_undo\`）⇒ **109 → 111，必须显式重冻**；同一次重冻并落地 `send_window_message` 的**描述补全 + 高危消息护栏**（新增参数 `confirm` ⇒ 本版 `CHANGED=send_window_message`）；另**登记**（不改 schema）`add_component{type:"form"}` 改由 IDE 自建 + `createdVia`/`ideRouteNote`、`control_execution.mode` 的 12 值 enum、以及两条工具面局限（`command_bars{list}` 不含 Add-Ins 弹层；`AddFromTemplate` 窗体模板路线本机不可用） |
@@ -163,8 +164,9 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 ### 1. `instructions` 版块（首行必须可一行读完）
 ```text
-PRODUCT vb6-mcp <semver>  CONTRACT v1.7.0  TOOLS 111  BUILT <sha256 前 8 位>
+PRODUCT vb6-mcp <semver>  CONTRACT v1.9.0  TOOLS 114  BUILT <sha256 前 8 位>
 BREAKING (read before calling):
+- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)
 - v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted
 - v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s
 - v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)
@@ -1014,5 +1016,45 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 * ★**级联：无**（冻结件与 hub 未变，工具数与契约未变）。
 * ★**遗留边界（不是缺陷）**：子窗聚合仍受 `FG_MAX = 800` 上限约束（实测本夹具 70 / 95 窗，远未触及）。
 
+### 19. `v1.9.0`：`ide_quiet_mode`（A）+ `immediate_eval`/`immediate_run`（B）+ `ide_state{release_inflight}` 与卡死自愈（C）—— TASK-P1-164 / TASK-P1-168
 
+> 基线（本版之前，实测）：**add-in 111 工具 / contract v1.8.0 / DLL `79609DBC…`（2,568,192 B）**。
+> 本版：**add-in 114 工具 / contract v1.9.0 / DLL `158BB063D6ED4A91…`（2,637,824 B）**，**四冻件全部重冻**。
 
+#### 19.1 A · `ide_quiet_mode`（会话级安静模式）
+- 参数：`on`（boolean，**必填**）、`ttl_ms`（integer，可选，默认 600000 = 10 分钟；TTL 每次读取时重新判定，到期自动失效）。
+- 返回：`{ok, quietMode, previousQuietMode, changed, since, ttlMs, quietExpiresAt, expiresInMs, suppressedFocusCount, foregroundBefore, foregroundAfter, foregroundTookFocus, foregroundReadable, advisory, suppressedPoints, note}`。
+- 语义（ON）：**`control_window{action:"activate"}` 不调 `Window.SetFocus`**（该回执带 `quietModeSuppressedFocus:true` + `suppressedAction` + `quietModeNote`，**其余动作照做**）；且**每次** `tools/call` 正文带 `quiet{quietMode, since, ttlMs, quietExpiresAt, expiresInMs, suppressedFocusCount, advisory, note}`，`advisory` = 「quiet mode is ON - do not type in this IDE while an agent is driving it」。
+- `native_breakpoint` 是 **Debug 菜单命令**，**无法在不激活 IDE 的前提下发出** ⇒ 安静模式只能在那里**交还前台**（回执 `quietModeSuppressedFocus:false` + `quietModeForegroundRestored`），**如实标注**，不谎称抑制。
+- ★**不得用 0/0 声称「没抢前台」**：本机 `GetForegroundWindow()` 恒返回 **0**（非交互窗口站）⇒ `foregroundReadable=false` 只表示**读不到**；判据必须写成 `fgAfter == fgBefore`（**值可为 0**）**且** `quietModeSuppressedFocus:true`。
+- 分类为**只读**（只改插件自身状态）⇒ 写类在飞时**仍可被服务**。
+- ★**quiet OFF ⇒ 逐字节回到 v1.8.0**：不抑制、不加 `quiet{}`。
+
+#### 19.2 B · `immediate_eval` / `immediate_run`（立即求值 / 运行并取回输出）
+- `immediate_eval{expression, timeout_ms=5000}` ⇒ `{ok, value, typeName, valueParsed, output, outputTrimmed, outputLines, outputBytes, outputTruncated, debugPrintRewrites, line, ret, retHex, execAnswered, elapsedMs, sinkFile, sinkDeleted, ...}`。表达式**只求值一次**（先赋给 `v511`，再 `Print #511, TypeName(v511) & "|" & v511`）。
+- `immediate_run{code, timeout_ms=5000}` ⇒ 同形状；`output`/`outputTrimmed` 只含**本次**打印的文本；**语句边界**的 `Debug.Print` 被内部改写到 sink（`debugPrintRewrites` 如实计数）。
+- ★**调用方不再需要写 `Open`/`Print #`/`Close`**：工具内部把值/输出经**私有临时文件**带出（`%TEMP%\vb6mcp_im\*.tmp`，读完即删，`sinkDeleted` 回读证明）。
+- ★**解析失败必须如实结构化**：`{ok:false, reason:"value_not_parsed"}` + 原始 `output`/`outputTrimmed`，**不许猜**；引擎拒行时 `reason:"engine_refused_line"`（带 `ret`/`retHex`）。
+- ★**实测通道事实**（本轮真机，原始回执在 `docs/evidence/TASK-P1-168/`）：
+  `Open "…" For Output As #511: Print #511, 1+1: Close #511` = `ret=0`（sink `" 2 "`）；
+  `v511 = 3/4: Print #511, TypeName(v511) & "|" & v511: Close #511` = `Double|0.75`；
+  **`On Error Resume Next`（单独或冒号连写）被拒 `ret=40036`**；**行内 CR/LF 亦被拒 `ret=40036`** ⇒ 多语句以「冒号 + 空格」连接，`?` 简写与 `_` 续行**不支持**。
+- ★**抛错语句仍会挂住 IDE**（VB6 弹出它自己的模态「实时错误」框，见 19.3）：因此 `timeout_ms` **不是硬超时** —— 回执恒带 `timeoutMsEnforcedBy:"gate_age_threshold"`、`hardTimeoutEnforced:false`、`statementInterrupted:false`；它是**闸门年龄阈值**，到达后由**下一次工具调用**自动释放闸门（见 19.3 的 armed release）。
+- ★既有 `vba6_probe{exec_probe}` 与既有回执**逐字节不变**（本版未改其实现）。
+
+#### 19.3 C · 缺陷 #10：单飞闸门可强释 + 卡死自愈
+- **实测根因**（本机 v1.8.0 构建，原始回执 `docs/evidence/TASK-P1-168/`）：抛错语句使 `EbExecuteLine` **不返回**，IDE 弹出**它自己的模态框**（`read_active_dialogs` 报 `ownerDisabled=true`，正文「实时错误 '13': 类型不匹配」），`m_mutBusy` 不再释放 ⇒ 此后**所有写类调用**一律 `{ok:false, reason:"busy"}`，而**只读仍被服务**（`ide_state` 19 ms 应答）。★**把模态框点掉后闸门自行恢复**（实测：`set_codepane` 立刻不再 busy）⇒ 根因是那个模态框，不是「线程楔死」。
+- **强释入口**：**`ide_state{release_inflight:true, release_min_held_ms?}`**（默认阈值 60000）—— **当且仅当**在飞调用**年龄 > 阈值**时才动手；只读 ⇒ 卡死期间**仍可被服务**。
+- **回执 `release{}`（固定键集，每条 ide_state 都有）**：`{attempted, released, releasedTool, releasedKind, heldMs, minHeldMs, retryAfterMs, depthBefore, depthAfter, targetDepth, mutBusyBefore, abandonedSeq, reason, gateReleaseCount, statementInterrupted:false, timeoutMsEnforcedBy:"gate_age_threshold", note, recoveryAction, recoveryHint}`。
+  `released:true` 时 `note` 明写「**被阻塞的调用仍在 IDE 内运行；闸门是被强释的；它做的事没有被撤销；没有语句被打断**」。
+  `reason` ∈ `not_requested` | `nothing_in_flight` | `age_below_threshold`（带 `retryAfterMs`）| `forced_release` | `auto_released_armed_timeout`。
+- ★**弃帧语义（防二次扣减）**：每次调用带 token（`m_callSeq`），**最外层帧**的 token 记在 `m_outerSeq`（在 depth 变 1 时捕获，这样嵌套读**不会**把自己当成在飞者）。强释时把**被弃帧**的 token 记入 `m_abandonSeq` 并把 `m_callDepth` 归零。被弃帧日后返回时，其 unwind 在 `CallUnwind` 里**被吞掉恰好一次**；并且**只有持有者**（`m_mutBusyTool = name`）才能清 `m_mutBusy` ⇒ **不可能出现「归零后旧帧再减一次」**（那会让后续调用被错误拒绝，且偶发难查）。
+- ★**自愈（armed release）**：`immediate_*` 在调用 `EbExecuteLine` **之前** arm（`timeout_ms`），正常返回即解除；若没返回，**下一次任意工具调用**在入场处按年龄强释 ⇒ **一次坏语句不会把会话永久卡死**，无需人工干预。
+- ★**完整恢复配方（机器可读，写在 `recoveryAction`/`recoveryHint`）**：①`ide_state{release_inflight:true}` 强释闸门 → ②`close_active_dialogs` 把那个模态框点掉（被阻塞的语句才可能返回）→ ③ 正常继续。★注意 `close_active_dialogs` 自身是**写类**，卡死期间会被 `busy` 拒绝，所以**必须先强释**。
+- 只读回执在**发生过强释之后**才追加 `gateReleased` / `gateReleaseCount` / `gateReleasedBy` / `gateReleasedTool` / `gateReleasedHeldMs` / `gateReleasedAt` / `gateReleaseReason` / `gateReleaseNote`；**未发生过则键集不变**（零漂移）。
+- ★`gateReleasedBy` 指明**是谁/什么**释放的：**`ide_state`** = 有一次显式 `release_inflight=true` 请求；**`armed_release`** = `immediate_*` 的 **armed timeout 自动释放**（**没有**任何调用带过 `release_inflight`）。两者的 `gateReleaseReason` 分别是 `forced_release` 与 `auto_released_armed_timeout`。★这一区分是本卡真机跑出来的：初版把自动释放也标成 `ide_state`，会让回执声称一个**没人提过**的请求，已改。
+
+#### 19.4 不变式
+- `tools/list` 结果键仍**恰为** `{tools}`；`tools/call` 结果键仍**恰为** `{content,isError}`；版本戳仍只在正文里。
+- **四冻件（本版全部重冻）**：`docs/tools_schema.json` == `tools/schema_baseline.json` = **`B0C18528845DFB58…`**（123,357 B，114 工具）；`bridge/hub_schema.generated.json` = **`2AC4036B2F619B12…`**（127,021 B）；`docs/CONTRACTS.md` = 本文件。
+- **产品版本 `0.3.0` 不变**（本版只改契约面，不改产品语义版本）。

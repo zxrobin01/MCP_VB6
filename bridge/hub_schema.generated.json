@@ -1,11 +1,12 @@
 {
   "generatedFrom": "docs/tools_schema.json",
-  "contractVersion": "v1.8.0",
-  "contractDeclaredToolCount": 111,
+  "contractVersion": "v1.9.0",
+  "contractDeclaredToolCount": 114,
   "versionToolCountMismatch": false,
-  "toolCount": 111,
-  "instructions": "PRODUCT vb6-mcp <semver>  CONTRACT v1.7.0  TOOLS 111  BUILT <sha256 前 8 位>\nBREAKING (read before calling):\n- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted\n- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s\n- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)\n- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)\n- get_component_code: coords default disk -> ide (pass coords=\"disk\" for the old text/numbering); response is a JSON envelope, text in result.text\n- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal\n- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason\n- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)\n- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status",
+  "toolCount": 114,
+  "instructions": "PRODUCT vb6-mcp <semver>  CONTRACT v1.9.0  TOOLS 114  BUILT <sha256 前 8 位>\nBREAKING (read before calling):\n- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)\n- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted\n- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s\n- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)\n- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)\n- get_component_code: coords default disk -> ide (pass coords=\"disk\" for the old text/numbering); response is a JSON envelope, text in result.text\n- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal\n- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason\n- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)\n- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status",
   "breaking": [
+    "- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)",
     "- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted",
     "- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s",
     "- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)",
@@ -19,7 +20,7 @@
   "tools": [
     {
       "name": "ide_state",
-      "description": "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note}; pass cancel_inflight=true to abort the call that is in flight.",
+      "description": "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to abort the call that is in flight, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -30,6 +31,14 @@
           "cancel_target": {
             "type": "string",
             "description": "Optional: the tool you believe is in flight (informational only - the receipt reports what the add-in actually finds)."
+          },
+          "release_inflight": {
+            "type": "boolean",
+            "description": "TASK-P1-168 (C / defect #10): FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate."
+          },
+          "release_min_held_ms": {
+            "type": "integer",
+            "description": "The age threshold for release_inflight, in ms (default 60000). The gate is NOT touched while the in-flight call is younger than this, so a healthy long call keeps the single-flight guarantee."
           }
         }
       }
@@ -2841,6 +2850,66 @@
             "description": "Default FALSE: restore changes the component's PANE text only, the file on disk is NEVER touched by default. true is not supported yet and is refused with reason=to_disk_not_supported - use save_project to flush the project."
           }
         }
+      }
+    },
+    {
+      "name": "immediate_eval",
+      "description": "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:\"value_not_parsed\"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "Expression to evaluate in the ACTIVE project's immediate context, e.g. 1/4 or UCase$(\"ab\"). It is evaluated exactly ONCE."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout - the add-in cannot preempt a statement."
+          }
+        },
+        "required": [
+          "expression"
+        ]
+      }
+    },
+    {
+      "name": "immediate_run",
+      "description": "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "One or more statements to run, e.g. Debug.Print 1+1 or x = 5: Debug.Print x. A CR/LF in the input is joined with a colon and a space; each statement-boundary Debug.Print is redirected into the sink."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout."
+          }
+        },
+        "required": [
+          "code"
+        ]
+      }
+    },
+    {
+      "name": "ide_quiet_mode",
+      "description": "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:\"activate\"} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the foreground handle could not be READ (it is 0 here) - never read that as \"the focus was left alone\". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "on": {
+            "type": "boolean",
+            "description": "true = turn quiet mode ON (the add-in stops taking the user's foreground and every receipt carries a quiet{} block with an advisory); false = turn it OFF and restore the previous behaviour byte for byte."
+          },
+          "ttl_ms": {
+            "type": "integer",
+            "description": "Optional lifetime in ms (default 600000 = 10 minutes). The mode expires by itself once the TTL passes; the TTL is re-evaluated on every read."
+          }
+        },
+        "required": [
+          "on"
+        ]
       }
     }
   ]

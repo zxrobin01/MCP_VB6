@@ -26,7 +26,7 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 ' TASK-P1-089: the P1-087 snapshot parameter is an inputSchema change, so the contract
 ' version moves with it. It is ADDITIVE (optional parameter, default off), but a tool-face
 ' change still has to be named by a version - the rule above is "bump it HERE, in one line".
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.8.0"
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.9.0"
 ' TASK-P1-066: message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.

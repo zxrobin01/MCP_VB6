@@ -81,6 +81,64 @@ Private Const CANCEL_HONOR_MIN_MS As Long = 1500
 ' TASK-P1-126 (MCP-09): how many read-only receipts carried the inflight block in
 ' this process - a cheap, machine-checkable proof that the block is really emitted.
 Private m_inflightStamped As Long
+' =====================================================================
+' TASK-P1-168 (C / defect #10): the gate is now FORCE-RELEASABLE.
+'   Measured on its own instance with the v1.8.0 build (raw receipts under
+'   docs/evidence/TASK-P1-168/): a raising statement sent through
+'   vba6_probe{exec_probe} does NOT make EbExecuteLine return. The IDE shows its own
+'   modal run-time-error box, the single-flight gate stayed held, and every
+'   write-class call was refused with reason=busy for as long as that box was up.
+'   Reads kept being served (ide_state answered in 19 ms), which is the whole reason
+'   this abort has to be carried by a READ-ONLY tool.
+'   What this adds:
+'     * m_callSeq / m_outerSeq - a per-call token. m_outerSeq is the token of the
+'       OUTERMOST frame, captured at entry when the depth becomes 1, so a nested read
+'       can no longer mistake ITSELF for the call that is in flight.
+'     * m_abandonSeq - the token of a frame the gate was force-released for. Its
+'       unwind is SWALLOWED exactly once (CallUnwind), so no frame can ever decrement
+'       the depth twice.
+'     * m_gateRelease* - the machine-readable record of the last forced release.
+'   The release is HONEST about what it does NOT do: it does not interrupt the
+'   blocked statement (a single-threaded add-in cannot preempt EbExecuteLine), so the
+'   receipt says the blocked call is still running inside the IDE.
+' =====================================================================
+Private m_callSeq As Long
+Private m_outerSeq As Long
+Private m_outerTool As String
+Private m_outerAt As Long
+Private m_abandonSeq As Long
+Private m_gateReleaseCount As Long
+Private m_gateReleasedBy As String
+Private m_gateReleasedTool As String
+Private m_gateReleasedHeldMs As Long
+Private m_gateReleasedAt As String
+Private m_gateReleasedReason As String
+Private Const GATE_RELEASE_MIN_MS As Long = 60000
+' TASK-P1-168 (B): an ARMED release. immediate_eval / immediate_run set it before they
+' hand their line to EbExecuteLine; if that call never comes back, the NEXT tool call
+' sees the age and force-releases the gate by itself, so one bad statement cannot leave
+' the session permanently busy.
+Private m_armTool As String
+Private m_armMs As Long
+Private m_armAt As Long
+' =====================================================================
+' TASK-P1-164 (A): session-level QUIET MODE.
+'   While ON the add-in must not STEAL the user's foreground: control_window's
+'   action=activate skips Window.SetFocus, and every receipt (StampMcp) carries a
+'   quiet{} block whose advisory says "do not type in this IDE". While OFF nothing is
+'   emitted and nothing is suppressed, so the receipt stream stays byte-for-byte the
+'   pre-v1.9.0 one.
+' =====================================================================
+Private m_quietOn As Boolean
+Private m_quietSince As Long
+Private m_quietTtlMs As Long
+Private m_quietSuppressed As Long
+Private Const QUIET_TTL_DEFAULT_MS As Long = 600000
+Private Const QUIET_ADVISORY As String = "quiet mode is ON - do not type in this IDE while an agent is driving it"
+' TASK-P1-168 (B): the immediate_* sink. 511 is the top of VB6's file-number range and the
+' generated line closes it first, so the handle is idempotent even after a failed line.
+Private Const IM_SINK_MAX_BYTES As Long = 65536
+Private Const IM_FILE_NUM As Long = 511
 ' TASK-P1-125: ToolBuild chooses the in-IDE route itself when the project is the
 ' one the IDE holds, and ToolMakeProject route=cli delegates to ToolBuild - this
 ' override breaks the cycle and pins the in-IDE path once it has been chosen.
@@ -179,8 +237,10 @@ Public Function BuildToolsListResult() As Object
     Set pIs = CreateObject("Scripting.Dictionary")
     Set pIs("cancel_inflight") = Prop("boolean", "TASK-P1-126 (MCP-08): ask the call currently in flight to STOP. This read-only call is served even while a WRITE is busy; it sets a cooperative cancel flag and returns cancel{...}. The in-flight call aborts at its next pump point (at least 1500 ms in) with {ok:false, reason:cancelled_by_request}. A call already blocked inside a HOST modal loop reaches none of our pump points - use the hub tool ide_restart for that case.")
     Set pIs("cancel_target") = Prop("string", "Optional: the tool you believe is in flight (informational only - the receipt reports what the add-in actually finds).")
+    Set pIs("release_inflight") = Prop("boolean", "TASK-P1-168 (C / defect #10): FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate.")
+    Set pIs("release_min_held_ms") = Prop("integer", "The age threshold for release_inflight, in ms (default 60000). The gate is NOT touched while the in-flight call is younger than this, so a healthy long call keeps the single-flight guarantee.")
     tools.Add MakeTool("ide_state", _
-        "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note}; pass cancel_inflight=true to abort the call that is in flight.", _
+        "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to abort the call that is in flight, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000).", _
         SchemaWith(pIs))
 
     tools.Add MakeTool("current_position", _
@@ -1328,6 +1388,31 @@ Public Function BuildToolsListResult() As Object
         "Component-level undo of the LAST edit, from snapshots taken before every text write (the pre-write PANE text is stored as UTF-8 in <project>_undo<component>.<timestamp>.txt). Explicit and single-step: it never rolls back automatically and never touches a file on disk. action=list shows the available snapshots; action=restore (default) restores one through the same minimal-write path and reports the sha before/after plus diskUntouched.", _
         SchemaWith(pUnd))
 
+    ' ---- contract v1.9.0 (TASK-P1-164 A / TASK-P1-168 B): foreground safety + immediate execution ----
+    Dim pImE As Object
+    Set pImE = CreateObject("Scripting.Dictionary")
+    Set pImE("expression") = Prop("string", "Expression to evaluate in the ACTIVE project's immediate context, e.g. 1/4 or UCase$(""ab""). It is evaluated exactly ONCE.")
+    Set pImE("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout - the add-in cannot preempt a statement.")
+    tools.Add MakeTool("immediate_eval", _
+        "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards.", _
+        SchemaWith(pImE, Req("expression")))
+
+    Dim pImR As Object
+    Set pImR = CreateObject("Scripting.Dictionary")
+    Set pImR("code") = Prop("string", "One or more statements to run, e.g. Debug.Print 1+1 or x = 5: Debug.Print x. A CR/LF in the input is joined with a colon and a space; each statement-boundary Debug.Print is redirected into the sink.")
+    Set pImR("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout.")
+    tools.Add MakeTool("immediate_run", _
+        "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open.", _
+        SchemaWith(pImR, Req("code")))
+
+    Dim pQm As Object
+    Set pQm = CreateObject("Scripting.Dictionary")
+    Set pQm("on") = Prop("boolean", "true = turn quiet mode ON (the add-in stops taking the user's foreground and every receipt carries a quiet{} block with an advisory); false = turn it OFF and restore the previous behaviour byte for byte.")
+    Set pQm("ttl_ms") = Prop("integer", "Optional lifetime in ms (default 600000 = 10 minutes). The mode expires by itself once the TTL passes; the TTL is re-evaluated on every read.")
+    tools.Add MakeTool("ide_quiet_mode", _
+        "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:""activate""} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the foreground handle could not be READ (it is 0 here) - never read that as ""the focus was left alone"". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.", _
+        SchemaWith(pQm, Req("on")))
+
     Set BuildToolsListResult = root
 End Function
 
@@ -1450,12 +1535,53 @@ Private Function StampMcp(ByVal body As String) As String
         StampMcp = body
         Exit Function
     End If
+    ' TASK-P1-164 (A): while ide_quiet_mode is ON every receipt carries the quiet{} block
+    ' (and therefore the advisory). While it is OFF QuietStamp() returns "" and the string
+    ' built below is character-for-character the pre-v1.9.0 one.
+    Dim q As String
+    q = QuietStamp()
     If Len(body) = 2 Then
         ' "{}" must not gain a trailing comma
-        StampMcp = "{" & McpStampJson() & "}"
+        StampMcp = "{" & McpStampJson() & q & "}"
     Else
-        StampMcp = "{" & McpStampJson() & "," & Mid$(body, 2)
+        StampMcp = "{" & McpStampJson() & q & "," & Mid$(body, 2)
     End If
+End Function
+
+' TASK-P1-164 (A): the leading-comma fragment of the quiet{} block, or "" while quiet
+' mode is OFF. Kept out of every tool body so no tool has to know about it.
+Private Function QuietStamp() As String
+    If Not QuietActive() Then
+        QuietStamp = ""
+        Exit Function
+    End If
+    QuietStamp = "," & Chr$(34) & "quiet" & Chr$(34) & ":" & QuietJson()
+End Function
+
+' TASK-P1-164 (A): the live quiet state. The TTL is evaluated on every read, so a mode
+' left ON cannot outlive its TTL even if nobody turns it off.
+Private Function QuietActive() As Boolean
+    If Not m_quietOn Then Exit Function
+    If m_quietTtlMs <= 0 Then Exit Function
+    If (GetTickCount() - m_quietSince) >= m_quietTtlMs Then
+        m_quietOn = False
+        Exit Function
+    End If
+    QuietActive = True
+End Function
+
+Private Function QuietJson() As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("quietMode") = True
+    d("since") = m_quietSince
+    d("ttlMs") = m_quietTtlMs
+    d("quietExpiresAt") = m_quietSince + m_quietTtlMs
+    d("expiresInMs") = m_quietTtlMs - (GetTickCount() - m_quietSince)
+    d("suppressedFocusCount") = m_quietSuppressed
+    d("advisory") = QUIET_ADVISORY
+    d("note") = "while this mode is ON the add-in does not call Window.SetFocus (control_window{action:""activate""}) and gives the foreground back after any menu-driven action (native_breakpoint). foregroundReadable=false means the foreground handle could not be READ in this window station (it is 0 here) - that is NOT evidence that the focus was left alone."
+    QuietJson = JsonStringify(d)
 End Function
 
 ' =====================================================================
@@ -1945,7 +2071,8 @@ Private Function IsMutatingTool(ByVal name As String) As Boolean
              "list_lessons", "export_lessons", "ext_list", "project_changes", _
              "get_callstack", "check_references", "workspace_status", "verify_scope", _
              "todo_status", "mcp_info", "list_members", "get_component_properties", "git", _
-             "dependency_graph", "control_execution", "read_active_dialogs"
+             "dependency_graph", "control_execution", "read_active_dialogs", _
+             "ide_quiet_mode"
             IsMutatingTool = False
         Case Else
             IsMutatingTool = True
@@ -2060,6 +2187,20 @@ Private Function InflightJson() As String
     d("cancelRequested") = m_cancelRequested
     d("readonlyWhileWrite") = (m_mutBusy And Not m_callIsMut)
     d("stampedCount") = m_inflightStamped
+    ' TASK-P1-168 (C): once the gate has EVER been force-released, every read-only
+    ' receipt says so - the caller must be able to see that the single-flight guarantee
+    ' was traded away, and for which call. While the feature is unused these keys are
+    ' absent, so receipts stay byte-for-byte the pre-v1.9.0 ones.
+    If m_gateReleaseCount > 0 Then
+        d("gateReleased") = True
+        d("gateReleaseCount") = m_gateReleaseCount
+        d("gateReleasedBy") = m_gateReleasedBy
+        d("gateReleasedTool") = m_gateReleasedTool
+        d("gateReleasedHeldMs") = m_gateReleasedHeldMs
+        d("gateReleasedAt") = m_gateReleasedAt
+        d("gateReleaseReason") = m_gateReleasedReason
+        d("gateReleaseNote") = "the gate was force-released for a call that never came back; that call is STILL RUNNING inside the IDE, so a write issued now can interleave with it. Dismiss the host modal (close_active_dialogs) to let it finish."
+    End If
     d("note") = "read-only calls ARE served while a WRITE is in flight (MCP-09); a WRITE is refused while ANY call is in flight through the message pump (MCP-08). A read served while a write is in flight can observe a mid-mutation snapshot, which is why active=true and kind=write are reported with it."
     InflightJson = JsonStringify(d)
     Err.Clear
@@ -2134,10 +2275,107 @@ Private Sub MaybeHonorCancel()
     Err.Raise vbObjectError + 91, "CodeTools", "MCPREASON:cancelled_by_request|" & m_cancelTargetTool & "|" & m_cancelTargetKind
 End Sub
 
+' TASK-P1-168 (C / defect #10): FORCE-RELEASE the single-flight gate.
+'   targetDepth = the depth to KEEP. A caller that is itself executing INSIDE the gate
+'   (ide_state) passes 1 so its own frame stays counted; a caller that runs BEFORE its own
+'   depth is incremented (CallTool entry, i.e. the armed release) passes 0.
+'   The returned Dictionary has a FIXED key set on every path, so a caller can branch on
+'   reason/released without probing for keys.
+Private Function ForceReleaseGate(ByVal byTool As String, ByVal why As String, ByVal minHeldMs As Long, ByVal targetDepth As Long) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("attempted") = True
+    d("released") = False
+    d("releasedTool") = ""
+    d("releasedKind") = ""
+    d("heldMs") = 0
+    d("minHeldMs") = minHeldMs
+    d("retryAfterMs") = 0
+    d("depthBefore") = m_callDepth
+    d("depthAfter") = m_callDepth
+    d("targetDepth") = targetDepth
+    d("mutBusyBefore") = m_mutBusy
+    d("abandonedSeq") = 0
+    d("reason") = ""
+    d("gateReleaseCount") = m_gateReleaseCount
+    d("statementInterrupted") = False
+    d("timeoutMsEnforcedBy") = "gate_age_threshold"
+    d("note") = ""
+    d("recoveryAction") = ""
+    d("recoveryHint") = ""
+    If m_callDepth <= targetDepth Then
+        d("reason") = "nothing_in_flight"
+        d("note") = "no OTHER call is in flight (this read-only call is the only one), so there is nothing to release"
+        Set ForceReleaseGate = d
+        Exit Function
+    End If
+    Dim tk As String, at As Long
+    tk = ""
+    at = 0
+    If m_mutBusy Then
+        tk = m_mutBusyTool
+        at = m_mutBusyAt
+    Else
+        tk = m_outerTool
+        at = m_outerAt
+    End If
+    Dim held As Long
+    held = GetTickCount() - at
+    d("releasedTool") = tk
+    d("releasedKind") = IIf(m_mutBusy, "write", "read")
+    d("heldMs") = held
+    If minHeldMs < 0 Then minHeldMs = 0
+    d("minHeldMs") = minHeldMs
+    If held < minHeldMs Then
+        d("reason") = "age_below_threshold"
+        d("retryAfterMs") = minHeldMs - held
+        d("note") = "the in-flight call is younger than minHeldMs, so NOTHING was touched. This threshold is what keeps a HEALTHY long call (a normal build, a slow write) from losing the single-flight guarantee."
+        d("recoveryAction") = "call ide_state{release_inflight:true, release_min_held_ms:<ms>} again after retryAfterMs"
+        d("recoveryHint") = "wait retryAfterMs and repeat the call"
+        Set ForceReleaseGate = d
+        Exit Function
+    End If
+    ' ---- the release ----
+    m_gateReleaseCount = m_gateReleaseCount + 1
+    m_gateReleasedBy = byTool
+    m_gateReleasedTool = tk
+    m_gateReleasedHeldMs = held
+    m_gateReleasedAt = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    m_gateReleasedReason = why
+    m_abandonSeq = m_outerSeq
+    m_callDepth = targetDepth
+    m_mutBusy = False
+    m_mutBusyTool = ""
+    m_mutBusyAt = 0
+    m_armMs = 0
+    m_armTool = ""
+    m_armAt = 0
+    d("released") = True
+    d("abandonedSeq") = m_abandonSeq
+    d("depthAfter") = m_callDepth
+    d("gateReleaseCount") = m_gateReleaseCount
+    d("reason") = why
+    d("note") = "the blocked call is STILL RUNNING inside the IDE; the gate was force-released and the work it was doing was NOT undone. This add-in cannot preempt EbExecuteLine, so no statement was interrupted."
+    d("recoveryAction") = "close_active_dialogs"
+    d("recoveryHint") = "the blocked call usually waits on the IDE's OWN modal run-time-error box (read_active_dialogs shows it with ownerDisabled=true). Dismiss that box (close_active_dialogs) so the blocked call can return - its unwind is swallowed exactly once, so the depth can never be decremented twice. If no modal is present the statement is simply still running: use the hub tool ide_restart, or wait."
+    Set ForceReleaseGate = d
+End Function
+
 Public Function CallTool(ByVal name As String, ByVal args As Object) As Object
     ' TASK-P1-066: the gate. m_callDepth > 0 means this call arrived from a
     ' message-pump point inside another tool call (a normal call always starts
     ' at depth 0).
+    ' TASK-P1-168 (C): every call carries a token. The token is what makes the forced
+    ' release safe: only the frame whose token was abandoned skips its unwind.
+    m_callSeq = m_callSeq + 1
+    Dim mySeq As Long
+    mySeq = m_callSeq
+    If m_callDepth > 0 Then
+        ' TASK-P1-168 (B/C): an ARMED immediate_* call that outlived its own timeout_ms is
+        ' released HERE, before the gate is consulted, so THIS call is the one that finds the
+        ' session usable again instead of being refused with reason=busy.
+        MaybeAutoRelease
+    End If
     If m_callDepth > 0 Then
         ' (1) a state-changing call is ALREADY in flight.
         ' TASK-P1-126 (MCP-09 kept / MCP-08 answered): a WRITE is STILL refused -
@@ -2181,6 +2419,12 @@ Public Function CallTool(ByVal name As String, ByVal args As Object) As Object
     ' (served at the pump point while a write is in flight, see the gate above) used to
     ' wipe the OUTER call's sideEffects/undo manifest half-way through the write.
     If m_callDepth = 1 Then
+        ' TASK-P1-168 (C): the OUTERMOST frame's identity, captured BEFORE a nested read can
+        ' overwrite m_callToolName / m_callStartAt (it sets both for ITSELF), so a forced
+        ' release can never name the wrong tool.
+        m_outerSeq = mySeq
+        m_outerTool = name
+        m_outerAt = GetTickCount()
         Set m_dirWrites = New Collection
         Set m_paneDiskMaps = CreateObject("Scripting.Dictionary")
         SeReset
@@ -2194,22 +2438,53 @@ Public Function CallTool(ByVal name As String, ByVal args As Object) As Object
     On Error GoTo WrapperFail
     Set CallTool = CallToolInner(name, args)
     On Error GoTo 0
-    m_callDepth = m_callDepth - 1
-    If wasMut Then m_mutBusy = False
-    m_callIsMut = prevSelfMut
-    If m_callDepth = 0 Then m_cancelRequested = False
+    CallUnwind name, mySeq, wasMut, prevSelfMut
     Exit Function
 WrapperFail:
     Dim wErr As Long, wMsg As String
     wErr = Err.Number
     wMsg = Err.Description
     Err.Clear
-    m_callDepth = m_callDepth - 1
-    If wasMut Then m_mutBusy = False
-    m_callIsMut = prevSelfMut
-    If m_callDepth = 0 Then m_cancelRequested = False
+    CallUnwind name, mySeq, wasMut, prevSelfMut
     Set CallTool = TextResult(SealedReceipt(name, UnexpectedErrorJson(name, wMsg, wErr)), True)
 End Function
+
+' TASK-P1-168 (C): the ONE unwind point. A frame whose token was abandoned by a forced
+' release must NOT unwind again - the release already dropped it from m_callDepth, and
+' decrementing a second time would leave a phantom outer frame that makes later calls be
+' refused with reason=busy intermittently (the exact class of bug the lead asked to rule out).
+Private Sub CallUnwind(ByVal name As String, ByVal mySeq As Long, ByVal wasMut As Boolean, ByVal prevSelfMut As Boolean)
+    If mySeq <> 0 And mySeq = m_abandonSeq Then
+        ' Swallow this unwind exactly once. The CURRENT in-flight accounting (a newer call)
+        ' is left untouched.
+        m_abandonSeq = 0
+        Exit Sub
+    End If
+    m_callDepth = m_callDepth - 1
+    ' Only the call that OWNS the flag may clear it: an abandoned frame can return while a
+    ' NEW write is in flight, and clearing it there would let a third call interleave.
+    If wasMut Then
+        If m_mutBusyTool = name Then m_mutBusy = False
+    End If
+    m_callIsMut = prevSelfMut
+    If m_callDepth = 0 Then m_cancelRequested = False
+End Sub
+
+' TASK-P1-168 (B): the armed, SELF-HEALING release. immediate_eval / immediate_run arm it
+' immediately before handing their line to EbExecuteLine and disarm it on a normal return.
+' If the engine never comes back, the arm survives and the next tool call releases the gate
+' on its own, so one bad statement cannot leave the session permanently busy.
+Private Sub MaybeAutoRelease()
+    If m_armMs <= 0 Then Exit Sub
+    If Not m_mutBusy Then Exit Sub
+    If Len(m_armTool) = 0 Then Exit Sub
+    If m_mutBusyTool <> m_armTool Then Exit Sub
+    If (GetTickCount() - m_mutBusyAt) < m_armMs Then Exit Sub
+    ' byTool says WHO/WHAT released it: "armed_release" is the automatic arm, NOT an
+    ' ide_state call that carried release_inflight=true. Labelling it "ide_state" made the
+    ' receipt claim a request nobody made (caught on the live run of this very card).
+    Call ForceReleaseGate("armed_release", "auto_released_armed_timeout", m_armMs, 0)
+End Sub
 
 Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Object
     Dim res As Object
@@ -2389,7 +2664,13 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "debug_commands"
             outText = ToolDebugCommands()
         Case "ide_state"
-            outText = ToolIdeState(JsonGetBool(args, "cancel_inflight", False), JsonGetStr(args, "cancel_target"))
+            outText = ToolIdeState(JsonGetBool(args, "cancel_inflight", False), JsonGetStr(args, "cancel_target"), JsonGetBool(args, "release_inflight", False), JsonGetLong(args, "release_min_held_ms"))
+        Case "ide_quiet_mode"
+            outText = ToolIdeQuietMode(JsonGetBool(args, "on", False), JsonGetLong(args, "ttl_ms"))
+        Case "immediate_eval"
+            outText = ToolImmediateEval(JsonGetStr(args, "expression"), JsonGetLong(args, "timeout_ms", 5000))
+        Case "immediate_run"
+            outText = ToolImmediateRun(JsonGetStr(args, "code"), JsonGetLong(args, "timeout_ms", 5000))
         Case "current_position"
             outText = ToolCurrentPosition()
         Case "list_breakpoints"
@@ -3505,6 +3786,370 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
         Exit Function
     End If
     ToolVba6ExecProbe = inj
+End Function
+
+' =====================================================================
+' TASK-P1-168 (B): immediate_eval / immediate_run - run a line in the IDE's own
+' immediate context and CARRY THE RESULT BACK MACHINE-READABLY.
+'   The caller must NOT have to write Open/Print/Close itself, and the VBA6 metadata has
+'   NO channel that returns EbExecuteLine's value. The sink below was measured on a LIVE
+'   instance BEFORE this code existed (raw receipts: docs/evidence/TASK-P1-168/):
+'     * Open "<p>" For Output As #511: Print #511, 1+1: Close #511   -> ret=0, sink " 2 "
+'     * v511 = 3/4: Print #511, TypeName(v511) & "|" & v511: Close #511 -> "Double|0.75"
+'     * a leading Close #511 is harmless and makes the handle idempotent
+'     * an embedded CRLF makes EbExecuteLine REFUSE the line with ret=40036
+'     * On Error Resume Next (ALONE or colon-joined) is REFUSED with ret=40036, so a line
+'       that RAISES cannot be made error-tolerant from here. That is the exact mechanism
+'       behind defect #10: the IDE's own modal run-time-error box keeps the call alive.
+'   Stated instead of hidden:
+'     * a raising expression still blocks the IDE (same family as #10). The armed release
+'       and ide_state{release_inflight:true} are the RECOVERY, not a hard timeout;
+'     * the add-in cannot preempt a statement, so timeout_ms is a GATE-AGE threshold
+'       (timeoutMsEnforcedBy says exactly that, hardTimeoutEnforced is false);
+'     * the sink is a FILE, so the value is captured only when the statement completes.
+'   NOTE: IM_SINK_MAX_BYTES / IM_FILE_NUM are declared in the DECLARATIONS SECTION at the
+'   top of this module - VB6 rejects a module-level Const that appears after the first
+'   procedure (measured this round: the compiler then reported the unrelated call site of
+'   ToolFaultInject as "Sub or Function not defined").
+' =====================================================================
+Private Function ImSinkDir() As String
+    Dim p As String
+    p = Util.TempDir() & "\vb6mcp_im"
+    On Error Resume Next
+    If Len(Dir$(p, vbDirectory)) = 0 Then MkDir p
+    On Error GoTo 0
+    ImSinkDir = p
+End Function
+
+Private Function ImSinkPath(ByVal tag As String) As String
+    ImSinkPath = ImSinkDir() & "\" & tag & "_" & CStr(m_callSeq) & "_" & CStr(GetTickCount()) & ".tmp"
+End Function
+
+' The immediate context accepts ONE physical line: a line carrying CR or LF is refused
+' with ret=40036 (measured). Multi-statement input is therefore joined with ": " - the
+' same thing a human would type.
+Private Function ImFlatLine(ByVal code As String) As String
+    Dim s As String
+    s = Replace(code, vbCrLf, ": ")
+    s = Replace(s, vbLf, ": ")
+    s = Replace(s, vbCr, ": ")
+    ImFlatLine = Trim$(s)
+End Function
+
+' Redirect the caller's own Debug.Print into the sink. Only a STATEMENT-BOUNDARY
+' Debug.Print is rewritten (start of the line or right after a colon) so ordinary text is
+' left alone; the number of rewrites is reported rather than assumed.
+Private Function ImRewriteDebugPrint(ByVal code As String, ByRef rewrites As Long) As String
+    rewrites = 0
+    ImRewriteDebugPrint = code
+    If Len(code) = 0 Then Exit Function
+    Dim rx As Object
+    Dim col As Object
+    On Error Resume Next
+    Set rx = CreateObject("VBScript.RegExp")
+    If Err.Number <> 0 Or rx Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    rx.Global = True
+    rx.IgnoreCase = True
+    rx.Pattern = "(^|:)\s*Debug\s*\.\s*Print\b"
+    Set col = rx.Execute(code)
+    If Err.Number = 0 Then
+        If Not col Is Nothing Then rewrites = col.Count
+    End If
+    Err.Clear
+    ImRewriteDebugPrint = rx.Replace(code, "$1 Print #" & CStr(IM_FILE_NUM) & ",")
+    If Err.Number <> 0 Then
+        ImRewriteDebugPrint = code
+        rewrites = 0
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function ImReadSink(ByVal p As String, ByRef wasTruncated As Boolean) As String
+    Dim h As Integer
+    Dim n As Long
+    Dim s As String
+    ImReadSink = ""
+    wasTruncated = False
+    On Error Resume Next
+    If Len(p) = 0 Then Exit Function
+    If Len(Dir$(p)) = 0 Then Exit Function
+    n = FileLen(p)
+    If n <= 0 Then Exit Function
+    If n > IM_SINK_MAX_BYTES Then
+        wasTruncated = True
+        n = IM_SINK_MAX_BYTES
+    End If
+    h = FreeFile
+    Open p For Binary As #h
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    s = Space$(n)
+    Get #h, , s
+    Close #h
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    ImReadSink = s
+    Err.Clear
+End Function
+
+Private Function ImDeleteSink(ByVal p As String) As Boolean
+    ImDeleteSink = False
+    On Error Resume Next
+    If Len(Dir$(p)) > 0 Then Kill p
+    ImDeleteSink = (Len(Dir$(p)) = 0)
+    Err.Clear
+End Function
+
+Private Function ImJoinLines(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, vbCrLf, vbLf)
+    t = Replace(t, vbCr, vbLf)
+    ImJoinLines = t
+End Function
+
+Private Function ImTrimLines(ByVal s As String) As String
+    Dim parts() As String
+    Dim i As Long
+    Dim out As String
+    out = ""
+    parts = Split(ImJoinLines(s), vbLf)
+    For i = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(i))) > 0 Then
+            If Len(out) > 0 Then out = out & vbLf
+            out = out & Trim$(parts(i))
+        End If
+    Next i
+    ImTrimLines = out
+End Function
+
+Private Function ImCountLines(ByVal s As String) As Long
+    Dim t As String
+    If Len(s) = 0 Then Exit Function
+    t = ImJoinLines(s)
+    If Right$(t, 1) = vbLf Then t = Left$(t, Len(t) - 1)
+    If Len(t) = 0 Then Exit Function
+    ImCountLines = UBound(Split(t, vbLf)) + 1
+End Function
+
+Private Function ToolImmediateEval(ByVal expression As String, ByVal timeoutMs As Long) As String
+    Dim o As Object
+    Set o = ImExecuteImmediate("eval", expression, timeoutMs)
+    o("expression") = expression
+    ToolImmediateEval = JsonStringify(o)
+End Function
+
+Private Function ToolImmediateRun(ByVal code As String, ByVal timeoutMs As Long) As String
+    Dim o As Object
+    Set o = ImExecuteImmediate("run", code, timeoutMs)
+    o("code") = code
+    ToolImmediateRun = JsonStringify(o)
+End Function
+
+Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As String, ByVal timeoutMs As Long) As Object
+    Dim o As Object
+    Set o = CreateObject("Scripting.Dictionary")
+    o("tool") = IIf(mode = "eval", "immediate_eval", "immediate_run")
+    o("mode") = mode
+    o("ok") = False
+    o("reason") = ""
+    o("valueParsed") = False
+    o("value") = ""
+    o("typeName") = ""
+    o("output") = ""
+    o("outputTrimmed") = ""
+    o("outputBytes") = 0
+    o("outputTruncated") = False
+    o("outputLines") = 0
+    o("debugPrintRewrites") = 0
+    o("sinkFile") = ""
+    o("sinkDeleted") = False
+    o("line") = ""
+    o("elapsedMs") = 0
+    o("execAnswered") = False
+    o("ret") = 0
+    o("retHex") = ""
+    o("timeoutMs") = timeoutMs
+    o("timeoutMsEnforcedBy") = "gate_age_threshold"
+    o("hardTimeoutEnforced") = False
+    o("statementInterrupted") = False
+    o("armedReleaseMs") = timeoutMs
+    o("recoveryAction") = "ide_state{release_inflight:true, release_min_held_ms:<timeout_ms>}"
+    o("recoveryHint") = "the add-in cannot preempt a statement, so there is NO hard timeout here. If this call never returns, the ARMED release frees the single-flight gate on the next tool call; if the IDE is waiting on its own modal run-time-error box, read_active_dialogs shows it and close_active_dialogs dismisses it."
+    o("note") = ""
+    If timeoutMs <= 0 Then timeoutMs = 5000
+    o("timeoutMs") = timeoutMs
+    o("armedReleaseMs") = timeoutMs
+    If Len(payload) = 0 Then
+        o("reason") = "empty_input"
+        o("note") = "pass a non-empty " & IIf(mode = "eval", "expression", "code") & "; nothing was executed"
+        Set ImExecuteImmediate = o
+        Exit Function
+    End If
+    Dim sink As String
+    sink = ImSinkPath(mode)
+    o("sinkFile") = sink
+    On Error Resume Next
+    If Len(Dir$(sink)) > 0 Then Kill sink
+    On Error GoTo 0
+    Dim flat As String
+    Dim rewrites As Long
+    Dim body As String
+    flat = ImFlatLine(payload)
+    rewrites = 0
+    If mode = "eval" Then
+        ' Evaluate ONCE into a Variant, then print "TypeName|value". The leading Close #511
+        ' makes the handle idempotent even if an earlier line died holding it.
+        body = "v511 = " & flat & ": Print #" & CStr(IM_FILE_NUM) & ", TypeName(v511) & ""|"" & v511"
+    Else
+        body = ImRewriteDebugPrint(flat, rewrites)
+        o("debugPrintRewrites") = rewrites
+    End If
+    Dim execLine As String
+    execLine = "Close #" & CStr(IM_FILE_NUM) & ": Open """ & sink & """ For Output As #" & CStr(IM_FILE_NUM) & ": " & body & ": Close #" & CStr(IM_FILE_NUM)
+    o("line") = execLine
+    ' ---- arm the self-healing release, THEN run
+    m_armTool = o("tool")
+    m_armMs = timeoutMs
+    m_armAt = GetTickCount()
+    Dim t0 As Long
+    t0 = GetTickCount()
+    Dim raw As String
+    Dim raised As Boolean
+    Dim rNum As Long
+    Dim rDesc As String
+    raw = ""
+    raised = False
+    rNum = 0
+    rDesc = ""
+    On Error Resume Next
+    Err.Clear
+    raw = Vba6Probe.ExecLineJson(execLine, 0, 0, 0, False, False, False)
+    If Err.Number <> 0 Then
+        raised = True
+        rNum = Err.Number
+        rDesc = Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+    o("elapsedMs") = GetTickCount() - t0
+    ' we came back, so the arm is moot
+    m_armMs = 0
+    m_armTool = ""
+    m_armAt = 0
+    If raised Or Len(raw) = 0 Then
+        o("reason") = "exec_error"
+        o("execError") = "vbErrNumber=" & CStr(rNum) & "; description=" & rDesc
+        o("note") = "the add-in DID answer, but the call into the exec probe raised: " & rDesc
+        o("raw") = Left$(raw, 400)
+    Else
+        o("execAnswered") = True
+        o("ret") = CLng(Val(JsonFieldRaw(raw, "ret")))
+        o("retHex") = JsonFieldRaw(raw, "retHex")
+        If o("ret") <> 0 Then
+            o("reason") = "engine_refused_line"
+            o("note") = "EbExecuteLine returned " & CStr(o("retHex")) & " (ret=" & CStr(o("ret")) & "), so the line was NOT executed. On this channel ret=40036 (0x9C64) means the line was REFUSED - measured for an embedded CRLF and for any line carrying On Error Resume Next."
+        End If
+    End If
+    ' ---- read the sink back (the ONLY result channel)
+    Dim txt As String
+    Dim trunc As Boolean
+    trunc = False
+    txt = ImReadSink(sink, trunc)
+    o("outputBytes") = Len(txt)
+    o("outputTruncated") = trunc
+    o("output") = ImJoinLines(txt)
+    o("outputTrimmed") = ImTrimLines(txt)
+    o("outputLines") = ImCountLines(txt)
+    o("sinkDeleted") = ImDeleteSink(sink)
+    If mode = "eval" Then
+        Dim joined As String
+        Dim firstLine As String
+        Dim nl As Long
+        Dim bar As Long
+        joined = ImJoinLines(txt)
+        firstLine = joined
+        nl = InStr(joined, vbLf)
+        If nl > 0 Then firstLine = Left$(joined, nl - 1)
+        bar = InStr(firstLine, "|")
+        If bar > 0 Then
+            o("typeName") = Left$(firstLine, bar - 1)
+            o("value") = Mid$(firstLine, bar + 1)
+            o("valueParsed") = True
+        End If
+    End If
+    If o("reason") = "" Then
+        If mode = "eval" Then
+            If o("valueParsed") Then
+                o("ok") = True
+            Else
+                o("reason") = "value_not_parsed"
+                o("note") = "the statement completed (ret=0) but the sink carried no parseable TypeName|value line. output/outputTrimmed hold the RAW sink text - nothing is guessed."
+            End If
+        Else
+            o("ok") = True
+        End If
+    End If
+    If o("ok") Then
+        If mode = "eval" Then
+            o("note") = "the expression was evaluated ONCE in the ACTIVE project's immediate context; the value was carried out through a temp file, so the caller never had to write Open/Print/Close. VB's Print formatting applies (a positive number is written with a leading space)."
+        Else
+            o("note") = "the code ran in the ACTIVE project's immediate context with each statement-boundary Debug.Print redirected into a temp file the tool reads back; only what THIS call printed is returned. The ? shorthand and _ line continuations are NOT supported; CR/LF in the input is joined with a colon and a space."
+        End If
+    End If
+    Set ImExecuteImmediate = o
+End Function
+
+' =====================================================================
+' TASK-P1-164 (A): ide_quiet_mode - a session-level switch that stops the add-in from
+' STEALING the user's foreground while an agent drives the IDE.
+' =====================================================================
+Private Function ToolIdeQuietMode(ByVal enable As Boolean, ByVal ttlMs As Long) As String
+    Dim fgB As Long
+    Dim fgA As Long
+    fgB = WoFrontHwnd()
+    Dim wasOn As Boolean
+    wasOn = QuietActive()
+    If enable Then
+        If ttlMs <= 0 Then ttlMs = QUIET_TTL_DEFAULT_MS
+        m_quietOn = True
+        m_quietSince = GetTickCount()
+        m_quietTtlMs = ttlMs
+    Else
+        m_quietOn = False
+        m_quietSince = 0
+        m_quietTtlMs = 0
+    End If
+    Dim nowOn As Boolean
+    nowOn = QuietActive()
+    fgA = WoFrontHwnd()
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = True
+    d("tool") = "ide_quiet_mode"
+    d("quietMode") = nowOn
+    d("previousQuietMode") = wasOn
+    d("changed") = (nowOn <> wasOn)
+    d("since") = m_quietSince
+    d("ttlMs") = m_quietTtlMs
+    d("quietExpiresAt") = IIf(nowOn, m_quietSince + m_quietTtlMs, 0)
+    d("expiresInMs") = IIf(nowOn, m_quietTtlMs - (GetTickCount() - m_quietSince), 0)
+    d("suppressedFocusCount") = m_quietSuppressed
+    d("foregroundBefore") = fgB
+    d("foregroundAfter") = fgA
+    d("foregroundTookFocus") = (fgA <> fgB)
+    d("foregroundReadable") = (fgB <> 0 Or fgA <> 0)
+    d("advisory") = IIf(nowOn, QUIET_ADVISORY, "")
+    d("suppressedPoints") = "control_window{action:""activate""} skips Window.SetFocus while quiet mode is ON (that receipt carries quietModeSuppressedFocus:true). native_breakpoint CANNOT be issued without activating the IDE - it is a Debug-menu command - so quiet mode can only give the foreground BACK there (quietModeForegroundRestored)."
+    d("note") = "quiet OFF restores the pre-v1.9.0 behaviour byte for byte: no SetFocus is suppressed and no quiet{} block is added to any receipt. foregroundReadable=false means GetForegroundWindow() returned 0 in this window station (it does here) - that must NOT be read as the focus was left alone."
+    ToolIdeQuietMode = JsonStringify(d)
 End Function
 
 ' TASK-P1-160 (R17): insert extra top-level members into a JSON OBJECT text without
@@ -8783,6 +9428,14 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     root("foregroundAfter") = fgAfter
     root("foregroundTookFocus") = (fgAfter <> fgBefore)
     root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+    ' TASK-P1-164 (A): a menu-driven toggle CANNOT be issued without activating the IDE, so
+    ' quiet mode can only GIVE THE FOREGROUND BACK (done above). Report that honestly rather
+    ' than claiming a suppression that did not happen.
+    If QuietActive() Then
+        root("quietModeSuppressedFocus") = False
+        root("quietModeForegroundRestored") = (fgAfter = fgBefore)
+        root("quietModeNote") = "quiet mode is ON, but a Debug-menu breakpoint toggle cannot be issued without activating the IDE: the foreground was taken and then GIVEN BACK (foregroundTookFocus / quietModeForegroundRestored say which). Quiet mode does not suppress this one - it only compensates for it."
+    End If
     root("ideNativeBreakpointApi") = False
     root("breakpointWithoutCursorMove") = False
     root("breakpointQuietNote") = "VB6's extensibility model exposes NO breakpoint API (list_breakpoints says the same), and the Debug menu item acts on the caret; there is therefore NO channel that sets an IDE-native breakpoint without moving the cursor. This tool moves the caret to the target line and, as compensation, restores the previous selection afterwards (cursorRestored) and gives the foreground back (foregroundTookFocus). The alternative, set_breakpoint, does not move the caret but WRITES text (an injected Debug.Assert marker block)."
@@ -9796,6 +10449,9 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
     ' frame as a side effect, and that is exactly how a user's typing lands in the wrong window.
     Dim fgBefore As Long
     Dim fgAfter As Long
+    ' TASK-P1-164 (A): set when action=activate skipped Window.SetFocus because quiet mode is ON.
+    Dim quietSuppressed As Boolean
+    quietSuppressed = False
     ' TASK-P1-164 (R18-2): a window action writes no text, so the contract is "the pane
     ' text is UNCHANGED". When the addressed window IS a code window, its component is
     ' identified by the WINDOW HANDLE (not by a caption guess) and its pane is compared.
@@ -9811,7 +10467,15 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
     fgBefore = WoFrontHwnd()
     Select Case LCase$(action)
         Case "activate"
-            w.SetFocus
+            ' TASK-P1-164 (A): the ONE place where the add-in deliberately takes the user's
+            ' foreground. With quiet mode ON the SetFocus is NOT issued - the window is still
+            ' resolved and every other part of the action is performed.
+            If QuietActive() Then
+                quietSuppressed = True
+                m_quietSuppressed = m_quietSuppressed + 1
+            Else
+                w.SetFocus
+            End If
         Case "close"
             w.Close
         Case "show"
@@ -9871,6 +10535,13 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
     ' TASK-P1-164 (R18-2) honesty: a foreground handle of 0 means the foreground could not
     ' be READ in this session station - it does NOT mean the operation left the focus alone.
     root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+    ' TASK-P1-164 (A): report the suppression ON THE RECEIPT that caused it. The key only
+    ' exists when it actually happened, so a quiet-OFF call stays byte-identical.
+    If quietSuppressed Then
+        root("quietModeSuppressedFocus") = True
+        root("suppressedAction") = "control_window{action:""activate""}: Window.SetFocus was NOT called because ide_quiet_mode is ON"
+        root("quietModeNote") = "quiet mode is ON: this action did NOT ask for the foreground. The window was resolved and every other part of the action was performed. NOTE: foregroundBefore/foregroundAfter can both be 0 in this window station - foregroundReadable=false says the handle could not be READ, not that the focus was left alone."
+    End If
     If Len(pAssertComp) = 0 Then
         root("paneAssertionTarget") = "no code pane could be matched to the addressed window (tried hwnd identity, then exact caption equality), so the assertion is reported as notApplicable - never as a pass"
     End If
@@ -15703,7 +16374,7 @@ End Function
 
 ' Contract section 1: the IDE mode, read live. Deliberately NOT cached - the whole
 ' point is that a design/run/break switch is visible on the very next call.
-Private Function ToolIdeState(Optional ByVal cancelInflight As Boolean = False, Optional ByVal cancelTarget As String = "") As String
+Private Function ToolIdeState(Optional ByVal cancelInflight As Boolean = False, Optional ByVal cancelTarget As String = "", Optional ByVal releaseInflight As Boolean = False, Optional ByVal releaseMinHeldMs As Long = 0) As String
     On Error Resume Next
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
@@ -15734,7 +16405,52 @@ Private Function ToolIdeState(Optional ByVal cancelInflight As Boolean = False, 
         cb("note") = "the cancel request could not be evaluated; nothing was changed"
     End If
     Set root("cancel") = cb
+    ' TASK-P1-168 (C / defect #10): the release{} block, with a FIXED key set on every path
+    ' (same discipline as cancel{} above). This read-only tool is the only channel that is
+    ' still served while the gate is stuck, so it is where the forced release lives.
+    Dim rb As Object
+    Set rb = ReleaseRequestBody(releaseInflight, releaseMinHeldMs)
+    If rb Is Nothing Then
+        Set rb = CreateObject("Scripting.Dictionary")
+        rb("attempted") = True
+        rb("released") = False
+        rb("reason") = "internal_error"
+        rb("note") = "the release request could not be evaluated; nothing was changed"
+    End If
+    Set root("release") = rb
     ToolIdeState = JsonStringify(root)
+End Function
+
+' TASK-P1-168 (C): build the release{} block of an ide_state receipt. The KEY SET is fixed
+' and identical on every path, exactly like cancel{} (discipline 98).
+Private Function ReleaseRequestBody(ByVal requested As Boolean, ByVal minHeldMs As Long) As Object
+    If requested Then
+        If minHeldMs <= 0 Then minHeldMs = GATE_RELEASE_MIN_MS
+        Set ReleaseRequestBody = ForceReleaseGate("ide_state", "forced_release", minHeldMs, 1)
+        Exit Function
+    End If
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("attempted") = False
+    d("released") = False
+    d("releasedTool") = ""
+    d("releasedKind") = ""
+    d("heldMs") = 0
+    d("minHeldMs") = GATE_RELEASE_MIN_MS
+    d("retryAfterMs") = 0
+    d("depthBefore") = m_callDepth
+    d("depthAfter") = m_callDepth
+    d("targetDepth") = 1
+    d("mutBusyBefore") = m_mutBusy
+    d("abandonedSeq") = 0
+    d("reason") = "not_requested"
+    d("gateReleaseCount") = m_gateReleaseCount
+    d("statementInterrupted") = False
+    d("timeoutMsEnforcedBy") = "gate_age_threshold"
+    d("note") = "pass release_inflight=true (optionally release_min_held_ms) to FORCE-RELEASE the single-flight gate of a call that never came back. Read-only, so it is served while the gate is held."
+    d("recoveryAction") = ""
+    d("recoveryHint") = ""
+    Set ReleaseRequestBody = d
 End Function
 
 ' The IDE main window caption. RUN mode suspends the VBIDE object model, so fall
@@ -18062,6 +18778,9 @@ Private Function BreakingList() As Object
     c.Add BreakingEntry("v1.6.0", _
         "recorded tool-face limitations: command_bars{list} does NOT enumerate the Add-Ins popup (only execute-by-caption or by id reaches those items), and the AddFromTemplate form route is unavailable on this machine (no plain form template exists in editsec\templates or the VB6 Template\Forms folder) and was deliberately NOT implemented", _
         "reach the settings entry with command_bars{action:""execute"",control:""VB6 MCP Settings...""}; create forms with add_component(type=form) as usual")
+    c.Add BreakingEntry("v1.9.0", _
+        "three tools were added - immediate_eval / immediate_run / ide_quiet_mode - and ide_state gained release_inflight / release_min_held_ms plus a release{} block (add-in 111 -> 114)", _
+        "purely additive for existing callers: no existing tool lost a parameter, and no existing receipt changed on the quiet-OFF / no-release path. ide_state now ALWAYS carries a release{} block with a fixed key set (the same discipline as cancel{}), and read-only receipts gain gate* keys ONLY after a forced release has actually happened")
     ' TASK-P1-089 (contract v1.7.0): the snapshot parameter added by TASK-P1-087 is
     ' ADDITIVE - it is optional and defaults to off, so no existing call changes behaviour
     ' (cross-build A/B over the shared call sequence: 0 differences). This version therefore
@@ -18084,6 +18803,9 @@ Private Function MigrationsList() As Object
     c.Add "v1.8.0: replace_code{replace|delete} now REQUIRES expected_sha256 (a line-number edit must pin the text it was measured against; the refusal carries currentSha256 so the fix is one retry) - this is the only caller-visible break. insert/append/set stay optional. validate_code gains an OPTIONAL baseline and every diagnostic gains proc/procOffset/fingerprint/stableKey plus an always-present baseline_diff{added,removed}. ide_state gains cancel_inflight/cancel_target and every read-only receipt carries inflight{}. write-class tools refuse a block that does not pair its own first/last procedure keywords BEFORE writing"
     c.Add "v1.7.0: replace_code / apply_edits / edit_by_anchor accept an OPTIONAL snapshot (boolean, default false; the strings ""on""/""yes""/""1"" are also accepted). snapshot=true guarantees exactly ONE pre-edit pane snapshot so undo_edit can restore that edit; with the argument absent behaviour is UNCHANGED (additive). replace_code's replace/insert/append/delete write no snapshot by default; apply_edits / edit_by_anchor already snapshot by default. undo_edit answers reason=no_snapshot_for_component plus a hint when a NAMED component has no snapshot"
     c.Add "v1.7.0: the frozen tool face was re-frozen once for that additive parameter - tools/schema_baseline.json == docs/tools_schema.json (sha256 1EE3BFA9E917AB6E5D148D409FB6B33ACA91EF2B20C7988E39ADE589536108BE); the tool count is unchanged at 111, and mcp_info.breaking gains NO v1.7.0 entry because nothing in this version breaks a caller"
+    c.Add "v1.9.0: immediate_eval / immediate_run run statements in the ACTIVE project's immediate context and carry the VALUE and the PRINTED text out through a private temp file - no Immediate-window pane read, and no Open/Print/Close for the caller. A statement that RAISES still blocks the IDE (On Error is REFUSED on this channel with ret=40036 - measured), so timeout_ms is a GATE-AGE threshold and NOT a hard timeout; immediate_* ARM that release, so the NEXT tool call heals the session by itself, and ide_state{release_inflight:true, release_min_held_ms} forces the gate open on demand"
+    c.Add "v1.9.0: ide_state{release_inflight:true} FORCE-RELEASES the single-flight gate of a call that never came back. The receipt reports {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false} and says the blocked call is STILL RUNNING; the abandoned frame's unwind is swallowed exactly once, so the depth can never be decremented twice. release_min_held_ms (default 60000) keeps a HEALTHY long call from losing the guarantee"
+    c.Add "v1.9.0: ide_quiet_mode{on,ttl_ms} is a session-level switch. While ON, control_window{action:""activate""} does NOT call Window.SetFocus (the receipt says quietModeSuppressedFocus:true) and EVERY tools/call receipt carries quiet{...,advisory}. quiet OFF is byte-for-byte the previous behaviour, and foregroundReadable=false means the handle could not be READ (it is 0 here) - never read that as the focus having been left alone"
     Set MigrationsList = c
 End Function
 
@@ -18098,6 +18820,7 @@ Private Function ChangelogList() As Object
     c.Add "v1.6.0 replace_in_files + undo_edit (109 -> 111); send_window_message description completed (the parameter is message, not msg; raw numbers accepted) + high-risk message guard (confirm=true); add_component(type=form) creates the form through the IDE itself (createdVia / ideRouteNote); control_execution.mode enum documented at its 12 accepted values; recorded tool-face limits (command_bars{list} omits the Add-Ins popup; the AddFromTemplate form route is unavailable here)"
     c.Add "v1.8.0 replace_code{replace|delete} requires expected_sha256 (breaking for line-number callers; the refusal returns currentSha256); validate_code baseline + proc/procOffset/fingerprint/stableKey + baseline_diff; ide_state cancel_inflight + inflight{} on every read-only receipt; PRE-WRITE block pairing refusal in replace_code / add_code / apply_edits / edit_by_anchor; multi-line (block) anchors + duplicate-anchor hits + process-scope echo in edit_by_anchor; close_active_dialogs emits one key set on dry_run AND real clicks; add-in 107 + hub 5 = 112 tools (hub ide_restart added); contract v1.7.0 -> v1.8.0"
     c.Add "v1.7.0 optional snapshot parameter (default off) on replace_code / apply_edits / edit_by_anchor + undo_edit structured no_snapshot_for_component; additive, tool count stays 111, frozen tool face re-frozen once (1EE3BFA9...)"
+    c.Add "v1.9.0 three tools: ide_quiet_mode (A - foreground safety: SetFocus suppressed, quiet{} + advisory on every receipt), immediate_eval / immediate_run (B - value and printed output carried out through a private temp file, so no pane read and no Open/Print/Close for the caller; an unparseable sink is a structured value_not_parsed); ide_state{release_inflight, release_min_held_ms} + release{} and an ARMED self-healing release (C / defect #10 - the single-flight gate is force-releasable); add-in tool count 111 -> 114; contract v1.8.0 -> v1.9.0"
     Set ChangelogList = c
 End Function
 
