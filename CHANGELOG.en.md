@@ -12,6 +12,10 @@ This file records **source and feature** changes only; packaging, release and ot
 
 ## 2026-10-13
 
+### 14:23 · The wheel works immediately in a newly opened code pane
+
+**What changed**: after a **new code pane** opens, the **mouse wheel now works immediately** (no need to click elsewhere first); this comes with a **250 ms lightweight hook timer** and per-window hook diagnostics.
+**Why**: the only driver that used to hook new panes was a **5-second watchdog** (measured: 2 scans in 10 seconds) - so for a few seconds after a new window opened the **wheel was bound to do nothing**, then recovered on its own.
 ### 14:04 · In-process execution and read-back · session-level quiet mode · forced gate release
 
 **What changed**: added an **in-process execution and read-back** capability (**returns values directly and captures output**, so callers no longer have to write a file to get data out); added a **session-level quiet mode** (suppresses tools stealing the foreground); when a call is stuck on one of the IDE's own modal boxes, the **gate can now be force-released** so later calls recover.
