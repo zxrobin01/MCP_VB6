@@ -165,7 +165,7 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 `export_lessons` · `import_lessons_md`）与 **扩展库**（`ext_list` · `ext_enable` · `ext_disable` ·
 `ext_reload` · `ext_install` · `ext_uninstall`）。
 
-### 经验库与扩展库（仿 dynsim MCP）
+### 经验库与扩展库
 
 - **经验库** `mcp_lessons/`：`defaults.json`（随插件发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
   合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。

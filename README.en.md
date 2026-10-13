@@ -187,7 +187,7 @@ The table below covers the original 45 tools (the complete VBIDE object-model pa
 `delete_lesson`, `export_lessons`, `import_lessons_md`) and the **extension store** (`ext_list`,
 `ext_enable`, `ext_disable`, `ext_reload`, `ext_install`, `ext_uninstall`).
 
-### Lesson store and extension store (modelled on the dynsim MCP)
+### Lesson store and extension store
 
 - **Lesson store** `mcp_lessons/`: `defaults.json` (shipped with the add-in, do not edit) plus
   `user.json` (the user layer, which may override, disable or add entries by id). The merged

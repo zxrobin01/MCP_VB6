@@ -969,7 +969,7 @@ Public Function BuildToolsListResult() As Object
         "Compare text against a recorded fixture: same / added / removed / firstDiffLine.", _
         SchemaWith(pKf, Req("path")))
 
-    ' ---- lessons library (经验库), modelled on the dynsim MCP mcp_lessons ----
+    ' ---- lessons library (经验库) ----
     Dim pLl As Object
     Set pLl = CreateObject("Scripting.Dictionary")
     Set pLl("includeDisabled") = Prop("boolean", "Include disabled lessons (default false)")

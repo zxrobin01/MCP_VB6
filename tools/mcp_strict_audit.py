@@ -1,6 +1,6 @@
 """Strict-schema audit of a Streamable HTTP MCP endpoint.
 
-Derived from the dynsim MCP post-mortems: the official @modelcontextprotocol/sdk
+Derived from strict-client post-mortems: the official @modelcontextprotocol/sdk
 client validates responses with STRICT zod schemas, so extra/malformed keys make it
 drop the response and register NO tools ("configured but does not take effect").
 

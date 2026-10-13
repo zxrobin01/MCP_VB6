@@ -1,6 +1,6 @@
 Attribute VB_Name = "Lessons"
 Option Explicit
-' Lessons (经验库) - modelled on the dynsim MCP mcp_lessons.py.
+' Lessons (经验库).
 '
 ' Storage lives next to the add-in DLL:
 '   mcp_lessons\defaults.json   shipped with the add-in (never written by tools)

@@ -1,6 +1,6 @@
 Attribute VB_Name = "Extensions"
 Option Explicit
-' Extension library (扩展库) - modelled on the dynsim MCP mcp_extensions.
+' Extension library (扩展库).
 '
 ' An extension is a DECLARATIVE tool pack: <dll dir>\mcp_extensions\*.json
 '   { "name": "net-tools", "version": "1.0", "description": "...",

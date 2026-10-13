@@ -538,7 +538,7 @@ Private Function BuildInitializeResult(ByVal clientVersion As String) As Object
     ' contract v1.3.0: which tool-face contract this server implements
     d("contractVersion") = VB6MCP_CONTRACT_VERSION
     ' Lessons are published through initialize.instructions so the agent reads
-    ' them before calling anything (mirrors the dynsim MCP lessons package).
+    ' them before calling anything.
     On Error Resume Next
     d("instructions") = m_tools.BuildInstructions()
     On Error GoTo 0
