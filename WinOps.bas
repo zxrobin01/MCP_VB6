@@ -245,6 +245,36 @@ Private m_cfmArmedAt As Long
 Private m_cfmScan(0 To 31) As Long
 Private m_cfmScanN As Long
 
+' ---- TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the GENERIC MODAL GUARD ----
+' State for the bounded, Cancel-first modal safety net. It lives HERE because VB6
+' requires every module-level declaration before the first procedure.
+Private m_mgArmed As Boolean
+Private m_mgBy As String
+Private m_mgAt As Long
+Private m_mgDeadline As Long
+Private m_mgWaitMs As Long
+Private m_mgTries As Long
+Private m_mgBusy As Boolean
+Private m_mgSeen As Boolean
+Private m_mgSeenCount As Long
+Private m_mgHwnd As Long
+Private m_mgCls As String
+Private m_mgTitle As String
+Private m_mgBody As String
+Private m_mgRisk As String
+Private m_mgRiskClass As String
+Private m_mgRiskReason As String
+Private m_mgClicked As Boolean
+Private m_mgClickedText As String
+Private m_mgClickedHwnd As Long
+Private m_mgMethod As String
+Private m_mgDismissed As Boolean
+Private m_mgRefused As Long
+Private m_mgRefusedReason As String
+Private m_mgTimedOut As Boolean
+Private m_mgResolvedMs As Long
+Private m_mgAllowHostModal As Boolean
+
 ' =====================================================================
 ' small helpers
 ' =====================================================================
@@ -1264,6 +1294,15 @@ End Function
 Public Sub WoConfirmTick()
     On Error Resume Next
     If Not m_cfmArmed Then Exit Sub
+
+    ' TASK-P2FIX4 (round 5): when the GENERIC MODAL GUARD is armed it OWNS the dialog
+    ' decision, because this one-shot confirm only ever presses a CONFIRM caption
+    ' (Open / OK / the Chinese twins). On VB6's own Make Project box the enumeration
+    ' order is Open(read-only,disabled), OK(id1), Cancel(id2)... so pressing "the first
+    ' confirm caption" STARTS the compile inside the host's modal loop - defect #4.
+    ' The guard is Cancel-first and never does that.
+    If m_mgArmed Then Exit Sub
+
     m_cfmTries = m_cfmTries + 1
     Dim n As Long, d As Long, btn As Long, t As String
     n = WoCfmDialogs()
@@ -1300,6 +1339,366 @@ Public Sub WoConfirmTick()
     End If
 End Sub
 
+
+' =====================================================================
+' TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the GENERIC MODAL GUARD
+'
+' WHY. Three unrelated tools were measured to leave a MODAL #32770 box up and
+' then never return:
+'   #11 native_breakpoint{toggle, <a line VB6 refuses>} -> "a breakpoint cannot be
+'       set on this line" (the Debug menu item blocks inside the modal loop);
+'   #10 vba6_probe{exec_probe} on a raising statement -> VB6's run-time error box;
+'   #4  make_project's failure-fallback File>Make -> VB6's own Make Project box.
+' In all three the add-in is single-threaded and the tool call is SUSPENDED
+' INSIDE the host's modal message loop, so no code after the failing call can ever
+' dismiss the box. The only channel that still runs is a message that modal loop
+' itself dispatches: the watchdog tick (ServerForm.tmrWatch -> WheelTick), which is
+' the same channel WoConfirmTick already proved works (TASK-P1-084).
+'
+' WHAT. Arm the guard around ONE risky call. While armed, every pass enumerates the
+' visible #32770 windows of THIS process that BLOCK their owner (ownerDisabled=true)
+' and presses at most ONE button:
+'   * ALWAYS preferred: an exact Cancel-like caption (Cancel / Close / Ignore) or an
+'     explicit No. Cancelling cannot START the operation, so it is safe even on a box
+'     this call did not open.
+'   * otherwise, ONLY when the box is NOT host-modal risk=known: the first ENABLED
+'     button whose caption is on the SAFE whitelist close_active_dialogs already uses
+'     (WoButtonAllow), provided the dialog BODY names no destructive action.
+'   * otherwise: NOTHING is sent, and the refusal is reported.
+' VB6's own Make Project box enumerates its buttons Open-as-read-only(disabled),
+' OK(id1), Cancel(id2), Help, Options. "The first safe button" would therefore press
+' OK and start a compile inside that same modal loop - which IS defect #4. The
+' Cancel-first rule is what makes this guard safe.
+'
+' HONESTY. This is a bounded SAFETY NET, not a proof:
+'   * a box that never appears inside the budget leaves modalDetected=false and
+'     recoveredBy="not_needed" - that is NOT a claim that no box existed;
+'   * a box that appears but cannot be pressed leaves modalDetected=true with an
+'     empty clickedButton and recoveredBy="modal_guard_timeout";
+'   * nothing is ever swallowed silently - the receipt is on EVERY path of every
+'     tool that arms this guard.
+' =====================================================================
+
+Public Function WoModalGuardArmed() As Boolean
+    WoModalGuardArmed = m_mgArmed
+End Function
+
+Public Sub WoModalGuardArm(ByVal byTool As String, ByVal waitMs As Long, Optional ByVal allowHostModal As Boolean = False)
+    On Error Resume Next
+    m_mgBy = byTool
+    m_mgAt = WoGetTickCount()
+    If waitMs < 1000 Then waitMs = 1000
+    If waitMs > 120000 Then waitMs = 120000
+    m_mgWaitMs = waitMs
+    m_mgDeadline = m_mgAt + waitMs
+    m_mgTries = 0
+    m_mgBusy = False
+    m_mgSeen = False
+    m_mgSeenCount = 0
+    m_mgHwnd = 0
+    m_mgCls = ""
+    m_mgTitle = ""
+    m_mgBody = ""
+    m_mgRisk = ""
+    m_mgRiskClass = ""
+    m_mgRiskReason = ""
+    m_mgClicked = False
+    m_mgClickedText = ""
+    m_mgClickedHwnd = 0
+    m_mgMethod = ""
+    m_mgDismissed = False
+    m_mgRefused = 0
+    m_mgRefusedReason = ""
+    m_mgTimedOut = False
+    m_mgResolvedMs = 0
+    m_mgAllowHostModal = allowHostModal
+    m_mgArmed = True
+    Err.Clear
+End Sub
+
+' Disarm. When the budget ran out with a box SEEN but nothing pressed, that is
+' recorded as a timeout instead of being left ambiguous.
+Public Sub WoModalGuardDisarm()
+    On Error Resume Next
+    If m_mgArmed Then
+        If m_mgSeen And Not m_mgClicked Then
+            If WoGetTickCount() >= m_mgDeadline Then m_mgTimedOut = True
+        End If
+    End If
+    ' TASK-P2FIX4: the LAST chance to OBSERVE the result of a click. BM_CLICK is sent
+    ' synchronously, but a MODAL dialog is torn down by the host's own modal loop when it
+    ' regains control - i.e. AFTER the callback that sent the click has returned. On the
+    ' first build of this card that made modalDismissed stay False and the receipt say
+    ' "unknown ... still open at the last check" even though the box was gone. One
+    ' DoEvents lets that teardown run, so "dismissed" can be a FACT here; when the box is
+    ' genuinely still there it is reported as still there rather than guessed.
+    If m_mgClicked Then
+        DoEvents
+        If WoIsWindow(m_mgHwnd) = 0 Then m_mgDismissed = True
+    End If
+    m_mgArmed = False
+    Err.Clear
+End Sub
+
+' PURE READ: TRUE while the guard still has work to do. It never changes state, so a
+' caller can pump on it and then disarm explicitly.
+Public Function WoModalGuardPending() As Boolean
+    On Error Resume Next
+    If Not m_mgArmed Then Exit Function
+    If m_mgRefused > 0 Then Exit Function
+    WoModalGuardPending = (WoGetTickCount() < m_mgDeadline)
+    Err.Clear
+End Function
+
+' PURE READ: TRUE once a BLOCKING dialog has been SEEN during this arm cycle. A caller
+' uses it to decide whether the full budget is still worth waiting for: with no box in
+' sight the pump only needs a short grace, and waiting the whole budget on every healthy
+' call would be a needless 15 s stall.
+Public Function WoModalGuardSawBox() As Boolean
+    WoModalGuardSawBox = m_mgSeen
+End Function
+
+' The dialog BODY as this guard sees it: title plus every child control's text.
+Private Function WoMgBodyOf(ByVal d As Object) As String
+    On Error Resume Next
+    Dim s As String
+    s = CStr(d("title"))
+    Dim ctrls As Object
+    Set ctrls = d("controls")
+    If Not ctrls Is Nothing Then
+        Dim i As Long, ce As Object
+        For i = 1 To ctrls.Count
+            Set ce = ctrls.Item(i)
+            s = s & " | " & CStr(ce("text"))
+        Next
+    End If
+    If Len(s) > 800 Then s = Left$(s, 800) & "...[truncated]"
+    WoMgBodyOf = s
+    Err.Clear
+End Function
+
+' Pick the ONE button this guard is allowed to press in dialog d.
+' Pass 1 = cancel-like (always preferred; safe on a box this call did not open).
+' Pass 2 = the shared SAFE whitelist; the CALLER still refuses this one when the
+' dialog is host-modal risk=known, because on VB6's Make box it is "OK" = compile.
+Private Function WoMgPickButton(ByVal d As Object, ByRef outText As String, ByRef outWhy As String, ByRef outCancel As Boolean, ByRef outId As Long) As Long
+    On Error Resume Next
+    outText = ""
+    outWhy = "no_button"
+    outCancel = False
+    outId = 0
+    Dim btns As Object
+    Set btns = btnsOf(d)
+    If btns Is Nothing Then Exit Function
+    Dim j As Long, b As Object, t As String, norm As String
+    For j = 1 To btns.Count
+        Set b = btns.Item(j)
+        t = CStr(b("text"))
+        norm = UCase$(Trim$(Replace(t, "&", "")))
+        If CBool(b("enabled")) Then
+            If WoButtonCancelLike(norm) Or WoButtonExplicitNo(norm) Then
+                outText = t
+                outCancel = True
+                outWhy = "cancel_like_caption"
+                outId = CLng(b("id"))
+                WoMgPickButton = CLng(b("hwnd"))
+                Exit Function
+            End If
+        End If
+    Next
+    Dim n2 As String
+    For j = 1 To btns.Count
+        Set b = btns.Item(j)
+        t = CStr(b("text"))
+        n2 = ""
+        If CBool(b("enabled")) Then
+            If WoButtonAllow(t, n2) Then
+                outText = t
+                outCancel = False
+                outWhy = "safe_whitelist_caption"
+                outId = CLng(b("id"))
+                WoMgPickButton = CLng(b("hwnd"))
+                Exit Function
+            End If
+        End If
+    Next
+    outWhy = "no_safe_button"
+    Err.Clear
+End Function
+
+' One guard pass. Idempotent, re-entrancy guarded, and self-terminating on its own
+' deadline so a caller that never comes back cannot leave the guard armed for ever
+' (which would keep WoConfirmTick standing down).
+Public Function WoModalGuardTick() As Boolean
+    On Error Resume Next
+    WoModalGuardTick = False
+    If Not m_mgArmed Then Exit Function
+    If m_mgBusy Then Exit Function
+    If m_woScanBusy Then Exit Function
+    If m_mgRefused > 0 Then Exit Function
+    If WoGetTickCount() >= m_mgDeadline Then
+        If m_mgSeen And Not m_mgClicked Then m_mgTimedOut = True
+        m_mgArmed = False
+        Err.Clear
+        Exit Function
+    End If
+    If m_mgClicked Then
+        ' the press already happened: this pass only checks whether it worked.
+        m_mgTries = m_mgTries + 1
+        If WoIsWindow(m_mgHwnd) = 0 Then
+            m_mgDismissed = True
+            m_mgArmed = False
+        End If
+        WoModalGuardTick = True
+        Err.Clear
+        Exit Function
+    End If
+    m_mgBusy = True
+    m_mgTries = m_mgTries + 1
+    Dim ds As Object
+    Set ds = WoDialogsJson("#32770", 0, True)
+    Dim n As Long
+    n = 0
+    If Not ds Is Nothing Then n = ds.Count
+    If n = 0 Then
+        m_mgBusy = False
+        Err.Clear
+        Exit Function
+    End If
+    m_mgSeen = True
+    m_mgSeenCount = n
+    Dim i As Long
+    For i = 1 To n
+        Dim d As Object
+        Set d = ds.Item(i)
+        ' ONLY a box that DISABLES ITS OWNER blocks the IDE. A merely visible window
+        ' (a modeless toolbox, a floating pane) must never be clicked.
+        If CBool(d("ownerDisabled")) Then
+            Dim mgRisk As String, mgReason As String, mgClass As String
+            WoHostModalRiskOfDialog d, mgRisk, mgReason, mgClass
+            Dim bdy As String
+            bdy = WoMgBodyOf(d)
+            Dim bang As Boolean, bangHit As String
+            bang = WoDialogBodyDangerous(d, bangHit)
+            If m_mgHwnd = 0 Then
+                m_mgTitle = CStr(d("title"))
+                m_mgHwnd = CLng(d("hwnd"))
+                m_mgCls = CStr(d("cls"))
+                m_mgBody = bdy
+                m_mgRisk = mgRisk
+                m_mgRiskClass = mgClass
+                m_mgRiskReason = mgReason
+            End If
+            Dim pick As Long, pickText As String, pickWhy As String, pickCancel As Boolean
+            Dim pickId As Long
+            pick = WoMgPickButton(d, pickText, pickWhy, pickCancel, pickId)
+            If pick <> 0 Then
+                If mgRisk = "known" And Not pickCancel And Not m_mgAllowHostModal Then
+                    ' VB6's own Make Project box: only a cancel-like caption may be
+                    ' pressed here. Pressing "the first safe button" starts a compile
+                    ' inside the host's modal loop = defect #4.
+                    m_mgRefused = m_mgRefused + 1
+                    m_mgRefusedReason = "host_modal_risk_known: only a cancel-like caption is pressed on this box (pressing its confirm caption starts a compile inside the host modal loop)"
+                    m_mgMethod = "none (refused before any message was sent)"
+                ElseIf bang And Not pickCancel Then
+                    m_mgRefused = m_mgRefused + 1
+                    m_mgRefusedReason = "dangerous_dialog_body: " & bangHit
+                    m_mgMethod = "none (refused before any message was sent)"
+                Else
+                    m_mgClickedHwnd = pick
+                    m_mgClickedText = pickText
+                    m_mgMethod = "BM_CLICK"
+                    WoSendMessageW pick, BM_CLICK, 0, 0
+                    ' BM_CLICK is documented to do nothing on an INACTIVE dialog. It is sent
+                    ' SYNCHRONOUSLY to a window of our own thread, so re-probing the box NOW
+                    ' is authoritative - and if it is still there, use the dialog's own
+                    ' WM_COMMAND/BN_CLICKED path once, exactly like close_active_dialogs.
+                    If WoIsWindow(m_mgHwnd) <> 0 Then
+                        m_mgMethod = "BM_CLICK+WM_COMMAND"
+                        WoSendMessageW CLng(d("hwnd")), WM_COMMAND, pickId, pick
+                    End If
+                    m_mgClicked = True
+                    If WoIsWindow(m_mgHwnd) = 0 Then m_mgDismissed = True
+                    m_mgResolvedMs = WoGetTickCount() - m_mgAt
+                    m_mgArmed = False
+                    m_mgBusy = False
+                    WoModalGuardTick = True
+                    Err.Clear
+                    Exit Function
+                End If
+            Else
+                m_mgRefused = m_mgRefused + 1
+                m_mgRefusedReason = pickWhy
+                m_mgMethod = "none (no caption this guard is allowed to press)"
+            End If
+        End If
+    Next
+    m_mgBusy = False
+    Err.Clear
+End Function
+
+' The machine-readable guard receipt. Nothing is invented: modalDetected=true means a
+' blocking box WAS seen; clickedButton="" means nothing was pressed.
+Public Function WoModalGuardReceipt() As Object
+    On Error Resume Next
+    If m_mgAt = 0 Then
+        Set WoModalGuardReceipt = Nothing
+        Err.Clear
+        Exit Function
+    End If
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("armedBy") = m_mgBy
+    root("modalDetected") = m_mgSeen
+    root("modalCount") = m_mgSeenCount
+    root("modalHwnd") = m_mgHwnd
+    root("modalCls") = m_mgCls
+    root("modalTitle") = m_mgTitle
+    root("modalBody") = m_mgBody
+    root("modalHostRisk") = m_mgRisk
+    root("modalHostRiskClass") = m_mgRiskClass
+    root("modalHostRiskReason") = m_mgRiskReason
+    root("modalClickedButton") = m_mgClickedText
+    root("modalClickedHwnd") = m_mgClickedHwnd
+    root("modalClicked") = m_mgClicked
+    root("modalClickMethod") = m_mgMethod
+    root("modalDismissed") = m_mgDismissed
+    root("modalResolvedMs") = m_mgResolvedMs
+    root("modalRefusedCount") = m_mgRefused
+    root("modalRefusedReason") = m_mgRefusedReason
+    root("modalAllowHostModal") = m_mgAllowHostModal
+    root("modalWaitMs") = m_mgWaitMs
+    root("modalWaitedMs") = IIf(m_mgAt = 0, 0, WoGetTickCount() - m_mgAt)
+    root("modalTicks") = m_mgTries
+    root("modalPolicy") = "CANCEL-FIRST, bounded. An exact Cancel/Close/Ignore/No caption is always preferred; a non-cancel caption is pressed ONLY when the dialog is not host-modal risk=known and its body names no destructive action. VB6's Make Project box enumerates Open(read-only,disabled)/OK(id1)/Cancel(id2)/Help/Options, so 'the first safe button' would press OK and start a compile inside the host's modal loop - the guard never does that."
+    Dim rb As String
+    rb = "not_needed"
+    If m_mgSeen Then
+        If m_mgClicked Then
+            rb = "modal_guard_click"
+        Else
+            rb = "modal_guard_timeout"
+        End If
+    End If
+    If m_mgTimedOut Then rb = "modal_guard_timeout"
+    root("modalRecoveredBy") = rb
+    Dim ses As String
+    If m_mgClicked Then
+        If m_mgDismissed Then
+            ses = "none: caption '" & m_mgClickedText & "' was pressed and the box is gone. The guard never presses a CONFIRM caption on a host-modal box, so it did not start that box's operation."
+        Else
+            ses = "unknown: caption '" & m_mgClickedText & "' was pressed but the box was still open at the last check - re-probe with read_active_dialogs"
+        End If
+    ElseIf m_mgSeen Then
+        ses = "none: nothing was sent (see modalRefusedReason)"
+    Else
+        ses = "none: no blocking dialog was seen inside the budget"
+    End If
+    root("modalSideEffects") = ses
+    root("modalNote") = "the guard is driven by the watchdog tick (ServerForm.tmrWatch -> WheelTick), the only channel the host's own modal loop still dispatches (TASK-P1-084). It is a bounded SAFETY NET, not a proof: modalDetected=false means no blocking box was seen within modalWaitMs, NOT that none existed."
+    Set WoModalGuardReceipt = root
+    Err.Clear
+End Function
 Private Function btnsOf(ByVal d As Object) As Object
     On Error Resume Next
     Set btnsOf = d("buttons")
@@ -2234,6 +2633,13 @@ Public Sub WheelTick()
     ' by the modal loop itself, which is precisely why the click can happen at all.
     WoConfirmTick
     ' TASK-P1-132 (D-130-01): run a scroll the WndProc could not perform, from the TIMER
+
+    ' TASK-P2FIX4 (round 5): the GENERIC MODAL GUARD ticks here, right after the
+    ' one-shot Add Form confirm and BEFORE the wheel's own early exit, for exactly the
+    ' reason WoConfirmTick runs here: the host's modal loop dispatches this watchdog's
+    ' WM_TIMER itself, so this is the only place a click can come from while a tool
+    ' call is suspended inside that loop (#10 / #11 / #4).
+    WoModalGuardTick
     ' path (outside the subclassed window procedure), then read the result back.
     WheelPumpPending
     If Not m_whEnabled Then Exit Sub

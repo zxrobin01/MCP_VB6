@@ -114,6 +114,11 @@ Private m_gateReleasedHeldMs As Long
 Private m_gateReleasedAt As String
 Private m_gateReleasedReason As String
 Private Const GATE_RELEASE_MIN_MS As Long = 60000
+' TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the bounded budget of the generic
+' modal guard. Long enough for TWO watchdog ticks (tmrWatch.Interval is 5000 ms in
+' steady state, measured in TASK-P1-157), short enough that a caller is never left
+' hanging on a box this add-in cannot dismiss.
+Private Const MODAL_GUARD_WAIT_MS As Long = 15000
 ' TASK-P1-168 (B): an ARMED release. immediate_eval / immediate_run set it before they
 ' hand their line to EbExecuteLine; if that call never comes back, the NEXT tool call
 ' sees the age and force-releases the gate by itself, so one bad statement cannot leave
@@ -2486,6 +2491,134 @@ Private Sub MaybeAutoRelease()
     Call ForceReleaseGate("armed_release", "auto_released_armed_timeout", m_armMs, 0)
 End Sub
 
+' =====================================================================
+' TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the three call paths that were
+' measured to hang on a host modal now share ONE bounded protocol:
+'   arm   -> WinOps.WoModalGuardArm(tool, MODAL_GUARD_WAIT_MS)  (Cancel-first
+'            dismissal of the box, driven by the watchdog tick and by our own pump)
+'         -> ArmGateRelease(tool, wait + slack)                 (the BACKSTOP: if the
+'            call still never comes back, the next tool call releases the single-flight
+'            gate by itself, so the chain does not stay busy for ever)
+'   settle-> ModalGuardSettle()   (bounded pump so the tick can run even when the
+'            failing call did NOT block inside the modal)
+'   disarm-> WinOps.WoModalGuardDisarm + DisarmGateRelease
+'   report-> MergeModalGuard(root) or ModalGuardFragment(), on EVERY path.
+' Nothing here is silent: a guard that saw nothing, a guard that dismissed a box and a
+' guard that could NOT dismiss one all produce DIFFERENT, machine-readable receipts.
+' =====================================================================
+
+' The backstop. Reuses the EXACT machinery immediate_eval / immediate_run already use
+' (MaybeAutoRelease -> ForceReleaseGate ... "armed_release" ...), so no new state is
+' introduced and the existing receipt already says WHO released WHAT and WHY.
+Private Sub ArmGateRelease(ByVal toolName As String, ByVal budgetMs As Long)
+    If budgetMs < 1000 Then budgetMs = 1000
+    m_armTool = toolName
+    m_armMs = budgetMs
+    m_armAt = GetTickCount()
+End Sub
+
+Private Sub DisarmGateRelease()
+    m_armMs = 0
+    m_armTool = ""
+    m_armAt = 0
+End Sub
+
+' Bounded pump. The host modal loop drives WheelTick by itself, but a box can also be
+' merely POSTED rather than reached synchronously; pumping here covers that case and
+' lets the guard finish before the tool returns. Always bounded, and the cooperative
+' cancel is honoured at this pump point exactly like every other pump in this class.
+Private Sub ModalGuardSettle(ByVal waitMs As Long)
+    ' WHY THIS IS NOT JUST "pump for waitMs": the host's modal loop drives the guard by
+    ' itself (that is what TASK-P1-084 proved), so when the risky call really DID block on
+    ' a box the box is already gone by the time we get here. The pump exists only for the
+    ' case where a box is merely POSTED rather than reached synchronously. Waiting the
+    ' whole budget on every HEALTHY call would therefore add a needless 15 s stall to
+    ' native_breakpoint - measured on this card's first build (15085 ms for a toggle that
+    ' should take milliseconds). So: a SHORT grace period while no box is in sight, and
+    ' the FULL budget only once the guard has actually seen a blocking box.
+    Const MG_GRACE_MS As Long = 1200
+    Dim t0 As Long
+    Dim deadline As Long
+    t0 = GetTickCount()
+    deadline = t0 + MG_GRACE_MS
+    On Error Resume Next
+    Do While WinOps.WoModalGuardPending()
+        WinOps.WoModalGuardTick
+        MaybeHonorCancel
+        DoEvents
+        If WinOps.WoModalGuardSawBox() Then deadline = t0 + waitMs
+        If GetTickCount() >= deadline Then Exit Do
+    Loop
+    Err.Clear
+End Sub
+
+' Copy the guard receipt onto a Dictionary-shaped reply. Called on EVERY return path of
+' the tools that arm the guard.
+Private Sub MergeModalGuard(ByRef root As Object)
+    On Error Resume Next
+    Dim mg As Object
+    Set mg = WinOps.WoModalGuardReceipt()
+    If mg Is Nothing Then Exit Sub
+    root("modalGuard") = "armed"
+    root("modalDetected") = mg("modalDetected")
+    root("modalTitle") = mg("modalTitle")
+    root("modalBody") = mg("modalBody")
+    root("modalClickedButton") = mg("modalClickedButton")
+    root("modalClicked") = mg("modalClicked")
+    root("modalWaitMs") = mg("modalWaitMs")
+    root("modalWaitedMs") = mg("modalWaitedMs")
+    root("modalSideEffects") = mg("modalSideEffects")
+    root("modalRecoveredBy") = mg("modalRecoveredBy")
+    root("modalPolicy") = mg("modalPolicy")
+    root("modalRefusedReason") = mg("modalRefusedReason")
+    root("modalHostRisk") = mg("modalHostRisk")
+    root("modalHostRiskClass") = mg("modalHostRiskClass")
+    root("modalNote") = mg("modalNote")
+    ' The same facts under the names the round-5 task asked for, so a caller can read
+    ' either spelling. NOTE: a bare `sideEffects` is deliberately NOT aliased - that is
+    ' the global additive audit block added by SealedReceipt, and overwriting it would
+    ' destroy other evidence.
+    root("clickedButton") = mg("modalClickedButton")
+    root("waitedMs") = mg("modalWaitedMs")
+    Err.Clear
+End Sub
+
+' The same receipt as a JSON FRAGMENT (no outer braces), for the tools whose reply is a
+' JSON TEXT rather than a Dictionary (vba6_probe). Built by serialising a Dictionary and
+' stripping its braces, so no hand-rolled escaping can break the shape.
+Private Function ModalGuardFragment() As String
+    On Error Resume Next
+    ModalGuardFragment = ""
+    Dim mg As Object
+    Set mg = WinOps.WoModalGuardReceipt()
+    If mg Is Nothing Then Exit Function
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("modalGuard") = "armed"
+    d("modalDetected") = mg("modalDetected")
+    d("modalTitle") = mg("modalTitle")
+    d("modalBody") = mg("modalBody")
+    d("modalClickedButton") = mg("modalClickedButton")
+    d("modalClicked") = mg("modalClicked")
+    d("modalWaitMs") = mg("modalWaitMs")
+    d("modalWaitedMs") = mg("modalWaitedMs")
+    d("modalSideEffects") = mg("modalSideEffects")
+    d("modalRecoveredBy") = mg("modalRecoveredBy")
+    d("modalPolicy") = mg("modalPolicy")
+    d("modalRefusedReason") = mg("modalRefusedReason")
+    d("modalHostRisk") = mg("modalHostRisk")
+    d("modalHostRiskClass") = mg("modalHostRiskClass")
+    d("modalNote") = mg("modalNote")
+    d("clickedButton") = mg("modalClickedButton")
+    d("waitedMs") = mg("modalWaitedMs")
+    Dim whole As String
+    whole = JsonStringify(d)
+    If Len(whole) > 2 Then
+        If Left$(whole, 1) = "{" Then ModalGuardFragment = Mid$(whole, 2, Len(whole) - 2)
+    End If
+    Err.Clear
+End Function
+
 Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Object
     Dim res As Object
     Set res = CreateObject("Scripting.Dictionary")
@@ -3693,7 +3826,61 @@ End Sub
 '                  by the add-in: they mean the add-in never answered at all, so no
 '                  add-in receipt - and therefore no exec_error - can exist for them.
 ' =====================================================================
+' TASK-P2FIX4 (round 5, defect #10): the exec probe is the SECOND path measured to hang.
+' A raising statement (x = CDbl("abc")) makes VB6 put up its OWN run-time error box; the
+' add-in is single-threaded and suspended inside that modal loop, so no code after the
+' failing call can dismiss it. The wrapper below arms the bounded modal guard (Cancel-
+' first) and the gate backstop around ONLY the exec_probe branch, then merges the guard
+' receipt into the reply. The probe body itself is UNCHANGED, so a clean probe still
+' returns byte-identically and no existing successful caller can change behaviour.
 Private Function ToolVba6ExecProbe(ByVal args As Object) As String
+    Dim res As String
+    On Error Resume Next
+    ' Only the exec_probe branch hands a line to EbExecuteLine; the other probe branches
+    ' cannot open that box and are NOT armed - their reply is returned verbatim.
+    If Not JsonGetBool(args, "exec_probe", False) Then
+        Err.Clear
+        On Error GoTo 0
+        ToolVba6ExecProbe = ToolVba6ExecProbeBody(args)
+        Exit Function
+    End If
+    On Error GoTo 0
+    Dim mgWait As Long
+    mgWait = MODAL_GUARD_WAIT_MS
+    WinOps.WoModalGuardArm "vba6_probe{exec_probe}", mgWait
+    ArmGateRelease "vba6_probe", mgWait + 5000
+    res = ToolVba6ExecProbeBody(args)
+    Call ModalGuardSettle(mgWait)
+    WinOps.WoModalGuardDisarm
+    DisarmGateRelease
+    Dim frag As String
+    frag = ModalGuardFragment()
+    If Len(frag) = 0 Then
+        ToolVba6ExecProbe = res
+        Exit Function
+    End If
+    Dim merged As String
+    merged = JsonPrependMembers(res, frag)
+    If merged <> res Then
+        ToolVba6ExecProbe = merged
+        Exit Function
+    End If
+    ' The guard fields could NOT be merged because the probe's answer was not a plain
+    ' non-empty JSON object. Say so, and carry BOTH the verbatim answer and the guard
+    ' receipt, instead of silently dropping the guard's evidence.
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = "modal_guard_fields_not_merged"
+    d("tool") = "vba6_probe"
+    d("probe") = "exec_probe"
+    d("raw") = res
+    d("note") = "the exec probe's answer was not a plain non-empty JSON object, so the modal-guard fields could not be merged into it in place. The probe's own answer is carried verbatim in raw, and the guard receipt is in the modal* fields."
+    Call MergeModalGuard(d)
+    ToolVba6ExecProbe = JsonStringify(d)
+End Function
+
+Private Function ToolVba6ExecProbeBody(ByVal args As Object) As String
     Dim raw As String
     Dim raised As Boolean
     Dim rNum As Long
@@ -3730,7 +3917,7 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
         Set d("exec_error") = e
         d("raw") = Left$(raw, 400)
         d("transportReasonSpace") = transportNote
-        ToolVba6ExecProbe = JsonStringify(d)
+        ToolVba6ExecProbeBody = JsonStringify(d)
         Exit Function
     End If
     ' The probe answered. When it captured a VB error while executing the line, re-label the
@@ -3744,7 +3931,7 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
     f1 = JsonFieldRaw(raw, "vbaError")
     If Len(f1) > 0 Then n = CLng(Val(f1))
     If n = 0 Then
-        ToolVba6ExecProbe = raw
+        ToolVba6ExecProbeBody = raw
         Exit Function
     End If
     dr = JsonFieldRaw(raw, "vbaErrorDesc")
@@ -3782,10 +3969,10 @@ Private Function ToolVba6ExecProbe(ByVal args As Object) As String
         d3("raw") = raw
         d3("relabelFailed") = "the probe's answer was not a plain non-empty JSON object, so it could not be re-labelled in place"
         d3("transportReasonSpace") = transportNote
-        ToolVba6ExecProbe = JsonStringify(d3)
+        ToolVba6ExecProbeBody = JsonStringify(d3)
         Exit Function
     End If
-    ToolVba6ExecProbe = inj
+    ToolVba6ExecProbeBody = inj
 End Function
 
 ' =====================================================================
@@ -8519,6 +8706,24 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     ' would put the add-in inside somebody else's modal loop - the exact stuck state
     ' the user hit (every later write tool answered reason=busy until the IDE was
     ' killed). Refuse, and hand back the hwnd/title/controls needed to decide.
+    ' ---- TASK-P2FIX4 (round 5, defect #4) ------------------------------------------
+    ' Arm the bounded modal guard for the WHOLE risky region of this tool. Its
+    ' Cancel-first policy is what stops VB6's own Make Project box from being CONFIRMED:
+    ' that box enumerates its buttons Open-as-read-only(disabled), OK(id1), Cancel(id2),
+    ' Help, Options, so "the default button" is OK - and pressing it starts a compile
+    ' INSIDE the host's modal loop, from which this single-threaded add-in never returns
+    ' (#4's original symptom; docs/evidence/TASK-P1-VERIFY/PREFIX_A_FINDINGS.md L25-L26).
+    ' The guard presses Cancel instead, the host aborts the Make, and the call RETURNS.
+    ' While it is armed it also makes WoConfirmTick stand down, because that one-shot
+    ' confirm only ever presses a CONFIRM caption.
+    ' GATE BACKSTOP BUDGET: MAKE_LAND_WAIT_MS + MODAL_GUARD_WAIT_MS + 5000 is this tool's
+    ' own worst-case bounded runtime AFTER the modal handling, so a healthy compile inside
+    ' the tool's documented budget is never force-released; a genuinely wedged call still
+    ' is. See the report for why this budget is deliberately long here.
+    Dim mgWait As Long
+    mgWait = MODAL_GUARD_WAIT_MS
+    WinOps.WoModalGuardArm "make_project", mgWait, allowHostModal
+    ArmGateRelease "make_project", MAKE_LAND_WAIT_MS + mgWait + 5000
     Dim preRisk As String, preReason As String, preClass As String, preDetails As String
     Dim preNDlg As Long
     preNDlg = WinOps.HostModalRiskProbe("#32770", preRisk, preReason, preClass, preDetails)
@@ -8537,8 +8742,21 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         root("note") = "a host-modal box was already up before this call, so make_project neither compiled nor touched the artifact"
         ' TASK-P1-125 (discipline 98): this early exit must still report the same
         ' shape, including the dialog counts and the elapsed time.
-        root("dialogs_after") = preNDlg
-        root("dialogs_leaked") = 0
+        ' TASK-P2FIX4 (round 5): the box that was already up is now DISMISSED with a
+        ' CANCEL-like caption instead of being left over the IDE. Cancel cannot START the
+        ' host-modal operation, so pressing it in a box this call did not open is safe -
+        ' it only aborts something nobody asked THIS call to do. The confirm caption is
+        ' still never pressed. Nothing is compiled and the artifact is NOT touched, which
+        ' is what the pre-existing path already promised.
+        If Not allowHostModal Then
+            Call ModalGuardSettle(mgWait)
+            root("modalDismissPolicy") = "cancel_only: the box predated this call, so only a Cancel/Close/Ignore/No caption could be pressed; the confirm caption was never pressed and no compile was started"
+        End If
+        WinOps.WoModalGuardDisarm
+        DisarmGateRelease
+        Call MergeModalGuard(root)
+        root("dialogs_after") = WinOps.HostModalRiskProbe("#32770", preRisk, preReason, preClass, preDetails)
+        root("dialogs_leaked") = root("dialogs_after")
         root("elapsedMs") = GetTickCount() - t0
         ToolMakeProject = JsonStringify(root)
         Exit Function
@@ -8651,21 +8869,43 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     ' for a compile and expects the call to block for it, and the box is reported as
     ' host_modal_risk=known so the blocking is explicit instead of silent. The defect
     ' was a tool the caller expected to return quickly (close_active_dialogs) doing it.
+    ' ---- TASK-P2FIX4 (round 5, defect #4): CANCEL-FIRST on a host-modal box ---------
+    ' When the box that is up is VB6's OWN Make Project box (risk=known), the bounded
+    ' modal guard presses its CANCEL caption. ConfirmMakeDialog would press the DEFAULT
+    ' button, which on this box is OK(id1) - the click that starts a compile inside the
+    ' host's modal loop and never returns. allow_host_modal=true keeps the old behaviour
+    ' for a caller who explicitly asks for the compile to run inside the host.
     If nDlg > 0 Then
         Sleep 400
         root("modalConfirmAttempted") = True
-        ConfirmMakeDialog
-        buildStarted = True
+        If risk = "known" And Not allowHostModal Then
+            Call ModalGuardSettle(mgWait)
+            root("modalDismissPolicy") = "cancel_only: VB6's own Make Project box is host-modal risk=known, so its CONFIRM caption was deliberately NOT pressed. ConfirmMakeDialog was NOT called, because its default button on this box is OK(id1) and that click starts a compile inside the host's modal loop."
+            buildStarted = False
+        Else
+            ConfirmMakeDialog
+            buildStarted = True
+        End If
         If risk = "known" Then
-            root("modal_note") = "VB6's own Make Project box was up and WAS confirmed: this call is now inside the host's modal loop for the whole compile. That is expected for make_project, and it is exactly why close_active_dialogs must never click this box."
+            If allowHostModal Then
+                root("modal_note") = "VB6's own Make Project box was up and allow_host_modal=true, so it WAS confirmed: this call is now inside the host's modal loop for the whole compile. That is exactly why close_active_dialogs must never click this box."
+            Else
+                root("modal_note") = "VB6's own Make Project box was up. The bounded modal guard pressed its CANCEL caption rather than its default OK, so NO compile was started inside the host's modal loop and this call returns. Pass allow_host_modal=true to confirm it deliberately."
+            End If
         End If
     ElseIf compiled Then
         buildStarted = True
     ElseIf usedMenuFallback Then
         Sleep 400
         root("modalConfirmAttempted") = True
-        ConfirmMakeDialog
-        buildStarted = True
+        If risk = "known" And Not allowHostModal Then
+            Call ModalGuardSettle(mgWait)
+            root("modalDismissPolicy") = "cancel_only: the File>Make fallback raised VB6's Make Project box; the bounded modal guard owned it and pressed CANCEL, so no compile was started inside the host's modal loop."
+            buildStarted = False
+        Else
+            ConfirmMakeDialog
+            buildStarted = True
+        End If
     End If
     root("buildStarted") = buildStarted
     root("usedMenuFallback") = usedMenuFallback
@@ -9050,6 +9290,16 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
             End If
         End If
     End If
+    ' TASK-P2FIX4 (round 5): the two layers that can dismiss a box during a compile now
+    ' coexist, and the receipt must not look like the watchdog failed when it was the
+    ' GUARD that acted. WoConfirmTick stands down whenever the guard is armed (it only
+    ' ever presses a CONFIRM caption, which is exactly what must not happen on VB6's Make
+    ' box), so make_watchdog_clicked can legitimately be false while the box WAS
+    ' dismissed - the modal* fields say by whom.
+    root("modalWatchdogRelationship") = "while the generic modal guard is armed, the one-shot make watchdog (WinOps.WoConfirmArm/WoConfirmTick) STANDS DOWN, because it only ever presses a CONFIRM caption and on VB6's Make Project box that caption starts the compile inside the host's modal loop. So make_watchdog_clicked=false next to modalClickedButton='Cancel' is the EXPECTED, correct combination - not a failure of the watchdog."
+    WinOps.WoModalGuardDisarm
+    DisarmGateRelease
+    Call MergeModalGuard(root)
     ToolMakeProject = JsonStringify(root)
 End Function
 
@@ -9296,11 +9546,33 @@ End Function
 ' ---------------------------------------------------------------------
 ' native IDE breakpoint (Debug menu; does not modify any source file)
 ' ---------------------------------------------------------------------
-Private Function BreakpointLocationProblem(ByVal comp As String, ByVal line As Long) As String
+Private Function BreakpointLocationProblem(ByVal comp As String, ByVal line As Long, _
+                                           ByRef outKind As String, ByRef outWhy As String, _
+                                           ByRef outText As String) As String
     ' Returns "" when the position can hold a breakpoint, else a short reason code.
     ' VB6 refuses breakpoints in "some regions": blank lines, comment lines and the
     ' declaration section. Asking anyway aimed the IDE at a position it will not
     ' accept, and the request died with the connection closed and no reply.
+    '
+    ' TASK-P2FIX4 (round 5, defect #11): the reasons are now split into two classes and
+    ' the caller MUST be able to tell them apart:
+    '   * EXACT   - component_not_found / no_code_module / line_out_of_range /
+    '               blank_line / comment_line / declaration_section. VB6 itself computes
+    '               these through the code-module API (CountOfDeclarationLines, Lines).
+    '   * HEURISTIC - breakpoint_not_allowed_on_line, with outKind naming the class:
+    '               continuation_line / procedure_header / procedure_footer /
+    '               attribute_line / declaration_statement. These are LANGUAGE-LEVEL
+    '               facts about VB6, NOT a query: the extensibility model exposes no
+    '               breakpoint API and no "can I break here?" call, so this is a
+    '               conservative PRE-FILTER and it says so in the receipt
+    '               (heuristic:true). It can only ever REFUSE a line; a line it accepts
+    '               may still be refused by the IDE, and that residue is covered by the
+    '               bounded modal guard in WinOps (MODAL_GUARD_WAIT_MS).
+    ' WHY CONSERVATIVE ERRORS TOWARD REFUSAL: refusing a line VB6 would have accepted
+    ' costs the caller one retry; letting VB6 refuse it used to cost the whole session's
+    ' write path (measured: the Debug-menu toggle hung ~1 minute behind a modal "this
+    ' line cannot hold a breakpoint" box and every later write answered reason=busy -
+    ' TASK-P1-164 A11 section 4).
     On Error Resume Next
     If Len(comp) = 0 Then Exit Function
     Dim c As VBIDE.VBComponent
@@ -9325,6 +9597,7 @@ Private Function BreakpointLocationProblem(ByVal comp As String, ByVal line As L
     End If
     Dim txt As String
     txt = Trim$(cm.Lines(line, 1))
+    outText = txt
     If Len(txt) = 0 Then
         BreakpointLocationProblem = "blank_line"
         Exit Function
@@ -9335,8 +9608,116 @@ Private Function BreakpointLocationProblem(ByVal comp As String, ByVal line As L
     End If
     If LCase$(Left$(txt, 4)) = "rem " Or LCase$(txt) = "rem" Then
         BreakpointLocationProblem = "comment_line"
+        Exit Function
     End If
+    ' ---- TASK-P2FIX4 (round 5, defect #11): the HEURISTIC pre-filter -----------
+    Dim lo As String
+    lo = LCase$(txt)
+    ' A procedure can carry an access modifier, and "Public Function X()" is a PROCEDURE
+    ' HEADER - not a declaration statement. Stripping ONE leading modifier for the header
+    ' test (and leaving lo intact for the declaration test) is what keeps lineKind honest:
+    ' measured on this card, "Public Function Sum2(...)" was first reported as
+    ' declaration_statement, which would have told the caller the wrong thing.
+    Dim core As String
+    core = lo
+    If BpStartsWord(core, "public ") Then core = Mid$(core, 8)
+    If BpStartsWord(core, "private ") Then core = Mid$(core, 9)
+    If BpStartsWord(core, "friend ") Then core = Mid$(core, 8)
+    If BpStartsWord(core, "global ") Then core = Mid$(core, 8)
+    If BpStartsWord(core, "static ") Then core = Mid$(core, 8)
+    ' (a) a CONTINUATION line: the previous physical line ends with the VB6 line
+    '     continuation character, so this line does not START a statement.
+    If line > 1 Then
+        Dim prev As String
+        prev = RTrim$(cm.Lines(line - 1, 1))
+        If Len(prev) > 0 Then
+            If Right$(prev, 1) = "_" Then
+                outKind = "continuation_line"
+                outWhy = "this line continues the statement that starts on the previous physical line, so it does not start a statement of its own"
+                BreakpointLocationProblem = "breakpoint_not_allowed_on_line"
+                Exit Function
+            End If
+        End If
+    End If
+    ' (b) a PROCEDURE header or footer is not an executable statement. This is the
+    '     class that produced the round-5 sample (a line inside a module whose pane
+    '     numbering is offset by its Attribute line resolves to a Function header).
+    If BpStartsWord(core, "sub ") Or BpStartsWord(core, "function ") Or _
+       BpStartsWord(core, "property ") Or BpStartsWord(core, "declare ") Then
+        outKind = "procedure_header"
+        outWhy = "this is a procedure header (Sub/Function/Property/Declare), not an executable statement"
+        BreakpointLocationProblem = "breakpoint_not_allowed_on_line"
+        Exit Function
+    End If
+    If lo = "end sub" Or lo = "end function" Or lo = "end property" Then
+        outKind = "procedure_footer"
+        outWhy = "this is the END line that closes a procedure, not an executable statement"
+        BreakpointLocationProblem = "breakpoint_not_allowed_on_line"
+        Exit Function
+    End If
+    ' (c) a source-file ATTRIBUTE line. VB6 does not always count Attribute/VERSION as
+    '     declaration lines, so this test has to be separate from the section test.
+    If BpStartsWord(lo, "attribute ") Or BpStartsWord(lo, "version ") Then
+        outKind = "attribute_line"
+        outWhy = "this is a source-file attribute line (Attribute/VERSION), not code"
+        BreakpointLocationProblem = "breakpoint_not_allowed_on_line"
+        Exit Function
+    End If
+    ' (d) a DECLARATION statement. The declaration-SECTION test above only covers
+    '     module-level declarations that VB6 counts; VB6 also refuses a breakpoint on
+    '     Option/Dim/Static/Const/Type/Enum and on the module-level Public/Private/
+    '     Friend/Global form (an in-procedure Dim is the common case in the wild).
+    If BpStartsWord(lo, "dim ") Or BpStartsWord(lo, "static ") Or _
+       BpStartsWord(lo, "const ") Or BpStartsWord(lo, "option ") Or _
+       BpStartsWord(lo, "type ") Or BpStartsWord(lo, "enum ") Or _
+       BpStartsWord(lo, "public ") Or BpStartsWord(lo, "private ") Or _
+       BpStartsWord(lo, "friend ") Or BpStartsWord(lo, "global ") Then
+        outKind = "declaration_statement"
+        outWhy = "this is a declaration statement (Option/Dim/Static/Const/Type/Enum, or a module-level Public/Private/Friend/Global), not an executable statement"
+        BreakpointLocationProblem = "breakpoint_not_allowed_on_line"
+        Exit Function
+    End If
+    outKind = ""
+    outWhy = ""
 End Function
+
+' TASK-P2FIX4: does a line start with the KEYWORD w (case-insensitive)? w already
+' carries its own trailing space, so the word boundary is inherent. Used only by the
+' conservative breakpoint pre-filter above.
+Private Function BpStartsWord(ByVal loLine As String, ByVal w As String) As Boolean
+    If Len(loLine) <= Len(w) Then Exit Function
+    If Left$(loLine, Len(w)) <> w Then Exit Function
+    BpStartsWord = True
+End Function
+
+' TASK-P2FIX4 (round 5, defect #11): the machine-readable detail for a pre-check
+' refusal, so a caller never has to guess WHICH class of position was refused and
+' whether the verdict was exact or heuristic.
+Private Sub BreakpointRejectDetail(ByVal reason As String, ByRef why As String, _
+                                   ByRef advice As String, ByRef note As String)
+    advice = "move the caret to an executable statement inside a procedure and retry"
+    note = "nothing was executed and no menu command was sent, so this refusal cannot open a host modal"
+    Select Case reason
+        Case "component_not_found"
+            why = "the component name was not found in the active project"
+            advice = "call get_component_list and use the exact component name"
+        Case "no_code_module"
+            why = "the component has no code module (it is a designer-only component)"
+            advice = "address a component that has code (a module, class module or form)"
+        Case "line_out_of_range"
+            why = "the line number is outside the code module's own line count"
+            advice = "call get_component_code (coords=ide) and use a line it actually returns"
+        Case "declaration_section"
+            why = "the line is inside the module's declaration section (VB6 computes CountOfDeclarationLines itself)"
+        Case "blank_line"
+            why = "the line is blank, so there is no statement to break on"
+        Case "comment_line"
+            why = "the line is a comment (a leading apostrophe or a Rem statement)"
+        Case "breakpoint_not_allowed_on_line"
+            ' why / kind come from the classifier itself
+            note = "HEURISTIC PRE-FILTER, not VB6's own verdict: the extensibility model exposes no breakpoint API and no 'can I break here?' query, so this is a language-level classification. It can only ever refuse a line; a line it accepts may still be refused by the IDE, and that residue is covered by the bounded modal guard (see the modal* fields of the receipt)."
+    End Select
+End Sub
 
 Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     Dim action As String
@@ -9353,6 +9734,22 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     ' answer with a structured failure instead.
     Dim preReason As String
     preReason = ""
+    ' TASK-P2FIX4 (round 5, defect #11): the pre-check now also reports WHAT KIND of
+    ' position was refused and WHY, so a heuristic refusal can never be mistaken for
+    ' VB6's own ruling.
+    Dim preKind As String
+    Dim preWhy As String
+    Dim preText As String
+    Dim preAdvice As String
+    Dim preNote As String
+    preKind = ""
+    preWhy = ""
+    preText = ""
+    preAdvice = ""
+    preNote = ""
+    ' TASK-P2FIX4 (round 5): the bounded modal-guard budget for the menu-driven toggle.
+    Dim mgWait As Long
+    mgWait = MODAL_GUARD_WAIT_MS
     Dim cp As VBIDE.CodePane
     ' TASK-P1-164 (R18-2 / R18-3): BEFORE anything moves, remember the caret and the pane
     ' text so the receipt can PROVE the pane was not rewritten and the caret was put back.
@@ -9374,7 +9771,7 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
         Case "toggle"
             ctrlCands = "Toggle Breakpoint|" & ChrW$(&H5207) & ChrW$(&H6362) & ChrW$(&H65AD) & ChrW$(&H70B9)
             If line > 0 Then
-                preReason = BreakpointLocationProblem(comp, line)
+                preReason = BreakpointLocationProblem(comp, line, preKind, preWhy, preText)
                 If Len(preReason) = 0 Then
                     Set cp = GetCodePane(comp)
                     On Error Resume Next
@@ -9413,9 +9810,33 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     If Len(preReason) > 0 Then
         Dim rej As Object
         Set rej = CreateObject("Scripting.Dictionary")
+        Call BreakpointRejectDetail(preReason, preWhy, preAdvice, preNote)
+        ' TASK-P2FIX4 (round 5, defect #11): a structured refusal that NAMES the class of
+        ' position and says whether the verdict is exact (a code-module query VB6 itself
+        ' computes) or heuristic (this file's language-level classifier). The menu command
+        ' is NEVER sent on this path, so no host modal can appear: that is the whole point
+        ' of pre-checking, and the receipt states it as a fact (menuCommandSent / modal).
+        rej("ok") = False
         rej("action") = action
         rej("executed") = False
         rej("reason") = preReason
+        rej("lineKind") = preKind
+        rej("why") = preWhy
+        rej("lineText") = preText
+        rej("heuristic") = (preReason = "breakpoint_not_allowed_on_line")
+        rej("advice") = preAdvice
+        rej("menuCommandSent") = False
+        rej("modalDetected") = False
+        rej("modalClickedButton") = ""
+        rej("modalWaitedMs") = 0
+        rej("modalRecoveredBy") = "not_needed: the refusal happens BEFORE any menu command, so this call cannot open a host modal"
+        rej("modalGuard") = "not armed on this path - no menu command is sent and no host modal can be opened by this call"
+        rej("modalSideEffects") = "none: nothing was sent to the IDE"
+        rej("modalPolicy") = "PRE-CHECK FIRST: a position VB6 refuses makes the Debug-menu toggle block inside a host modal that this single-threaded add-in cannot dismiss from the call that opened it (measured: ~1 minute, then every later write answered reason=busy). When the pre-check can refuse, it does, and the menu is never touched."
+        rej("modalNote") = "this is a STRUCTURED REFUSAL, not a timeout and not a swallowed dialog. See heuristic/lineKind/why for whether the verdict is exact or a conservative pre-filter."
+        ' the same facts under the names the round-5 task asked for
+        rej("clickedButton") = ""
+        rej("waitedMs") = 0
         If Len(comp) > 0 Then rej("component") = comp
         If line > 0 Then rej("line") = line
         If Len(comp) > 0 And line > 0 Then
@@ -9423,18 +9844,40 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
             Set rej("coords") = CoordsDictOfName(comp, line, "ide")
         End If
         rej("state") = GetIdeState()
-        rej("note") = "VB6 does not allow a breakpoint at this position (blank line, comment, declaration section, or out of range)."
+        rej("note") = preNote
         ToolNativeBreakpoint = JsonStringify(rej)
         Exit Function
     End If
+    ' ---- TASK-P2FIX4 (round 5, defect #11): arm the bounded modal guard -------------
+    ' The pre-check above is a HEURISTIC and can only be conservative, so the residue -
+    ' a line it accepted that VB6 still refuses - must not be able to hang the session
+    ' again. The guard's Cancel-first policy dismisses VB6's "this line cannot hold a
+    ' breakpoint" box (a plain OK/Help message box) from the watchdog tick, which is the
+    ' only channel the host's modal loop still dispatches. ArmGateRelease is the
+    ' BACKSTOP: if the toggle still never returns, the NEXT tool call releases the
+    ' single-flight gate by itself instead of the caller having to know about
+    ' ide_state{release_inflight}.
+    Dim mgT0 As Long
+    mgT0 = 0
+    Dim mgJsonNote As String
+    mgJsonNote = ""
+    WinOps.WoModalGuardArm "native_breakpoint", mgWait
+    ArmGateRelease "native_breakpoint", mgWait + 5000
     Dim ctrl As Object
     Set ctrl = FindCmd(action, barCands, ctrlCands)
     If ctrl Is Nothing Then
+        WinOps.WoModalGuardDisarm
+        DisarmGateRelease
         Err.Raise vbObjectError + 84, "CodeTools", "Debug menu item not found for action=" & action & ". The CommandBars model is suspended while the program runs - stop it (end/break) and retry."
     End If
     Dim n As Long
     n = ExecIfEnabled(ctrl, action)
     DoEvents
+    ' The host modal loop drives WheelTick itself; this bounded pump covers the case
+    ' where the box is merely POSTED rather than reached synchronously.
+    Call ModalGuardSettle(mgWait)
+    WinOps.WoModalGuardDisarm
+    DisarmGateRelease
     ' ---- R18-3 compensation: restore the caret, then give the foreground back --------
     ' VB6 exposes NO breakpoint API (see list_breakpoints), and the Debug menu item acts on
     ' the CARET, so there is NO channel that sets an IDE-native breakpoint "without moving
@@ -9503,6 +9946,11 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     ' R18-2: the write-after assertion. A native breakpoint is menu-driven and writes no
     ' text, so the contract here is "the pane text is UNCHANGED"; a change flips the
     ' receipt to ok:false / reason:paneTextMismatch with the differing lines.
+    ' TASK-P2FIX4 (round 5): the guard receipt, on every path. It never invents a
+    ' dismissal: modalDetected=false means no blocking box was seen inside the budget,
+    ' and modalRecoveredBy says which of {not_needed, modal_guard_click,
+    ' modal_guard_timeout} actually happened.
+    Call MergeModalGuard(root)
     PaneAssertFinish root, pAssertComp, pAssertBefore, pAssertOn, "native_breakpoint"
     ToolNativeBreakpoint = JsonStringify(root)
 End Function
