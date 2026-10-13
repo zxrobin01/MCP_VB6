@@ -12,6 +12,10 @@ This file records **source and feature** changes only; packaging, release and ot
 
 ## 2026-10-13
 
+### 14:04 · In-process execution and read-back · session-level quiet mode · forced gate release
+
+**What changed**: added an **in-process execution and read-back** capability (**returns values directly and captures output**, so callers no longer have to write a file to get data out); added a **session-level quiet mode** (suppresses tools stealing the foreground); when a call is stuck on one of the IDE's own modal boxes, the **gate can now be force-released** so later calls recover.
+**Why**: runtime acceptance used to require **a human watching the IDE Immediate window**; a tool stealing the foreground can drop the user's **in-progress keystrokes into the code pane**; a single accidentally triggered throwing statement could **lock the whole tool chain** with no way to recover.
 ### 13:29 · Cumulative line numbers · operation receipts and refusals · foreground and pane protection · conditional-compilation arguments
 
 **What changed**: component disk line numbers now **accumulate per line** (no longer too low when hidden inline Attribute lines exist); the "delete control" and "open project" receipts now carry a **success flag, before/after counts and the memory-vs-disk difference**, and **refuse structurally** when it is unsafe; tools that touch the caret or a pane now **report and restore the foreground**, and **verify the pane text is unchanged** across the operation; conditional-compilation argument values are **no longer quoted**, and the receipt shows the actual command line.
