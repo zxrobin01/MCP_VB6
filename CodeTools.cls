@@ -839,7 +839,7 @@ Public Function BuildToolsListResult() As Object
     Set pRt("id") = Prop("string", "Trace id to remove")
     Set pRt("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("remove_trace", _
-        "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-129: it also removes the modMcpTrace component that inject_trace attached automatically - but ONLY while that module still carries the VB6MCP autogen marker; a hand-written modMcpTrace is left alone and the receipt says so.", _
+        "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-149: the modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=""kept_by_design"" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.", _
         SchemaWith(pRt, Req("name", "id")))
 
     Dim pFi As Object
@@ -14296,12 +14296,13 @@ Private Function ToolRemoveTrace(ByVal name As String, ByVal id As String, ByVal
     Dim wCalls As Long
     wCalls = SetCompTextMinimal(name, cur, nx)
     tWrite = GetTickCount()
-    ' TASK-P1-129: the module inject_trace attached automatically is removed here as
-    ' well, so remove_trace really undoes the whole operation. A modMcpTrace that does
-    ' NOT carry the autogen marker is somebody else's module and is left alone.
+    ' TASK-P1-149: only THIS id's injected block is removed. modMcpTrace is KEPT BY DESIGN -
+    ' the user may have added code to it, and other @mcp-trace blocks elsewhere may still
+    ' call it, so the project would stop compiling without it. The receipt reports the state
+    ' and the manual removal steps. (The TASK-P1-129 automatic removal was withdrawn.)
     Dim modInfo As Object
     Set modInfo = CreateObject("Scripting.Dictionary")
-    RemoveAutoTraceModule modInfo
+    ReportTraceModuleKept modInfo
     ' TASK-P1-031 (P4-028 section 15.2): cleaning the PANE is not enough. After a run,
     ' VB6's pre-run save has already written the injected block to the FILE, so the disk
     ' keeps a copy, the pane and the disk silently diverge and verify() reports FAIL.
@@ -14341,11 +14342,12 @@ Private Function ToolRemoveTrace(ByVal name As String, ByVal id As String, ByVal
     extra("writeMs") = tWrite - tLint
     extra("modulePresentBefore") = modInfo("modulePresentBefore")
     extra("moduleRemoved") = modInfo("moduleRemoved")
+    extra("moduleLeftInPlace") = modInfo("moduleLeftInPlace")
+    extra("moduleAutogenMarker") = modInfo("moduleAutogenMarker")
     extra("moduleRemoveReason") = modInfo("moduleRemoveReason")
     If modInfo.Exists("moduleRemoveNote") Then extra("moduleRemoveNote") = modInfo("moduleRemoveNote")
-    If modInfo.Exists("moduleRemoveMs") Then extra("moduleRemoveMs") = modInfo("moduleRemoveMs")
-    If modInfo.Exists("moduleRemoveError") Then extra("moduleRemoveError") = modInfo("moduleRemoveError")
-    If modInfo.Exists("moduleFileLeftOnDisk") Then extra("moduleFileLeftOnDisk") = modInfo("moduleFileLeftOnDisk")
+    If modInfo.Exists("moduleKeptNote") Then extra("moduleKeptNote") = modInfo("moduleKeptNote")
+    If modInfo.Exists("moduleFileOnDisk") Then extra("moduleFileOnDisk") = modInfo("moduleFileOnDisk")
     AddWritePhases extra
     ToolRemoveTrace = ChangeResult2(name, cur, nx, pack, extra, tEntry)
 End Function
@@ -17416,26 +17418,40 @@ Private Sub EnsureTraceModule(ByRef info As Object)
     End If
 End Sub
 
-' Removes the modMcpTrace that inject_trace attached, and ONLY that one: the module must
-' still carry the VB6MCP autogen marker, so a hand-written module of the same name is
-' never deleted. Module state is reported back through info.
-Private Sub RemoveAutoTraceModule(ByRef info As Object)
+' TASK-P1-149: modMcpTrace is NEVER removed automatically. inject_trace attaches it;
+' remove_trace removes ONLY that id's injected block. The module is kept because
+'   (a) the user may have added his own code to an auto-generated module, and deleting it
+'       would destroy that code, and
+'   (b) other @mcp-trace blocks may still exist elsewhere and call McpTrace/McpTraceOn,
+'       so the project would no longer compile once the module was gone.
+' The automatic-removal branch that used to live here (reason "removed_autogen_module") was
+' DELETED: there is no code path left that removes the component. Module state is reported
+' back through info, and the receipt carries the manual removal instructions.
+Private Sub ReportTraceModuleKept(ByRef info As Object)
     info("modulePresentBefore") = False
     info("moduleRemoved") = False
+    info("moduleLeftInPlace") = False
+    info("moduleAutogenMarker") = False
+    info("moduleRemoveReason") = "module_absent"
     Dim comp As VBIDE.VBComponent
     On Error Resume Next
     Set comp = FindComponent("modMcpTrace")
     If Err.Number <> 0 Then Err.Clear
     On Error GoTo 0
     If comp Is Nothing Then
-        info("moduleRemoveReason") = "module_absent"
+        info("moduleKeptNote") = "no modMcpTrace component exists in this project, so there was nothing to keep or remove"
         Exit Sub
     End If
     info("modulePresentBefore") = True
-    If Not TraceGen.IsAutogenTraceModule(ComponentPaneText(comp)) Then
-        info("moduleRemoveReason") = "module_not_autogen"
-        info("moduleRemoveNote") = "modMcpTrace exists but does not carry the VB6MCP autogen marker, so it is treated as YOUR module and is left alone"
-        Exit Sub
+    info("moduleLeftInPlace") = True
+    info("moduleRemoveReason") = "kept_by_design"
+    Dim manual As String
+    manual = " To remove it yourself: confirm that NO '@mcp-trace' block remains anywhere in the project (search for the marker), then call remove_component with name='modMcpTrace'. remove_trace never does this for you."
+    If TraceGen.IsAutogenTraceModule(ComponentPaneText(comp)) Then
+        info("moduleAutogenMarker") = True
+        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN (TASK-P1-149); the previous automatic removal (reason removed_autogen_module) was withdrawn because (a) you may have added your own code to this auto-generated module and deleting it would have destroyed that code, and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling once the module was gone." & manual
+    Else
+        info("moduleRemoveNote") = "modMcpTrace is left in place BY DESIGN (TASK-P1-149). It does not carry the VB6MCP autogen marker, so it is treated as YOUR module - and even an auto-generated one is never removed now, because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn." & manual
     End If
     Dim boundFile As String
     boundFile = ""
@@ -17446,40 +17462,7 @@ Private Sub RemoveAutoTraceModule(ByRef info As Object)
         boundFile = ""
     End If
     On Error GoTo 0
-    Dim t0 As Long
-    t0 = GetTickCount()
-    Dim errMsg As String
-    errMsg = ""
-    Dim res As String
-    On Error Resume Next
-    res = ToolRemoveComponent("modMcpTrace")
-    If Err.Number <> 0 Then
-        errMsg = "0x" & Hex$(Err.Number) & " " & Err.Description
-        Err.Clear
-    End If
-    On Error GoTo 0
-    info("moduleRemoveMs") = GetTickCount() - t0
-    If Not ModulePresent("") Then
-        info("moduleRemoved") = True
-        info("moduleRemoveReason") = "removed_autogen_module"
-        ' HONESTY (TASK-P1-129): VBComponents.Remove takes the component out of the
-        ' PROJECT only - it never deletes a file. So the file the component was bound to
-        ' (captured before the removal) is reported as STILL ON DISK, not as removed.
-        info("moduleRemoveNote") = "VBComponents.Remove takes the component out of the PROJECT only - it NEVER deletes a file on disk."
-        If Len(boundFile) > 0 Then
-            On Error Resume Next
-            If Dir$(boundFile) <> "" Then info("moduleFileLeftOnDisk") = boundFile
-            If Err.Number <> 0 Then Err.Clear
-            On Error GoTo 0
-        End If
-    Else
-        info("moduleRemoveReason") = "remove_failed"
-        If Len(errMsg) > 0 Then
-            info("moduleRemoveError") = errMsg
-        Else
-            info("moduleRemoveError") = "remove_component reported no error but modMcpTrace is still present"
-        End If
-    End If
+    If Len(boundFile) > 0 Then info("moduleFileOnDisk") = boundFile
 End Sub
 
 ' The code-pane text of one component (empty when it cannot be read).

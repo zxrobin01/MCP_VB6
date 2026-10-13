@@ -142,6 +142,8 @@ Merge the `mcpServers.vb6` entry from `mcp_config.example.json` into
 `%APPDATA%\Claude\claude_desktop_config.json` (point `command` at the python/py path on your
 machine) and restart Claude Desktop.
 
+> **Replace every path with one from your own machine**: the paths in `mcp_config.example.json` (and in the "Other stdio clients" example below) are **placeholders** - both `command` (python/py) and the `args` path to `bridge/mcp_stdio_bridge.py` must point at your own installation. In JSON prefer forward slashes `/`; a Windows backslash must be written as `\\`.
+
 ### Cursor (SSE / streamable HTTP)
 
 Cursor can talk to the HTTP endpoint directly, with no bridge:
@@ -355,14 +357,24 @@ practice is to leave VB6 running in the background.
 
 ---
 
-## Does `inject_trace` need `modMcpTrace`, and do I have to add it by hand?
+## What is `modMcpTrace` for, and is it required?
 
-**No.** Since `TASK-P1-129`, when the target project has no `modMcpTrace`, `inject_trace` **generates and attaches it for you**, then re-reads the component list to prove it landed; if the module is already there the step is skipped (idempotent).
+**1. What it is for**: a tiny standard module holding just `McpTrace` / `McpTraceOn` (plus a switch variable). It exists only to serve `inject_trace` - the injected tracing calls land on it and it writes one JSON line per event to the trace file.
 
-- **Automatic attach**: the module source is embedded in the add-in (VB6MCP.dll); it is no longer shipped as a repository file. The receipt carries `moduleAutoAttached` / `moduleAttachAction` / `moduleAttachMs`, plus `moduleAttachError` when the attach fails (a failure is always reported, never silently downgraded).
+**2. Is it required?**: **No - VB6MCP itself does not need it.** The add-in (editing, checking, compiling, running, breakpoints, dialogs, forms, snapshots, packaging) is independent of it, and **a project that never used `inject_trace` and keeps no injected calls should not have this module at all**.
+
+**3. When is it needed?**: only when you **used `inject_trace` and kept the injected calls**, because those calls resolve to `McpTrace` / `McpTraceOn`, which live in this module. *If you keep the injected calls and build/ship an EXE or DLL, the module must be compiled into it* (the receipt's `shipNote` says the same).
+
+**4. How MCP adds it**: when the target project has no `modMcpTrace`, `inject_trace` **generates and attaches it itself, choosing the comment language from the IDE** (the module source is embedded in VB6MCP.dll, so **there is nothing to import by hand**); it then re-reads the component list to prove it landed, and **skips the step entirely when the module already exists** (idempotent). The receipt carries `moduleAutoAttached` / `moduleAttachAction` / `moduleAttachMs`, plus `moduleAttachError` when the attach fails (a failure is always reported, never silently downgraded).
+
 - **Which comment language (UI first)**: the **IDE's own UI language** decides first (main-window menu captions File/Edit/View/Help, else the mode marker `[design]`/`[run]` in the title); if that cannot be read it falls back to the VB6.EXE version resource (`\VarFileInfo\Translation`; LANG_CHINESE => Chinese); if neither can be read the answer is **English** (readable on every code page, while Chinese becomes mojibake on a non-Chinese one). The receipt reports all three signals side by side - `ideLanguage` (version resource), `ideMenuLanguage` (UI) and `commentLanguage` (the final choice) - each with its own `*Source` explanation.
-- **Shipping**: the injected calls resolve to `McpTrace` / `McpTraceOn`, which live in `modMcpTrace`, so **if you keep the injected calls and build/ship an EXE or DLL, this module must be compiled into it** (the receipt's `shipNote` says the same).
-- **Cleaning up**: `remove_trace` removes the injected blocks **and** takes the auto-attached `modMcpTrace` out of the project (`moduleRemoved` / `moduleRemoveReason`). Only a module carrying this add-in's autogen marker (the comment line `' VB6MCP-AUTOGEN modMcpTrace`) is removed; a hand-written module of the same name is never touched. Note that `VBComponents.Remove` only removes the component from the PROJECT - it **does not delete the .bas file on disk** (reported as `moduleFileLeftOnDisk`).
+
+**5. When its *reference* is added or removed**:
+
+- **Added**: on the first injection when the project does not contain it (see 4).
+- **Removed**: **the new version never removes it automatically** (`TASK-P1-149`). `remove_trace` deletes only **that id's injected block** and always keeps `modMcpTrace`; the receipt states `moduleRemoved:false` / `moduleLeftInPlace:true` / `moduleRemoveReason:"kept_by_design"` (or `module_absent` when the project has no such component), and `moduleRemoveNote` carries the two reasons below plus the manual-removal steps.
+- **The old behaviour is withdrawn (and why)**: `TASK-P1-129` used to have `remove_trace` take an auto-generated `modMcpTrace` out of the project as well (`moduleRemoveReason:"removed_autogen_module"`). That branch has been **deleted**, because (a) you may have added your own code to an auto-generated module and deleting the module would have destroyed that code, and (b) other `@mcp-trace` blocks may still exist elsewhere, so with the module gone those calls could no longer find `McpTrace`/`McpTraceOn` and **the project would stop compiling**.
+- **Removing it by hand**: first confirm that **no** `@mcp-trace` block remains anywhere in the project, then call `remove_component{name:"modMcpTrace"}` yourself. Note that `VBComponents.Remove` only removes the component from the PROJECT - it **does not delete the .bas file on disk** (the receipt reports the bound path as `moduleFileOnDisk`).
 - **Where the log goes**: tracing is enabled by environment variables of the VB6 process - `MCP_TRACE_ON=1` or `MCP_TRACE_FILE=<path>`; the default sink is `%TEMP%\mcp_trace.jsonl`. A write failure is recorded in `MCP_TRACE_ERR_FILE` (default `%TEMP%\mcp_trace_err.log`) instead of being swallowed.
 - **No other tool needs it**: editing, checking, compiling, running, breakpoints, dialogs, forms, snapshots and packaging are all independent of it.
 

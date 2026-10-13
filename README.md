@@ -122,6 +122,8 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
 `%APPDATA%\Claude\claude_desktop_config.json`（`command` 用你机器上的
 python/py 路径），重启 Claude Desktop 即可。
 
+> ★**配置里的路径都要换成你自己机器上的**：`mcp_config.example.json`（以及下面「其它 stdio 客户端」的示例）用的是**占位路径** —— `command` 的 python/py、`args` 指向的 `bridge/mcp_stdio_bridge.py` 都要改成你的实际安装位置。JSON 里建议统一用正斜杠 `/`；若要写 Windows 反斜杠，必须写成 `\\`。
+
 ### Cursor（SSE / streamable HTTP 模式）
 
 Cursor 可直接连 HTTP 端点，无需桥接器：
@@ -303,14 +305,24 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 
 ---
 
-## `inject_trace` 会自动附加 `modMcpTrace`，我需要手工导入吗？
+## `modMcpTrace` 是干什么的？必须要有吗？
 
-**不需要。** 从 `TASK-P1-129` 起，目标工程里没有 `modMcpTrace` 时，`inject_trace` 会**自己把该模块生成并添加到你的工程**，添加后还会复验它确实在工程里；模块已存在时直接跳过（幂等）。
+**① 它是干什么用的**：一个很小的标准模块，里面只有 `McpTrace` / `McpTraceOn` 两个过程（外加开关变量）。它只服务于 `inject_trace` —— 被注入的追踪调用最终落在它上面，负责把一行 JSON 写进追踪文件。
 
-- **自动附加**：模块源码内嵌在插件 VB6MCP.dll 里，不再作为仓库文件发布。回执会带 `moduleAutoAttached` / `moduleAttachAction` / `moduleAttachMs`；附加失败时带 `moduleAttachError`（失败一律如实报告，不静默降级）。
+**② 是否必须**：**VB6MCP 自身不需要它。** 插件本身（编辑、检查、编译、运行、断点、弹窗、窗体、快照、打包等）与它完全无关；**没有用过 `inject_trace`、也没有保留注入调用的工程里本来就不该有它**。
+
+**③ 只有什么情况需要**：只有当你**用过 `inject_trace` 并且保留了那些注入调用**时才需要 —— 注入块调用的 `McpTrace` / `McpTraceOn` 就定义在它里面。★**保留注入调用并编译/发布 EXE 或 DLL 时，必须把该模块一起编进去**（回执里的 `shipNote` 同样说明）。
+
+**④ MCP 怎么添加它**：`inject_trace` 发现目标工程里没有 `modMcpTrace` 时，会**自己按 IDE 语言生成并附加**（模块源码内嵌在 VB6MCP.dll 里，**免手工导入**），附加后还会复验它确实在工程里；**模块已存在则直接跳过**（幂等）。回执带 `moduleAutoAttached` / `moduleAttachAction` / `moduleAttachMs`；附加失败时带 `moduleAttachError`（失败一律如实报告，不静默降级）。
+
 - **注释语言怎么选（界面优先）**：先看 **IDE 自己的界面语言**（主窗口菜单文案 文件/编辑/视图/帮助，其次标题里的模式标记 `[设计]`/`[运行]`）——能可靠读出就用它；读不出来再回退到 VB6.EXE 的版本资源语言 ID（`\VarFileInfo\Translation`，主语言中文 LANG_CHINESE ⇒ 中文）；两者都拿不到 ⇒ **英文**（英文在任何代码页都可读，中文在非中文系统会乱码）。回执里并排给出三个信号：`ideLanguage`（版本资源）· `ideMenuLanguage`（界面）· `commentLanguage`（最终选择），以及各自的 `*Source` 依据。
-- **发布提醒**：注入块调用的 `McpTrace` / `McpTraceOn` 就定义在 `modMcpTrace` 里，所以**保留注入调用并编译/发布 EXE 或 DLL 时，必须把该模块一起编进去**（回执里的 `shipNote` 同样说明）。
-- **怎么清理**：`remove_trace` 会移除注入块，**并且**把自动附加的 `modMcpTrace` 从工程中一并移除（回执 `moduleRemoved` / `moduleRemoveReason`）。只有带本插件自动生成标记（注释行 `' VB6MCP-AUTOGEN modMcpTrace`）的模块才会被删；同名的、你自己写的模块一律不动。注意 `VBComponents.Remove` 只从工程里移除组件，**不会删除磁盘上的 .bas 文件**（回执用 `moduleFileLeftOnDisk` 如实标注）。
+
+**⑤ 什么情况会添加／移除它的「引用」**：
+
+- **添加**：首次注入且工程内没有该模块时（见 ④）。
+- **移除**：**新版不再自动移除**（`TASK-P1-149`）。`remove_trace` 只删除**该 id 的注入块**，`modMcpTrace` **一律保留**；回执如实给出 `moduleRemoved:false` · `moduleLeftInPlace:true` · `moduleRemoveReason:"kept_by_design"`（工程里根本没有该模块时为 `module_absent`），并由 `moduleRemoveNote` 写明下面两条理由与手动移除指引。
+- **旧行为已废除（及原因）**：`TASK-P1-129` 曾让 `remove_trace` 顺带删除**带自动生成标记**的 `modMcpTrace`（`moduleRemoveReason:"removed_autogen_module"`）。该分支已**删除**，因为：(a) 用户可能在自动生成的模块里加了自己的代码，删模块会把那些代码一起毁掉；(b) 工程别处可能仍有 `@mcp-trace` 注入块，模块一旦被删，那些调用找不到 `McpTrace`/`McpTraceOn`，**工程将编译不过**。
+- **需要手动清理时**：先确认全工程**没有** `@mcp-trace` 残留，再自行调用 `remove_component{name:"modMcpTrace"}`。注意 `VBComponents.Remove` 只从工程里移除组件，**不会删除磁盘上的 .bas 文件**（回执用 `moduleFileOnDisk` 如实标注它绑定在哪）。
 - **日志落点**：追踪由 VB6 进程的环境变量控制 —— `MCP_TRACE_ON=1` 或 `MCP_TRACE_FILE=<路径>` 打开；默认写 `%TEMP%\mcp_trace.jsonl`。写失败记到 `MCP_TRACE_ERR_FILE`（默认 `%TEMP%\mcp_trace_err.log`），不会静默吞掉。
 - **其它工具都不需要它**：编辑、检查、编译、运行、断点、弹窗、窗体、快照、打包，全部与它无关。
 

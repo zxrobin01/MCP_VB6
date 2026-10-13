@@ -1699,7 +1699,7 @@
     },
     {
       "name": "remove_trace",
-      "description": "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-129: it also removes the modMcpTrace component that inject_trace attached automatically - but ONLY while that module still carries the VB6MCP autogen marker; a hand-written modMcpTrace is left alone and the receipt says so.",
+      "description": "Remove a previously injected trace block; sha256 returns to the pre-injection value. TASK-P1-149: the modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=\"kept_by_design\" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.",
       "inputSchema": {
         "type": "object",
         "properties": {
