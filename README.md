@@ -280,6 +280,52 @@ VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` 
 **想在未打开 VB6 IDE 时也能用**
 → 不行：本插件依赖 VBIDE 对象模型，必须随 IDE 运行。日常做法是让 VB6 常驻后台。
 
+**Agent 正在操作 IDE 时，我能在同一台机器的 IDE 里打字吗？**
+→ **不要。** 这不是建议而是纪律：插件驱动 IDE 时会设置光标、滚动、打开窗格，有的动作还会把窗口提到前台
+（`control_window{action:"activate"}`；`native_breakpoint` 会先把光标移到目标行）。**这时你的按键会落到「当时前台的那个窗口」**——
+本项目实测过一次真实事故：用户在 Agent 操作期间打字，击键落进了代码窗，源码里多出一行游离字符
+（那是**击键**写进去的，不是工具写的）。要在同一台机器上手工编辑，请**先让 Agent 停手**，或用**另一台机器 / 另一个实例**。
+
+写类工具为此加了护栏（回执里都能看到）：
+
+- **写后回读断言**：编辑类工具本来就有 `expected_sha256` / `sha256Before` / `sha256After`；**不写文本**的断点与窗口类工具
+  （`native_breakpoint` / `control_window` / `set_codepane`）现在也在操作前后各取一次窗格文本的 sha256，**两者必须相同**：
+  一旦不同，回执被翻成 `{ok:false, reason:"paneTextMismatch"}` 并附**逐行差异**（`paneDiffLines`）。
+  窗格读不到时如实标注 `paneAssertion:"notApplicable"`，**不会**当成「通过」。
+- `set_member_attribute` 写后**回读**该成员属性，回执给 `readback` 与 `applied`（★那是**内存**里的值；能否落成磁盘上的 `Attribute` 行由 VB6 在保存组件时决定，见 FAQ §50）。
+- **焦点安全**：`native_breakpoint` / `control_window` 的回执带 `foregroundBefore` / `foregroundAfter` / `foregroundTookFocus`，
+  且**非 activate 动作会把前台还给原来的窗口**。
+- **断点类没有第三条路**（如实写在回执里）：VB6 **没有断点 API**，Debug 菜单项只作用于**光标**，另一条路 `set_breakpoint` 是**写文本**注入标记块。
+  所以 `native_breakpoint` 采用**补偿**：操作后把光标放回原处（`cursorRestored`）。`breakpointWithoutCursorMove:false` 就是这个事实的机器可读标记。
+
+**文件里改的 `.vbp` 为什么没生效？`open_project` 现在会告诉你**
+→ 已打开的工程以前只回 `alreadyOpen:true`，读起来像「你指名的文件被加载了」，其实**没有重读磁盘**。现在回执区分
+`reloaded` / `keptInMemory`，回显 IDE **内存里**的工程属性（`inMemory{}`），并把 `.vbp` 与内存做比较（`diskVsMemory{}`）。
+两者真的不一致时**一律结构化拒绝**（`ok:false` + 结构化 `reason`），绝不静默忽略，也**不会为了让磁盘生效而去关工程**：
+- 内存里有未保存改动 ⇒ `reason:"unsaved_changes_would_be_lost"`；
+- 内存干净 ⇒ `reason:"disk_vs_memory_mismatch"`；
+- `VBProject.Saved` 读不到 ⇒ `reason:"project_saved_flag_unreadable"`。
+
+★**为什么不做"真重载"**：本机实测（2026-10-13）关掉再重开（`VBProjects.Remove` → `AddFromFile`）会抛 **59999**「方法 '~' 作用于对象 '~' 失败」，
+**把工作区丢成 0 个工程**，紧接着再 `AddFromFile` 仍然失败 ⇒ 工具**不会为了刷新而摧毁工作区**，回执带 `reloadNotAttempted:true` 与说明。
+要采用磁盘版本，请自己走 `remove_project` → `open_project`。
+
+**`coords:"disk"` 的行号为什么不是连续的？**
+→ 因为 VBA6 会把**成员 Attribute 行**（形如 `Attribute Foo.VB_UserMemId = -4`）留在磁盘上、却**不显示在代码窗格里**。
+磁盘行号因此是**逐行累计**出来的（`diskLine = ideLine + headerLines + 该行之上被隐藏的 Attribute 行数`），
+跳过隐藏行时行号自然不连续。回执带 `mappingBasis` / `mappingResolved` / `hiddenInlineAttributeLines` 与
+`hiddenInlineAttributeDiskLines`（被隐藏的磁盘行号），对齐失败时如实标 `mappingResolved:false`，**不假装精确**。
+
+**`build` 的 `/d` 宏为什么偶尔不生效？**
+→ 已修：**仅当值里含空格才加引号**（无条件加引号会让编译器把引号折进宏名，宏静默失效而构建仍报成功）。
+回执给 `commandLine`（**实际命令行**）、`conditionalCompileArgs`（结构化的 `name` / `value` / `quoted`）、
+`conditionalCompileArgsRaw` 与 `conditionalCompileQuoteRule`。
+
+**`vba6_probe{exec_probe}` 报错时，怎么区分「语句抛错」和「通道挂了」？**
+→ 两种原因已分开：**`exec_error`** = 插件**答了**（语句抛错，或 EbExecuteLine 报了 VB 错误）⇒ 回执带结构化的
+`exec_error{vbaErrNumber, description}`；**`forward_timeout` / `forward_failed`** = 由**hub**（`bridge/vb6mcp_hub.mjs`）报告，
+含义是插件**根本没答**（通道挂住或超出转发预算），此时不存在插件回执，也就不可能有 `exec_error`。
+
 ## 九、协议说明
 
 - 实现 MCP 核心：`initialize` / `ping` / `tools/list` / `tools/call` / 通知。

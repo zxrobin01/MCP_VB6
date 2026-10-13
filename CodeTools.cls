@@ -117,6 +117,11 @@ Private m_lastJoinMs As Long
 Private m_lastDelMs As Long
 Private m_lastInsMs As Long
 Private m_lastMaxBlock As Long
+' TASK-P1-161 (R4): per-call cache of the pane->disk line map (component name -> map dict).
+' VBA6 keeps inline member `Attribute X.VB_UserMemId = ...` lines on disk that the code
+' pane never shows, so the disk line of a pane line is the SUM of the hidden lines
+' above it and not one constant offset. Reset once per top-level call in CallTool.
+Private m_paneDiskMaps As Object
 ' TASK-P1-085: the project-directory write manifest of the CURRENT top-level call. It is
 ' reset once per call in CallTool (the single tool funnel), filled by the writers that can
 ' put a file into the project directory on the caller's behalf - today the _undo snapshot
@@ -2177,6 +2182,7 @@ Public Function CallTool(ByVal name As String, ByVal args As Object) As Object
     ' wipe the OUTER call's sideEffects/undo manifest half-way through the write.
     If m_callDepth = 1 Then
         Set m_dirWrites = New Collection
+        Set m_paneDiskMaps = CreateObject("Scripting.Dictionary")
         SeReset
     End If
     If wasMut Then
@@ -2460,7 +2466,10 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
             ElseIf JsonGetBool(args, "frame_probe", False) Then
                 outText = Vba6Probe.FrameStateJson()
             ElseIf JsonGetBool(args, "exec_probe", False) Then
-                outText = Vba6Probe.ExecLineJson(JsonGetStr(args, "exec_line"), JsonGetLong(args, "exec_a2"), JsonGetLong(args, "exec_a3"), JsonGetLong(args, "exec_a4"), JsonGetBool(args, "exec_scope", False), JsonGetBool(args, "exec_dump_ctx", False), JsonGetBool(args, "exec_set_frame", False))
+                ' TASK-P1-160 (R17): the exec probe goes through a wrapper that splits
+                ' "the statement raised" from "the forward/channel died" and carries the VB
+                ' error as structure. The other probe branches are untouched.
+                outText = ToolVba6ExecProbe(args)
             Else
                 outText = Vba6Probe.ProbeRunJson(JsonGetBool(args, "run_break_probes", False), JsonGetBool(args, "force", False), JsonGetStr(args, "ident"), JsonGetStr(args, "step"), JsonGetLong(args, "frame_index"))
             End If
@@ -2798,14 +2807,85 @@ Private Function ToolOpenProject(ByVal path As String, ByVal exclusive As Boolea
     Dim alreadyOpen As Boolean
     Dim savedBeforeClose As Boolean
     Dim missingInVbp As String
+    ' TASK-P1-165 (R16-1): reloaded/keptInMemory + the disk-vs-memory comparison + the
+    ' in-memory project echo. A real reload happens only when nothing unsaved would be
+    ' lost; otherwise the request is REFUSED structurally (never silently ignored).
+    Dim reloaded As Boolean
+    Dim keptInMemory As Boolean
+    Dim reloadRefusal As String
+    Dim reloadNote As String
+    Dim reloadClosed As Boolean
+    Dim diskCmp As Object
+    Dim diskCmpAfter As Object
+    Dim memBefore As Object
+    Dim unsavedInfo As Object
+    Dim projSaved As Boolean
+    Dim savedReadable As Boolean
+    Dim mustRefuse As Boolean
+    Dim reloadNotAttempted As Boolean
     alreadyOpen = False
     savedBeforeClose = False
     missingInVbp = MissingVbpFiles(full)
+    reloaded = False
+    keptInMemory = False
+    reloadRefusal = ""
+    reloadNote = ""
+    reloadClosed = False
+    reloadNotAttempted = False
+    Set diskCmp = Nothing
+    Set diskCmpAfter = Nothing
+    Set memBefore = Nothing
     Dim p As VBIDE.VBProject
     Set p = FindOpenProject(full)
     If Not p Is Nothing Then
         alreadyOpen = True
         OpLog "already open as " & p.Name
+        ' The project on disk is compared with the project the IDE HOLDS. "alreadyOpen"
+        ' alone used to be the whole answer, which read as "the file you named was
+        ' loaded" - it was not.
+        ' Read the dirty flag EXACTLY ONCE and reuse it everywhere (echo + gate).
+        projSaved = False
+        savedReadable = True
+        On Error Resume Next
+        Err.Clear
+        projSaved = p.Saved
+        If Err.Number <> 0 Then
+            savedReadable = False
+            projSaved = False
+            Err.Clear
+        End If
+        On Error GoTo 0
+        OpLog "open_project already-open: VBProject.Saved=" & CStr(projSaved) & " readable=" & CStr(savedReadable)
+        Set memBefore = InMemoryProjectProps(p)
+        memBefore("saved") = projSaved
+        memBefore("savedReadable") = savedReadable
+        Set diskCmp = VbpDiskVsMemory(full, p)
+        Set unsavedInfo = CreateObject("Scripting.Dictionary")
+        keptInMemory = True
+        OpLog "diskVsMemory matches=" & CStr(diskCmp("matches"))
+        If Not CBool(diskCmp("matches")) Then
+            mustRefuse = ProjectHasUnsavedWork(projSaved, savedReadable, p, unsavedInfo)
+            OpLog "gate: projSaved=" & CStr(projSaved) & " readable=" & CStr(savedReadable) & " mustRefuse=" & CStr(mustRefuse)
+            ' NO RELOAD IS ATTEMPTED. MEASURED 2026-10-13 on this build: the close+re-add
+            ' route (VBProjects.Remove, then VBProjects.AddFromFile) DID remove the project and
+            ' then raised 59999 "Method '~' of object '~' failed", leaving the workspace with
+            ' ZERO projects; the immediately following AddFromFile failed the same way, so the
+            ' IDE could not recover inside that call. A tool must not destroy the workspace in
+            ' order to refresh it, so a divergence is answered with a STRUCTURED REFUSAL and
+            ' nothing is closed. See reloadNotAttemptedNote.
+            reloadNotAttempted = True
+            If savedReadable = False Then
+                reloadRefusal = "project_saved_flag_unreadable"
+                reloadNote = "the .vbp on disk does not describe the project the IDE holds, and VBProject.Saved could not be read on this build, so the tool cannot prove that the in-memory copy has nothing unsaved. No reload is attempted (see reloadNotAttemptedNote); the in-memory copy is still the one in use. See unsavedWorkBasis."
+            ElseIf mustRefuse = True Then
+                reloadRefusal = "unsaved_changes_would_be_lost"
+                reloadNote = "the .vbp on disk does not describe the project the IDE holds, and the in-memory project has UNSAVED changes (VBProject.Saved = False, read once and reported in unsavedWorkBasis); no reload is attempted (see reloadNotAttemptedNote). Two ways forward: (a) call save_project and then open_project again - but be aware save_project REWRITES the .vbp, so it will overwrite the disk edits you were trying to pick up; or (b) call remove_project and then open_project to abandon the in-memory copy and load the disk copy."
+            Else
+                reloadRefusal = "disk_vs_memory_mismatch"
+                reloadNote = "the .vbp on disk does not describe the project the IDE holds, and the in-memory copy reports no unsaved changes - but the reload is NOT attempted (see reloadNotAttemptedNote). The in-memory copy is still the one in use and the disk edits were NOT applied. To take the disk copy, call remove_project and then open_project."
+            End If
+            OpLog "reload refused: reason=" & reloadRefusal
+        End If
     Else
         If exclusive Then
             ' VB6 holds one project (or project group) at a time, so an
@@ -2901,10 +2981,46 @@ Private Function ToolOpenProject(ByVal path As String, ByVal exclusive As Boolea
     End If
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
-    root("opened") = p.Name
-    root("fileName") = p.FileName
+    If p Is Nothing Then
+        root("opened") = "<none>"
+        root("fileName") = ""
+    Else
+        root("opened") = p.Name
+        root("fileName") = p.FileName
+    End If
     root("exclusive") = exclusive
     root("alreadyOpen") = alreadyOpen
+    ' TASK-P1-165 (R16-1): the receipt distinguishes the three states explicitly, echoes
+    ' what the IDE holds, and reports whether the .vbp on disk describes it.
+    root("reloaded") = reloaded
+    root("keptInMemory") = keptInMemory
+    If alreadyOpen Then
+        If Not memBefore Is Nothing Then Set root("inMemory") = memBefore
+        If Not diskCmp Is Nothing Then
+            Set root("diskVsMemory") = diskCmp
+            If reloaded Then
+                If Not diskCmpAfter Is Nothing Then
+                    root("diskVsMemoryAfterReloadMatches") = diskCmpAfter("matches")
+                    Set root("diskVsMemoryAfterReload") = diskCmpAfter
+                End If
+            End If
+        End If
+        root("openProjectSemantics") = "alreadyOpen:true means the IDE already had this .vbp open. reloaded tells you whether it was re-read from disk; keptInMemory tells you whether the in-memory copy is still the one in use. diskVsMemory compares the .vbp on disk with the project the IDE holds."
+        If Not unsavedInfo Is Nothing Then Set root("unsavedWorkBasis") = unsavedInfo
+        root("reloadNotAttempted") = reloadNotAttempted
+        If reloadNotAttempted Then
+            root("reloadNotAttemptedNote") = "MEASURED 2026-10-13: closing the already-open project and re-adding it from disk (VBProjects.Remove then AddFromFile) raised 59999 and left the workspace with ZERO projects, so open_project never destroys the open project in order to refresh it. A disk-vs-memory divergence is answered with a structured refusal (ok:false + reason) instead."
+        End If
+        If Len(reloadRefusal) > 0 Then
+            root("ok") = False
+            root("reason") = reloadRefusal
+            root("reloadRefused") = True
+            root("reloadNote") = reloadNote
+            root("error") = reloadNote
+            root("sideEffects") = "none: nothing was closed, reloaded or written"
+            root("suggestedAction") = "save_project (or check the .vbp edits on disk), then call open_project again"
+        End If
+    End If
     If exclusive Then
         root("closedProjects") = closed
         root("skippedUnsavedProjects") = skippedUnsaved
@@ -3012,6 +3128,401 @@ Private Function MissingVbpFiles(ByVal vbpPath As String) As String
         End If
     Next
     MissingVbpFiles = bad
+End Function
+
+' =============================================================
+' TASK-P1-165 (R16): what the IDE HOLDS vs what the .vbp SAYS
+' =============================================================
+
+' =============================================================
+' TASK-P1-165 (R16): what the IDE HOLDS vs what the .vbp SAYS
+' =============================================================
+
+' A .vbp line key that declares a COMPONENT (as opposed to a reference, an object or
+' a project option). Same set MissingVbpFiles uses.
+Private Function VbpComponentKey(ByVal key As String) As Boolean
+    VbpComponentKey = False
+    Select Case key
+        Case "form", "module", "class", "usercontrol", "propertypage", "userdocument", "designer"
+            VbpComponentKey = True
+    End Select
+End Function
+
+' Both sides of the type comparison are normalised through this table, because the .vbp
+' spells the project type as a WORD while the object model hands back a NUMBER.
+Private Function NormalizeProjectTypeToken(ByVal s As String) As String
+    Dim t As String
+    t = LCase$(Trim$(s))
+    Select Case t
+        Case "0", "exe", "standardexe"
+            NormalizeProjectTypeToken = "standardexe"
+        Case "1", "oleexe", "activexexe"
+            NormalizeProjectTypeToken = "activexexe"
+        Case "2", "oledll", "activexdll"
+            NormalizeProjectTypeToken = "activexdll"
+        Case "3", "olectl", "activexcontrol", "control"
+            NormalizeProjectTypeToken = "activexcontrol"
+        Case Else
+            NormalizeProjectTypeToken = t
+    End Select
+End Function
+
+' Can closing the in-memory project destroy work?
+' The gate uses the VBProject.Saved value that the CALLER read ONCE - never a second read
+' inside this helper. MEASURED 2026-10-13: within ONE open_project call the first read of
+' VBProject.Saved reported True (it was echoed as inMemory.saved) while the gate path still
+' concluded "unsaved", so every divergence refused with "unsaved work" for a project that
+' save_project had just written (a misdiagnosis, discipline 39). One read, one value, used
+' for BOTH the echo and the decision - no ambiguity left.
+' VBComponent.Saved is only REPORTED (on this build it raises, so it is reported as
+' unreadable); it is never decisive.
+Private Function ProjectHasUnsavedWork(ByVal projSaved As Boolean, ByVal savedReadable As Boolean, _
+                                      ByVal p As VBIDE.VBProject, ByRef info As Object) As Boolean
+    ProjectHasUnsavedWork = False
+    info("projectSaved") = projSaved
+    info("projectSavedReadable") = savedReadable
+    info("unsavedGateBasis") = "VBProject.Saved, read ONCE by the caller and reused for BOTH the inMemory echo and this gate. VBComponent.Saved is reported when readable and is never decisive."
+    Dim comps As Object
+    Set comps = New Collection
+    Set info("componentSavedFlags") = comps
+    Dim compReadable As Boolean
+    compReadable = True
+    On Error Resume Next
+    If p Is Nothing Then
+        info("componentSavedReadable") = compReadable
+        Exit Function
+    End If
+    Dim i As Long
+    For i = 1 To p.VBComponents.Count
+        Dim c As VBIDE.VBComponent
+        Set c = Nothing
+        Set c = p.VBComponents.Item(i)
+        If Not c Is Nothing Then
+            Dim e As Object
+            Set e = CreateObject("Scripting.Dictionary")
+            e("name") = c.Name
+            Dim sv As Boolean
+            sv = False
+            Err.Clear
+            sv = c.Saved
+            If Err.Number <> 0 Then
+                compReadable = False
+                Err.Clear
+                e("savedReadable") = False
+            Else
+                e("saved") = sv
+            End If
+            comps.Add e
+        End If
+        Err.Clear
+    Next
+    info("componentSavedReadable") = compReadable
+    Err.Clear
+    ' EXPLICIT comparisons, never 'Not <boolean>': a bitwise Not on a non-Boolean variant
+    ' (VB's Not is bitwise when the operand is numeric) would turn 1 into -2, i.e. TRUE,
+    ' which is exactly how this gate refused a project that VBProject.Saved said was clean.
+    If savedReadable = False Then
+        info("unsavedRefusalCause") = "project_saved_flag_unreadable"
+        ProjectHasUnsavedWork = True
+        info("gateValue") = True
+        Exit Function
+    End If
+    If projSaved = False Then
+        info("unsavedRefusalCause") = "project_reports_unsaved"
+        ProjectHasUnsavedWork = True
+        info("gateValue") = True
+        Exit Function
+    End If
+    ProjectHasUnsavedWork = False
+    info("gateValue") = False
+    info("gateBasis") = "projSaved=" & CStr(projSaved) & " savedReadable=" & CStr(savedReadable) & " => reload is safe"
+End Function
+
+' The properties the VBIDE object model exposes for the OPEN project.
+Private Function InMemoryProjectProps(ByVal p As VBIDE.VBProject) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Set InMemoryProjectProps = d
+    On Error Resume Next
+    If p Is Nothing Then Exit Function
+    d("name") = p.Name
+    d("fileName") = p.FileName
+    d("saved") = p.Saved
+    d("description") = p.Description
+    d("helpFile") = p.HelpFile
+    d("helpContextID") = p.HelpContextID
+    d("buildFileName") = p.BuildFileName
+    d("readOnly") = p.ReadOnly
+    d("componentCount") = p.VBComponents.Count
+    Dim names As Object
+    Set names = New Collection
+    Dim i As Long
+    For i = 1 To p.VBComponents.Count
+        Dim c As VBIDE.VBComponent
+        Set c = p.VBComponents.Item(i)
+        If Not c Is Nothing Then names.Add c.Name
+        Err.Clear
+    Next
+    Set d("componentNames") = names
+    Dim so As String
+    so = ""
+    so = p.StartUpObject
+    If Err.Number <> 0 Then
+        Err.Clear
+        d("startupObjectUnreadable") = True
+    Else
+        d("startupObject") = so
+    End If
+    Err.Clear
+End Function
+
+' Compare the .vbp on disk with the project the IDE holds. matches=False is what turns
+' "alreadyOpen" into a real reload or a structured refusal.
+Private Function VbpDiskVsMemory(ByVal path As String, ByVal p As VBIDE.VBProject) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("matches") = False
+    d("diskVbpPath") = path
+    d("diskVbpSha256") = ""
+    d("diskProjectType") = ""
+    d("memoryProjectType") = ""
+    d("diskComponentCount") = 0
+    d("memoryComponentCount") = 0
+    d("decisiveScalarDiffs") = 0
+    d("matchesBasis") = "the .vbp's declared COMPONENT FILES and Type= against the components and type the IDE holds; the ExeName32/BuildFileName and Startup/StartUpObject pairs count only when BOTH sides are non-empty (an unset property on one side means 'not reported here', not 'different')"
+    Set d("componentsOnlyOnDisk") = New Collection
+    Set d("componentsOnlyInMemory") = New Collection
+    Set d("scalarDiffs") = New Collection
+    Set VbpDiskVsMemory = d
+    On Error Resume Next
+    If Len(path) = 0 Then Exit Function
+    If Dir$(path) = "" Then Exit Function
+    Dim txt As String
+    txt = Build.ReadLogAnsi(path)
+    d("diskVbpSha256") = Sha256.Sha256HexTextUtf8(txt)
+    Dim lines() As String, i As Long, ln As String, key As String, val As String, eq As Long, sp As Long
+    Dim diskSet As Object, memSet As Object
+    Set diskSet = CreateObject("Scripting.Dictionary")
+    Set memSet = CreateObject("Scripting.Dictionary")
+    Dim diskType As String, diskExe As String, diskStartup As String
+    diskType = ""
+    diskExe = ""
+    diskStartup = ""
+    lines = Split(Replace(Replace(txt, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    For i = 0 To UBound(lines)
+        ln = Trim$(lines(i))
+        eq = InStr(ln, "=")
+        If eq > 1 Then
+            key = LCase$(Trim$(Left$(ln, eq - 1)))
+            val = Trim$(Mid$(ln, eq + 1))
+            If key = "type" Then diskType = val
+            If key = "exename32" Then diskExe = val
+            If key = "startup" Then diskStartup = val
+            If VbpComponentKey(key) Then
+                sp = InStrRev(val, ";")
+                If sp > 0 Then val = Trim$(Mid$(val, sp + 1))
+                If Len(val) > 0 Then diskSet(LCase$(BaseNameOf(val))) = True
+            End If
+        End If
+    Next
+    d("diskProjectType") = diskType
+    d("diskComponentCount") = diskSet.Count
+    Dim memType As String, memExe As String, memStartup As String
+    memType = ""
+    memExe = ""
+    memStartup = ""
+    If Not p Is Nothing Then
+        memType = CStr(p.Type)
+        memExe = p.BuildFileName
+        memStartup = ""
+        memStartup = p.StartUpObject
+        If Err.Number <> 0 Then Err.Clear
+        For i = 1 To p.VBComponents.Count
+            Dim c As VBIDE.VBComponent
+            Set c = p.VBComponents.Item(i)
+            If Not c Is Nothing Then
+                Dim fn As String
+                fn = ""
+                fn = c.FileNames(1)
+                If Len(fn) > 0 Then memSet(LCase$(BaseNameOf(fn))) = True
+            End If
+            Err.Clear
+        Next
+    End If
+    d("memoryProjectType") = memType
+    d("memoryComponentCount") = memSet.Count
+    d("typeMatches") = (NormalizeProjectTypeToken(diskType) = NormalizeProjectTypeToken(memType))
+    Dim k As Variant
+    For Each k In diskSet.Keys
+        If Not memSet.Exists(CStr(k)) Then d("componentsOnlyOnDisk").Add CStr(k)
+    Next
+    For Each k In memSet.Keys
+        If Not diskSet.Exists(CStr(k)) Then d("componentsOnlyInMemory").Add CStr(k)
+    Next
+    AddScalarDiff d, "ExeName32 vs BuildFileName", diskExe, memExe
+    AddScalarDiff d, "Startup vs StartUpObject", diskStartup, memStartup
+    d("matches") = (d("componentsOnlyOnDisk").Count = 0 And d("componentsOnlyInMemory").Count = 0 And CBool(d("typeMatches")) And d("decisiveScalarDiffs") = 0)
+    If Err.Number <> 0 Then Err.Clear
+End Function
+
+' One scalar pair. An EMPTY side means "not reported here" and is skipped, so an unset
+' BuildFileName can never by itself trigger a reload.
+Private Sub AddScalarDiff(ByVal d As Object, ByVal pair As String, ByVal diskV As String, ByVal memV As String)
+    Dim dv As String, mv As String
+    dv = Trim$(diskV)
+    mv = Trim$(memV)
+    If Len(dv) = 0 Or Len(mv) = 0 Then Exit Sub
+    If StrComp(BaseNameOf(dv), BaseNameOf(mv), vbTextCompare) = 0 Then Exit Sub
+    Dim e As Object
+    Set e = CreateObject("Scripting.Dictionary")
+    e("pair") = pair
+    e("disk") = dv
+    e("memory") = mv
+    e("decisive") = True
+    d("scalarDiffs").Add e
+    d("decisiveScalarDiffs") = d("decisiveScalarDiffs") + 1
+End Sub
+
+' TASK-P1-162 (R7-4): the /d-related receipt block, used on BOTH the cache-hit path and
+' the real build path so a caller can always see exactly what was passed.
+Private Sub CcArgsInto(ByVal root As Object, ByVal cmdArgs As String, ByVal ccExtra As String, _
+                       ByVal ccArgs As Object, ByVal defines As String, ByVal useIde As Boolean)
+    root("commandLine") = cmdArgs
+    root("commandLineApplies") = (Not useIde)
+    If useIde Then
+        root("commandLineNote") = "this receipt came from the IN-IDE Make route, which starts NO compiler subprocess; the command line shown is the one the isolated /make route would have used (and did NOT run here)."
+    Else
+        root("commandLineNote") = "the exact command line handed to VB6.EXE (/make ...), including the /d arguments exactly as they were written."
+    End If
+    root("conditionalCompileArgsRaw") = defines
+    root("conditionalCompileArgsExtra") = ccExtra
+    root("conditionalCompileArgsCount") = ccArgs.Count
+    Set root("conditionalCompileArgs") = ccArgs
+    root("conditionalCompileQuoteRule") = "a /d value is quoted ONLY when it contains a space; an unconditional quote folds the quoted text into the macro NAME on this compiler, so the macro silently never applies while the build still reports success."
+End Sub
+
+
+' =====================================================================
+' TASK-P1-160 (R17, narrowed): split "the statement raised" from "the forward/channel
+' died", and carry the VB error as a STRUCTURED field instead of prose.
+'   * exec_error - the add-in DID answer: either the call into the probe raised, or
+'                  EbExecuteLine reported a VB error. The number was ALREADY captured
+'                  (Vba6Probe.bas vbaError/vbaErrorDesc); it is re-labelled, not re-derived.
+'   * forward_timeout / forward_failed - produced by the HUB (bridge/vb6mcp_hub.mjs), not
+'                  by the add-in: they mean the add-in never answered at all, so no
+'                  add-in receipt - and therefore no exec_error - can exist for them.
+' =====================================================================
+Private Function ToolVba6ExecProbe(ByVal args As Object) As String
+    Dim raw As String
+    Dim raised As Boolean
+    Dim rNum As Long
+    Dim rDesc As String
+    raw = ""
+    raised = False
+    rNum = 0
+    rDesc = ""
+    On Error Resume Next
+    Err.Clear
+    raw = Vba6Probe.ExecLineJson(JsonGetStr(args, "exec_line"), JsonGetLong(args, "exec_a2"), JsonGetLong(args, "exec_a3"), JsonGetLong(args, "exec_a4"), JsonGetBool(args, "exec_scope", False), JsonGetBool(args, "exec_dump_ctx", False), JsonGetBool(args, "exec_set_frame", False))
+    If Err.Number <> 0 Then
+        raised = True
+        rNum = Err.Number
+        rDesc = Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+    Dim transportNote As String
+    transportNote = "exec_error means the add-in DID answer: either the call into the probe raised, or EbExecuteLine reported a VB error. It is a DIFFERENT failure from forward_timeout / forward_failed, which the HUB reports when the add-in cannot answer at all (the channel is hung, or the call outlived the forward budget) - for those there is no add-in receipt, and therefore no exec_error."
+    If raised Or Len(raw) = 0 Then
+        Dim d As Object
+        Set d = CreateObject("Scripting.Dictionary")
+        d("ok") = False
+        d("reason") = "exec_error"
+        d("tool") = "vba6_probe"
+        d("probe") = "exec_probe"
+        Dim e As Object
+        Set e = CreateObject("Scripting.Dictionary")
+        e("vbaErrNumber") = rNum
+        e("description") = rDesc
+        e("raisedIn") = "the add-in, while calling Vba6Probe.ExecLineJson"
+        If Len(raw) = 0 Then e("emptyReceipt") = True
+        Set d("exec_error") = e
+        d("raw") = Left$(raw, 400)
+        d("transportReasonSpace") = transportNote
+        ToolVba6ExecProbe = JsonStringify(d)
+        Exit Function
+    End If
+    ' The probe answered. When it captured a VB error while executing the line, re-label the
+    ' SAME numbers as a structured exec_error. A clean probe is returned BYTE-IDENTICAL to
+    ' before, so no existing successful caller can change behaviour.
+    Dim n As Long
+    Dim dr As String
+    n = 0
+    dr = ""
+    Dim f1 As String
+    f1 = JsonFieldRaw(raw, "vbaError")
+    If Len(f1) > 0 Then n = CLng(Val(f1))
+    If n = 0 Then
+        ToolVba6ExecProbe = raw
+        Exit Function
+    End If
+    dr = JsonFieldRaw(raw, "vbaErrorDesc")
+    Dim addd As Object
+    Set addd = CreateObject("Scripting.Dictionary")
+    addd("ok") = False
+    addd("reason") = "exec_error"
+    addd("transportReasonSpace") = transportNote
+    Dim e2 As Object
+    Set e2 = CreateObject("Scripting.Dictionary")
+    e2("vbaErrNumber") = n
+    e2("description") = dr
+    e2("raisedIn") = "Vba6Probe.ExecLineJson (the probe answered with vbaError/vbaErrorDesc)"
+    Set addd("exec_error") = e2
+    Dim whole As String
+    whole = JsonStringify(addd)
+    Dim frag As String
+    frag = Mid$(whole, 2, Len(whole) - 2)
+    Dim inj As String
+    inj = JsonPrependMembers(raw, frag)
+    If inj = raw Then
+        ' The shape was not a plain non-empty JSON object. Say so instead of pretending.
+        Dim d3 As Object
+        Set d3 = CreateObject("Scripting.Dictionary")
+        d3("ok") = False
+        d3("reason") = "exec_error"
+        d3("tool") = "vba6_probe"
+        d3("probe") = "exec_probe"
+        Dim e3 As Object
+        Set e3 = CreateObject("Scripting.Dictionary")
+        e3("vbaErrNumber") = n
+        e3("description") = dr
+        e3("raisedIn") = "Vba6Probe.ExecLineJson (the probe answered with vbaError)"
+        Set d3("exec_error") = e3
+        d3("raw") = raw
+        d3("relabelFailed") = "the probe's answer was not a plain non-empty JSON object, so it could not be re-labelled in place"
+        d3("transportReasonSpace") = transportNote
+        ToolVba6ExecProbe = JsonStringify(d3)
+        Exit Function
+    End If
+    ToolVba6ExecProbe = inj
+End Function
+
+' TASK-P1-160 (R17): insert extra top-level members into a JSON OBJECT text without
+' re-parsing it. Returns jsonText unchanged when the shape is not a plain non-empty
+' object, so the caller can detect the refusal with a plain equality test.
+Private Function JsonPrependMembers(ByVal jsonText As String, ByVal frag As String) As String
+    JsonPrependMembers = jsonText
+    If Len(jsonText) = 0 Then Exit Function
+    If Len(frag) = 0 Then Exit Function
+    Dim s As String
+    Dim i As Long
+    s = Trim$(jsonText)
+    If Len(s) < 2 Then Exit Function
+    If Left$(s, 1) <> "{" Then Exit Function
+    If Mid$(s, 2, 1) = "}" Then Exit Function
+    i = InStr(jsonText, "{")
+    If i = 0 Then Exit Function
+    JsonPrependMembers = Left$(jsonText, i) & frag & "," & Mid$(jsonText, i + 1)
 End Function
 
 Private Function OpenProjectName(ByVal p As VBIDE.VBProject) As String
@@ -3431,12 +3942,27 @@ Private Function ToolGetComponentCode(ByVal name As String, ByVal includeLineNum
     Dim cd As Object
     Set cd = CoordsDictOfName(comp.Name, sIde, cs)
     Set root("coords") = cd
+    ' TASK-P1-161 (R4): VB6 requires a LOCAL variable to be declared BEFORE its first
+    ' use, so the accumulated map is resolved here - above every use of it.
+    Dim em As Object
+    Set em = PaneDiskMapCached(name)
     ' TASK-P1-020 rework: say which space the numbered output is in AND which space the
     ' edit tools take, so a caller cannot lose track (an independent verifier read the
     ' numbered lines as edit lines and reported a false defect).
     root("lineNumbersAre") = cs
     root("editToolsTake") = "ide"
     root("convertToEditLine") = "ideLine = diskLine - coords.headerOffset"
+    ' TASK-P1-161 (R4): the mapping basis belongs at the TOP level of the one tool whose
+    ' output is NUMBERED in disk space, and the hidden lines are named so the gaps in the
+    ' numbering can be reproduced instead of being taken on trust.
+    If cs = "disk" Then
+        root("mappingBasis") = em("basis")
+        root("mappingResolved") = em("resolved")
+        root("hiddenInlineAttributeLines") = em("hiddenCount")
+        Set root("hiddenInlineAttributeDiskLines") = em("hiddenDiskLines")
+        If Not CBool(em("resolved")) Then Set root("mappingDeviationPaneLines") = em("deviationPaneLines")
+        root("diskLineNote") = "in the DISK spaces the emitted line numbers skip the hidden inline Attribute lines, so they are not always consecutive; hiddenInlineAttributeDiskLines lists the disk lines the code pane does not show."
+    End If
     If sliced Then
         root("startLine") = sIde
         root("endLine") = eIde
@@ -3451,10 +3977,19 @@ Private Function ToolGetComponentCode(ByVal name As String, ByVal includeLineNum
     On Error Resume Next
     off = CLng(cd("headerOffset"))
     On Error GoTo 0
+    ' TASK-P1-161 (R4): the DISK line of every EMITTED line comes from the accumulated
+    ' pane->disk map, because a hidden inline Attribute line inside the module shifts
+    ' everything below it. hl is the number of header lines this tool prepends.
+    Dim headerText As String
+    Dim hl As Long
+    headerText = ""
+    hl = 0
     Dim code As String
     Dim baseNo As Long
     If cs = "disk" And Not sliced Then
-        code = ComponentHeaderOf(name, wholePane) & wholePane
+        headerText = ComponentHeaderOf(name, wholePane)
+        hl = HeaderLineCountOf(headerText)
+        code = headerText & wholePane
         baseNo = 1
     Else
         code = SliceLines(wholePane, sIde, eIde)
@@ -3499,12 +4034,28 @@ Private Function ToolGetComponentCode(ByVal name As String, ByVal includeLineNum
         Dim k As Long
         ReDim parts(0 To ub)
         k = 0
+        Dim thisNo As Long
         For i = 0 To ub
             MaybePump
             If i = ub Then
                 If Len(lines(i)) = 0 Then Exit For
             End If
-            parts(k) = Right$("    " & CStr(baseNo + i), 5) & "| " & lines(i) & vbCrLf
+            ' TASK-P1-161 (R4): number each emitted line from the ACCUMULATED map. In the
+            ' whole-module disk space the prepended header occupies disk lines 1..hl and
+            ' the pane lines follow; in a slice the pane line is sIde + i.
+            thisNo = baseNo + i
+            If cs = "disk" Then
+                If sliced Then
+                    If ExactDiskLineOf(em, sIde + i, 0) > 0 Then thisNo = ExactDiskLineOf(em, sIde + i, 0)
+                Else
+                    If i < hl Then
+                        thisNo = i + 1
+                    Else
+                        If ExactDiskLineOf(em, i - hl + 1, 0) > 0 Then thisNo = ExactDiskLineOf(em, i - hl + 1, 0)
+                    End If
+                End If
+            End If
+            parts(k) = Right$("    " & CStr(thisNo), 5) & "| " & lines(i) & vbCrLf
             k = k + 1
         Next
         If k > 0 Then
@@ -3517,6 +4068,21 @@ Private Function ToolGetComponentCode(ByVal name As String, ByVal includeLineNum
     root("sha256") = root("textSha256")
     ToolGetComponentCode = JsonStringify(root)
 End Function
+
+' The number of lines in a header text (it ends with a CRLF, so the trailing empty
+' element is not a line).
+Private Function HeaderLineCountOf(ByVal headerText As String) As Long
+    HeaderLineCountOf = 0
+    If Len(headerText) = 0 Then Exit Function
+    Dim a() As String
+    a = Split(Replace(Replace(headerText, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    If Len(a(UBound(a))) = 0 Then
+        HeaderLineCountOf = UBound(a)
+    Else
+        HeaderLineCountOf = UBound(a) + 1
+    End If
+End Function
+
 
 ' TASK-P1-024 gamma-2 helpers -------------------------------------------------
 Private Function SliceLines(ByVal pane As String, ByVal sLine As Long, ByVal eLine As Long) As String
@@ -5652,6 +6218,12 @@ End Function
 Private Function ToolSetCodePane(ByVal component As String, ByVal selection As String, ByVal topLine As Long, ByVal view As String, ByVal activate As Boolean) As String
     Dim cp As VBIDE.CodePane
     Set cp = GetCodePane(component)
+    ' TASK-P1-164 (R18-2): set_codepane moves the SELECTION and the SCROLL position, never
+    ' the text. The pane text is captured here and asserted at the end.
+    Dim pAssertComp As String, pAssertBefore As String
+    Dim pAssertOn As Boolean
+    pAssertComp = cp.CodeModule.Name
+    pAssertBefore = PaneTextOfName(pAssertComp, pAssertOn)
     Dim applied As Object
     Set applied = New Collection
     If Len(selection) > 0 Then
@@ -5692,6 +6264,8 @@ Private Function ToolSetCodePane(ByVal component As String, ByVal selection As S
             "this call WAS applied (see applied) - the argument is reported here rather than silently ignored. Inspect the " & _
             "current mode with get_codepane.view; switch it with the IDE's own Full Module / Procedure View buttons."
     End If
+    ' R18-2: a selection/scroll change must not rewrite the pane text.
+    PaneAssertFinish root, pAssertComp, pAssertBefore, pAssertOn, "set_codepane"
     ToolSetCodePane = JsonStringify(root)
 End Function
 
@@ -8082,6 +8656,22 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     Dim preReason As String
     preReason = ""
     Dim cp As VBIDE.CodePane
+    ' TASK-P1-164 (R18-2 / R18-3): BEFORE anything moves, remember the caret and the pane
+    ' text so the receipt can PROVE the pane was not rewritten and the caret was put back.
+    Dim curOk As Boolean
+    Dim curSL As Long, curSC As Long, curEL As Long, curEC As Long
+    Dim pAssertComp As String, pAssertBefore As String
+    Dim pAssertOn As Boolean
+    Dim curRestored As Boolean
+    Dim curNote As String
+    Dim fgBefore As Long, fgAfter As Long
+    curOk = False
+    pAssertOn = False
+    pAssertComp = ""
+    pAssertBefore = ""
+    curRestored = False
+    curNote = "not attempted"
+    fgBefore = WoFrontHwnd()
     Select Case action
         Case "toggle"
             ctrlCands = "Toggle Breakpoint|" & ChrW$(&H5207) & ChrW$(&H6362) & ChrW$(&H65AD) & ChrW$(&H70B9)
@@ -8094,6 +8684,15 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
                     If cp Is Nothing Then
                         preReason = "no_code_pane"
                     Else
+                        ' R18-3: the IDE has NO breakpoint API, so "Toggle Breakpoint" acts on the
+                        ' CARET (Debug menu item). Save the caret and the pane text here; both are
+                        ' restored/checked after the menu command has run.
+                        curSL = 0: curSC = 0: curEL = 0: curEC = 0
+                        cp.GetSelection curSL, curSC, curEL, curEC
+                        If Err.Number = 0 Then curOk = True
+                        Err.Clear
+                        pAssertComp = comp
+                        pAssertBefore = PaneTextOfName(comp, pAssertOn)
                         cp.SetSelection line, 1, line, 1
                         If Err.Number <> 0 Then
                             preReason = "selection_failed"
@@ -8105,6 +8704,11 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
             End If
         Case "clear_all"
             ctrlCands = "Clear All Breakpoints|" & ChrW$(&H6E05) & ChrW$(&H9664) & ChrW$(&H6240) & ChrW$(&H6709) & ChrW$(&H65AD) & ChrW$(&H70B9)
+            ' R18-2: clear_all names no component, so the assertion target is the ACTIVE code
+            ' pane. When there is none, the assertion is reported as notApplicable rather than
+            ' skipped silently. Clear All Breakpoints does not touch the code text either.
+            pAssertComp = PaneCompOfActive()
+            If Len(pAssertComp) > 0 Then pAssertBefore = PaneTextOfName(pAssertComp, pAssertOn)
         Case Else
             Err.Raise vbObjectError + 84, "CodeTools", "Invalid action: " & action & " (expected toggle/clear_all)"
     End Select
@@ -8133,11 +8737,55 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     Dim n As Long
     n = ExecIfEnabled(ctrl, action)
     DoEvents
+    ' ---- R18-3 compensation: restore the caret, then give the foreground back --------
+    ' VB6 exposes NO breakpoint API (see list_breakpoints), and the Debug menu item acts on
+    ' the CARET, so there is NO channel that sets an IDE-native breakpoint "without moving
+    ' the cursor and without changing text". What can be done - and is done here - is to
+    ' put the caret back exactly where it was and to hand the foreground back to whatever
+    ' window owned it. The receipt says all three facts so the trade-off is visible.
+    If LCase$(action) = "toggle" Then
+        If curOk Then
+            On Error Resume Next
+            Set cp = GetCodePane(comp)
+            If cp Is Nothing Then
+                curNote = "the code pane could not be resolved again, so the caret was NOT restored"
+            Else
+                Err.Clear
+                cp.SetSelection curSL, curSC, curEL, curEC
+                If Err.Number = 0 Then
+                    curRestored = True
+                    curNote = "the caret was put back at the selection read before the toggle"
+                Else
+                    curNote = "SetSelection raised " & CStr(Err.Number) & " (" & Err.Description & "); the caret was NOT restored"
+                    Err.Clear
+                End If
+            End If
+            On Error GoTo 0
+        Else
+            curNote = "the caret could not be read before the toggle, so nothing could be restored"
+        End If
+    Else
+        curNote = "action " & action & " does not move the caret"
+    End If
+    fgAfter = WoFrontHwnd()
+    If fgAfter <> fgBefore Then
+        WoFrontRestore fgBefore
+        fgAfter = WoFrontHwnd()
+    End If
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("action") = action
     root("executed") = (n > 0)
     root("caption") = ctrl.Caption
+    root("cursorRestored") = curRestored
+    root("cursorNote") = curNote
+    root("foregroundBefore") = fgBefore
+    root("foregroundAfter") = fgAfter
+    root("foregroundTookFocus") = (fgAfter <> fgBefore)
+    root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+    root("ideNativeBreakpointApi") = False
+    root("breakpointWithoutCursorMove") = False
+    root("breakpointQuietNote") = "VB6's extensibility model exposes NO breakpoint API (list_breakpoints says the same), and the Debug menu item acts on the caret; there is therefore NO channel that sets an IDE-native breakpoint without moving the cursor. This tool moves the caret to the target line and, as compensation, restores the previous selection afterwards (cursorRestored) and gives the foreground back (foregroundTookFocus). The alternative, set_breakpoint, does not move the caret but WRITES text (an injected Debug.Assert marker block)."
     If Len(comp) > 0 Then root("component") = comp
     If line > 0 Then root("line") = line
     If Len(comp) > 0 And line > 0 Then
@@ -8146,6 +8794,10 @@ Private Function ToolNativeBreakpoint(ByVal args As Object) As String
     End If
     root("state") = GetIdeState()
     root("note") = "Menu-driven IDE breakpoint: no source file was modified. The IDE keeps breakpoints only for the current session."
+    ' R18-2: the write-after assertion. A native breakpoint is menu-driven and writes no
+    ' text, so the contract here is "the pane text is UNCHANGED"; a change flips the
+    ' receipt to ok:false / reason:paneTextMismatch with the differing lines.
+    PaneAssertFinish root, pAssertComp, pAssertBefore, pAssertOn, "native_breakpoint"
     ToolNativeBreakpoint = JsonStringify(root)
 End Function
 
@@ -9033,11 +9685,56 @@ Private Function ToolSetMemberAttribute(ByVal component As String, ByVal member 
         Case Else
             Err.Raise vbObjectError + 60, "CodeTools", "Unknown attrName: " & attrName
     End Select
+    ' TASK-P1-164 (R18-2): a write-class tool reads its own write BACK, so a setter that
+    ' silently did nothing cannot be mistaken for a success.
+    Dim rb As String
+    Dim want As String
+    rb = ""
+    want = value
+    Select Case LCase$(attrName)
+        Case "description"
+            rb = m.Description
+        Case "help_context_id"
+            rb = CStr(m.HelpContextID)
+            want = CStr(CLng(Val(value)))
+        Case "hidden"
+            rb = CStr(m.Hidden)
+            want = CStr(b)
+        Case "browsable"
+            rb = CStr(m.Browsable)
+            want = CStr(b)
+        Case "ui_default"
+            rb = CStr(m.UIDefault)
+            want = CStr(b)
+        Case "bindable"
+            rb = CStr(m.Bindable)
+            want = CStr(b)
+        Case "default_bind"
+            rb = CStr(m.DefaultBind)
+            want = CStr(b)
+        Case "display_bind"
+            rb = CStr(m.DisplayBind)
+            want = CStr(b)
+        Case "request_edit"
+            rb = CStr(m.RequestEdit)
+            want = CStr(b)
+        Case "category"
+            rb = m.Category
+        Case "property_page"
+            rb = m.PropertyPage
+        Case "standard_method"
+            rb = CStr(m.StandardMethod)
+            want = CStr(CLng(Val(value)))
+    End Select
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("component") = comp.Name
     root("member") = m.Name
     root("attribute") = attrName
+    root("requestedValue") = value
+    root("readback") = rb
+    root("applied") = (LCase$(Trim$(rb)) = LCase$(Trim$(want)))
+    root("readbackNote") = "readback is the value the IDE reports for this member attribute AFTER the set; applied compares it with the normalised request. It is the IN-MEMORY value only - whether it reaches the FILE on disk is up to VB6 when the component is saved (save_project), and member attributes such as hidden/uidDefault are written as Attribute lines the code pane never shows."
     ToolSetMemberAttribute = JsonStringify(root)
 End Function
 
@@ -9093,6 +9790,25 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
         ToolControlWindow = JsonStringify(miss)
         Exit Function
     End If
+    ' TASK-P1-164 (R18 focus safety): record the foreground window across EVERY action so the
+    ' receipt can show whether driving the IDE stole the user's foreground. An action that did
+    ' NOT ask to activate (move/resize/show/...) gives the foreground BACK - VB6 can raise the
+    ' frame as a side effect, and that is exactly how a user's typing lands in the wrong window.
+    Dim fgBefore As Long
+    Dim fgAfter As Long
+    ' TASK-P1-164 (R18-2): a window action writes no text, so the contract is "the pane
+    ' text is UNCHANGED". When the addressed window IS a code window, its component is
+    ' identified by the WINDOW HANDLE (not by a caption guess) and its pane is compared.
+    Dim pAssertComp As String, pAssertBefore As String
+    Dim pAssertOn As Boolean
+    Dim pAssertVia As String
+    pAssertComp = ""
+    pAssertBefore = ""
+    pAssertOn = False
+    pAssertVia = ""
+    pAssertComp = PaneCompOfWindowTarget(w.HWnd, w.Caption, pAssertVia)
+    If Len(pAssertComp) > 0 Then pAssertBefore = PaneTextOfName(pAssertComp, pAssertOn)
+    fgBefore = WoFrontHwnd()
     Select Case LCase$(action)
         Case "activate"
             w.SetFocus
@@ -9119,9 +9835,21 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
         Case Else
             Err.Raise vbObjectError + 61, "CodeTools", "Unknown action: " & action
     End Select
+    fgAfter = WoFrontHwnd()
+    If fgAfter <> fgBefore Then
+        If LCase$(action) <> "activate" Then
+            ' The action did not request the foreground, so put the user's window back and
+            ' re-read: the receipt reports what is true AFTER the restore attempt.
+            WoFrontRestore fgBefore
+            fgAfter = WoFrontHwnd()
+        End If
+    End If
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("ok") = True
+    root("foregroundBefore") = fgBefore
+    root("foregroundAfter") = fgAfter
+    root("foregroundTookFocus") = (fgAfter <> fgBefore)
     root("caption") = w.Caption
     root("visible") = w.Visible
     root("windowState") = WindowStateName(w.WindowState)
@@ -9136,6 +9864,15 @@ Private Function ToolControlWindow(ByVal window As String, ByVal action As Strin
             "\`caption\` cannot be applied: action=set_caption is accepted but the window is NOT renamed. The window's " & _
             "CURRENT caption is in this receipt. The action you did request was performed (see visible/windowState/type); " & _
             "use move / resize / show / hide / minimize / maximize / restore to change the window instead."
+    End If
+    ' R18-2: see E1 - a window action must not touch the code text.
+    PaneAssertFinish root, pAssertComp, pAssertBefore, pAssertOn, "control_window"
+    root("paneAssertionVia") = pAssertVia
+    ' TASK-P1-164 (R18-2) honesty: a foreground handle of 0 means the foreground could not
+    ' be READ in this session station - it does NOT mean the operation left the focus alone.
+    root("foregroundReadable") = (fgBefore <> 0 Or fgAfter <> 0)
+    If Len(pAssertComp) = 0 Then
+        root("paneAssertionTarget") = "no code pane could be matched to the addressed window (tried hwnd identity, then exact caption equality), so the assertion is reported as notApplicable - never as a pass"
     End If
     ToolControlWindow = JsonStringify(root)
 End Function
@@ -9943,18 +10680,64 @@ Private Function ToolRemoveControl(ByVal form As String, ByVal index As Long, By
     Dim des As Object
     Set des = comp.Designer
     If des Is Nothing Then Err.Raise vbObjectError + 63, "CodeTools", "Component has no designer: " & form
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    Dim cntBefore As Long
+    Dim cntAfter As Long
+    cntBefore = -1
+    cntAfter = -1
+    On Error Resume Next
+    cntBefore = des.VBControls.Count
+    If Err.Number <> 0 Then
+        Err.Clear
+        cntBefore = -1
+    End If
+    On Error GoTo 0
     Dim idx As Long
+    On Error Resume Next
+    Err.Clear
     idx = ResolveControlIndex(des, control, index)
+    If Err.Number <> 0 Then
+        Dim cfMsg As String
+        cfMsg = Err.Description
+        Err.Clear
+        On Error GoTo 0
+        root("ok") = False
+        root("reason") = "control_not_found"
+        root("form") = comp.Name
+        root("requestedControl") = control
+        root("requestedIndex") = index
+        root("error") = cfMsg
+        root("controlCountBefore") = cntBefore
+        root("controlCountAfter") = cntBefore
+        root("sideEffects") = "none: the call was refused before any control was removed"
+        ToolRemoveControl = JsonStringify(root)
+        Exit Function
+    End If
+    On Error GoTo 0
     Dim ctl As Object
     Set ctl = GetControlByIndex(des, idx)
     Dim ctlName As String
     ctlName = ControlName(ctl)
     des.VBControls.Remove ctl
-    Dim root As Object
-    Set root = CreateObject("Scripting.Dictionary")
-    root("form") = comp.Name
-    root("removedIndex") = idx
-    If Len(control) > 0 Then root("removedControl") = ctlName
+    On Error Resume Next
+    cntAfter = des.VBControls.Count
+    If Err.Number <> 0 Then
+        Err.Clear
+        cntAfter = -1
+    End If
+    On Error GoTo 0
+    ' TASK-P1-163 (R6): the receipt used to carry no 'ok' and no control counts, so the only
+    ' way to confirm a deletion was a second form_designer info call. Report the verdict and
+    ' the before/after counts here, and a structured 'control_not_found' failure instead of
+    ' an exception when the name/index does not resolve.
+    root("ok") = True
+    root("removedControl") = ctlName
+    root("controlCountBefore") = cntBefore
+    root("controlCountAfter") = cntAfter
+    If cntBefore < 0 Or cntAfter < 0 Then
+        root("controlCountNote") = "VBControls.Count was not readable on this IDE; the count fields carry -1"
+    End If
     ToolRemoveControl = JsonStringify(root)
 End Function
 
@@ -11441,6 +12224,420 @@ Private Function TextLines(ByVal text As String) As String()
     TextLines = Split(Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf), vbLf)
 End Function
 
+' =====================================================================
+' TASK-P1-161 (R4): the pane line -> disk line map, ACCUMULATED per line.
+'
+' The mapping used to be ONE SCALAR per component: diskLine = ideLine + headerOffset,
+' where headerOffset counted only the disk lines BEFORE the pane's first line. VBA6
+' hides MORE of the file than that: a member attribute stored as its own
+' `Attribute Foo.VB_UserMemId = -4` line sits inside the module body, is present in
+' the .cls on disk, and NEVER appears in the code pane. Every pane line after such a
+' line therefore got a disk number that was too small by one per hidden line, and a
+' proc:/symbol: slice was numbered from a wrong base as well.
+'
+' The map below aligns the disk text with the pane text line by line and counts each
+' hidden line AS IT IS PASSED, so the offset of line N is the SUM of the hidden lines
+' above it. The alignment validates itself: a pane line that cannot be matched fixes
+' resolved=False, and the receipt then says the number is NOT exact instead of
+' publishing a scalar that only holds near the top of the file.
+' =====================================================================
+
+' True when a DISK line is a member attribute line VBA6 hides from the code pane:
+' "Attribute <Name>.<Member> = <value>". The LEADING module attributes
+' ("Attribute VB_Name = ...") belong to the header, not to this test; the dot before
+' the '=' is what separates the two forms.
+Private Function IsInlineAttributeLine(ByVal s As String) As Boolean
+    IsInlineAttributeLine = False
+    Dim t As String
+    t = Trim$(s)
+    If Len(t) < 11 Then Exit Function
+    If LCase$(Left$(t, 10)) <> "attribute " Then Exit Function
+    Dim eq As Long
+    eq = InStr(t, "=")
+    If eq = 0 Then Exit Function
+    Dim dot As Long
+    dot = InStr(t, ".")
+    If dot > 11 And dot < eq Then IsInlineAttributeLine = True
+End Function
+
+' Line equality for the alignment. The RAW compare is tried first because the code pane
+' expands TABs; CollapseWs is only paid on the lines that really differ.
+Private Function LinesEqNorm(ByVal a As String, ByVal b As String) As Boolean
+    If a = b Then
+        LinesEqNorm = True
+        Exit Function
+    End If
+    LinesEqNorm = (CollapseWs(a) = CollapseWs(b))
+End Function
+
+' Align pane lines to disk lines from a given header length. Fills map() (0-based,
+' value = 1-based disk line, 0 = unmapped) and the two output collections; returns the
+' number of DEVIATING pane lines (0 = the whole module aligned).
+Private Function AlignPaneToDisk(ByRef dl() As String, ByVal nDisk As Long, _
+                                 ByRef pl() As String, ByVal nPane As Long, _
+                                 ByVal hdr As Long, ByRef map() As Long, _
+                                 ByVal hidden As Object, ByVal dev As Object) As Long
+    Dim di As Long, pi As Long, ndev As Long, k As Long
+    Dim matched As Boolean, resynced As Boolean, guard As Long
+    di = hdr
+    pi = 0
+    ndev = 0
+    Do While pi <= nPane
+        MaybePump
+        If di > nDisk Then
+            dev.Add pi + 1
+            ndev = ndev + 1
+            map(pi) = 0
+            pi = pi + 1
+        Else
+            matched = False
+            If LinesEqNorm(dl(di), pl(pi)) Then
+                matched = True
+            Else
+                guard = 0
+                Do While di <= nDisk And guard < 200
+                    If IsInlineAttributeLine(dl(di)) Then
+                        hidden.Add di + 1
+                        di = di + 1
+                        guard = guard + 1
+                        If di <= nDisk Then
+                            If LinesEqNorm(dl(di), pl(pi)) Then
+                                matched = True
+                                Exit Do
+                            End If
+                        End If
+                    Else
+                        Exit Do
+                    End If
+                Loop
+            End If
+            If matched Then
+                map(pi) = di + 1
+                di = di + 1
+                pi = pi + 1
+            Else
+                ' bounded resync: an extra DISK line that is not an Attribute line
+                resynced = False
+                k = 1
+                Do While k <= 4
+                    If di + k <= nDisk Then
+                        If LinesEqNorm(dl(di + k), pl(pi)) Then
+                            resynced = True
+                            Exit Do
+                        End If
+                    End If
+                    k = k + 1
+                Loop
+                If resynced Then
+                    di = di + k
+                    map(pi) = di + 1
+                    di = di + 1
+                    pi = pi + 1
+                Else
+                    dev.Add pi + 1
+                    ndev = ndev + 1
+                    map(pi) = 0
+                    pi = pi + 1
+                End If
+            End If
+        End If
+    Loop
+    AlignPaneToDisk = ndev
+End Function
+
+' The map for one component (not cached here - use PaneDiskMapCached).
+Private Function PaneDiskMap(ByVal name As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("component") = name
+    d("resolved") = False
+    d("headerLines") = 0
+    d("hiddenCount") = 0
+    d("paneLineCount") = 0
+    d("diskLineCount") = 0
+    d("deviationCount") = 0
+    d("method") = "cumulative pane->disk alignment: diskLine = ideLine + headerLines + every hidden inline Attribute line ABOVE that line"
+    d("basis") = "no map was computed (the component could not be resolved with a code module)"
+    Dim hidden As Object, dev As Object
+    Set hidden = New Collection
+    Set dev = New Collection
+    Set d("hiddenDiskLines") = hidden
+    Set d("deviationPaneLines") = dev
+    Dim mapArr() As Long
+    Set PaneDiskMap = d
+    On Error Resume Next
+    Dim path As String
+    path = DiskPathOf(name, "")
+    If Len(path) = 0 Then Err.Clear: Exit Function
+    If Dir$(path) = "" Then Err.Clear: Exit Function
+    Dim comp As VBIDE.VBComponent
+    Set comp = FindComponent(name)
+    If comp Is Nothing Then Err.Clear: Exit Function
+    If comp.CodeModule Is Nothing Then Err.Clear: Exit Function
+    Dim ideLines As Long
+    ideLines = comp.CodeModule.CountOfLines
+    d("paneLineCount") = ideLines
+    Dim pane As String
+    If ideLines > 0 Then pane = comp.CodeModule.Lines(1, ideLines)
+    Dim disk As String
+    disk = Build.ReadLogAnsi(path)
+    If Len(disk) = 0 Then Err.Clear: Exit Function
+    Dim dl() As String, pl() As String
+    dl = Split(Replace(Replace(disk, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    pl = Split(Replace(Replace(pane, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    Dim nDisk As Long, nPane As Long
+    nDisk = UBound(dl)
+    If nDisk > 0 Then
+        If Len(dl(nDisk)) = 0 Then nDisk = nDisk - 1
+    End If
+    If ideLines > 0 Then nPane = UBound(pl) Else nPane = -1
+    d("diskLineCount") = nDisk + 1
+    If nPane < 0 Then
+        d("resolved") = True
+        d("headerLines") = nDisk + 1
+        d("basis") = "the code pane is empty, so the whole file is header"
+        Err.Clear
+        Exit Function
+    End If
+    ' candidate header positions: the disk lines equal to the pane's FIRST line.
+    Dim cand(1 To 8) As Long
+    Dim ncand As Long, i As Long
+    ncand = 0
+    For i = 0 To nDisk
+        If dl(i) = pl(0) Then
+            ncand = ncand + 1
+            If ncand > 8 Then Exit For
+            cand(ncand) = i
+        End If
+    Next
+    If ncand = 0 Then
+        ' the raw text differs (TAB expansion, a rewritten line, ...): retry normalized
+        For i = 0 To nDisk
+            MaybePump
+            If i > 2000 Then Exit For
+            If LinesEqNorm(dl(i), pl(0)) Then
+                ncand = ncand + 1
+                If ncand > 8 Then Exit For
+                cand(ncand) = i
+            End If
+        Next
+    End If
+    If ncand = 0 Then
+        d("basis") = "the pane's first line was not found in the file on disk, so no mapping could be derived (the offset is NOT exact)"
+        Err.Clear
+        Exit Function
+    End If
+    ' use the FIRST candidate that aligns the WHOLE module with zero deviations
+    Dim tryNo As Long, devCount As Long, bestDev As Long
+    bestDev = -1
+    For tryNo = 1 To ncand
+        Set hidden = New Collection
+        Set dev = New Collection
+        ReDim mapArr(0 To nPane)
+        devCount = AlignPaneToDisk(dl, nDisk, pl, nPane, cand(tryNo), mapArr, hidden, dev)
+        If bestDev < 0 Or devCount < bestDev Then
+            bestDev = devCount
+            Set d("hiddenDiskLines") = hidden
+            Set d("deviationPaneLines") = dev
+            d("headerLines") = cand(tryNo)
+            d("hiddenCount") = hidden.Count
+            d("deviationCount") = dev.Count
+            d("ideToDisk") = mapArr
+        End If
+        If devCount = 0 Then Exit For
+    Next
+    d("resolved") = (bestDev = 0)
+    If bestDev = 0 Then
+        d("basis") = "diskLine = ideLine + headerLines(" & CStr(d("headerLines")) & ") + hiddenInlineAttributeLinesAbove(" & CStr(d("hiddenCount")) & " total); accumulated per line from the .cls on disk and validated by a whole-module alignment with 0 deviating pane lines"
+    Else
+        d("basis") = "NOT exact: the .cls on disk and the code pane could not be aligned (the best pass still had " & CStr(bestDev) & " deviating pane line(s)); the scalar headerOffset is reported instead and MUST NOT be trusted below the first hidden line"
+    End If
+    Err.Clear
+End Function
+
+' Per-top-level-call cache (m_paneDiskMaps is reset in CallTool).
+Private Function PaneDiskMapCached(ByVal name As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("component") = name
+    d("resolved") = False
+    d("headerLines") = 0
+    d("hiddenCount") = 0
+    d("paneLineCount") = 0
+    d("diskLineCount") = 0
+    d("deviationCount") = 0
+    d("method") = "cumulative pane->disk alignment"
+    d("basis") = "no map was computed (the component could not be resolved with a code module)"
+    Set d("hiddenDiskLines") = New Collection
+    Set d("deviationPaneLines") = New Collection
+    Set PaneDiskMapCached = d
+    On Error Resume Next
+    If m_paneDiskMaps Is Nothing Then Set m_paneDiskMaps = CreateObject("Scripting.Dictionary")
+    If m_paneDiskMaps.Exists(name) Then
+        Set PaneDiskMapCached = m_paneDiskMaps(name)
+        Err.Clear
+        Exit Function
+    End If
+    Dim m As Object
+    Set m = PaneDiskMap(name)
+    Set m_paneDiskMaps(name) = m
+    Set PaneDiskMapCached = m
+    Err.Clear
+End Function
+
+' =====================================================================
+' TASK-P1-164 (R18-2): the post-operation assertion for tools that may not write text.
+' Same contract as the editor's expected_sha256 - a mismatch is ok:false /
+' reason:paneTextMismatch WITH the differing lines, and "could not read" is its own
+' reported state; neither is ever a silent pass.
+' =====================================================================
+
+' The code-pane text of a component. got=False means it could not be read.
+Private Function PaneTextOfName(ByVal name As String, ByRef got As Boolean) As String
+    got = False
+    On Error Resume Next
+    PaneTextOfName = ""
+    If Len(name) = 0 Then Exit Function
+    Dim comp As VBIDE.VBComponent
+    Set comp = FindComponent(name)
+    If comp Is Nothing Then Exit Function
+    If comp.CodeModule Is Nothing Then Exit Function
+    Dim n As Long
+    n = comp.CodeModule.CountOfLines
+    If n > 0 Then PaneTextOfName = comp.CodeModule.Lines(1, n)
+    got = True
+    Err.Clear
+End Function
+
+' The component of the ACTIVE code pane ("" when there is none).
+Private Function PaneCompOfActive() As String
+    PaneCompOfActive = ""
+    On Error Resume Next
+    Dim cp As VBIDE.CodePane
+    Set cp = m_vbe.ActiveCodePane
+    If cp Is Nothing Then Exit Function
+    PaneCompOfActive = cp.CodeModule.Name
+    Err.Clear
+End Function
+
+' The component whose code pane IS this window. Two EXACT channels, in order:
+'   1. hwnd  - the window handle reported by list_windows (Window.HWnd) equals the
+'              code pane's own window handle. Measured 2026-10-13: this channel did NOT
+'              match on the live IDE, so it is tried first and reported when it hits.
+'   2. caption_exact - Window.Caption and CodePane.Window.Caption are the SAME string;
+'              equality (never a substring) is what keeps this from being a guess.
+' via reports which channel matched, so the receipt never implies more than was checked.
+Private Function PaneCompOfWindowTarget(ByVal hwnd As Long, ByVal caption As String, ByRef via As String) As String
+    PaneCompOfWindowTarget = ""
+    via = ""
+    On Error Resume Next
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    If p Is Nothing Then Exit Function
+    Dim i As Long
+    Dim c As VBIDE.VBComponent
+    Dim cp As VBIDE.CodePane
+    If hwnd <> 0 Then
+        For i = 1 To p.VBComponents.Count
+            Set c = p.VBComponents.Item(i)
+            If Not c Is Nothing Then
+                Set cp = Nothing
+                Set cp = c.CodeModule.CodePane
+                If Not cp Is Nothing Then
+                    If cp.Window.HWnd = hwnd Then
+                        PaneCompOfWindowTarget = c.Name
+                        via = "hwnd"
+                        Err.Clear
+                        Exit Function
+                    End If
+                End If
+            End If
+            Err.Clear
+        Next
+    End If
+    If Len(caption) > 0 Then
+        For i = 1 To p.VBComponents.Count
+            Set c = p.VBComponents.Item(i)
+            If Not c Is Nothing Then
+                Set cp = Nothing
+                Set cp = c.CodeModule.CodePane
+                If Not cp Is Nothing Then
+                    If cp.Window.Caption = caption Then
+                        PaneCompOfWindowTarget = c.Name
+                        via = "caption_exact"
+                        Err.Clear
+                        Exit Function
+                    End If
+                End If
+            End If
+            Err.Clear
+        Next
+    End If
+    Err.Clear
+End Function
+
+' The first N differing lines of two pane texts.
+Private Function PaneDiffLinesOf(ByVal before As String, ByVal after As String, ByVal maxN As Long) As Object
+    Dim c As Object
+    Set c = New Collection
+    Dim bl() As String, al() As String
+    bl = Split(Replace(Replace(before, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    al = Split(Replace(Replace(after, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    Dim n As Long, i As Long
+    n = UBound(bl)
+    If UBound(al) > n Then n = UBound(al)
+    For i = 0 To n
+        Dim b1 As String, a1 As String
+        b1 = ""
+        a1 = ""
+        If i <= UBound(bl) Then b1 = bl(i)
+        If i <= UBound(al) Then a1 = al(i)
+        If b1 <> a1 Then
+            Dim e As Object
+            Set e = CreateObject("Scripting.Dictionary")
+            e("line") = i + 1
+            e("before") = Left$(b1, 200)
+            e("after") = Left$(a1, 200)
+            c.Add e
+            If c.Count >= maxN Then Exit For
+        End If
+    Next
+    Set PaneDiffLinesOf = c
+End Function
+
+' Apply the assertion to a receipt. on_=False means the BEFORE text was not obtained;
+' that is reported as notApplicable and never as a pass.
+Private Sub PaneAssertFinish(ByVal root As Object, ByVal name As String, ByVal before As String, _
+                             ByVal on_ As Boolean, ByVal label As String)
+    If Not on_ Then
+        root("paneAssertion") = "notApplicable"
+        root("paneAssertionNote") = "the pane text could not be read BEFORE the operation, so nothing is claimed about it (" & label & ")"
+        Exit Sub
+    End If
+    Dim got As Boolean
+    Dim after As String
+    after = PaneTextOfName(name, got)
+    If Not got Then
+        root("paneAssertion") = "notApplicable"
+        root("paneAssertionNote") = "the pane text of " & name & " could not be read AFTER the operation, so no claim is made (" & label & ")"
+        Exit Sub
+    End If
+    root("paneAssertion") = "compared"
+    root("paneComponent") = name
+    root("paneSha256Before") = Sha256.Sha256HexTextUtf8(before)
+    root("paneSha256After") = Sha256.Sha256HexTextUtf8(after)
+    If before = after Then
+        root("paneTextUnchanged") = True
+        Exit Sub
+    End If
+    root("paneTextUnchanged") = False
+    root("ok") = False
+    root("reason") = "paneTextMismatch"
+    Set root("paneDiffLines") = PaneDiffLinesOf(before, after, 5)
+    root("paneMismatchNote") = "this tool is not supposed to write any text, but the code pane of " & name & " changed during the call. Nothing is claimed to have been written correctly: re-read the component and compare paneSha256Before/paneSha256After before trusting anything else in this receipt."
+End Sub
+
+
 ' coords{headerOffset, ideLine, diskLine, default} with headerOffset = diskLine - ideLine.
 ' 'default' names the line space the RESPONSE speaks about. It is per tool on
 ' purpose: get_component_code PREPENDS the file header, so its emitted numbers are
@@ -11512,7 +12709,44 @@ End Sub
 Private Function CoordsDictOfName(ByVal name As String, ByVal ideLine As Long, ByVal defaultCoord As String) As Object
     Dim off As Long, resolved As Boolean
     ComponentOffsetOf name, off, resolved
-    Set CoordsDictOfName = CoordsDict(ideLine, off, defaultCoord, resolved)
+    Dim d As Object
+    Set d = CoordsDict(ideLine, off, defaultCoord, resolved)
+    ' TASK-P1-161 (R4): diskLine is ACCUMULATED per line, not a constant offset, and the
+    ' receipt carries the mapping basis so a caller can audit the number instead of
+    ' trusting one scalar (discipline 39: the fallback is labelled, never silent).
+    Dim em As Object
+    Set em = PaneDiskMapCached(name)
+    d("mappingMethod") = em("method")
+    d("mappingBasis") = em("basis")
+    d("mappingResolved") = em("resolved")
+    d("hiddenInlineAttributeLines") = em("hiddenCount")
+    d("headerLines") = em("headerLines")
+    d("diskLineExact") = False
+    If CBool(em("resolved")) Then
+        Dim exact As Long
+        exact = ExactDiskLineOf(em, ideLine, 0)
+        If exact > 0 Then
+            d("diskLine") = exact
+            d("diskLineExact") = True
+            d("hiddenInlineAttributeLinesBefore") = exact - ideLine - CLng(em("headerLines"))
+        End If
+    End If
+    Set CoordsDictOfName = d
+End Function
+
+' TASK-P1-161 (R4): the exact disk line of a pane line, or 0 when the map has no
+' trustworthy answer for it (the caller then keeps its own scalar fallback).
+Private Function ExactDiskLineOf(ByVal em As Object, ByVal ideLine As Long, ByVal fallbackNo As Long) As Long
+    ExactDiskLineOf = fallbackNo
+    On Error Resume Next
+    If em Is Nothing Then Exit Function
+    If Not CBool(em("resolved")) Then Exit Function
+    Dim arr() As Long
+    arr = em("ideToDisk")
+    If ideLine < 1 Then Exit Function
+    If ideLine > UBound(arr) + 1 Then Exit Function
+    If arr(ideLine - 1) > 0 Then ExactDiskLineOf = arr(ideLine - 1)
+    Err.Clear
 End Function
 
 Private Function CompLineCount(ByVal name As String) As Long
@@ -12743,10 +13977,49 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     ' it up front would destroy the artifact that response points at.
     cmdArgs = "/make " & Chr$(34) & vbp & Chr$(34) & " /out " & Chr$(34) & logPath & Chr$(34)
     Dim d() As String, i As Long
+    ' TASK-P1-162 (R7-4): the /d arguments are recorded STRUCTURALLY as they are appended,
+    ' so the receipt can show the exact command line and the exact macro list instead of
+    ' asking the caller to trust that the define arrived.
+    Dim ccArgs As Object
+    Set ccArgs = New Collection
+    Dim ccExtra As String
+    ccExtra = ""
     If Len(defines) > 0 Then
         d = Split(defines, ",")
         For i = 0 To UBound(d)
-            If Len(Trim$(d(i))) > 0 Then cmdArgs = cmdArgs & " /d " & Chr$(34) & Trim$(d(i)) & Chr$(34)
+            If Len(Trim$(d(i))) > 0 Then
+                ' TASK-P1-162 (R7-4 / MCP-lead-4): do NOT wrap the /d value in quotes. VB6's
+                ' compiler folds the quoted text into the macro name, so the macro silently
+                ' never applies while the build still reports success. Quote ONLY when the
+                ' value really contains a space (then there is something to protect).
+                Dim dv As String
+                dv = Trim$(d(i))
+                Dim ccQuoted As Boolean
+                Dim ccFrag As String
+                ccQuoted = (InStr(1, dv, " ") > 0)
+                If ccQuoted Then
+                    ccFrag = " /d " & Chr$(34) & dv & Chr$(34)
+                Else
+                    ccFrag = " /d " & dv
+                End If
+                cmdArgs = cmdArgs & ccFrag
+                ccExtra = ccExtra & ccFrag
+                Dim ccOne As Object
+                Set ccOne = CreateObject("Scripting.Dictionary")
+                ccOne("raw") = dv
+                Dim ccEq As Long
+                ccEq = InStr(dv, "=")
+                If ccEq > 0 Then
+                    ccOne("name") = Left$(dv, ccEq - 1)
+                    ccOne("value") = Mid$(dv, ccEq + 1)
+                Else
+                    ccOne("name") = dv
+                    ccOne("value") = ""
+                End If
+                ccOne("quoted") = ccQuoted
+                ccOne("argument") = Trim$(ccFrag)
+                ccArgs.Add ccOne
+            End If
         Next
     End If
     ' ---- Card TASK-P1-008: fingerprint, cache, changed ------------------------
@@ -12884,6 +14157,8 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
                 cbk("note") = "cache hit: no VB6.EXE subprocess was started, so timeout_ms (which bounds only a compiler subprocess) had nothing to bound"
                 Set croot("blocking") = cbk
                 croot("note") = "no component changed since the last successful build; VB6.EXE was not launched; timeout_ms bounds only the compiler subprocess and this route never starts one"
+                ' TASK-P1-162 (R7-4): even a cache hit reports what WOULD have been passed.
+                CcArgsInto croot, cmdArgs, ccExtra, ccArgs, defines, useIde
                 ' TASK-P1-132 (A10): report (and, when needed, set) the LAA flag even on
                 ' a cache hit, so laaBefore/laaAfter/laaSet exist on EVERY path.
                 If laaUsable Then
@@ -13033,6 +14308,9 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     root("cached") = False
     If useIde Then root("path") = "make_project" Else root("path") = "make"
     ' Card TASK-P1-015: state the route explicitly and account for the blocking time.
+    ' TASK-P1-162 (R7-4): the actual command line + the structured /d list, so the
+    ' "did my macro really get passed?" question is answerable from the receipt alone.
+    CcArgsInto root, cmdArgs, ccExtra, ccArgs, defines, useIde
     root("projectPath") = vbp
     If useIde Then
         root("route") = "make_project"

@@ -46,10 +46,12 @@ Private Declare Function WoIsWindow Lib "user32" Alias "IsWindow" (ByVal h As Lo
 Private Declare Function WoIsWindowVisible Lib "user32" Alias "IsWindowVisible" (ByVal h As Long) As Long
 Private Declare Function WoIsWindowEnabled Lib "user32" Alias "IsWindowEnabled" (ByVal h As Long) As Long
 Private Declare Function WoGetDlgCtrlID Lib "user32" Alias "GetDlgCtrlID" (ByVal h As Long) As Long
+Private Declare Function WoSetForegroundWindow Lib "user32" Alias "SetForegroundWindow" (ByVal hWnd As Long) As Long
 Private Declare Function WoGetForegroundWindow Lib "user32" Alias "GetForegroundWindow" () As Long
 Private Declare Function WoGetWindowThreadProcessId Lib "user32" Alias "GetWindowThreadProcessId" (ByVal h As Long, ByRef pid As Long) As Long
 Private Declare Function WoGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 Private Declare Function WoGetTickCount Lib "kernel32" Alias "GetTickCount" () As Long
+
 
 ' ---- TASK-P1-079: registry access for the settings path --------------------
 ' WScript.Shell (COM) RegWrite FAILED inside this add-in process - measured with a diagnostic
@@ -2158,4 +2160,17 @@ Public Function WheelShutdownJson() As String
     d("note") = "no hook is installed at any time: the wheel is a window subclass on code panes of this process only"
     WheelShutdownJson = JsonStringify(d)
     Err.Clear
+End Function
+
+' TASK-P1-164 (R18 focus safety): foreground read/write wrappers. They sit at the END of the
+' module on purpose - VB6 only allows declarations before the first procedure, and this module
+' has declaration blocks further down.
+Public Function WoFrontHwnd() As Long
+    WoFrontHwnd = WoGetForegroundWindow()
+End Function
+
+Public Function WoFrontRestore(ByVal h As Long) As Boolean
+    ' Returns True only when SetForegroundWindow reported success - never claims silently.
+    If h = 0 Then Exit Function
+    WoFrontRestore = (WoSetForegroundWindow(h) <> 0)
 End Function
