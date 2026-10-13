@@ -12,6 +12,10 @@ This file records **source and feature** changes only; packaging, release and ot
 
 ## 2026-10-13
 
+### 14:50 · Breakpoint line pre-check · modal safety guard
+
+**What changed**: before toggling a breakpoint the tool now **checks whether that line allows it** (if not it **refuses structurally** instead of triggering the IDE error box); added a **modal safety guard** - when a call is blocked by a modal box the IDE itself popped up, it **clicks only safe buttons** and **reports honestly** (the box content, which button was clicked, elapsed time, side effects).
+**Why**: toggling a breakpoint on a line that does not allow it made the call **hang for about a minute** and left every later write operation answering busy; an accidentally triggered throwing statement could also pop a modal box and **stall the whole tool chain**.
 ### 14:23 · The wheel works immediately in a newly opened code pane
 
 **What changed**: after a **new code pane** opens, the **mouse wheel now works immediately** (no need to click elsewhere first); this comes with a **250 ms lightweight hook timer** and per-window hook diagnostics.
