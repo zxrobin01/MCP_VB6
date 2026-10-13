@@ -1567,6 +1567,14 @@ Public Function WoModalGuardTick() As Boolean
     End If
     m_mgSeen = True
     m_mgSeenCount = n
+    ' TASK-P1-175 (#4 + #12): the deadline is -this many ms after the LAST SIGHTING-,
+    ' NOT -this many ms after the arm-. Measured on arm 32F7D24C (round 5): on the
+    ' make_project path the host Make Project box appears only AFTER the old 15 s window
+    ' had already expired, so EVERY tick left through the deadline branch above and the box
+    ' was never dismissed (the call then died on the gate backstop with no receipt).
+    ' Renewing here means the guard stays eligible for as long as the box is actually on
+    ' screen; the deadline is now only a safety net for a box that appears and never returns.
+    m_mgDeadline = WoGetTickCount() + m_mgWaitMs
     Dim i As Long
     For i = 1 To n
         Dim d As Object

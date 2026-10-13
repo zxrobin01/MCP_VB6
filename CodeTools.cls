@@ -119,6 +119,11 @@ Private Const GATE_RELEASE_MIN_MS As Long = 60000
 ' steady state, measured in TASK-P1-157), short enough that a caller is never left
 ' hanging on a box this add-in cannot dismiss.
 Private Const MODAL_GUARD_WAIT_MS As Long = 15000
+' TASK-P1-175 (#4/#12): make_project's guard budget must cover the WHOLE call. Measured on
+' arm 32F7D24C: the Make Project box appears after the generic 15 s window (isolated
+' pre-check, LaaResolve, 3x MakeCompiledFile+Sleep, the File>Make CommandBars fallback),
+' so a 15 s budget guaranteed the tick had expired before the box ever existed.
+Private Const MODAL_GUARD_WAIT_MAKE_MS As Long = 120000
 ' TASK-P1-168 (B): an ARMED release. immediate_eval / immediate_run set it before they
 ' hand their line to EbExecuteLine; if that call never comes back, the NEXT tool call
 ' sees the age and force-releases the gate by itself, so one bad statement cannot leave
@@ -8716,12 +8721,12 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     ' The guard presses Cancel instead, the host aborts the Make, and the call RETURNS.
     ' While it is armed it also makes WoConfirmTick stand down, because that one-shot
     ' confirm only ever presses a CONFIRM caption.
-    ' GATE BACKSTOP BUDGET: MAKE_LAND_WAIT_MS + MODAL_GUARD_WAIT_MS + 5000 is this tool's
-    ' own worst-case bounded runtime AFTER the modal handling, so a healthy compile inside
+    ' GATE BACKSTOP BUDGET: MAKE_LAND_WAIT_MS + MODAL_GUARD_WAIT_MAKE_MS + 5000 is this
+    ' tool's own worst-case bounded runtime AFTER the modal handling, so a healthy compile
     ' the tool's documented budget is never force-released; a genuinely wedged call still
     ' is. See the report for why this budget is deliberately long here.
     Dim mgWait As Long
-    mgWait = MODAL_GUARD_WAIT_MS
+    mgWait = MODAL_GUARD_WAIT_MAKE_MS
     WinOps.WoModalGuardArm "make_project", mgWait, allowHostModal
     ArmGateRelease "make_project", MAKE_LAND_WAIT_MS + mgWait + 5000
     Dim preRisk As String, preReason As String, preClass As String, preDetails As String
