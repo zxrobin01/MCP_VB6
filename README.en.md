@@ -2,6 +2,8 @@
 
 > [中文](README.md) | **English**
 
+> **Changelog**: [CHANGELOG.en.md](CHANGELOG.en.md)
+
 VB6MCP is a **VB6 add-in**: once loaded into the VB6 IDE, the IDE itself becomes a
 [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server. AI coding assistants
 such as Claude Desktop, Cursor or Codex can then read, search and modify the VB6 project that

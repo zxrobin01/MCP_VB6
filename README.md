@@ -2,6 +2,8 @@
 
 > **中文** | [English](README.en.md)
 
+> **变更记录**：[CHANGELOG.md](CHANGELOG.md)
+
 VB6MCP 是一个 **VB6 插件（Add-In）**：把它加载到 VB6 IDE 之后，IDE 就变成一个
 [MCP (Model Context Protocol)](https://modelcontextprotocol.io) 服务器。
 Claude Desktop / Cursor / Codex 等 AI 编程助手即可直接读取、搜索、修改当前打开的
