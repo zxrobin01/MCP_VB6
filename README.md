@@ -44,9 +44,11 @@ AI 编程助手已经能很好地处理现代语言，却**够不到 VB6**：它
 也点不了那个「生成工程」对话框。本项目就是补这个缺口。
 
 **做法**：不另造编辑器，而是**把 VB6 IDE 本身变成一个 MCP 服务器**——加载一个插件，IDE
-就对外提供 114 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
-弹窗处理、窗体与项目元数据、快照与回滚、打包。**因为工具就住在 IDE 进程里**，它能做
-进程外方案做不到的事：真的去点那个对话框、真的按运行、真的读断点处的局部变量。
+就对外提供 110 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
+弹窗处理、窗体与项目元数据、快照与回滚、打包。此外还有 10 个 **hub 面**工具（IDE 实例管理与
+经验库）在 IDE 进程外提供，客户端合计可见 120 个。
+**因为工具就住在 IDE 进程里**，它能做进程外方案做不到的事：真的去点那个对话框、真的按运行、
+真的读断点处的局部变量。
 
 **目标**：让维护陈旧 VB6 的人（包括作者自己）用上现代 AI 工作流。项目采用 Apache-2.0 并
 允许任意扩充——**别人做得越好，我能用到的功能也越好**。
@@ -76,7 +78,7 @@ MCP_VB6/
 ├─ McpServer.cls          MCP/JSON-RPC 协议分发 + HTTP 路由
 ├─ HttpConn.cls           HTTP/1.1 请求缓冲与解析（支持 keep-alive）
 ├─ ServerForm.frm         隐藏窗体，承载 Winsock 监听 + 端口探测定时器
-├─ CodeTools.cls          114 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
+├─ CodeTools.cls          110 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
 ├─ JsonLib.bas            零依赖 JSON 解析/序列化
 ├─ Utf8.bas               UTF-8/ANSI/UTF-16 转换（kernel32 API）
 ├─ Util.bas               日志、端口文件
@@ -87,6 +89,72 @@ MCP_VB6/
 ├─ bridge/mcp_stdio_bridge.py stdio 桥接器（Python 3 标准库）
 └─ tests/smoke_test.py     直接打 HTTP 端点的冒烟测试
 ```
+
+## 用 AI 助手一键安装（推荐）
+
+不想照下面一步步点？把这一段**整段**复制进你的 AI 编程助手（Claude Code / Cursor / Codex / 任何能开终端的 agent）。
+唯一要你补的是仓库地址：把 `<REPO_URL>` 换成这个仓库的 URL（先填上更好；留空也行，它会回头问你）。
+它会自己取源码、编译、注册、启动 IDE、**真的验证 MCP 服务能用**，再把客户端接好，最后把「做了什么、看到什么、哪一步没做到」原样报给你。
+
+```text
+你是我的安装助手。请在一台 Windows 机器上，从零把 VB6MCP 装好、启动，并通过真实验证。VB6MCP 是一个 VB6 IDE 插件（Add-In，ActiveX DLL，编译产物 VB6MCP.dll）：把它加载进 VB6 IDE 之后，IDE 本身就成了一个 MCP 服务器，AI 客户端可以直接读写我当前打开的 VB6 工程、编译并运行它。
+
+源码仓库：<REPO_URL>
+如果这个地址还是占位符（空的、或仍写着 <REPO_URL>），先问我要仓库地址；不要猜，也不要去找一个同名的别的仓库。
+
+本次交付：源码取到 -> 编译 -> 注册 -> 启动 IDE -> 真实验证 MCP 服务可用 -> 接好客户端 -> 跑冒烟测试 -> 如实汇报。
+
+边界（请先读完再动手）：
+- 只做这一件事。不要顺手改我别的工程、别的插件或别的注册表项。
+- 禁止破坏性或不可逆的操作：不要删除/覆盖非你创建的文件和目录，不要改动我已有的 VB6 工程，不要卸载或禁用我其它插件，不要"清理"进程或注册表。
+- 不要杀进程。不要结束 VB6.EXE 或任何进程；需要关闭 IDE 时先问我（我可能有没保存的改动）。
+- 端口只碰你探测到的那个。默认 127.0.0.1:8766；被占用时插件会自己向上探测（最多 +40），真实端口以 http://127.0.0.1:<端口>/health 返回的 port 字段为准，也可以看 %TEMP%\vb6mcp_port.txt。不要扫描、占用或改动其它端口，也不要把这个服务暴露到回环地址之外。
+- 任何可能弄坏我现有 VB6 环境的动作（机器级重新注册 OCX/类型库、改 HKCU\Software\VB6MCP、改 VB6 的引用设置等），先停下来问我：你要改什么、为什么、怎么撤回。
+- 所有产物只放在你新建的工作目录里；每个结论都要有可复现的命令和原始输出，不要用"应该成功了"下结论。需要我手工点的地方，直接告诉我。
+
+步骤（按顺序执行，每步给出证据）：
+
+1) 查前提。确认是 Windows（32 位或 64 位），然后检查：
+   - 有没有装 VB6 IDE（SP6）：找 VB6.EXE（标准安装目录是 VB98 文件夹，各机器可能不同）。
+   - MSWINSCK.OCX（Winsock 控件）是否可用/已注册；MSADDNDR.DLL（Add-In Designer 类型库）是否可用。
+   - 32 位注册工具：64 位 Windows 上用 %SystemRoot%\SysWOW64\regsvr32.exe，不要用裸 regsvr32，也不要把 Windows 目录写死（用 %SystemRoot% 变量）。
+   - 如果没有 VB6：立刻停下并如实告诉我——VB6MCP 是 VB6 IDE 的插件，没有 VB6 就既不能编译也不能运行，没有绕过办法；仓库也不分发任何微软文件，必须用我自己合法的 VB6 安装。不要试图用别的工具链"伪造"VB6，也不要在没有 VB6 的机器上继续后面的步骤。
+   - 如果缺 MSWINSCK.OCX / MSADDNDR.DLL，按仓库 README 的 FAQ 处理；要写系统目录先问我。
+
+2) 取源码。git clone <REPO_URL> 到你/我约定的工作目录（或下载仓库 ZIP 解压）。确认目录里有 MCP_VB6.vbp、build.bat、register.reg、bridge/mcp_stdio_bridge.py、tests/smoke_test.py。
+
+3) 编译。优先直接运行 build.bat（它会先注册 MSADDNDR.DLL，再编译出 VB6MCP.dll）。如果 VB6 不在默认位置，改 build.bat 里的 VB6 变量，不要另处硬编码路径。
+   注意：不要在 IDE 已经加载了这个插件 DLL 时原地重编译——DLL 被占用会让编译失败。先关掉 IDE（关之前先问我有没有没保存的东西），或用另一个 VB6 实例构建。
+   也可以在 IDE 里打开 MCP_VB6.vbp 编译，但不要把 VB6MCP 工程自己当成当前活动工程去"生成"（同样是文件锁）。
+   编译失败时把编译器原始报错贴出来（例如工程引用是否勾选了 VB6 Extensibility 与 Add-In Designer，见 README 的 FAQ）；不要凭猜测改源码。
+
+4) 注册并启动 IDE。用步骤 1 确认的 32 位 regsvr32 注册 VB6MCP.dll，导入 register.reg，然后自己查一遍注册表确认：
+   reg query "HKCU\Software\Microsoft\Visual Basic\6.0\Addins\VB6MCP.Connect" /v LoadBehavior
+   应得到 0x3（=3，表示自动加载），FriendlyName 应为 VB6 MCP Server。build.bat 一般会替你做注册和导入，但仍要自己查证。
+   然后启动 VB6 IDE（它本来就开着且没加载插件时，先问我要不要重开，不要自己杀进程），在菜单 外接程序(Add-Ins) -> 外接程序管理器 里确认 "VB6 MCP Server" 已勾选（LoadBehavior=3 通常会自动加载）。
+
+5) 真实验证服务器（关键一步，不能只看"进程起来了"）：
+   - GET http://127.0.0.1:8766/health，直到返回 {"ok":true,...}；以响应里的 port 为准（端口被占用时插件会向上探测），并与 %TEMP%\vb6mcp_port.txt 对照。下面把这个端口记作 <端口>。
+   - 对它发一次真正的 MCP 调用：POST http://127.0.0.1:<端口>/rpc，Content-Type: application/json
+     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"install-check","version":"1.0"}}}
+     然后 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+   - 数 tools/list 里的工具个数，并与仓库自己的权威清单对比：docs/TOOL_CATALOG.md 里记录的数量，以及 tools/schema_baseline.json 里 tools 数组的长度。不要写死任何数字——就用你刚克隆下来的仓库里的数字。也可以调用 mcp_info 工具，看服务端自报的 contract 与 toolCount。
+   - 三者一致就通过并记录数字；不一致就如实报告差多少、多了/少了哪些，不要改仓库、也不要"凑数字"。如果 tools/list 根本拿不到，把原始响应和 HTTP 状态码贴出来。
+
+6) 接客户端。把 mcp_config.example.json 里的 mcpServers.vb6 条目合并进目标客户端的配置（Claude Desktop 是 %APPDATA%\Claude\claude_desktop_config.json；Cursor 用它的 MCP 配置），把里面的占位路径换成这台机器上的真实路径：command 指向本机 Python，args 指向 bridge/mcp_stdio_bridge.py；JSON 里用 / 或写成 \\。其它 stdio 客户端同理；Cursor 也可以按 README 第 3 节直连 HTTP 端点。改配置前先备份原文件。
+
+7) 跑冒烟测试：python tests/smoke_test.py --port <端口>。这一步必须在 VB6 IDE 已打开且插件已加载的前提下跑，它不是离线自检。
+
+8) 汇报（最重要）。给我：
+   - 你实际执行过的命令（原样）与实际观察到的结果（关键输出、health 响应、工具数、冒烟测试结果）；
+   - 每一步的判定（通过/失败/跳过），失败的给出原始报错；
+   - 你没能做到的事，直说（例如"没装 VB6，所以无法编译"、"需要我手工点某个对话框"、"这一步没权限"）。
+   不要为了让报告好看而编造成功；做不到就说做不到。
+
+再次强调：不要杀进程；不要动你没被要求动的端口、服务、注册表、工程文件；任何可能破坏我现有环境的事，先问再做。我需要的是"确实成功了"，或者"诚实地说清卡在哪里"。
+```
+
+想手动来一遍 → 见下面「一、构建」「二、端口与多实例」「三、接入 MCP 客户端」。两条路任选其一即可。
 
 ## 一、构建
 
@@ -153,58 +221,239 @@ Cursor 可直接连 HTTP 端点，无需桥接器：
 python tests/smoke_test.py --port 8766
 ```
 
-## 四、工具列表（114 个）
+## 四、工具列表（插件面 110 + hub 面 10 = 120 个）
 
-> 权威清单见 **`docs/TOOL_CATALOG.md`**（由运行中的 add-in 经 `tools/list` 导出），
+> 权威清单见 **`docs/TOOL_CATALOG.md`**（由运行中的 add-in 经 `tools/list` 导出，再并入 hub 自有工具），
 > 离线基线为 `tools/schema_baseline.json`，可用 `tools/check_live_tools.py docs/tools_schema.json` 做离线交叉比对。
+>
+> 工具来自**两个面**：**插件面 110 个**（`docs/tools_schema.json`，住在 VB6 IDE 进程内）与
+> **hub 面 10 个**（`bridge/hub_tools.json`，在 IDE 进程外）。下面按功能把两个面共 **120 个**工具分组，
+> 每个工具只出现一次：插件面分 16 类，hub 面见第 17 节；`关键参数` 一列直接取自各自的
+> `inputSchema`（必填参数在前），不是凭记忆写的。hub 面的 5 个经验库工具**无需 IDE 在线即可用**。
 
-下表为最初 45 个工具（完整 VBIDE 对象模型部分）；其余 69 个为后续新增的
-语法门禁 / 编辑安全 / 编译权威 / 快照一致性 / 测试宿主 / 运行时观测 / 调试控制 /
-VBA6 探针 / 治理项（`validate_code` · `check_component` · `read_source` · `write_source` ·
-`edit_by_anchor` · `apply_edits` · `preview_edit` · `build` · `verify` · `inject_trace` ·
-`remove_trace` · `fault_inject` · `clear_faults` · `set_breakpoint` · `clear_breakpoints` ·
-`debug_commands` · `execution_state` · `native_breakpoint` · `project_changes` · `vba6_probe_plan` · `audit_tail` · `export_public_api` ·
-`check_public_api` · `dependency_graph` · `purity_check` · `generate_stub` · `record_fixture` ·
-`compare_fixture`），外加 **经验库**（`list_lessons` · `add_lesson` · `delete_lesson` ·
-`export_lessons` · `import_lessons_md`）与 **扩展库**（`ext_list` · `ext_enable` · `ext_disable` ·
-`ext_reload` · `ext_install` · `ext_uninstall`）。
+### 1. 工程与工作区
 
-### 经验库与扩展库
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `get_project_info` | 读工程全貌：类型、IDE 状态、启动对象、编译路径、组件与引用 | - |
+| `set_project_options` | 设置工程选项：描述、启动对象、编译输出路径、只读模式 | `description`, `startup_object`, `build_file_name` |
+| `open_project` | 打开 .vbp 工程，可独占替换当前工作区 | `path`, `exclusive` |
+| `add_project` | 新建工程，或按模板创建工程 | `type`, `template_path` |
+| `remove_project` | 从 IDE 工作区关闭一个工程 | `name` |
+| `save_project` | 保存工程与全部未保存组件 | `path` |
+| `vbg_group` | 读写 .vbg 工程组：列出、添加、移除工程 | `action`, `path`, `project` |
+| `workspace_status` | 对比未保存组件与 git 工作区状态 | `repo` |
 
-- **经验库** `mcp_lessons/`：`defaults.json`（随插件发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
-  合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。
+### 2. 组件生命周期
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `get_component_list` | 列出全部组件及其过程、行号、脏状态 | - |
+| `add_component` | 新建模块/类/窗体等组件 | `type`, `name`, `code` |
+| `remove_component` | 从工程移除组件，不可撤销 | `name` |
+| `import_component` | 把源文件或模板导入为工程组件 | `path`, `mode` |
+| `export_component` | 把组件代码或整个设计器导出到文件 | `name`, `path` |
+| `rename_component` | 重命名工程内的组件 | `name`, `new_name` |
+| `reload_component` | 从磁盘上绑定的文件重新加载组件 | `name` |
+| `activate_component` | 打开组件代码窗格或设计器并置前 | `name`, `window` |
+
+### 3. 代码读取、检索与光标
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `get_component_code` | 从 IDE 内存读组件代码，可只要某个过程或符号 | `name`, `include_line_numbers`, `coords` |
+| `read_source` | 读磁盘源码：编码识别 + 字节级 sha256 | `path` |
+| `read_file` | 读任意文本文件，UTF-8/UTF-16/ANSI 自动识别 | `path`, `max_lines` |
+| `find_in_component` | 在组件内查找文本：整词、大小写、模式匹配 | `component`, `target`, `start_line` |
+| `get_selection` | 读 IDE 当前选中的组件、活动窗口与光标 | - |
+| `get_codepane` | 读代码窗格的选区、顶行与可见行数 | `component` |
+| `set_codepane` | 设置代码窗格选区与滚动，并可置前 | `component`, `selection`, `top_line`, `activate` |
+| `current_position` | 读断点停在哪：模块、过程、行号、源码行 | - |
+
+### 4. 代码编辑与安全事务
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `replace_code` | 行级改代码：替换、插入、追加、删除、整模块替换 | `name`, `operation`, `start_line` |
+| `add_code` | 向组件追加代码，来自字符串或文件主体 | `component`, `code`, `file` |
+| `create_event_proc` | 生成事件过程桩，如 Command1_Click | `component`, `object`, `event` |
+| `write_file` | 写文本文件，可选编码、建目录与备份 | `path`, `content`, `encoding` |
+| `write_source` | 写 VB 源码文件：显式编码 + 字节级 sha256 | `path`, `text`, `encoding` |
+| `edit_by_anchor` | 按唯一内容锚点替换整行，不依赖行号 | `name`, `anchor`, `new_text` |
+| `apply_edits` | 原子批量锚点编辑，任一处失败则整批不改 | `name`, `edits`, `expected_sha256` |
+| `preview_edit` | 只回统一 diff 预览，不写任何内容 | `name`, `edits` |
+| `replace_in_files` | 跨组件字面/正则替换，默认只计划不写 | `path`, `query`, `replacement` |
+| `rename_symbol` | 按词法重命名标识符，跳过字符串与注释 | `path`, `old_name`, `new_name` |
+
+### 5. 语法门禁与工程校验
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `validate_code` | 写前静态校验代码，回带稳定指纹的诊断 | `code`, `name`, `kind` |
+| `check_component` | 用同一套规则校验 IDE 里的组件文本 | `name` |
+| `verify` | 组件总判定：IDE 与磁盘一致 + 诊断计数 | `name`, `disk_path`, `baseline` |
+| `verify_scope` | 批量核验多个组件的 IDE 与磁盘一致性 | `components`, `path` |
+| `format_code` | 按块结构重排缩进，并证明只改前导空白 | `path`, `indent`, `apply` |
+| `check_references` | 列出工程引用并标出文件缺失的引用 | `include_resolved` |
+
+### 6. 依赖、纯度与公开 API
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类 | - |
+| `purity_check` | 判定组件能否进离线测试宿主及原因 | `name` |
+| `export_public_api` | 把组件公开 API 冻结成可比对规格 | `name` |
+| `check_public_api` | 与冻结规格比对，报移除、变更、新增成员 | `baseline`, `name` |
+| `generate_stub` | 生成可编译桩模块：留声明、清过程体 | `name` |
+
+### 7. 编译与交付产物
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `make_project` | 编译工程并回权威产物判定，可选真日志诊断 | `output_path`, `laa`, `diagnose` |
+| `build` | 用隔离的 VB6.EXE /make 编译并回编译器日志 | `project`, `defines`, `laa` |
+| `package_app` | 组装交付目录：exe、清单、依赖表、安装脚本 | `path`, `exe_path`, `out_dir` |
+| `app_manifest` | 生成或读取 exe/dll 旁清单（UAC 与 DPI） | `action`, `path`, `level` |
+
+### 8. 运行、调试与断点
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `control_execution` | 控制运行：启动、全编译、中断、单步、结束、重启 | `mode` |
+| `execution_state` | 读进程窗口、是否无响应、模态框数量 | `pid` |
+| `debug_commands` | 列出本服务器认识的调试命令目录（固定表） | - |
+| `set_breakpoint` | 注入 Debug.Assert False 断点，编译版自动省略 | `name`, `anchor`, `id` |
+| `clear_breakpoints` | 按 id 移除注入的断点块 | `name`, `id`, `expected_sha256` |
+| `list_breakpoints` | 列出注入的断点及其行号与启用状态 | - |
+| `native_breakpoint` | 经调试菜单切换真实 IDE 断点或全部清除 | `action`, `component`, `line` |
+| `fault_inject` | 在过程入口注入受控故障：抛错、返回、延时 | `name`, `procedure`, `mode`, `id` |
+| `clear_faults` | 移除先前注入的故障块 | `name`, `id`, `expected_sha256` |
+
+### 9. 追踪、调用栈与进程内执行
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `inject_trace` | 在过程入口插 McpTrace 调用，缺模块自动生成 | `name`, `procedure`, `id` |
+| `remove_trace` | 移除注入的追踪块，自动生成的模块保留 | `name`, `id`, `expected_sha256` |
+| `project_changes` | 轮询 IDE 变更日志：组件与控件增删改名 | `since`, `clear` |
+| `get_callstack` | 读引擎自己的调用栈，逐帧给出过程名 | `max_frames` |
+| `vba6_probe` | 进程内探 VBA6 调试引擎：模式、调用栈、立即执行 | `exec_probe`, `exec_line`, `run_break_probes` |
+| `vba6_probe_plan` | 给出探针的有序执行计划与前置条件 | - |
+| `immediate_eval` | 在立即上下文求值一个表达式并取回结果 | `expression`, `expression_file`, `timeout_ms` |
+| `immediate_run` | 在立即上下文执行语句并取回打印输出 | `code`, `code_file`, `timeout_ms` |
+
+### 10. 窗口、对话框与 UI 自动化
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `list_windows` | 枚举 IDE 窗口：标题、可见性、位置与大小 | - |
+| `control_window` | 操作单个 IDE 窗口：聚焦、关闭、显隐、移动、缩放 | `window`, `action` |
+| `find_gui` | 递归枚举本进程窗口，按关键字或类名过滤 | `keyword`, `cls`, `showing` |
+| `ui_text` | 读窗口及子树的可见文本 | `hwnd`, `cls`, `depth` |
+| `read_active_dialogs` | 列出阻塞中对话框及其按钮，只读不点 | `cls`, `include_children`, `max` |
+| `close_active_dialogs` | 只点安全按钮关掉阻塞对话框，可预演 | `hwnd`, `button`, `dry_run` |
+| `send_window_message` | 向本进程窗口发消息：点击、按键或原始消息号 | `hwnd`, `action`, `message` |
+| `command_bars` | 列出或执行 IDE 菜单命令，按名称或 id | `action`, `bar`, `control` |
+
+### 11. 设计器与控件
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `form_designer` | 窗体设计器：控件清单、属性、选区与剪贴板 | `form`, `action`, `control` |
+| `add_control` | 按 ProgID 在窗体添加控件，先校验已注册 | `form`, `prog_id`, `name` |
+| `remove_control` | 按名称或序号从窗体移除控件 | `form`, `index`, `control` |
+| `set_control_property` | 设置控件的设计期属性 | `form`, `property`, `value` |
+| `list_component_parts` | 列出工程注册的 ActiveX 控件部件与解析路径 | - |
+
+### 12. 引用、成员与属性
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `add_reference` | 按 GUID 或文件路径添加类型库引用 | `guid`, `path`, `mode` |
+| `remove_reference` | 按名称或 GUID 移除工程引用 | `name` |
+| `get_component_properties` | 读组件设计期属性，即属性窗口内容 | `name` |
+| `set_component_property` | 设置组件属性，支持多维索引属性 | `name`, `property`, `value` |
+| `list_members` | 列出类组件的公开成员及代码位置 | `component` |
+| `set_member_attribute` | 改类成员属性：说明、Hidden、Category 等 | `component`, `member`, `attribute`, `value` |
+| `property_bag` | 读写工程或组件的属性包键值 | `target`, `key`, `name` |
+
+### 13. 磁盘文件与工程元数据
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `list_files` | 按通配符递归列出目录下的文件 | `path`, `pattern`, `recursive` |
+| `search_in_files` | 跨文件文本或正则搜索，回文件名与行号 | `query`, `path`, `pattern` |
+| `project_meta` | 读写 .vbp 版本资源与构建元数据 | `action`, `path`, `major` |
+| `git` | 只读 git：状态、diff --stat、提交日志 | `action`, `repo`, `file` |
+
+### 14. 快照、回滚与测试宿主
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `project_snapshot` | 工程级快照与回滚，带逐文件清单 | `action`, `path`, `dir` |
+| `undo_edit` | 组件级单步撤销，只恢复窗格文本不动磁盘 | `component`, `action`, `ts` |
+| `test_host` | 生成离线测试宿主 .vbp，或统计 PASS/FAIL | `action`, `vbp_path`, `module_name` |
+| `record_fixture` | 以原始 ANSI 字节记录回归夹具 | `path`, `text` |
+| `compare_fixture` | 与夹具比对：相同、新增、删除、首个差异行 | `path`, `text` |
+
+### 15. 扩展库
+
 - **扩展库** `mcp_extensions/`：每个 `*.json` 是一个**声明式工具包**（`name` / `tools[].inputSchema` / `tools[].handler`）。
   启用的包其工具自动并入 `tools/list` 并由 `CodeTools.CallTool` 兜底分发；`state.json` 记录禁用列表（默认启用）。
   处理器只开放少量安全原语（`http_get` / `read_file` / `write_file`），**不从磁盘加载 VB6 代码**。
 
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `ext_list` | 列出扩展包及其启用状态与工具数 | - |
+| `ext_enable` | 启用扩展包，其工具并入 tools/list | `name` |
+| `ext_disable` | 禁用扩展包，其工具从 tools/list 消失 | `name` |
+| `ext_reload` | 重扫 mcp_extensions 并报告包与工具数 | - |
+| `ext_install` | 把扩展 JSON 安装进 mcp_extensions | `path` |
+| `ext_uninstall` | 移除扩展包，文件改名保留 | `name` |
+
+### 16. 治理、自检与 IDE 环境
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `mcp_info` | 读服务器版本戳、契约、工具数与构建哈希 | - |
+| `ide_state` | 即时读 IDE 模式与在飞、取消、释放闸门状态 | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
+| `desktop_probe` | 测量宿主进程桌面与可交互性，且不抢焦点 | - |
+| `ide_quiet_mode` | 开或关安静模式：不抢前台，回执附提示 | `on`, `ttl_ms` |
+| `todo_status` | 只读扫描仓库内的任务板与报告 | - |
+| `audit_tail` | 读最近的工具调用审计条目 | `count` |
+| `list_addins` | 列出已注册插件及其连接状态 | - |
+| `set_addin_state` | 加载或卸载一个 IDE 插件 | `prog_id`, `connect` |
+| `quit_ide` | 退出 IDE，响应后延迟执行，未保存会丢 | - |
+
+### 17. hub 面：IDE 实例管理与经验库（10 个，无需 IDE 在线）
+
+这 10 个工具由 MCP hub（`bridge/vb6mcp_hub.mjs`）提供，**在 IDE 进程之外**运行：客户端不必先加载插件，
+VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，**无需 IDE 在线即可用**。
+
+- **经验库** `mcp_lessons/`：`defaults.json`（随包发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
+  合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。
+- **IDE 实例管理**：`ide_list` 扫描本机实例（含同一工程被两个实例打开的冲突），`ide_target` 记住默认目标，
+  `ide_start` / `ide_stop` / `ide_restart` 只操作**本 hub 自己启动的**实例。
+
+| 工具 | 能干什么 | 关键参数 |
+|------|----------|----------|
+| `ide_list` | 列出本机发现的 VB6 IDE 实例、端口与冲突 | - |
+| `ide_target` | 设置或清除默认 IDE 目标：pid、工程名或 auto | `target` |
+| `ide_start` | 按 .vbp 启动一个 VB6 IDE 实例 | `project` |
+| `ide_stop` | 停止本 hub 启动的 IDE 实例 | `pid`, `force` |
+| `ide_restart` | 重启卡死的自有 IDE 实例并证明已就绪 | `pid`, `project` |
+| `list_lessons` | 列出经验条目：场景、陷阱、做法（hub 面，无需 IDE 在线） | `includeDisabled` |
+| `add_lesson` | 新增或覆盖一条用户经验，带备份（无需 IDE 在线） | `id`, `scenario`, `trap`, `do` |
+| `delete_lesson` | 删除用户经验，或禁用随包经验（无需 IDE 在线） | `id` |
+| `export_lessons` | 把合并后的经验库导出为 Markdown（无需 IDE 在线） | `includeDisabled` |
+| `import_lessons_md` | 从 Markdown 导入经验，可只解析不写（无需 IDE 在线） | `path`, `dryRun` |
+
+> `get_codepane` / `set_codepane` **没有** `view` 参数：VB6 的可扩展模型把代码窗格的视图模式
+> （`CodePaneView`）定为只读、命令栏里也没有视图切换项，插件无法在 full_module / procedure 之间切换；
+> 传入 `view` 会被记入 `ignoredArgs`。
+
 完整对象模型清单与差距分析见 `内部 VBIDE 对象模型笔记`（由 VB6EXT.OLB 5.3
 类型库二进制解析生成，原始数据见 `内部类型库转储`）。
-
-| 工具 | 说明 | 关键参数 |
-|------|------|----------|
-| `get_project_info` | 工程/工作区全貌：类型、IDE 状态、启动对象、编译路径、组件、引用、已打开工程 | - |
-| `set_project_options` | 工程选项：描述、帮助文件/上下文、启动对象、启动工程、编译输出路径、活动工程、只读模式 | `description`, `startup_object`, `build_file_name` ... |
-| `open_project` / `add_project` / `remove_project` | 打开 .vbp / 新建工程（或从模板）/ 关闭工程 | `path`, `type`, `template_path`, `name` |
-| `get_component_list` | 组件列表：过程、行号、脏状态、设计器信息 | - |
-| `get_component_code` | 从 IDE 内存读取组件全部代码 | `name`, `include_line_numbers` |
-| `replace_code` | 行级修改：replace/insert/append/delete/**set(整模块替换)** | `name`, `operation`, `start_line`, `end_line`, `code` |
-| `add_component` / `remove_component` / `import_component` / `export_component` / `rename_component` / `reload_component` | 组件全生命周期（reload 配合 write_file 使用） | `type`, `name`, `path`, `new_name` ... |
-| `add_code` / `create_event_proc` / `find_in_component` | 追加代码（字符串/文件）/ 生成事件过程桩 / 模块内查找 | `component`, `code`, `file`, `object`, `event`, `target` |
-| `get_codepane` / `set_codepane` | 代码窗格：光标/选区/滚动/视图模式 | `component`, `selection`, `top_line`, `view` |
-| `get_selection` / `activate_component` | IDE 当前选区 / 激活组件（代码或设计器窗口） | `name`, `window` |
-| `list_files` / `read_file` / `write_file` / `search_in_files` | 磁盘文件操作（UTF-8/UTF-16/ANSI 自动识别） | `path`, `pattern`, `query` ... |
-| `save_project` | 保存工程与全部脏组件 | - |
-| `make_project` | **静默编译**（VBProject.MakeCompiledFile，可指定输出路径；失败回退菜单方式）；编译成功后默认给产物打 LAA；`diagnose:true` 用隔离副本拿真编译日志 | `output_path`, `laa`, `diagnose` |
-| `control_execution` | 运行控制：run / full_compile / break / end / restart | `mode` |
-| `add_reference` / `remove_reference` | 引用：按 GUID 或文件路径添加 / 按名称移除 | `mode`, `guid`, `path`, `name` |
-| `get_component_properties` / `set_component_property` | 设计期属性（Properties 窗口）：读取/设置（含多维索引） | `name`, `property`, `value`, `indices` |
-| `list_members` / `set_member_attribute` | 类成员：类型/作用域/属性；设置 Hidden/Browsable/Category 等 | `component`, `member`, `attribute`, `value` |
-| `list_windows` / `control_window` | IDE 窗口：枚举/聚焦/关闭/显隐/最小化/移动/改名 | `window`, `action` ... |
-| `form_designer` / `add_control` / `remove_control` / `set_control_property` | 窗体设计器：控件枚举/选区/剪贴板/增删控件/设控件属性 | `form`, `action`, `prog_id`, `index` |
-| `property_bag` | 工程/组件属性包读写（ReadProperty/WriteProperty） | `target`, `key`, `value` |
-| `list_addins` / `set_addin_state` | 插件枚举 / 加载卸载插件 | `prog_id`, `connect` |
-| `command_bars` | IDE 菜单：枚举或按名称执行命令 | `action`, `bar`, `control` |
-| `quit_ide` | 退出 IDE（响应发出后延迟执行，未保存会丢失） | - |
 
 ## 五、两条修改代码的路径（重要）
 

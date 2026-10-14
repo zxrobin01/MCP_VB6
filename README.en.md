@@ -54,12 +54,13 @@ neither see the project open in the IDE nor click that "Make Project" dialog. Th
 fills that gap.
 
 **The approach**: rather than building another editor, **turn the VB6 IDE itself into an MCP
-server**. Load one add-in and the IDE exposes 114 tools: read/search/edit code, static
+server**. Load one add-in and the IDE exposes 110 tools: read/search/edit code, static
 checking, anchor-based editing with safe transactions, compilation, run and single-step,
-dialog handling, form and project metadata, snapshots and rollback, packaging. **Because the
-tools live inside the IDE process**, they can do what an out-of-process approach cannot:
-actually click that dialog, actually press Run, actually read the local variables at a
-breakpoint.
+dialog handling, form and project metadata, snapshots and rollback, packaging. Ten more
+**hub-face** tools (IDE instance management plus the lesson store) run outside the IDE
+process, so a client sees 120 tools in total. **Because the tools live inside the IDE process**,
+they can do what an out-of-process approach cannot: actually click that dialog, actually press
+Run, actually read the local variables at a breakpoint.
 
 **The goal**: let people who maintain old VB6 (including the author) use a modern AI workflow.
 The project is Apache-2.0 and allows arbitrary extension - **the better others make it, the
@@ -91,7 +92,7 @@ MCP_VB6/
 |-- McpServer.cls          MCP/JSON-RPC dispatch + HTTP routing
 |-- HttpConn.cls           HTTP/1.1 request buffering and parsing (keep-alive supported)
 |-- ServerForm.frm         hidden form hosting the Winsock listener + port-probe timer
-|-- CodeTools.cls          the 114 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
+|-- CodeTools.cls          the 110 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
 |-- JsonLib.bas            zero-dependency JSON parser/serializer
 |-- Utf8.bas               UTF-8/ANSI/UTF-16 conversion (kernel32 APIs)
 |-- Util.bas               logging, port file
@@ -102,6 +103,76 @@ MCP_VB6/
 |-- bridge/mcp_stdio_bridge.py stdio bridge (Python 3 standard library)
 +-- tests/smoke_test.py     smoke test that talks to the HTTP endpoint directly
 ```
+
+## Let an AI agent install it for you (recommended)
+
+Not in the mood to click through the steps below? Copy this **whole block** into your AI coding assistant
+(Claude Code / Cursor / Codex / any agent with a terminal). The only thing you have to supply is the
+repository address: replace `<REPO_URL>` with this repository's URL (filling it in is better; leaving it
+blank is fine too - the agent will ask you for it). The agent then fetches the source, builds, registers,
+starts the IDE, **actually verifies the MCP server works**, wires up your client, and finally reports back
+what it did, what it saw and what it could not do.
+
+```text
+You are my installation assistant. On one Windows machine, install VB6MCP from scratch, start it, and verify that it really works. VB6MCP is a VB6 IDE add-in (an ActiveX DLL that produces VB6MCP.dll): load it into the VB6 IDE and the IDE itself becomes an MCP server, so an AI client can read and modify the VB6 project I have open, compile it and run it.
+
+Source repository: <REPO_URL>
+If that address is still a placeholder (empty, or still literally <REPO_URL>), ask me for the repository address first. Do not guess, and do not go looking for a different repository with a similar name.
+
+Deliverable: obtain the source -> build -> register -> start the IDE -> really verify the MCP server -> wire up the client -> run the smoke test -> report honestly.
+
+Boundaries (read these before touching anything):
+- Do this one job only. Do not also change my other projects, other add-ins or other registry entries.
+- No destructive or irreversible actions: do not delete or overwrite files and directories you did not create, do not modify any VB6 project I already have, do not uninstall or disable my other add-ins, do not "clean up" processes or registry keys.
+- Do not kill processes. Never terminate VB6.EXE or anything else; if the IDE has to be closed, ask me first (I may have unsaved work).
+- Touch only the port you detect. The default is 127.0.0.1:8766; when that is taken the add-in probes upwards by itself (up to +40). The real port is the port field returned by http://127.0.0.1:<port>/health, and %TEMP%\vb6mcp_port.txt. Do not scan, occupy or change any other port, and never expose this server beyond the loopback address.
+- Stop and ask me before anything that could break my existing VB6 setup (machine-wide re-registration of OCX files or type libraries, changes under HKCU\Software\VB6MCP, changes to VB6's references, ...): tell me what you would change, why, and how to undo it.
+- Keep every artifact inside a working directory you create. Every conclusion must rest on a reproducible command and its raw output; "it should have worked" is not a conclusion. If something needs me to click it, just tell me.
+
+Steps (in order; give evidence for each):
+
+1) Check the prerequisites. Confirm this is Windows (32-bit or 64-bit), then check:
+   - Is a VB6 IDE (SP6) installed? Look for VB6.EXE (the standard install folder is VB98; it differs between machines).
+   - Is MSWINSCK.OCX (the Winsock control) available/registered, and is MSADDNDR.DLL (the Add-In Designer type library) available?
+   - The 32-bit registration tool: on 64-bit Windows use %SystemRoot%\SysWOW64\regsvr32.exe. Do not use a bare regsvr32 and do not hardcode the Windows folder path (use the %SystemRoot% variable).
+   - If VB6 is absent: stop immediately and tell me the truth - VB6MCP is an add-in for the VB6 IDE, so without VB6 it can neither be built nor run, and there is no workaround; the repository redistributes no Microsoft files, so my own licensed VB6 installation is required. Do not try to fake VB6 with another toolchain, and do not continue with the later steps on a machine that has no VB6.
+   - If MSWINSCK.OCX or MSADDNDR.DLL is missing, follow the repository README's FAQ; ask me before writing into system directories.
+
+2) Get the source. git clone <REPO_URL> into the working directory we agree on (or download and unpack the repository ZIP). Confirm the tree contains MCP_VB6.vbp, build.bat, register.reg, bridge/mcp_stdio_bridge.py and tests/smoke_test.py.
+
+3) Build. Prefer running build.bat directly (it registers MSADDNDR.DLL first, then compiles VB6MCP.dll). If VB6 is not in the default location, edit the VB6 variable inside build.bat rather than hardcoding a path anywhere else.
+   Note: do not rebuild in place while the IDE already has this add-in DLL loaded - the file lock makes the build fail. Close the IDE first (ask me whether anything is unsaved), or build from another VB6 instance.
+   You may also open MCP_VB6.vbp in the IDE and compile there, but do not make the VB6MCP project itself the active project and use "Make" (same file lock).
+   If the build fails, quote the compiler's original error text (for example whether the project references VB6 Extensibility and Add-In Designer are ticked - see the README FAQ). Do not guess-edit source.
+
+4) Register and start the IDE. Register VB6MCP.dll with the 32-bit regsvr32 you confirmed in step 1, import register.reg, then check the registration yourself:
+   reg query "HKCU\Software\Microsoft\Visual Basic\6.0\Addins\VB6MCP.Connect" /v LoadBehavior
+   It should read 0x3 (=3, load automatically) and FriendlyName should be VB6 MCP Server. build.bat normally does the registration and the import for you, but verify it anyway.
+   Then start the VB6 IDE (if it is already open but the add-in is not loaded, ask me whether to restart it - do not kill the process yourself) and confirm "VB6 MCP Server" is ticked under Add-Ins -> Add-In Manager (LoadBehavior=3 usually loads it automatically).
+
+5) Really verify the server (the key step: "the process is running" is not evidence):
+   - GET http://127.0.0.1:8766/health until it returns {"ok":true,...}; trust the port field in that response (the add-in probes upwards when the port is taken) and compare with %TEMP%\vb6mcp_port.txt. Call that port <port> below.
+   - Make a real MCP call to it: POST http://127.0.0.1:<port>/rpc with Content-Type: application/json
+     {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"install-check","version":"1.0"}}}
+     then {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+   - Count the tools in tools/list and compare against the repository's own authoritative catalog: the number recorded in docs/TOOL_CATALOG.md, and the length of the tools array in tools/schema_baseline.json. Do not hardcode any number - use the numbers from the repository you just cloned. You may also call the mcp_info tool and read the contract and toolCount the server reports about itself.
+   - If all three agree, pass the step and record the number. If they disagree, report the exact difference and which tools are extra or missing; do not edit the repository to make it match and do not fudge the number. If tools/list cannot be obtained at all, paste the raw response and the HTTP status code.
+
+6) Wire up the client. Merge the mcpServers.vb6 entry from mcp_config.example.json into the target client's configuration (Claude Desktop: %APPDATA%\Claude\claude_desktop_config.json; Cursor: its MCP configuration) and replace the placeholder paths with the real paths on this machine: command must point at this machine's Python, args at bridge/mcp_stdio_bridge.py; in JSON use / or write \\. The same entry works for any other stdio client; for Cursor the HTTP endpoint documented in section 3 of the README is also available. Back up the configuration file before changing it.
+
+7) Run the smoke test: python tests/smoke_test.py --port <port>. It requires the VB6 IDE to be open with the add-in loaded; it is not an offline self-check.
+
+8) Report back (this is the most important step). Give me:
+   - the commands you actually ran (verbatim) and what you actually observed (key output, the health response, the tool count, the smoke-test result);
+   - your verdict per step (pass/fail/skipped), with the raw error for anything that failed;
+   - plainly, what you could not do (for example "VB6 is not installed, so I could not build", "this step needs me to click a dialog", "I lacked permission here").
+   Never invent a success to make the report look better; if it did not work, say it did not work.
+
+One more time: do not kill processes; do not touch ports, services, registry keys or project files you were not asked to touch; ask before anything that could damage my existing setup. I want a real success, or an honest statement of where it is stuck.
+```
+
+Prefer to do it by hand → see "1. Building", "2. Ports and multiple instances" and "3. Connecting an MCP
+client" below. Either route works; you only need one.
 
 ## 1. Building
 
@@ -173,65 +244,250 @@ To check the whole chain (**needs the VB6 IDE open with the add-in loaded** - th
 python tests/smoke_test.py --port 8766
 ```
 
-## 4. Tool list (114 tools)
+## 4. Tool list (add-in face 110 + hub face 10 = 120 tools)
 
 > The authoritative list is `docs/TOOL_CATALOG.md` (exported from a running add-in via
-> `tools/list`); the offline baseline is `tools/schema_baseline.json`, and
-> `tools/check_live_tools.py docs/tools_schema.json` compares the shipped snapshot against that baseline.
+> `tools/list` and merged with the hub's own tools); the offline baseline is
+> `tools/schema_baseline.json`, and `tools/check_live_tools.py docs/tools_schema.json`
+> compares the shipped snapshot against that baseline.
+>
+> Tools come from **two faces**: the **add-in face, 110 tools** (`docs/tools_schema.json`, inside
+> the VB6 IDE process) and the **hub face, 10 tools** (`bridge/hub_tools.json`, outside it). Below,
+> all **120** tools are grouped: 16 add-in categories plus the hub section (17); each tool
+> appears exactly once. The key-parameter column is taken straight from each tool's own
+> `inputSchema` (required parameters first), never typed from memory. The five hub lesson tools
+> **work with no IDE online**.
 
-The table below covers the original 45 tools (the complete VBIDE object-model part). The other
-69 were added later for syntax gating / edit safety / compile authority / snapshot consistency
-/ test hosting / runtime observation / debug control / VBA6 probing / governance
-(`validate_code`, `check_component`, `read_source`, `write_source`, `edit_by_anchor`,
-`apply_edits`, `preview_edit`, `build`, `verify`, `inject_trace`, `remove_trace`,
-`fault_inject`, `clear_faults`, `set_breakpoint`, `clear_breakpoints`, `debug_commands`,
-`execution_state`, `native_breakpoint`, `project_changes`, `vba6_probe_plan`, `audit_tail`,
-`export_public_api`, `check_public_api`, `dependency_graph`, `purity_check`, `generate_stub`,
-`record_fixture`, `compare_fixture`), plus the **lesson store** (`list_lessons`, `add_lesson`,
-`delete_lesson`, `export_lessons`, `import_lessons_md`) and the **extension store** (`ext_list`,
-`ext_enable`, `ext_disable`, `ext_reload`, `ext_install`, `ext_uninstall`).
+### 1. Project & workspace
 
-### Lesson store and extension store
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `get_project_info` | Read project overview: type, IDE state, startup object, build path, components, references | - |
+| `set_project_options` | Set project options: description, startup object, build path, read-only mode | `description`, `startup_object`, `build_file_name` |
+| `open_project` | Open a .vbp project, optionally replacing the workspace | `path`, `exclusive` |
+| `add_project` | Create a new project, or one from a template | `type`, `template_path` |
+| `remove_project` | Close a project from the IDE workspace | `name` |
+| `save_project` | Save the project and every dirty component | `path` |
+| `vbg_group` | Read or edit a .vbg project group: list, add, remove | `action`, `path`, `project` |
+| `workspace_status` | Show unsaved components beside the git working tree | `repo` |
 
-- **Lesson store** `mcp_lessons/`: `defaults.json` (shipped with the add-in, do not edit) plus
-  `user.json` (the user layer, which may override, disable or add entries by id). The merged
-  result is published to clients through `initialize.instructions`, so an agent can read it
-  before calling any tool; `add`/`delete`/`import` write `user.json` with a `.bak` backup.
+### 2. Component lifecycle
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `get_component_list` | List components with procedures, line ranges and dirty state | - |
+| `add_component` | Add a component: module, class, form and more | `type`, `name`, `code` |
+| `remove_component` | Remove a component from the project, cannot be undone | `name` |
+| `import_component` | Import a source file or template as a project component | `path`, `mode` |
+| `export_component` | Export a component's code or whole designer to a file | `name`, `path` |
+| `rename_component` | Rename a component inside the project | `name`, `new_name` |
+| `reload_component` | Reload a component from the file it is bound to | `name` |
+| `activate_component` | Open a component's code pane or designer window | `name`, `window` |
+
+### 3. Reading code, search & caret
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `get_component_code` | Read component code from IDE memory, optionally one proc or symbol | `name`, `include_line_numbers`, `coords` |
+| `read_source` | Read a source file from disk with encoding detection and sha256 | `path` |
+| `read_file` | Read any text file, UTF-8, UTF-16 or ANSI auto-detected | `path`, `max_lines` |
+| `find_in_component` | Find text in a component: whole word, case, pattern | `component`, `target`, `start_line` |
+| `get_selection` | Read the IDE's selected component, active window and caret | - |
+| `get_codepane` | Read code-pane selection, top line and visible line count | `component` |
+| `set_codepane` | Set code-pane selection and scroll, optionally activating it | `component`, `selection`, `top_line`, `activate` |
+| `current_position` | Read where the engine stopped: module, procedure, line, text | - |
+
+### 4. Editing with safety transactions
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `replace_code` | Line-level edit: replace, insert, append, delete or set module | `name`, `operation`, `start_line` |
+| `add_code` | Append code to a component from a string or a file | `component`, `code`, `file` |
+| `create_event_proc` | Create an event-procedure stub such as Command1_Click | `component`, `object`, `event` |
+| `write_file` | Write a text file with optional encoding, directory creation and backup | `path`, `content`, `encoding` |
+| `write_source` | Write a VB source file with explicit encoding and byte-level sha256 | `path`, `text`, `encoding` |
+| `edit_by_anchor` | Replace one uniquely matched line by content anchor, not line numbers | `name`, `anchor`, `new_text` |
+| `apply_edits` | Apply a batch of anchor edits atomically, all or nothing | `name`, `edits`, `expected_sha256` |
+| `preview_edit` | Preview anchor edits as a unified diff, writing nothing | `name`, `edits` |
+| `replace_in_files` | Cross-component literal or regex replace, dry_run by default | `path`, `query`, `replacement` |
+| `rename_symbol` | Rename an identifier lexically, skipping strings and comments | `path`, `old_name`, `new_name` |
+
+### 5. Syntax gating & project checks
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `validate_code` | Validate code before writing, with stable-key diagnostics | `code`, `name`, `kind` |
+| `check_component` | Lint the current in-IDE text of one component | `name` |
+| `verify` | Aggregate verdict: IDE equals disk plus lint counts | `name`, `disk_path`, `baseline` |
+| `verify_scope` | Check many components for IDE/disk equality and diagnostics | `components`, `path` |
+| `format_code` | Re-indent by block structure, proving only leading whitespace changed | `path`, `indent`, `apply` |
+| `check_references` | List project references and flag ones whose file is missing | `include_resolved` |
+
+### 6. Dependencies, purity & public API
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity | - |
+| `purity_check` | Classify whether a component can enter an offline test host | `name` |
+| `export_public_api` | Freeze a component's public API into a comparable spec | `name` |
+| `check_public_api` | Compare against a frozen spec: removed, changed, added members | `baseline`, `name` |
+| `generate_stub` | Generate a compilable stub: declarations kept, bodies emptied | `name` |
+
+### 7. Build & delivery artifacts
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `make_project` | Compile and return the authoritative artifact verdict; diagnose gives a real log | `output_path`, `laa`, `diagnose` |
+| `build` | Compile via an isolated VB6.EXE /make and return the log | `project`, `defines`, `laa` |
+| `package_app` | Assemble a delivery folder: exe, manifest, dependencies, installer | `path`, `exe_path`, `out_dir` |
+| `app_manifest` | Generate or read the app manifest beside an exe or dll | `action`, `path`, `level` |
+
+### 8. Run, debug & breakpoints
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `control_execution` | Control execution: run, full compile, break, step, end, restart | `mode` |
+| `execution_state` | Read a process's windows, responsiveness and modal-dialog count | `pid` |
+| `debug_commands` | Catalog of known debug commands, a fixed table | - |
+| `set_breakpoint` | Inject a Debug.Assert False breakpoint, omitted in compiled builds | `name`, `anchor`, `id` |
+| `clear_breakpoints` | Remove an injected breakpoint block by id | `name`, `id`, `expected_sha256` |
+| `list_breakpoints` | List injected breakpoints with line and enabled state | - |
+| `native_breakpoint` | Toggle a real IDE breakpoint through the Debug menu | `action`, `component`, `line` |
+| `fault_inject` | Inject a guarded fault at a procedure start: raise, return, delay | `name`, `procedure`, `mode`, `id` |
+| `clear_faults` | Remove a previously injected fault block | `name`, `id`, `expected_sha256` |
+
+### 9. Tracing, call stack & in-process execution
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `inject_trace` | Insert a runtime-guarded McpTrace call, generating the module if absent | `name`, `procedure`, `id` |
+| `remove_trace` | Remove an injected trace block, keeping the generated module | `name`, `id`, `expected_sha256` |
+| `project_changes` | Poll the IDE change journal: component and control churn | `since`, `clear` |
+| `get_callstack` | Read the engine's own call stack with per-frame procedure names | `max_frames` |
+| `vba6_probe` | Probe the VBA6 debug engine in-process: mode, callstack, execute | `exec_probe`, `exec_line`, `run_break_probes` |
+| `vba6_probe_plan` | Ordered probe plan with preconditions, read-only steps first | - |
+| `immediate_eval` | Evaluate one expression in the immediate context and return its value | `expression`, `expression_file`, `timeout_ms` |
+| `immediate_run` | Run statements in the immediate context and return what they printed | `code`, `code_file`, `timeout_ms` |
+
+### 10. Windows, dialogs & UI automation
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `list_windows` | List IDE windows with caption, visibility, position and size | - |
+| `control_window` | Control one IDE window: focus, close, show, hide, move, resize | `window`, `action` |
+| `find_gui` | Enumerate this process's windows, filtered by keyword or class | `keyword`, `cls`, `showing` |
+| `ui_text` | Read a window's accessible text via UIA, MSAA or WM_GETTEXT | `hwnd`, `cls`, `depth` |
+| `read_active_dialogs` | List active dialogs and their buttons without clicking anything | `cls`, `include_children`, `max` |
+| `close_active_dialogs` | Dismiss blocking dialogs by clicking only whitelisted safe buttons | `hwnd`, `button`, `dry_run` |
+| `send_window_message` | Send a window message to this process: click, key, raw number | `hwnd`, `action`, `message` |
+| `command_bars` | List IDE menu bars or execute one command by name or id | `action`, `bar`, `control` |
+
+### 11. Form designer & controls
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `form_designer` | Form designer: control inventory, properties, selection and clipboard | `form`, `action`, `control` |
+| `add_control` | Add a control by ProgID after pre-validating it is registered | `form`, `prog_id`, `name` |
+| `remove_control` | Remove a control from a form by name or index | `form`, `index`, `control` |
+| `set_control_property` | Set a control's design-time property value | `form`, `property`, `value` |
+| `list_component_parts` | List the project's registered ActiveX parts and resolved paths | - |
+
+### 12. References, members & properties
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `add_reference` | Add a type-library reference by GUID or file path | `guid`, `path`, `mode` |
+| `remove_reference` | Remove a project reference by name or GUID | `name` |
+| `get_component_properties` | Read a component's design-time properties, the Properties window content | `name` |
+| `set_component_property` | Set a component property, including multi-dimensional indexed ones | `name`, `property`, `value` |
+| `list_members` | List a class component's public members with code locations | `component` |
+| `set_member_attribute` | Change class-member attributes: description, Hidden, Browsable, Category | `component`, `member`, `attribute`, `value` |
+| `property_bag` | Read or write named values in a project or component property bag | `target`, `key`, `name` |
+
+### 13. Files on disk & project metadata
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `list_files` | List files under a directory by wildcard, recursively | `path`, `pattern`, `recursive` |
+| `search_in_files` | Search text or regex across files, returning file and line | `query`, `path`, `pattern` |
+| `project_meta` | Read or write .vbp version resources and build metadata | `action`, `path`, `major` |
+| `git` | Read-only Git: status, diff --stat and commit log | `action`, `repo`, `file` |
+
+### 14. Snapshots, rollback & test host
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `project_snapshot` | Project-level snapshot and rollback with a per-file manifest | `action`, `path`, `dir` |
+| `undo_edit` | Component-level single-step undo of pane text only | `component`, `action`, `ts` |
+| `test_host` | Generate an offline test host .vbp, or score PASS/FAIL results | `action`, `vbp_path`, `module_name` |
+| `record_fixture` | Record a deterministic fixture as raw ANSI bytes | `path`, `text` |
+| `compare_fixture` | Compare text against a fixture: same, added, removed, first diff | `path`, `text` |
+
+### 15. Extension store
+
 - **Extension store** `mcp_extensions/`: every `*.json` is a **declarative tool pack**
   (`name` / `tools[].inputSchema` / `tools[].handler`). An enabled pack's tools are merged into
   `tools/list` automatically and dispatched by `CodeTools.CallTool`; `state.json` records the
   disabled list (enabled by default). Handlers expose only a few safe primitives (`http_get`,
   `read_file`, `write_file`) and **never load VB6 code from disk**.
 
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `ext_list` | List extension packs with enabled state and tool count | - |
+| `ext_enable` | Enable an extension pack, its tools join tools/list | `name` |
+| `ext_disable` | Disable an extension pack, its tools leave tools/list | `name` |
+| `ext_reload` | Rescan mcp_extensions and report pack and tool counts | - |
+| `ext_install` | Install an extension pack JSON into mcp_extensions | `path` |
+| `ext_uninstall` | Remove an extension pack, renaming its file aside | `name` |
+
+### 16. Governance, self-check & IDE environment
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `mcp_info` | Read the server version stamp, contract, tool count and build hash | - |
+| `ide_state` | Read IDE mode plus in-flight, cancel and gate-release state | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
+| `desktop_probe` | Measure the host's desktop and interactivity without stealing focus | - |
+| `ide_quiet_mode` | Toggle session quiet mode: no focus stealing, advisory appended | `on`, `ttl_ms` |
+| `todo_status` | Read-only snapshot of an optional in-repo task board | - |
+| `audit_tail` | Return the most recent tool-call audit entries | `count` |
+| `list_addins` | List registered add-ins and their connection state | - |
+| `set_addin_state` | Load or unload an IDE add-in by ProgID | `prog_id`, `connect` |
+| `quit_ide` | Quit the IDE after responding, unsaved changes are lost | - |
+
+### 17. Hub face: IDE instance management & lesson store (10 tools, no IDE online required)
+
+These 10 tools come from the MCP hub (`bridge/vb6mcp_hub.mjs`) and run **outside the IDE
+process**: the client does not have to load the add-in first, and VB6 does not have to be
+running. The five lesson tools only touch a local JSON store, so they **work with no IDE online**.
+
+- **Lesson store** `mcp_lessons/`: `defaults.json` (shipped, do not edit) plus `user.json` (the user layer,
+  which may override, disable or add entries by id). The merged result is published to clients through
+  `initialize.instructions`, so an agent can read it before calling any tool; `add`/`delete`/`import` write
+  `user.json` with a `.bak` backup.
+- **IDE instance management**: `ide_list` scans this machine (including the conflict where two instances
+  hold the same project), `ide_target` remembers the default target, and `ide_start` / `ide_stop` /
+  `ide_restart` only ever act on **instances this hub started**.
+
+| Tool | What it does | Key parameters |
+|------|--------------|----------------|
+| `ide_list` | List VB6 IDE instances found on this machine, plus port conflicts | - |
+| `ide_target` | Set or clear the default IDE target: pid, project or auto | `target` |
+| `ide_start` | Start a VB6 IDE instance for a .vbp project | `project` |
+| `ide_stop` | Stop an IDE instance that this hub started | `pid`, `force` |
+| `ide_restart` | Restart a wedged own IDE instance and prove readiness | `pid`, `project` |
+| `list_lessons` | List lesson entries: scenario, trap, do (hub face, no IDE online) | `includeDisabled` |
+| `add_lesson` | Add or overwrite a user lesson, with backup (no IDE online) | `id`, `scenario`, `trap`, `do` |
+| `delete_lesson` | Remove a user lesson, or disable a shipped one (no IDE online) | `id` |
+| `export_lessons` | Export the merged lesson library as Markdown (no IDE online) | `includeDisabled` |
+| `import_lessons_md` | Import lessons from Markdown, optionally parse-only (no IDE online) | `path`, `dryRun` |
+
+> `get_codepane` / `set_codepane` take **no** `view` parameter: VB6 exposes `CodePaneView` as read-only
+> and its command bars carry no view toggle, so the add-in cannot switch between full_module and procedure
+> view; a `view` argument you pass is reported in `ignoredArgs`.
+
 The full object-model inventory and gap analysis live in the maintainer's internal VBIDE
 object-model notes (produced by parsing the VB6EXT.OLB 5.3 type-library binary; the raw data is
 in the internal type-library dump).
-
-| Tool | Purpose | Key parameters |
-|------|---------|----------------|
-| `get_project_info` | Project/workspace overview: type, IDE state, startup object, build path, components, references, open projects | - |
-| `set_project_options` | Project options: description, help file/context, startup object, startup project, build output path, active project, read-only mode | `description`, `startup_object`, `build_file_name` ... |
-| `open_project` / `add_project` / `remove_project` | Open a .vbp / create a project (or from a template) / close a project | `path`, `type`, `template_path`, `name` |
-| `get_component_list` | Component list: procedures, line numbers, dirty state, designer info | - |
-| `get_component_code` | Read a component's full code from IDE memory | `name`, `include_line_numbers` |
-| `replace_code` | Line-level edit: replace/insert/append/delete/**set (replace the whole module)** | `name`, `operation`, `start_line`, `end_line`, `code` |
-| `add_component` / `remove_component` / `import_component` / `export_component` / `rename_component` / `reload_component` | Full component lifecycle (use reload together with write_file) | `type`, `name`, `path`, `new_name` ... |
-| `add_code` / `create_event_proc` / `find_in_component` | Append code (string or file) / create an event-procedure stub / search inside a module | `component`, `code`, `file`, `object`, `event`, `target` |
-| `get_codepane` / `set_codepane` | Code pane: caret/selection/scroll/view mode | `component`, `selection`, `top_line`, `view` |
-| `get_selection` / `activate_component` | Current IDE selection / activate a component (code or designer window) | `name`, `window` |
-| `list_files` / `read_file` / `write_file` / `search_in_files` | Disk file operations (UTF-8/UTF-16/ANSI auto-detected) | `path`, `pattern`, `query` ... |
-| `save_project` | Save the project and every dirty component | - |
-| `make_project` | **Silent compile** (VBProject.MakeCompiledFile, output path optional; falls back to the menu route on failure); the artifact gets LAA by default; `diagnose:true` compiles an isolated copy for a real compiler log | `output_path`, `laa`, `diagnose` |
-| `control_execution` | Execution control: run / full_compile / break / end / restart | `mode` |
-| `add_reference` / `remove_reference` | References: add by GUID or file path / remove by name | `mode`, `guid`, `path`, `name` |
-| `get_component_properties` / `set_component_property` | Design-time properties (the Properties window): read/set, including multi-dimensional indices | `name`, `property`, `value`, `indices` |
-| `list_members` / `set_member_attribute` | Class members: type/scope/attributes; set Hidden/Browsable/Category and friends | `component`, `member`, `attribute`, `value` |
-| `list_windows` / `control_window` | IDE windows: enumerate/focus/close/show/hide/minimize/move/rename | `window`, `action` ... |
-| `form_designer` / `add_control` / `remove_control` / `set_control_property` | Form designer: enumerate controls, selection, clipboard, add/remove controls, set control properties | `form`, `action`, `prog_id`, `index` |
-| `property_bag` | Project/component property bag read/write (ReadProperty/WriteProperty) | `target`, `key`, `value` |
-| `list_addins` / `set_addin_state` | Enumerate add-ins / load or unload an add-in | `prog_id`, `connect` |
-| `command_bars` | IDE menus: enumerate, or execute a command by name | `action`, `bar`, `control` |
-| `quit_ide` | Quit the IDE (executed shortly after the response; unsaved work is lost) | - |
 
 ## 5. Two ways to modify code (important)
 

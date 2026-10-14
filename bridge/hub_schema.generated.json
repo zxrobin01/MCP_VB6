@@ -1,11 +1,12 @@
 {
   "generatedFrom": "docs/tools_schema.json",
-  "contractVersion": "v1.10.0",
-  "contractDeclaredToolCount": 115,
+  "contractVersion": "v1.11.0",
+  "contractDeclaredToolCount": 110,
   "versionToolCountMismatch": false,
-  "toolCount": 115,
-  "instructions": "PRODUCT vb6-mcp <semver>  CONTRACT v1.10.0  TOOLS 115  BUILT <sha256 前 8 位>\nBREAKING (read before calling):\n- v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=\"api_unavailable\" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)\n- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)\n- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted\n- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s\n- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)\n- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)\n- get_component_code: coords default disk -> ide (pass coords=\"disk\" for the old text/numbering); response is a JSON envelope, text in result.text\n- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal\n- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason\n- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)\n- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status",
+  "toolCount": 110,
+  "instructions": "PRODUCT vb6-mcp <semver>  CONTRACT v1.11.0  TOOLS 110  BUILT <sha256 前 8 位>\nBREAKING (read before calling):\n- v1.11.0 the 5 lessons tools (list_lessons / add_lesson / delete_lesson / export_lessons / import_lessons_md) MOVED from the add-in face to the hub face: names/descriptions/inputSchema are unchanged and they now also work with NO IDE online; the add-in face is 110 tools, the hub face 5 -> 10, DSH-facing total stays 120\n- v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=\"api_unavailable\" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)\n- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)\n- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted\n- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s\n- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)\n- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)\n- get_component_code: coords default disk -> ide (pass coords=\"disk\" for the old text/numbering); response is a JSON envelope, text in result.text\n- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal\n- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason\n- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)\n- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status\nCAPABILITY INDEX (question -> tool; read this before improvising):\n- impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)\n- who references a symbol -> rename_symbol  (dry_run=true by default; skips strings and comments)\n- public API broken? -> check_public_api / export_public_api ; missing files or OCX parts -> check_references / list_component_parts\n- runtime window tree / control text / modal dialog -> find_gui / ui_text / read_active_dialogs\n- click a button or send keys to a window of THIS VB6 process -> send_window_message\n- offline single-module test -> test_host ; stub a procedure or trace calls -> fault_inject / inject_trace\n- NOT available: screenshots; driving a standalone built EXE (message tools are in-process only)\nFILE ENCODING: .vbp/.frm/.cls/.bas/.ctl are ANSI WITHOUT BOM (write_file / write_source already do this); never write them as UTF-8-with-BOM, or VB6 reads a mangled first keyword and the project stops loading; use project_meta for .vbp version metadata (keeps a .bak).",
   "breaking": [
+    "- v1.11.0 the 5 lessons tools (list_lessons / add_lesson / delete_lesson / export_lessons / import_lessons_md) MOVED from the add-in face to the hub face: names/descriptions/inputSchema are unchanged and they now also work with NO IDE online; the add-in face is 110 tools, the hub face 5 -> 10, DSH-facing total stays 120",
     "- v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=\"api_unavailable\" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)",
     "- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)",
     "- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted",
@@ -16,7 +17,16 @@
     "- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal",
     "- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason",
     "- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)",
-    "- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status"
+    "- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status",
+    "CAPABILITY INDEX (question -> tool; read this before improvising):",
+    "- impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)",
+    "- who references a symbol -> rename_symbol  (dry_run=true by default; skips strings and comments)",
+    "- public API broken? -> check_public_api / export_public_api ; missing files or OCX parts -> check_references / list_component_parts",
+    "- runtime window tree / control text / modal dialog -> find_gui / ui_text / read_active_dialogs",
+    "- click a button or send keys to a window of THIS VB6 process -> send_window_message",
+    "- offline single-module test -> test_host ; stub a procedure or trace calls -> fault_inject / inject_trace",
+    "- NOT available: screenshots; driving a standalone built EXE (message tools are in-process only)",
+    "FILE ENCODING: .vbp/.frm/.cls/.bas/.ctl are ANSI WITHOUT BOM (write_file / write_source already do this); never write them as UTF-8-with-BOM, or VB6 reads a mangled first keyword and the project stops loading; use project_meta for .vbp version metadata (keeps a .bak)."
   ],
   "tools": [
     {
@@ -661,7 +671,7 @@
     },
     {
       "name": "write_file",
-      "description": "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits).",
+      "description": "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1617,7 +1627,7 @@
     },
     {
       "name": "write_source",
-      "description": "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE).",
+      "description": "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1935,7 +1945,7 @@
     },
     {
       "name": "dependency_graph",
-      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component.",
+      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount).",
       "inputSchema": {
         "type": "object",
         "properties": {}
@@ -2000,98 +2010,6 @@
           "text": {
             "type": "string",
             "description": "Current text to compare against the recorded fixture"
-          }
-        },
-        "required": [
-          "path"
-        ]
-      }
-    },
-    {
-      "name": "list_lessons",
-      "description": "List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "includeDisabled": {
-            "type": "boolean",
-            "description": "Include disabled lessons (default false)"
-          }
-        }
-      }
-    },
-    {
-      "name": "add_lesson",
-      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Stable lesson id (optional; auto custom-N)"
-          },
-          "scenario": {
-            "type": "string",
-            "description": "When this applies"
-          },
-          "trap": {
-            "type": "string",
-            "description": "The pitfall"
-          },
-          "do": {
-            "type": "string",
-            "description": "What to do instead"
-          },
-          "scope": {
-            "type": "string",
-            "description": "all | mcp | vb6 (optional)"
-          },
-          "enabled": {
-            "type": "boolean",
-            "description": "Enabled (default true)"
-          }
-        }
-      }
-    },
-    {
-      "name": "delete_lesson",
-      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false).",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Lesson id"
-          }
-        }
-      }
-    },
-    {
-      "name": "export_lessons",
-      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md).",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "includeDisabled": {
-            "type": "boolean",
-            "description": "Include disabled lessons (default false)"
-          }
-        }
-      }
-    },
-    {
-      "name": "import_lessons_md",
-      "description": "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Markdown file to import"
-          },
-          "dryRun": {
-            "type": "boolean",
-            "description": "Parse only, do not write (default false)"
           }
         },
         "required": [
@@ -2403,7 +2321,7 @@
     },
     {
       "name": "project_meta",
-      "description": "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept.",
+      "description": "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {

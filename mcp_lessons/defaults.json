@@ -1,0 +1,115 @@
+{
+  "_meta": {
+    "format": 1,
+    "note": "Shipped with the add-in. Do not edit here; add overrides in user.json via add_lesson."
+  },
+  "instructions": {
+    "intro": "VB6MCP usage notes (read before calling tools):",
+    "rules": [
+      "Compile before you trust: use build (offline /make) or make_project (in-IDE) and check the result; a passing lint is not a compile.",
+      "validate_code BEFORE writing: it is a local rule engine, not the VB6 compiler, and it reports a stable ruleId + line.",
+      "Editing is IDE-side: edit_by_anchor/apply_edits change the in-memory CodeModule; verify() reports IDE vs DISK, it does not save.",
+      "make_project pins the build target and deletes the stale output first, which is what keeps VB6's Make/overwrite dialogs away.",
+      "The project must be closed before rebuilding THIS add-in DLL, otherwise /make cannot overwrite the loaded DLL.",
+      "Long tool results are JSON on one line; parse them, do not eyeball truncated text."
+    ]
+  },
+  "lessons": [
+    {
+      "id": "mcp-strict-protocol-version",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "MCP client is configured but registers ZERO tools",
+      "trap": "The server answers initialize with a protocolVersion the official client does not list in its SUPPORTED_PROTOCOL_VERSIONS. The client rejects the handshake and registers no tools, while the server looks perfectly healthy.",
+      "do": "Echo the version the client asked for when it is one we implement; otherwise answer with the latest official version. Never advertise a custom/stateless version here."
+    },
+    {
+      "id": "mcp-no-top-level-meta",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "MCP responses silently dropped",
+      "trap": "A _meta key on the JSON-RPC envelope (same level as jsonrpc/id/result). The official SDK JSONRPCMessageSchema is strict, treats it as 'Unrecognized key' and DISCARDS the whole response.",
+      "do": "Put _meta inside result only. Keep the envelope to exactly jsonrpc/id/result or jsonrpc/id/error."
+    },
+    {
+      "id": "mcp-tools-list-strict",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "tools/list rejected by a strict client",
+      "trap": "nextCursor emitted as null (must be a string or omitted), or non-official fields such as ttlMs / cacheScope.",
+      "do": "Return exactly {tools:[...]}. Omit nextCursor instead of sending null."
+    },
+    {
+      "id": "mcp-verify-with-real-client",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "Believing a protocol change works because it compiles and returns HTTP 200",
+      "trap": "The tool list is only populated after a successful strict-schema handshake; compile success and HTTP 200 prove nothing about registration.",
+      "do": "Connect with the real client and confirm the tools actually appear; use tools/mcp_strict_audit.py for the schema half."
+    },
+    {
+      "id": "vb6-ide-locks-own-dll",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Rebuilding the VB6MCP add-in DLL",
+      "trap": "The running VB6 IDE has VB6MCP.dll loaded (image lock), so /make cannot overwrite it - build.bat can still exit 0 while the DLL is unchanged.",
+      "do": "Close the IDE first, then run build.bat, then confirm the DLL timestamp/size actually changed."
+    },
+    {
+      "id": "vb6-make-dialogs",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "make_project or File>Make pops a modal dialog",
+      "trap": "An empty BuildFileName opens the Make Project file dialog; an existing output opens Confirm Save As (a DirectUI dialog that ignores BM_CLICK/WM_COMMAND). The add-in is blocked inside the modal call and cannot click its own dialog.",
+      "do": "Pin BuildFileName and delete the stale output before compiling. For a manual File>Make on an open project, expect the per-session dialog; dismiss it from another process (tools/dialog_watch.py) only as a fallback."
+    },
+    {
+      "id": "vb6-variant-needs-set",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Reading a nested JSON object in VB6",
+      "trap": "p = obj.Item(\"params\") where the item is an object raises error 450; under On Error Resume Next it is silently swallowed and p stays Empty, so the value is never read.",
+      "do": "Use Set, or JsonLib.JsonGet (which does Set internally)."
+    },
+    {
+      "id": "vb6-binary-write-no-truncate",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Rewriting a shorter file",
+      "trap": "Open ... For Binary Access Write does NOT truncate, so the old tail survives and the file is corrupted.",
+      "do": "Kill the target path first, then write."
+    },
+    {
+      "id": "vb6-left-exact-length",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Comparing a prefix",
+      "trap": "Left$(s, n) returns the whole string when n exceeds its length, so comparing against a longer literal silently never matches (Left$(L,5)=\"loop\" never matches \"loop while\").",
+      "do": "Use the exact length of the literal you are matching."
+    },
+    {
+      "id": "mcp-stdio-must-be-utf8",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "stdio MCP bridge on Chinese Windows",
+      "trap": "Text-mode stdio uses the console code page (GBK); any non-GBK character makes json.dumps raise UnicodeEncodeError and the whole tools/call becomes -32603. Encoding applies to stdin too, otherwise Chinese arguments arrive as lone surrogates.",
+      "do": "Read/write sys.stdin.buffer / sys.stdout.buffer with explicit utf-8, or reconfigure BOTH stdin and stdout/stderr."
+    },
+    {
+      "id": "http-declare-charset",
+      "scope": "mcp",
+      "enabled": true,
+      "scenario": "Client mis-decodes tool results",
+      "trap": "An HTTP response without an explicit charset lets the client guess a code page and garble non-ASCII payloads.",
+      "do": "Always send Content-Type: application/json; charset=utf-8."
+    },
+    {
+      "id": "vba6-callstack-signatures",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Calling the VBA6.DLL debug-engine exports to read the VB6 callstack",
+      "trap": "Three separate mistakes all produce access violations that look like 'the API is unusable': (1) EbGetCallstackFunction arg5 is a POINTER (out long*), passing ByVal 0 writes to address 0; (2) frame indices are 0-BASED, so asking for frame == count walks past the list and reads [NULL+4]; (3) the out string is UTF-16 while the BSTR length is a byte count, so names come back with NULs between characters.",
+      "do": "Declare arg5 ByRef Long, iterate frames 0..count-1 and clamp, and decode the name by taking every other character when NULs are present. EbGetCallstackCount only walks the list when EbMode()==2; otherwise it writes the sentinel 1."
+    }
+  ]
+}

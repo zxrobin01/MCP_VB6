@@ -523,7 +523,7 @@ Public Function BuildToolsListResult() As Object
     Set pWrite("backup") = Prop("boolean", "Keep a .bak copy of the previous file (default: true)")
     Set pWrite("validate") = PropValidate()
     tools.Add MakeTool("write_file", _
-        "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits).", _
+        "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
         SchemaWith(pWrite, Req("path", "content")))
 
     Dim pSearch As Object
@@ -887,7 +887,7 @@ Public Function BuildToolsListResult() As Object
     Set pWs("encoding") = Prop("string", "auto|ansi|utf-8|utf-16le (default auto: VB files -> ansi)")
     Set pWs("validate") = PropValidate()
     tools.Add MakeTool("write_source", _
-        "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE).", _
+        "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
         SchemaWith(pWs, Req("path", "text")))
 
     Dim pVf As Object
@@ -1019,7 +1019,7 @@ Public Function BuildToolsListResult() As Object
     Dim pDg As Object
     Set pDg = CreateObject("Scripting.Dictionary")
     tools.Add MakeTool("dependency_graph", _
-        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component.", _
+        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount).", _
         SchemaWith(pDg))
 
     Dim pPu As Object
@@ -1051,48 +1051,6 @@ Public Function BuildToolsListResult() As Object
     tools.Add MakeTool("compare_fixture", _
         "Compare text against a recorded fixture: same / added / removed / firstDiffLine.", _
         SchemaWith(pKf, Req("path")))
-
-    ' ---- lessons library (经验库) ----
-    Dim pLl As Object
-    Set pLl = CreateObject("Scripting.Dictionary")
-    Set pLl("includeDisabled") = Prop("boolean", "Include disabled lessons (default false)")
-    tools.Add MakeTool("list_lessons", _
-        "List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state.", _
-        SchemaWith(pLl))
-
-    Dim pAl As Object
-    Set pAl = CreateObject("Scripting.Dictionary")
-    Set pAl("id") = Prop("string", "Stable lesson id (optional; auto custom-N)")
-    Set pAl("scenario") = Prop("string", "When this applies")
-    Set pAl("trap") = Prop("string", "The pitfall")
-    Set pAl("do") = Prop("string", "What to do instead")
-    Set pAl("scope") = Prop("string", "all | mcp | vb6 (optional)")
-    Set pAl("enabled") = Prop("boolean", "Enabled (default true)")
-    tools.Add MakeTool("add_lesson", _
-        "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.", _
-        SchemaWith(pAl))
-
-    Dim pDl As Object
-    Set pDl = CreateObject("Scripting.Dictionary")
-    Set pDl("id") = Prop("string", "Lesson id")
-    tools.Add MakeTool("delete_lesson", _
-        "Remove a user lesson, or disable a shipped one (writes enabled=false).", _
-        SchemaWith(pDl))
-
-    Dim pEl As Object
-    Set pEl = CreateObject("Scripting.Dictionary")
-    Set pEl("includeDisabled") = Prop("boolean", "Include disabled lessons (default false)")
-    tools.Add MakeTool("export_lessons", _
-        "Export the merged lesson library as Markdown (re-importable via import_lessons_md).", _
-        SchemaWith(pEl))
-
-    Dim pIl As Object
-    Set pIl = CreateObject("Scripting.Dictionary")
-    Set pIl("path") = Prop("string", "Markdown file to import")
-    Set pIl("dryRun") = Prop("boolean", "Parse only, do not write (default false)")
-    tools.Add MakeTool("import_lessons_md", _
-        "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.", _
-        SchemaWith(pIl, Req("path")))
 
     ' ---- extension library (扩展库): declarative tool packs ----
     Dim pXl As Object
@@ -1240,7 +1198,7 @@ Public Function BuildToolsListResult() As Object
     Set pPm("exe_name") = Prop("string", "ExeName32 (output file name)")
     Set pPm("cond_comp") = Prop("string", "CondComp (conditional compilation arguments, e.g. TESTING=1)")
     tools.Add MakeTool("project_meta", _
-        "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept.", _
+        "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
         SchemaWith(pPm, Req("action")))
 
     ' ---- application manifest (UAC / DPI) ----
@@ -1502,7 +1460,7 @@ End Function
 ' Contract v1.3.0 mechanism 1: the fixed banner an agent reads before calling.
 ' The FIRST line is exactly (two spaces between the groups):
 '   PRODUCT vb6-mcp <semver>  CONTRACT <contract>  TOOLS <n>  BUILT <sha256 first 8>
-' immediately followed by the BREAKING list, then the existing lessons block.
+' immediately followed by the BREAKING list and the capability index.
 Public Function BuildInstructions() As String
     Dim s As String
     s = "PRODUCT " & VB6MCP_PRODUCT & " " & VB6MCP_PRODUCT_VERSION & "  CONTRACT " & VB6MCP_CONTRACT_VERSION & "  TOOLS " & CStr(ToolCount()) & "  BUILT " & Left$(BuildSha256(), 8) & vbCrLf
@@ -1513,12 +1471,15 @@ Public Function BuildInstructions() As String
     s = s & "- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)" & vbCrLf
     s = s & "- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status" & vbCrLf
     s = s & "- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)" & vbCrLf
-    Dim les As String
-    On Error Resume Next
-    les = Lessons.Instructions()
-    Err.Clear
-    On Error GoTo 0
-    If Len(les) > 0 Then s = s & vbCrLf & les
+    s = s & "CAPABILITY INDEX (question -> tool; read this before improvising):" & vbCrLf
+    s = s & "- impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)" & vbCrLf
+    s = s & "- who references a symbol -> rename_symbol  (dry_run=true by default; skips strings and comments)" & vbCrLf
+    s = s & "- public API broken? -> check_public_api / export_public_api ; missing files or OCX parts -> check_references / list_component_parts" & vbCrLf
+    s = s & "- runtime window tree / control text / modal dialog -> find_gui / ui_text / read_active_dialogs" & vbCrLf
+    s = s & "- click a button or send keys to a window of THIS VB6 process -> send_window_message" & vbCrLf
+    s = s & "- offline single-module test -> test_host ; stub a procedure or trace calls -> fault_inject / inject_trace" & vbCrLf
+    s = s & "- NOT available: screenshots; driving a standalone built EXE (message tools are in-process only)" & vbCrLf
+    s = s & "FILE ENCODING: .vbp/.frm/.cls/.bas/.ctl are ANSI WITHOUT BOM (write_file / write_source already do this); never write them as UTF-8-with-BOM, or VB6 reads a mangled first keyword and the project stops loading; use project_meta for .vbp version metadata (keeps a .bak)." & vbCrLf
     BuildInstructions = s
 End Function
 
@@ -1546,8 +1507,7 @@ Public Function ServerPort() As Long
 End Function
 
 ' Insert the stamp as the FIRST key of a JSON *object* body. A body that is not
-' a JSON object is returned unchanged (export_lessons returns Markdown by
-' design), so a text payload is never corrupted.
+' a JSON object is returned unchanged, so a text payload is never corrupted.
 Private Function StampMcp(ByVal body As String) As String
     If Len(body) = 0 Then
         StampMcp = body
@@ -2090,7 +2050,7 @@ Private Function IsMutatingTool(ByVal name As String) As Boolean
              "validate_code", "read_source", "check_component", "preview_edit", "verify", _
              "audit_tail", "debug_commands", "execution_state", "vba6_probe_plan", _
              "export_public_api", "check_public_api", "purity_check", "compare_fixture", _
-             "list_lessons", "export_lessons", "ext_list", "project_changes", _
+             "ext_list", "project_changes", _
              "get_callstack", "check_references", "workspace_status", "verify_scope", _
              "todo_status", "mcp_info", "list_members", "get_component_properties", "git", _
              "dependency_graph", "control_execution", "read_active_dialogs", _
@@ -2935,37 +2895,6 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
             outText = Fixture.FixRecordJson(ResolvePath(JsonGetStr(args, "path")), JsonGetStr(args, "text"))
         Case "compare_fixture"
             outText = Fixture.FixCompareJson(ResolvePath(JsonGetStr(args, "path")), JsonGetStr(args, "text"))
-        Case "list_lessons"
-            outText = Lessons.ListJson(JsonGetBool(args, "includeDisabled", False))
-        Case "add_lesson"
-            outText = Lessons.AddJson(JsonGetStr(args, "id"), JsonGetStr(args, "scenario"), JsonGetStr(args, "trap"), JsonGetStr(args, "do"), JsonGetStr(args, "scope"), JsonGetBool(args, "enabled", True))
-        Case "delete_lesson"
-            outText = Lessons.DeleteJson(JsonGetStr(args, "id"))
-        Case "export_lessons"
-            outText = Lessons.ExportMd(JsonGetBool(args, "includeDisabled", False))
-        Case "import_lessons_md"
-            ' TASK-P1-113 (criterion 3): this used to answer ok:false with ONLY an \`error\` string and
-            ' no \`reason\`, so a caller could not branch without parsing prose. The schema now also
-            ' DECLARES path as required (registration above), so declaration and enforcement agree.
-            ' The verdict vocabulary is the TASK-P1-108 classifier's; \`error\` is kept for callers that
-            ' already read it.
-            Dim impPath As String
-            impPath = JsonGetStr(args, "path")
-            If Len(Trim$(impPath)) = 0 Then
-                Dim impErr As Object
-                Set impErr = CreateObject("Scripting.Dictionary")
-                impErr("ok") = False
-                impErr("reason") = "required_argument_missing"
-                impErr("tool") = "import_lessons_md"
-                impErr("argument") = "path"
-                impErr("error") = "path is required (the markdown file to import)"
-                impErr("message") = "path is required (the markdown file to import)"
-                impErr("suggestedAction") = "supply the reported argument (see 'argument' / 'message') and retry"
-                impErr("sideEffects") = "none: the call was refused before any file was read or written"
-                outText = JsonStringify(impErr)
-            Else
-                outText = Lessons.ImportMdJson(ResolvePath(impPath), JsonGetBool(args, "dryRun", False))
-            End If
         Case "ext_list"
             outText = Extensions.ListJson()
         Case "ext_enable"

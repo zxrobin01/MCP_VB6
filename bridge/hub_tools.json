@@ -74,6 +74,98 @@
         },
         "additionalProperties": false
       }
+    },
+    {
+      "name": "list_lessons",
+      "description": "List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeDisabled": {
+            "type": "boolean",
+            "description": "Include disabled lessons (default false)"
+          }
+        }
+      }
+    },
+    {
+      "name": "add_lesson",
+      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable lesson id (optional; auto custom-N)"
+          },
+          "scenario": {
+            "type": "string",
+            "description": "When this applies"
+          },
+          "trap": {
+            "type": "string",
+            "description": "The pitfall"
+          },
+          "do": {
+            "type": "string",
+            "description": "What to do instead"
+          },
+          "scope": {
+            "type": "string",
+            "description": "all | mcp | vb6 (optional)"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Enabled (default true)"
+          }
+        }
+      }
+    },
+    {
+      "name": "delete_lesson",
+      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Lesson id"
+          }
+        }
+      }
+    },
+    {
+      "name": "export_lessons",
+      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeDisabled": {
+            "type": "boolean",
+            "description": "Include disabled lessons (default false)"
+          }
+        }
+      }
+    },
+    {
+      "name": "import_lessons_md",
+      "description": "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Markdown file to import"
+          },
+          "dryRun": {
+            "type": "boolean",
+            "description": "Parse only, do not write (default false)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
     }
   ]
 }

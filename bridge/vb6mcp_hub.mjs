@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -43,6 +43,146 @@ const LIST_GRACE_MS = 400;          // discovery must never push a response towa
 // add-in over /rpc and only uses /mcp (best effort) for the instructions banner.
 const ADDIN_RPC_PATH = process.env.VB6MCP_ADDIN_PATH || '/rpc';
 const FACE_CACHE = path.join(HERE, 'hub_face_cache.json');
+// ---- endpoint list: the local machine + a configured allow-list of remote endpoints --------
+// The hub discriminates by IDE, not by machine: LOCAL and REMOTE IDEs are EQUIVALENT members
+// of ONE candidate set and `remote` is only an extra marker (author ruling, task-40).
+// Endpoints come from the env (VB6MCP_REMOTES) and/or bridge/hub_remotes.json; with neither
+// configured, every remote code path below is inert and the behaviour is the pre-change one.
+const REMOTES_FILE = path.join(HERE, 'hub_remotes.json');
+const LOCAL_ENDPOINT = 'local';
+const LABEL_RE = /^[A-Za-z0-9_.-]{2,32}$/;
+const REMOTE_PROBE_TIMEOUT_MS = parseInt(process.env.VB6MCP_REMOTE_PROBE_TIMEOUT_MS || '1500', 10);
+const REMOTE_FORWARD_TIMEOUT_MS = parseInt(process.env.VB6MCP_REMOTE_FORWARD_TIMEOUT_MS || String(FORWARD_TIMEOUT_MS), 10);
+const REMOTE_TTL_MS = parseInt(process.env.VB6MCP_REMOTE_TTL_MS || String(DISCOVERY_TTL_MS), 10);
+const REMOTE_GRACE_MS = parseInt(process.env.VB6MCP_REMOTE_GRACE_MS || '1500', 10);
+// The canonical identity rule, restated VERBATIM in every receipt that uses it.
+const TARGET_KEY_RULE = 'target key = [endpoint:]projectPath; endpoint omitted = local. Bare pid / bare project NAME stay accepted as LEGACY aliases and are never reported as the canonical key. Normalization: case-insensitive, "/" -> "\\", duplicate + trailing separators trimmed; a LOCAL path is additionally fs.realpathSync.native when the file exists; a REMOTE path is string-normalized only, because the endpoint marker is what disambiguates two machines holding the same path. The same normalized path on ONE endpoint is a conflict (VB6 cannot open the same .vbp twice); the same path on TWO endpoints is NOT a conflict.';
+function readEndpointConfig() {
+  const out = [], errors = [];
+  const push = function (e, source) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) { errors.push({ source: source, error: 'entry_not_an_object', raw: String(e) }); return; }
+    const label = String(e.label === undefined || e.label === null ? '' : e.label).trim();
+    const url = String(e.url === undefined || e.url === null ? '' : e.url).trim();
+    if (!LABEL_RE.test(label) || label.toLowerCase() === LOCAL_ENDPOINT) { errors.push({ source: source, label: label, error: 'invalid_label', hint: '2..32 chars of [A-Za-z0-9_.-]; "local" is reserved' }); return; }
+    if (!/^https?:\/\//i.test(url)) { errors.push({ source: source, label: label, error: 'invalid_url', url: url, hint: 'http(s)://host:port' }); return; }
+    const rec = { label: label, url: url.replace(/\/+$/, ''), note: (e.note === undefined || e.note === null) ? '' : String(e.note), source: source };
+    const dup = out.filter(function (x) { return x.label.toLowerCase() === label.toLowerCase(); })[0];
+    if (dup) { out[out.indexOf(dup)] = rec; } else { out.push(rec); }
+  };
+  const fromFile = readJson(REMOTES_FILE, null);
+  const fileArr = Array.isArray(fromFile) ? fromFile : (fromFile && Array.isArray(fromFile.remotes) ? fromFile.remotes : null);
+  if (fromFile !== null && !fileArr) errors.push({ source: 'hub_remotes.json', error: 'expected_array_or_{remotes:[]}' });
+  if (fileArr) for (const e of fileArr) push(e, 'hub_remotes.json');
+  const envRaw = process.env.VB6MCP_REMOTES;
+  if (envRaw && envRaw.trim()) {
+    let parsed = null, bad = false;
+    try { parsed = JSON.parse(envRaw); } catch (e) { bad = true; errors.push({ source: 'VB6MCP_REMOTES', error: 'invalid_json', message: String(e && e.message || e) }); }
+    if (!bad) {
+      const envArr = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.remotes) ? parsed.remotes : null);
+      if (!envArr) errors.push({ source: 'VB6MCP_REMOTES', error: 'expected_array_or_{remotes:[]}' });
+      else for (const e of envArr) push(e, 'VB6MCP_REMOTES');
+    }
+  }
+  return { endpoints: out, errors: errors };
+}
+const ENDPOINT_CFG = readEndpointConfig();
+const REMOTE_ENDPOINTS = ENDPOINT_CFG.endpoints;
+const ENDPOINT_CFG_ERRORS = ENDPOINT_CFG.errors;
+// Deferred: dbg() reads the DEBUG const that is declared further down, so a top-level call
+// here would hit the temporal dead zone.
+setTimeout(function () {
+  dbg('endpoints: local + ' + REMOTE_ENDPOINTS.length + ' remote(s) ' + JSON.stringify(REMOTE_ENDPOINTS.map(function (e) { return e.label + '=' + e.url; })) + (ENDPOINT_CFG_ERRORS.length ? ' configErrors=' + JSON.stringify(ENDPOINT_CFG_ERRORS) : ''));
+}, 0);
+function endpointByLabel(label) {
+  const s = String(label === undefined || label === null ? '' : label).toLowerCase();
+  if (!s) return null;
+  if (s === LOCAL_ENDPOINT) return { label: LOCAL_ENDPOINT, url: null, remote: false, note: 'this machine (instance registry + port scan)' };
+  for (const e of REMOTE_ENDPOINTS) if (e.label.toLowerCase() === s) return { label: e.label, url: e.url, remote: true, note: e.note, source: e.source };
+  return null;
+}
+function endpointLabels() { return [LOCAL_ENDPOINT].concat(REMOTE_ENDPOINTS.map(function (e) { return e.label; })); }
+// A configured endpoint url may carry an explicit rpc path (http://host:8796/rpc); otherwise
+// the add-in's default rpc path is used.
+function endpointRpcTarget(url) {
+  const m = /^(https?:\/\/[^\/]+)(\/.*)?$/i.exec(String(url === undefined || url === null ? '' : url));
+  if (!m) return { base: String(url || ''), path: ADDIN_RPC_PATH };
+  const p = m[2] || '';
+  if (!p || p === '/') return { base: m[1], path: ADDIN_RPC_PATH };
+  return { base: m[1], path: p };
+}
+
+// ---- deterministic project-path identity: THE canonical target key -------------------------
+// VB6 itself refuses to open the same .vbp twice, so the absolute path is the natural unique
+// key; pid/port/name are NOT (measured: 38 stale registry variants of one path, one name over
+// two paths, one port over two projects).
+function normalizePathString(p) {
+  let s = String(p === undefined || p === null ? '' : p).trim();
+  if (!s) return '';
+  s = s.replace(/\//g, '\\');
+  const unc = s.indexOf('\\\\') === 0;
+  let body = unc ? s.slice(2) : s;
+  body = body.replace(/\\+/g, '\\');
+  s = (unc ? '\\\\' : '') + body;
+  s = s.replace(/\\+$/, '');
+  if (/^[A-Za-z]:$/.test(s)) s = s + '\\';
+  return s;
+}
+function canonicalProjectPath(raw, isRemote) {
+  const base = normalizePathString(raw);
+  if (!base) return { path: '', key: '', via: 'empty' };
+  if (!isRemote) {
+    try {
+      if (fs.existsSync(base)) {
+        const rp = normalizePathString(fs.realpathSync.native(base));
+        if (rp) return { path: rp, key: rp.toLowerCase(), via: rp === base ? 'realpath_same' : 'realpath' };
+      }
+    } catch (e) { dbg('canonicalProjectPath realpath failed for ' + base + ': ' + (e && e.message)); }
+    return { path: base, key: base.toLowerCase(), via: 'string' };
+  }
+  return { path: base, key: base.toLowerCase(), via: 'string_remote' };
+}
+function candidateIdentity(c) {
+  const ep = String(c.endpoint || LOCAL_ENDPOINT).toLowerCase();
+  if (c.pathKey) return ep + '\u0000' + c.pathKey;
+  if (c.project) return ep + '\u0000name:' + String(c.project).toLowerCase();
+  return ep + '\u0000pid:' + String(c.pid);
+}
+// One local registry/scan instance -> a candidate of the SAME set a remote IDE belongs to.
+function localCandidate(i) {
+  const cp = canonicalProjectPath(i.projectPath || '', false);
+  const ppath = cp.path || null;
+  return Object.assign({}, i, {
+    endpoint: LOCAL_ENDPOINT, remote: false, endpointUrl: null,
+    projectPath: ppath, pathKey: cp.key, pathVia: cp.via,
+    targetKey: LOCAL_ENDPOINT + ':' + (ppath || ('pid=' + i.pid))
+  });
+}
+function identityConflicts(insts) {
+  const groups = new Map();
+  for (const i of insts) {
+    const k = candidateIdentity(i);
+    const g = groups.get(k);
+    if (g) g.push(i); else groups.set(k, [i]);
+  }
+  const out = [];
+  for (const v of groups.values()) {
+    if (v.length < 2) continue;
+    const ep = v[0].endpoint || LOCAL_ENDPOINT;
+    out.push('endpoint "' + ep + '": ' + v.length + ' live IDEs publish the same project identity "' + (v[0].projectPath || v[0].project || ('pid ' + v[0].pid)) + '" (pids ' + v.map(function (x) { return x.pid; }).join(',') + ', ports ' + v.map(function (x) { return x.port; }).join(',') + ') -- VB6 cannot open the same .vbp twice on one endpoint; refusing to pick one');
+  }
+  return out;
+}
+// ---- lessons (moved to the Python side: tools/lessons.py) --------------------------------
+// The 5 lesson tools are HUB tools now, and the rendered lessons text is appended to
+// initialize.instructions.  Both go through ONE frozen CLI:
+//   python tools/lessons.py <instructions|list|add|delete|export|import-md|validate>
+// which prints exactly ONE JSON object on stdout (failure = non-zero exit + {"ok":false}).
+// VB6MCP_LESSONS_PY / VB6MCP_PYTHON let a test instance point at a stub without touching
+// the shipped tree; the defaults are the frozen deployment.
+const LESSONS_PY = process.env.VB6MCP_LESSONS_PY || path.join(HERE, '..', 'tools', 'lessons.py');
+const PYTHON_BIN = process.env.VB6MCP_PYTHON || 'python';
+const LESSONS_TIMEOUT_MS = parseInt(process.env.VB6MCP_LESSONS_TIMEOUT_MS || '30000', 10);
+const LESSONS_RETRY_MS = 30000;     // a FAILED instructions read is retried, not cached forever
 // The add-in's instructions banner is fetched from /mcp, which can take seconds
 // on a busy add-in - so it is BEST EFFORT and never on the discovery critical path.  The
 // first discovery returns without it (the hub then labels the downgrade), later ones carry it.
@@ -204,12 +344,16 @@ function readRegistry() {
   return { dir: dir, entries: entries, unreadable: false };
 }
 
-async function rpc(port, method, params, proto, timeoutMs, rpcPath) {
+// One JSON-RPC POST against an absolute endpoint base ("http://host:port") - the SAME wire
+// shape the local add-in uses, so a remote IDE is reached exactly like a local one.  An
+// explicit path in the base (http://host:8796/rpc) wins over the add-in default.
+async function rpcAt(base, method, params, proto, timeoutMs, rpcPath) {
+  const target = endpointRpcTarget(base);
   const body = { jsonrpc: '2.0', id: (Date.now() % 100000) + 1, method: method };
   if (params !== undefined) body.params = params;
   const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
   if (proto) headers['MCP-Protocol-Version'] = proto;
-  const res = await fetch('http://127.0.0.1:' + port + (rpcPath || ADDIN_RPC_PATH), {
+  const res = await fetch(target.base + (rpcPath || target.path), {
     method: 'POST', headers: headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs || FORWARD_TIMEOUT_MS)
   });
   const raw = await res.text();
@@ -219,6 +363,9 @@ async function rpc(port, method, params, proto, timeoutMs, rpcPath) {
     if (s.startsWith('{')) return JSON.parse(s);
   }
   return raw.trim() ? JSON.parse(raw) : null;
+}
+async function rpc(port, method, params, proto, timeoutMs, rpcPath) {
+  return rpcAt('http://127.0.0.1:' + port, method, params, proto, timeoutMs, rpcPath);
 }
 
 // Runs in the BACKGROUND (never on a response path): a slow add-in must not delay the hub.
@@ -249,6 +396,128 @@ async function probe(port, knownProject, pids) {
       .catch(function () { dbg('instructions fetch failed for port ' + port); });
   }
   return { port: port, pid: pids[0], pids: pids, project: project, liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools, instructions: instructions };
+}
+
+// ---- remote endpoints: probe / cache / PER-ENDPOINT single-flight -------------------------
+// Keyed per endpoint: local discovery NEVER waits on this map, so a slow or dead remote cannot
+// stall a local call, while two concurrent calls to the SAME endpoint share one probe.
+const remoteProbe = new Map();   // label -> { at, data, promise }
+const remoteInstructionsCache = {};
+function remoteCacheGet(label) {
+  const st = remoteProbe.get(label);
+  if (!st || !st.data) return null;
+  if (Date.now() - st.at >= REMOTE_TTL_MS) return null;
+  return st.data;
+}
+function firstText(resp) {
+  const c = resp && resp.result && resp.result.content;
+  return (Array.isArray(c) && c[0] && typeof c[0].text === 'string') ? c[0].text : null;
+}
+// Best effort, BACKGROUND: the /mcp banner of a remote endpoint (never on a critical path).
+function remoteInstructions(ep, url) {
+  if (remoteInstructionsCache[ep.label]) return remoteInstructionsCache[ep.label];
+  rpcAt(url, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
+    .then(function (init) { const v = init && init.result && init.result.instructions; if (v) { remoteInstructionsCache[ep.label] = v; dbg('remote instructions cached for ' + ep.label); } })
+    .catch(function () { dbg('remote instructions fetch failed for ' + ep.label); });
+  return null;
+}
+async function probeRemoteEndpoint(ep, timeoutMs) {
+  const t0 = Date.now();
+  const url = ep.url;
+  let tl = null;
+  try { tl = await rpcAt(url, 'tools/list', {}, null, timeoutMs); }
+  catch (e) {
+    const isTimeout = !!(e && (e.name === 'TimeoutError' || e.name === 'AbortError' || /abort|timed? ?out/i.test(String(e && e.message))));
+    return { ok: false, endpoint: ep.label, endpointUrl: url, remote: true, reason: isTimeout ? 'endpoint_timeout' : 'endpoint_unreachable',
+             message: String(e && e.message || e), elapsedMs: Date.now() - t0, timeoutMs: timeoutMs };
+  }
+  const tools = (tl && tl.result && tl.result.tools) || [];
+  let ide = null, project = null, rawPath = '';
+  try {
+    const mi = await rpcAt(url, 'tools/call', { name: 'mcp_info', arguments: {} }, null, timeoutMs);
+    const txt = firstText(mi);
+    if (txt) { const j = JSON.parse(txt); if (j && j.ide) ide = j.ide; if (j && j.fileName) rawPath = String(j.fileName); if (j && j.name) project = String(j.name); }
+  } catch (e) { dbg('remote ' + ep.label + ' mcp_info failed: ' + (e && e.message)); }
+  if (!ide || !ide.project || !rawPath) {
+    try {
+      const gp = await rpcAt(url, 'tools/call', { name: 'get_project_info', arguments: {} }, null, timeoutMs);
+      const txt = firstText(gp);
+      if (txt) { const j = JSON.parse(txt); if (j && j.name && !project) project = String(j.name); if (j && j.fileName) rawPath = String(j.fileName); }
+    } catch (e) { dbg('remote ' + ep.label + ' get_project_info failed: ' + (e && e.message)); }
+  }
+  if (ide && ide.project) project = String(ide.project);
+  const pid = (ide && ide.pid !== undefined && ide.pid !== null) ? (parseInt(ide.pid, 10) || null) : null;
+  const port = (ide && ide.port !== undefined && ide.port !== null) ? (parseInt(ide.port, 10) || null) : null;
+  const cp = canonicalProjectPath(rawPath, true);
+  const candidate = {
+    endpoint: ep.label, remote: true, endpointUrl: url, note: ep.note,
+    pid: pid, pids: pid ? [pid] : [], port: port, project: project || null,
+    projectPath: cp.path || null, pathKey: cp.key, pathVia: cp.via,
+    targetKey: ep.label + ':' + (cp.path || ('pid=' + pid)),
+    discoveredBy: 'remote_probe', probeStatus: 'ok', pending: false,
+    liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools,
+    instructions: remoteInstructions(ep, url)
+  };
+  return { ok: true, endpoint: ep.label, endpointUrl: url, remote: true, candidate: candidate,
+           toolCount: tools.length, elapsedMs: Date.now() - t0, timeoutMs: timeoutMs };
+}
+async function probeEndpointCached(label, timeoutMs) {
+  const ep = endpointByLabel(label);
+  if (!ep || !ep.remote) return { ok: false, endpoint: String(label), reason: 'endpoint_unknown' };
+  const cached = remoteCacheGet(ep.label);
+  if (cached) return cached;
+  const st = remoteProbe.get(ep.label);
+  if (st && st.promise) return st.promise;               // per-endpoint single-flight
+  const promise = probeRemoteEndpoint(ep, timeoutMs || REMOTE_PROBE_TIMEOUT_MS).then(function (d) {
+    remoteProbe.set(ep.label, { at: Date.now(), data: d, promise: null });
+    return d;
+  }).catch(function (e) {
+    const d = { ok: false, endpoint: ep.label, endpointUrl: ep.url, remote: true, reason: 'endpoint_unreachable', message: String(e && e.message || e), elapsedMs: 0 };
+    remoteProbe.set(ep.label, { at: Date.now(), data: d, promise: null });
+    return d;
+  });
+  remoteProbe.set(ep.label, { at: st ? st.at : 0, data: st ? st.data : null, promise: promise });
+  return promise;
+}
+async function remoteCandidatesAvailable() {
+  const candidates = [], endpoints = [];
+  for (const ep of REMOTE_ENDPOINTS) {
+    const st = remoteProbe.get(ep.label);
+    const fresh = remoteCacheGet(ep.label);
+    const d = fresh || (st ? st.data : null);
+    endpoints.push({ label: ep.label, url: ep.url, remote: true, note: ep.note, source: ep.source,
+                     cached: !!fresh, pending: !!(st && st.promise), settled: !!d,
+                     reason: d ? (d.reason || 'ok') : null,
+                     elapsedMs: d && d.elapsedMs !== undefined ? d.elapsedMs : null });
+    if (fresh && fresh.ok && fresh.candidate) candidates.push(fresh.candidate);
+  }
+  return { candidates: candidates, endpoints: endpoints };
+}
+// A bounded pass over EVERY configured endpoint (all probes in parallel, no cross-endpoint
+// serialization).  Anything that has not settled within the grace window is reported as
+// pending/unreachable; the probes keep running in the background.
+async function remotePass(graceMs) {
+  if (!REMOTE_ENDPOINTS.length) return { candidates: [], endpoints: [] };
+  await Promise.race([
+    Promise.all(REMOTE_ENDPOINTS.map(function (ep) { return probeEndpointCached(ep.label).catch(function () { return null; }); })),
+    new Promise(function (r) { setTimeout(r, graceMs === undefined ? REMOTE_GRACE_MS : graceMs); })
+  ]);
+  return remoteCandidatesAvailable();
+}
+// THE merged candidate list (local + remote) in ONE set.  With no configured endpoint this is
+// a pass-through of the local discovery object, so every local result stays what it was.
+async function withRemoteCandidates(localD, graceMs) {
+  if (!REMOTE_ENDPOINTS.length) return localD;
+  let r = await remoteCandidatesAvailable();
+  const settled = r.endpoints.filter(function (e) { return e.settled; }).length;
+  if (settled < REMOTE_ENDPOINTS.length) r = await remotePass(graceMs);
+  return Object.assign({}, localD, {
+    instances: (localD.instances || []).concat(r.candidates),
+    endpoints: r.endpoints,
+    endpointConfigErrors: ENDPOINT_CFG_ERRORS,
+    targetKeyRule: TARGET_KEY_RULE,
+    remoteInstanceCount: r.candidates.length
+  });
 }
 
 async function discoverBounded() {
@@ -302,17 +571,18 @@ async function discoverBounded() {
       }
     }
   }
+  // Identity grouping is by NORMALIZED PROJECT PATH, never by project NAME (one name was
+  // measured over TWO different paths, so name-grouping both missed real duplicates and
+  // invented false ones).  The same path on ONE endpoint is the conflict; the same path on
+  // TWO endpoints is legitimate - that is what the endpoint marker exists for.
+  const candidates = insts.map(localCandidate);
   const conflicts = [];
-  insts.forEach(function (i) { if (i.pids.length > 1) conflicts.push('port ' + i.port + ' held by several processes: ' + i.pids.join(',')); });
-  const byProject = {};
-  insts.forEach(function (i) { if (i.project) { (byProject[i.project] = byProject[i.project] || []).push(i.port); } });
-  Object.keys(byProject).forEach(function (p) {
-    if (byProject[p].length > 1) conflicts.push('project "' + p + '" opened by several instances on ports ' + byProject[p].join(','));
-  });
+  candidates.forEach(function (i) { if (i.pids.length > 1) conflicts.push('port ' + i.port + ' held by several processes: ' + i.pids.join(',')); });
+  identityConflicts(candidates).forEach(function (m) { conflicts.push(m); });
   stale.forEach(function (s) {
     if (s.reason === 'duplicate_port_in_registry' || s.reason === 'registry_port_not_mcp') conflicts.push('registry ' + s.file + ': ' + s.reason);
   });
-  return { instances: insts, conflicts: conflicts, staleRegistry: stale, registryDir: scan.dir,
+  return { instances: candidates, conflicts: conflicts, staleRegistry: stale, registryDir: scan.dir,
            registryUnreadable: !!scan.unreadable, scanTruncated: scanTruncated, elapsedMs: Date.now() - t0 };
 }
 
@@ -352,17 +622,88 @@ async function discoverSoft(graceMs) {
 }
 function invalidateDiscovery() { discovery = { at: 0, data: null, promise: null }; }
 
-function pickTarget(insts, target) {
-  if (!insts.length) return { ok: false, message: 'no IDE instance listening (scanned ' + DEFAULT_PORTS.length + ' default ports + registry)' };
-  const explicit = !(target === 'auto' || target === undefined || target === null || target === '');
-  let t = explicit ? target : state.target;
-  if (t === 'auto' || t === undefined || t === null || t === '') t = null;
-  const desc = function () { return insts.map(function (i) { return i.port + '/' + (i.project || '?'); }).join(', '); };
-  if (t !== null) {
-    const s = String(t);
-    const hit = insts.filter(function (i) { return String(i.pid) === s || (i.project && i.project === s) || String(i.port) === s; });
-    if (hit.length === 1) return { ok: true, ...hit[0], selectedBy: (explicit ? 'explicit_target' : 'effective_default') };
-    if (hit.length > 1) return { ok: false, conflict: true, message: 'target "' + s + '" matches several instances: ' + hit.map(function (i) { return i.port + '/' + i.pid; }).join(',') };
+// ---- target parsing + candidate selection (ONE endpoint scope at a time) --------------------
+// _target syntax: "[endpoint:]selector"; the endpoint is omitted for local.  A Windows drive
+// letter is a DRIVE, not an endpoint, so a prefix only qualifies when it names a CONFIGURED
+// endpoint label (or the reserved "local").  A prefix that IS a valid label but is not
+// configured is an explicit endpoint_unknown error - never a silent local fallback.
+function parseTarget(raw) {
+  const t = String(raw === undefined || raw === null ? 'auto' : raw).trim();
+  if (t === '' || t.toLowerCase() === 'auto') return { kind: 'auto', raw: t };
+  // A BARE configured label addresses that endpoint's IDE(s) (selector = all of them); a bare
+  // anything-else stays a LOCAL selector, so legacy project NAME aliases keep working.
+  const bare = endpointByLabel(t);
+  if (bare) return { kind: 'endpoint', endpoint: bare, selector: '', raw: t };
+  const m = /^([^:\\\/]+):(.*)$/.exec(t);
+  if (m) {
+    const ep = endpointByLabel(m[1]);
+    if (ep) return { kind: 'endpoint', endpoint: ep, selector: m[2], raw: t };
+    // "<label>:<selector>" with a VALID but unconfigured label is an explicit error; a Windows
+    // drive ("D:\x.vbp") is one character and therefore never qualifies.
+    if (LABEL_RE.test(m[1])) return { kind: 'endpoint_unknown', label: m[1], selector: m[2], raw: t };
+  }
+  return { kind: 'local', selector: t, raw: t };
+}
+function selectorIsPathLike(s) {
+  const x = String(s === undefined || s === null ? '' : s);
+  return x.indexOf('\\') >= 0 || x.indexOf('/') >= 0 || /^[A-Za-z]:/.test(x);
+}
+// The canonical key is matched FIRST; bare pid / bare port / bare NAME stay accepted as legacy
+// aliases so every existing caller keeps working unchanged.
+function matchCandidates(insts, s, isRemoteScope) {
+  const sel = String(s);
+  const cp = canonicalProjectPath(sel, !!isRemoteScope);
+  return insts.filter(function (i) {
+    if (cp.key && i.pathKey && i.pathKey === cp.key) return true;
+    if (String(i.pid) === sel) return true;
+    if (String(i.port) === sel) return true;
+    if (i.project && i.project === sel) return true;
+    return false;
+  });
+}
+function matchedByFor(cand, s, isRemoteScope) {
+  const sel = String(s);
+  const cp = canonicalProjectPath(sel, !!isRemoteScope);
+  if (cp.key && cand.pathKey && cand.pathKey === cp.key) return 'project_path';
+  if (String(cand.pid) === sel) return 'pid';
+  if (String(cand.port) === sel) return 'port';
+  if (cand.project && cand.project === sel) return 'project_name';
+  return 'unknown';
+}
+function candidateDesc(insts, isRemoteScope) {
+  if (!isRemoteScope) return insts.map(function (i) { return i.port + '/' + (i.project || '?'); }).join(', ');
+  return insts.map(function (i) { return (i.endpoint || '?') + ':' + (i.projectPath || i.project || ('port ' + i.port)); }).join(', ');
+}
+function candidateBrief(i) {
+  return { pid: i.pid, port: i.port, project: i.project, projectPath: i.projectPath || null,
+           endpoint: i.endpoint || LOCAL_ENDPOINT, remote: !!i.remote, targetKey: i.targetKey || null };
+}
+// Selection inside ONE endpoint scope.  target = a resolved selector (or null); explicit =
+// the selector came from _target (a miss is an error) vs from the ide_target DEFAULT (a miss
+// is ignored, never vetoing the live set).
+function pickTarget(insts, target, opts) {
+  opts = opts || {};
+  const isRemoteScope = !!opts.remoteScope;
+  const explicit = !!opts.explicit;
+  if (!insts.length) return { ok: false, message: isRemoteScope ? 'the selected endpoint reports no IDE' : 'no IDE instance listening (scanned ' + DEFAULT_PORTS.length + ' default ports + registry)' };
+  const desc = function () { return candidateDesc(insts, isRemoteScope); };
+  if (target !== null && target !== undefined && target !== '') {
+    const s = String(target);
+    const hit = matchCandidates(insts, s, isRemoteScope);
+    if (hit.length === 1) return { ok: true, ...hit[0], selectedBy: (explicit ? 'explicit_target' : 'effective_default'),
+                                   matchedBy: matchedByFor(hit[0], s, isRemoteScope), matchedFrom: s };
+    if (hit.length > 1) {
+      const keySet = {};
+      hit.forEach(function (i) { keySet[candidateIdentity(i)] = 1; });
+      const ids = Object.keys(keySet);
+      const sameIdentity = ids.length === 1;
+      const ep = hit[0].endpoint || LOCAL_ENDPOINT;
+      return { ok: false, conflict: true, identityConflict: sameIdentity, distinctIdentities: ids.length, matchedCount: hit.length,
+        hits: hit.map(candidateBrief),
+        message: sameIdentity
+          ? 'target "' + s + '" is ONE project identity ("' + (hit[0].projectPath || hit[0].project || '?') + '") served by ' + hit.length + ' live IDEs on endpoint "' + ep + '": ' + hit.map(function (i) { return i.pid + '@' + i.port; }).join(',') + ' -- VB6 cannot open the same .vbp twice; refusing to pick one'
+          : 'target "' + s + '" is AMBIGUOUS: it matches ' + hit.length + ' live IDEs with ' + ids.length + ' different project identities on endpoint "' + ep + '": ' + hit.map(function (i) { return i.pid + '@' + i.port + ' ' + (i.projectPath || i.project || '?'); }).join(' | ') + ' -- pick one by its projectPath' };
+    }
     // A STALE DEFAULT (ide_target pointing at a project that is gone) must
     // never veto the live instances - that made every implicit call fail with no_ide_running
     // while the only live IDE was right there.
@@ -396,6 +737,13 @@ async function directTarget(target) {
   }
   const e2 = await ownerBy(function (x) { return x.project === s; });
   if (e2) return { ok: true, port: e2.port, pid: e2.pid, pids: e2.pids, project: e2.project || null, direct: true };
+  // A PATH selector addresses the add-in without discovery too: registry entries are matched
+  // by the SAME canonical key used everywhere else.
+  const cp = canonicalProjectPath(s, false);
+  if (cp.key) {
+    const e3 = await ownerBy(function (x) { return canonicalProjectPath(x.projectPath || '', false).key === cp.key; });
+    if (e3) return Object.assign({ ok: true }, localCandidate(e3), { direct: true, matchedBy: 'project_path', matchedFrom: s });
+  }
   return null;
 }
 
@@ -446,17 +794,121 @@ function stampBody(result, ide, contract, note) {
   return { content: content, isError: result && result.isError === true };
 }
 
-function buildInstructions(d, snap) {
-  const inst = d.instances.length ? d.instances[0] : null;
-  if (inst && inst.instructions) return inst.instructions;
-  if (inst && snap.instructions) {
-    const n = (inst.liveTools && inst.liveTools.length) || snap.tools.length;
-    return 'PRODUCT vb6mcp-hub ' + SERVER.version + '  BRIDGE-TO vb6-mcp ' + snap.contractVersion + '  TOOLS ' + n + '  (faceSource=live; add-in sent no instructions)' + (inst.pending ? '  [probe pending]' : '') + '\n' + snap.instructions;
+// ---- lessons: one spawn per lesson call, one spawn per PROCESS for the banner --------
+function runLessons(cliArgs) {
+  return new Promise(function (resolve) {
+    // PYTHONIOENCODING pins stdout to UTF-8 (the lesson text is Chinese on this host).
+    const env = Object.assign({}, process.env, { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' });
+    execFile(PYTHON_BIN, [LESSONS_PY].concat(cliArgs),
+      { encoding: 'utf8', timeout: LESSONS_TIMEOUT_MS, windowsHide: true, maxBuffer: 16 * 1024 * 1024, env: env },
+      function (err, stdout, stderr) {
+        const raw = (stdout === undefined || stdout === null) ? '' : String(stdout);
+        let parsed = null;
+        try { const t = raw.trim(); if (t) parsed = JSON.parse(t); } catch (e) { parsed = null; }
+        resolve({
+          parsed: parsed,
+          exitCode: (err && typeof err.code === 'number') ? err.code : (err ? 1 : 0),
+          error: err ? String(err.message || err) : null,
+          stdout: raw,
+          stderr: (stderr === undefined || stderr === null) ? '' : String(stderr)
+        });
+      });
+  });
+}
+// The frozen CLI mapping: tool arguments -> tools/lessons.py argv.
+function lessonCliArgs(name, args) {
+  args = args || {};
+  const v = function (k) { return (args[k] === undefined || args[k] === null) ? null : String(args[k]); };
+  if (name === 'list_lessons') return ['list'].concat(args.includeDisabled ? ['--include-disabled'] : []);
+  if (name === 'export_lessons') return ['export'].concat(args.includeDisabled ? ['--include-disabled'] : []);
+  if (name === 'delete_lesson') return ['delete', '--id', v('id') === null ? '' : v('id')];
+  if (name === 'import_lessons_md') return ['import-md', '--path', v('path') === null ? '' : v('path')].concat(args.dryRun ? ['--dry-run'] : []);
+  if (name === 'add_lesson') {
+    const a = ['add'];
+    for (const k of ['id', 'scenario', 'trap', 'do', 'scope']) { const x = v(k); if (x !== null) a.push('--' + k, x); }
+    if (args.enabled !== undefined) a.push('--enabled', args.enabled ? '1' : '0');
+    return a;
   }
-  const mm = snap.versionToolCountMismatch ? '  MISMATCH contract-declares=' + snap.contractDeclaredToolCount + ' snapshot=' + snap.tools.length : '';
-  const head = 'PRODUCT vb6mcp-hub ' + SERVER.version + '  BRIDGE-TO vb6-mcp ' + snap.contractVersion + '  TOOLS ' + snap.tools.length + '  (faceSource=snapshot; no IDE online)' + mm;
-  const brk = (snap.breaking && snap.breaking.length) ? snap.breaking : ['- (snapshot has no BREAKING extract; read docs/CONTRACTS.md)'];
-  return [head, 'BREAKING (read before calling):'].concat(brk).join('\n');
+  return null;
+}
+// Rendered lessons text, cached per process: initialize is frequent and must never spawn
+// python more than once per process (tools/list never touches python at all).  A FAILED
+// read is retried after LESSONS_RETRY_MS (the module may not be deployed yet).
+let lessonsCache = { text: '', ok: false, at: 0, error: null, inFlight: null };
+function lessonsText() {
+  if (lessonsCache.ok) return Promise.resolve(lessonsCache.text);
+  if (lessonsCache.error && Date.now() - lessonsCache.at < LESSONS_RETRY_MS) return Promise.resolve('');
+  if (lessonsCache.inFlight) return lessonsCache.inFlight;
+  lessonsCache.inFlight = runLessons(['instructions']).then(function (r) {
+    lessonsCache.inFlight = null;
+    lessonsCache.at = Date.now();
+    const p = r.parsed;
+    if (p && p.ok !== false && typeof p.text === 'string' && p.text.length) {
+      lessonsCache.ok = true; lessonsCache.text = p.text; lessonsCache.error = null;
+      dbg('lessons: instructions cached (' + p.text.length + ' chars)');
+    } else {
+      lessonsCache.ok = false; lessonsCache.text = '';
+      lessonsCache.error = (p && (p.error || p.message)) || r.error || String(r.stderr || '').trim() || 'lessons_cli_failed';
+      dbg('lessons: instructions UNAVAILABLE (' + lessonsCache.error + ') - initialize continues without the lessons block');
+    }
+    return lessonsCache.text;
+  }).catch(function (e) {
+    lessonsCache.inFlight = null; lessonsCache.at = Date.now();
+    lessonsCache.ok = false; lessonsCache.text = '';
+    lessonsCache.error = String(e && e.message || e);
+    return '';
+  });
+  return lessonsCache.inFlight;
+}
+// The lessons block is appended to EVERY branch and is never appended twice, so the composed
+// instructions are byte-identical whether the add-in banner already carries the block (the
+// pre-rebuild DLL still does) or not (after the move).
+function composeInstructions(base, lessons) {
+  if (!lessons) return base;
+  if (!base) return lessons;
+  const firstLine = lessons.split(/\r?\n/).filter(function (l) { return l.trim().length; })[0] || '';
+  if (firstLine && base.indexOf(firstLine) >= 0) return base;      // already carries the block
+  const nl = base.indexOf('\r\n') >= 0 ? '\r\n' : '\n';
+  return base.replace(/[\r\n]+$/, '') + nl + nl + lessons;
+}
+// tools/call result keys stay EXACTLY {content,isError}; the lesson JSON goes into the body
+// (with the usual mcp stamp) and {"ok":false} maps to isError.
+function lessonsResult(obj, contract) {
+  return { content: [{ type: 'text', text: bodyOf(obj, null, contract) }], isError: !!(obj && obj.ok === false) };
+}
+// `echo` carries the control-plane provenance of the request (r-a/r-b: lessons are GLOBAL;
+// _target never routes them, and a supplied target is echoed back rather than silently dropped).
+async function lessonsTool(name, args, contract, echo) {
+  const cliArgs = lessonCliArgs(name, args);
+  const r = await runLessons(cliArgs);
+  const p = r.parsed;
+  const pre = echo || {};
+  if (p && typeof p === 'object' && !Array.isArray(p)) return lessonsResult(Object.assign({}, pre, p), contract);
+  return lessonsResult(Object.assign({}, pre, {
+    ok: false, reason: 'lessons_cli_failed', tool: name,
+    cli: [PYTHON_BIN, LESSONS_PY].concat(cliArgs),
+    exitCode: r.exitCode, error: r.error,
+    stdout: r.stdout.slice(0, 2000), stderr: r.stderr.slice(0, 2000),
+    hint: 'tools/lessons.py must print exactly ONE JSON object on stdout; non-zero exit + {"ok":false,...} is the documented failure report'
+  }), contract);
+}
+
+async function buildInstructions(d, snap) {
+  const inst = d.instances.length ? d.instances[0] : null;
+  let base;
+  if (inst && inst.instructions) {
+    base = inst.instructions;
+  } else if (inst && snap.instructions) {
+    const n = (inst.liveTools && inst.liveTools.length) || snap.tools.length;
+    base = 'PRODUCT vb6mcp-hub ' + SERVER.version + '  BRIDGE-TO vb6-mcp ' + snap.contractVersion + '  TOOLS ' + n + '  (faceSource=live; add-in sent no instructions)' + (inst.pending ? '  [probe pending]' : '') + '\n' + snap.instructions;
+  } else {
+    const mm = snap.versionToolCountMismatch ? '  MISMATCH contract-declares=' + snap.contractDeclaredToolCount + ' snapshot=' + snap.tools.length : '';
+    const head = 'PRODUCT vb6mcp-hub ' + SERVER.version + '  BRIDGE-TO vb6-mcp ' + snap.contractVersion + '  TOOLS ' + snap.tools.length + '  (faceSource=snapshot; no IDE online)' + mm;
+    const brk = (snap.breaking && snap.breaking.length) ? snap.breaking : ['- (snapshot has no BREAKING extract; read docs/CONTRACTS.md)'];
+    base = [head, 'BREAKING (read before calling):'].concat(brk).join('\n');
+  }
+  // ALWAYS append the rendered lessons text when it is non-empty.
+  return composeInstructions(base, await lessonsText());
 }
 
 // Last persisted face, used only when discovery has not answered within the grace window.
@@ -468,7 +920,7 @@ async function cachedDiscovery() {
   for (const i of c.instances) {
     // TCP-only: no netstat on a response path
     const okp = pidAlive(i.pid) && await isListening(i.port, null);
-    if (okp) checked.push(i);
+    if (okp) checked.push(localCandidate(i));
   }
   dbg('cachedDiscovery: file instances=' + c.instances.length + ' still-alive=' + checked.length);
   if (!checked.length) return null;
@@ -533,8 +985,8 @@ async function registryCandidates() {
   const s = await scanRegistry(null);
   if (s.unreadable) return null;
   if (!s.live.length && !s.stale.length) return null;
-  const out = s.live;
-  return { instances: out, conflicts: [], staleRegistry: s.stale, registryDir: s.dir,
+  const out = s.live.map(localCandidate);
+  return { instances: out, conflicts: identityConflicts(out), staleRegistry: s.stale, registryDir: s.dir,
            registryUnreadable: false, scanTruncated: false, fromRegistryCandidates: true };
 }
 async function resolveDiscovery(d) {
@@ -549,10 +1001,13 @@ async function resolveDiscovery(d) {
 async function faceState(d) {
   d = await resolveDiscovery(d);
   // A cached/persisted face must NEVER freeze a dead instance: re-validate pid + port here,
-  // on every request, before it is reported.
+  // on every request, before it is reported.  A REMOTE candidate is validated by its endpoint
+  // probe instead - its pid/port live on ANOTHER machine, so a local pid test is meaningless
+  // (a recycled remote pid must not silently drop a healthy remote IDE).
   if (d.instances && d.instances.length) {
     const alive = [];
     for (const i of d.instances) {
+      if (i.remote) { alive.push(i); continue; }
       const okp = pidAlive(i.pid) && await isListening(i.port, null);
       if (okp) alive.push(i); else dbg('faceState: dropped dead instance pid=' + i.pid + ' port=' + i.port);
     }
@@ -567,6 +1022,14 @@ async function faceState(d) {
     const onlyLive = live.filter(function (n) { return snapNames.indexOf(n) < 0; });
     diff = { onlyInSnapshot: onlySnap, onlyInLive: onlyLive, aligned: onlySnap.length === 0 && onlyLive.length === 0 };
   }
+  // ONE identity pass over the MERGED set: the same normalized path on the SAME endpoint is a
+  // conflict (VB6 forbids it); the same path on TWO endpoints is legitimate.
+  const localInsts = d.instances.filter(function (i) { return !i.remote; });
+  const remoteInsts = d.instances.filter(function (i) { return !!i.remote; });
+  const idCount = {};
+  d.instances.forEach(function (i) { const k = candidateIdentity(i); idCount[k] = (idCount[k] || 0) + 1; });
+  const conflicts = (d.conflicts || []).slice();
+  identityConflicts(d.instances).forEach(function (m) { if (conflicts.indexOf(m) < 0) conflicts.push(m); });
   return {
     // Existence comes from the registry (pid alive + port listening), NOT from
     // whether the MCP probe has answered yet.  A pending probe is still a live IDE.
@@ -583,21 +1046,30 @@ async function faceState(d) {
       probeReason: i.probeReason || null,
       startedByHub: startedByHub.has(i.pid) || !!i.startedByHub,
       discoveredBy: i.discoveredBy || 'portscan', registryFile: i.registryFile || null,
-      version: i.version || null, dllSha256: i.dllSha256 || null, pending: !!i.pending
+      version: i.version || null, dllSha256: i.dllSha256 || null, pending: !!i.pending,
+      // ---- the ONE-set identity (ADDITIVE): a remote IDE is an equal member -----------------
+      endpoint: i.endpoint || LOCAL_ENDPOINT,
+      remote: !!i.remote,
+      endpointUrl: i.endpointUrl || null,
+      targetKey: i.targetKey || null,
+      pathVia: i.pathVia || null,
+      identityConflict: (idCount[candidateIdentity(i)] || 0) > 1
     }; }),
-    conflicts: d.conflicts,
+    conflicts: conflicts,
     // Observability: WHY this face looks the way it does - how many registry
     // entries were read, how many were credible, and the stale reasons by kind.
     registrySummary: {
-      entries: (d.instances || []).length + (d.staleRegistry || []).length,
-      live: (d.instances || []).length,
+      entries: localInsts.length + (d.staleRegistry || []).length,
+      live: localInsts.length,
       stale: (d.staleRegistry || []).length,
       staleByReason: (d.staleRegistry || []).reduce(function (m, x) { const k = x.reason || 'unknown'; m[k] = (m[k] || 0) + 1; return m; }, {})
     },
     staleRegistry: d.staleRegistry || [],
     registryDir: d.registryDir || null,
     registryUnreadable: !!d.registryUnreadable,
-    selectionRule: '_target (EXPLICIT) > ide_target default > the ONLY live instance; a STALE default is ignored (never vetoes); otherwise refuse with ambiguous_target / target_mismatch (never guess)',
+    selectionRule: '_target (EXPLICIT) > ide_target default > the ONLY live instance; a STALE default is ignored (never vetoes); otherwise refuse with ambiguous_target / target_mismatch (never guess). The canonical selector is [endpoint:]projectPath; bare pid / bare NAME are legacy aliases.',
+    targetKeyRule: TARGET_KEY_RULE,
+    endpointLabels: endpointLabels(),
     target: state.target,
     liveVsSnapshot: diff,
     scanTruncated: !!d.scanTruncated,
@@ -652,7 +1124,23 @@ function resolveVb6Exe() {
   return { exe: '', source: '', tried: tried };
 }
 
-async function hubState() { return faceState(await discoverSoft(LIST_GRACE_MS)); }
+async function hubState() {
+  // ide_list is the ONE read that shows the whole set (local + configured remote endpoints).
+  // tools/list + initialize deliberately stay on the LOCAL path so a slow remote can never
+  // push the MCP handshake towards its 1s budget.
+  const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
+  const d = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
+  const st = await faceState(d);
+  if (REMOTE_ENDPOINTS.length) {
+    st.remote = {
+      configured: REMOTE_ENDPOINTS.length,
+      instances: (d.instances || []).filter(function (i) { return !!i.remote; }).length,
+      endpoints: (d.endpoints || []).map(function (e) { return Object.assign({}, e, { allowList: 'VB6MCP_REMOTES / bridge/hub_remotes.json (never discovered)' }); }),
+      configErrors: d.endpointConfigErrors || ENDPOINT_CFG_ERRORS || []
+    };
+  }
+  return st;
+}
 
 async function hubTool(name, args) {
   const snap = snapshot();
@@ -909,37 +1397,84 @@ async function toolsListResult(d) {
       catch (e) { faceTools = snap.tools; }
     }
   }
+  // Hub-provided names WIN: the add-in copy of a name the hub owns is DROPPED.  The old DLL
+  // still serves the 5 lesson tools until the rebuild, so without this rule the face would
+  // carry each of them twice (and a duplicated name breaks strict clients).
+  const merged = [];
+  const seenNames = {};
+  for (const t of hubTools().concat(faceTools || [])) {
+    if (!t || !t.name || seenNames[t.name]) continue;
+    seenNames[t.name] = true;
+    merged.push(t);
+  }
   // Strict: EXACTLY {tools}.
-  return { tools: hubTools().concat(faceTools) };
+  return { tools: merged };
 }
 
-async function handleCall(params) {
-  const name = params && params.name;
-  const argsIn = (params && params.arguments) || {};
-  const snap = snapshot();
-  if (hubToolNames().indexOf(name) >= 0) return hubTool(name, argsIn);
-  const args = Object.assign({}, argsIn);
-  const explicit = Object.prototype.hasOwnProperty.call(args, '_target') ? args._target : 'auto';
-  delete args._target;
-  const tDisc = Date.now();
-  const soft = await discoverSoft(LIST_GRACE_MS);
-  const tRes = Date.now();
-  const d = await resolveDiscovery(soft);
-  const tPick = Date.now();
-  dbg('forward phases: discoverSoft=' + (tRes - tDisc) + 'ms resolveDiscovery=' + (tPick - tRes) + 'ms instances=' + d.instances.length);
-  let pick = pickTarget(d.instances, explicit);
-  if (!pick.ok) {
-    const want = explicit === 'auto' ? state.target : explicit;
-    const dt = want ? await directTarget(want) : null;
-    if (dt) { dbg('handleCall: directTarget bypass used for ' + want + ' -> port ' + dt.port); pick = dt; }
+// The refusal body keeps EVERY legacy key (ok/reason/message/instances/conflicts) in the same
+// order and ADDS the candidate detail the path key needs (candidates[], identityConflict).
+function refusalBody(pick, insts, conflicts) {
+  const reason = pick.conflict ? 'target_conflict' : (pick.mismatch ? 'target_mismatch' : (pick.ambiguous ? 'ambiguous_target' : 'no_ide_running'));
+  const body = {
+    ok: false, reason: reason, message: pick.message,
+    instances: (insts || []).map(function (i) { return { pid: i.pid, port: i.port, project: i.project }; }),
+    conflicts: conflicts
+  };
+  // candidates[] is emitted when it carries the identity information this change adds: a
+  // multi-match refusal (the same path on one endpoint, or one NAME over several paths) and
+  // ANY refusal once remote endpoints exist.  With remotes EMPTY and no multi-match, a refusal
+  // stays byte-identical to the pre-change hub (proven in re_work/t1103).
+  const showCandidates = REMOTE_ENDPOINTS.length > 0 || !!pick.conflict;
+  if (showCandidates) {
+    if (pick.identityConflict !== undefined) body.identityConflict = !!pick.identityConflict;
+    if (pick.distinctIdentities !== undefined) body.distinctIdentities = pick.distinctIdentities;
+    if (pick.matchedCount !== undefined) body.matchedCount = pick.matchedCount;
+    body.candidates = (pick.hits && pick.hits.length) ? pick.hits : (insts || []).map(candidateBrief);
   }
-  if (!pick.ok) {
-    const reason = pick.conflict ? 'target_conflict' : (pick.mismatch ? 'target_mismatch' : (pick.ambiguous ? 'ambiguous_target' : 'no_ide_running'));
+  if (REMOTE_ENDPOINTS.length) { body.endpoints = endpointLabels(); body.targetKeyRule = TARGET_KEY_RULE; }
+  return body;
+}
+// P1b (author ruling 2026-10-14: only an endpoint-qualified key may address a remote IDE).
+// An UNQUALIFIED call is refused here - it is routed NOWHERE: not to the remote IDE (that silent
+// machine jump is exactly what the ruling forbids) and not to a local IDE (there is none live).
+// The body stays ACTIONABLE: it names the endpoint-qualified keys the caller may use verbatim.
+function remoteRequiresEndpointBody(remoteInsts, conflicts) {
+  const keys = [];
+  for (const i of remoteInsts) { const k = i.targetKey; if (k && keys.indexOf(k) < 0) keys.push(k); }
+  const labels = [];
+  for (const i of remoteInsts) { const l = i.endpoint || 'remote'; if (labels.indexOf(l) < 0) labels.push(l); }
+  const example = keys.length ? keys[0] : (labels.length ? labels[0] : 'remote');
+  return {
+    ok: false,
+    reason: 'remote_requires_explicit_endpoint',
+    message: 'no LOCAL IDE is live; the only live IDE(s) are on remote endpoint(s) ' + labels.join(', ')
+      + ' -- an UNQUALIFIED call is never auto-routed to a remote IDE, so this call was routed NOWHERE',
+    qualifiedKeys: keys,
+    remoteEndpoints: labels,
+    hint: 'pass _target="' + example + '" (or set ide_target{target:"' + example + '"}) to address that remote IDE explicitly; '
+      + 'a live LOCAL IDE is still selected automatically, and a bare pid / bare project NAME only ever addresses THIS machine',
+    instances: (remoteInsts || []).map(function (i) { return { pid: i.pid, port: i.port, project: i.project }; }),
+    conflicts: conflicts || [],
+    candidates: (remoteInsts || []).map(candidateBrief),
+    routed: false,
+    endpoints: endpointLabels(),
+    targetKeyRule: TARGET_KEY_RULE
+  };
+}
+// The ONLY forward path: local goes to 127.0.0.1:<port> over the same wire the hub always used;
+// remote goes to the endpoint URL.  Per-endpoint timeout + per-endpoint probe single-flight
+// means a slow remote can never stall a local call.
+async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
+  // r-c (PROTOCOL SYMMETRY): a lesson method must NEVER be served by an endpoint.  Normal
+  // dispatch serves them at the control plane before routing is considered, so reaching this
+  // point is a protocol violation - fail STRUCTURALLY and never create a per-machine copy of
+  // the store (that is the rule that prevents knowledge divergence between machines).
+  if (lessonCliArgs(name, args)) {
     return stampBody({ content: [{ type: 'text', text: JSON.stringify({
-      ok: false, reason: reason, message: pick.message,
-      instances: d.instances.map(function (i) { return { pid: i.pid, port: i.port, project: i.project }; }),
-      conflicts: d.conflicts
-    }, null, 2) }], isError: false }, null, snap.contractVersion);
+      ok: false, reason: 'global_state_is_control_plane_only', tool: name,
+      endpoint: pick.endpoint || (pick.remote ? 'remote' : LOCAL_ENDPOINT), remote: !!pick.remote,
+      message: 'lesson tools read/write the SINGLE control-plane store (mcp_lessons/); an endpoint must never serve them and must never create a local copy of that store'
+    }, null, 2) }], isError: true }, null, snap.contractVersion);
   }
   const pickNote = {};
   if (pick.selectedBy) pickNote.selectedBy = pick.selectedBy;
@@ -948,24 +1483,141 @@ async function handleCall(params) {
     pickNote.staleTargetIgnored = true;
     pickNote.targetNote = 'the default ide_target "' + pick.staleTarget + '" points at no live instance (treated as unset, NOT rewritten); selected the only live instance ' + pick.port + '/' + (pick.project || '?') + ' -- clear it with ide_target{auto} if it is stale';
   }
+  const isRemote = !!pick.remote;
+  if (isRemote) { pickNote.remote = true; pickNote.endpoint = pick.endpoint; pickNote.endpointUrl = pick.endpointUrl; }
+  if (pick.matchedBy === 'project_path') {
+    pickNote.targetKey = pick.targetKey;
+    pickNote.targetNormalized = { from: pick.matchedFrom || rawRequest || null, to: pick.projectPath, endpoint: pick.endpoint || LOCAL_ENDPOINT, via: pick.pathVia || null, rule: TARGET_KEY_RULE };
+  }
+  const ideStamp = { pid: pick.pid, project: pick.project, port: pick.port };
+  if (isRemote) { ideStamp.endpoint = pick.endpoint; ideStamp.remote = true; }
+  const timeoutMs = isRemote ? REMOTE_FORWARD_TIMEOUT_MS : FORWARD_TIMEOUT_MS;
+  const base = isRemote ? pick.endpointUrl : ('http://127.0.0.1:' + pick.port);
   const tFwd = Date.now();
   let resp;
-  try { resp = await rpc(pick.port, 'tools/call', { name: name, arguments: args }, null); }
+  try { resp = await rpcAt(base, 'tools/call', { name: name, arguments: args }, null, timeoutMs); }
   catch (e) {
     const ms = Date.now() - tFwd;
     const isTimeout = !!(e && (e.name === 'TimeoutError' || /abort/i.test(String(e && e.message))));
-    return stampBody({ content: [{ type: 'text', text: JSON.stringify({
-      ok: false,
-      reason: isTimeout ? 'forward_timeout' : 'forward_failed',
-      message: String(e && e.message || e),
-      elapsedMs: ms,
-      budgetMs: FORWARD_TIMEOUT_MS,
-      hint: isTimeout ? 'raise VB6MCP_FORWARD_TIMEOUT_MS for legitimately long calls' : undefined
-    }) }], isError: true }, { pid: pick.pid, project: pick.project, port: pick.port }, snap.contractVersion, pickNote);
+    const errBody = { ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed', message: String(e && e.message || e), elapsedMs: ms, budgetMs: timeoutMs };
+    if (isRemote) { errBody.endpoint = pick.endpoint; errBody.endpointUrl = pick.endpointUrl; errBody.remote = true; }
+    else if (isTimeout) { errBody.hint = 'raise VB6MCP_FORWARD_TIMEOUT_MS for legitimately long calls'; }
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(errBody) }], isError: true }, ideStamp, snap.contractVersion, pickNote);
   }
-  dbg('forward phases: rpc=' + (Date.now() - tFwd) + 'ms tool=' + name + ' port=' + pick.port);
+  dbg('forward phases: rpc=' + (Date.now() - tFwd) + 'ms tool=' + name + ' ' + (isRemote ? 'endpoint=' + pick.endpoint : 'port=' + pick.port));
   const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
-  return stampBody(result, { pid: pick.pid, project: pick.project, port: pick.port }, snap.contractVersion, pickNote);
+  return stampBody(result, ideStamp, snap.contractVersion, pickNote);
+}
+
+async function handleCall(params) {
+  const name = params && params.name;
+  const argsIn = (params && params.arguments) || {};
+  const snap = snapshot();
+  // The lesson tools are declared in hub_tools.json but SERVED by the Python module (the
+  // add-in dropped them), so dispatch them before the generic hub-name branch.
+  // LESSONS ARE CONTROL-PLANE STATE (r-a/r-b): _target and ide_target have NO effect on them.
+  // A supplied target is ECHOED back so a caller is never left believing the write went to a
+  // remote machine; the call is always served HERE from the ONE local store.
+  // (r-d, deliberately NOT implemented yet: the ignored target belongs in PROVENANCE, e.g.
+  //  observed_on:"<label>"/<projectPath>, so machine-specific experience is not lost while the
+  //  store stays single.  That must not become a new inputSchema parameter in this batch.)
+  if (lessonCliArgs(name, argsIn)) {
+    const rawT = Object.prototype.hasOwnProperty.call(argsIn, '_target') ? argsIn._target : undefined;
+    const ignoredT = (rawT === undefined || rawT === null || String(rawT).trim() === '' || String(rawT).trim().toLowerCase() === 'auto') ? null : String(rawT).trim();
+    const defT = (state.target === undefined || state.target === null || state.target === '') ? null : String(state.target);
+    const echo = { globalState: true, store: 'control-plane (mcp_lessons/)', targetIgnored: ignoredT, defaultTargetIgnored: ignoredT ? null : defT };
+    if (ignoredT) {
+      echo.note = 'lessons are global control-plane state (ONE store, mcp_lessons/); the supplied _target "' + ignoredT + '" was IGNORED - the call was served locally and nothing was written to any other machine';
+    } else if (echo.defaultTargetIgnored) {
+      echo.note = 'lessons are global control-plane state (ONE store, mcp_lessons/); the default ide_target "' + echo.defaultTargetIgnored + '" does not apply to them';
+    } else {
+      echo.note = 'lessons are global control-plane state (ONE store, mcp_lessons/); endpoint targeting never applies to them';
+    }
+    return lessonsTool(name, argsIn, snap.contractVersion, echo);
+  }
+  if (hubToolNames().indexOf(name) >= 0) return hubTool(name, argsIn);
+  const args = Object.assign({}, argsIn);
+  const hasExplicit = Object.prototype.hasOwnProperty.call(argsIn, '_target') && argsIn._target !== undefined && argsIn._target !== null;
+  delete args._target;
+  // Effective request: EXPLICIT _target > ide_target default > auto.  The DEFAULT stays
+  // stale-tolerant (a vanished target never vetoes the live set); an explicit target is never
+  // silently redirected to another endpoint.
+  const defaultTarget = (state.target === undefined || state.target === null || state.target === '') ? 'auto' : String(state.target);
+  const rawRequest = hasExplicit ? String(argsIn._target) : defaultTarget;
+  const tgt = parseTarget(rawRequest);
+  const explicit = hasExplicit && tgt.kind !== 'auto';
+  const tDisc = Date.now();
+
+  if (tgt.kind === 'endpoint_unknown') {
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify({
+      ok: false, reason: 'endpoint_unknown', endpoint: tgt.label, endpoints: endpointLabels(),
+      message: 'endpoint "' + tgt.label + '" is not configured; configured endpoints: ' + endpointLabels().join(', ')
+    }, null, 2) }], isError: false }, null, snap.contractVersion);
+  }
+
+  // ---- endpoint-qualified REMOTE target: probe THAT endpoint; never fall back to local ------
+  if (tgt.kind === 'endpoint' && tgt.endpoint.remote) {
+    const t0 = Date.now();
+    const r = await probeEndpointCached(tgt.endpoint.label, REMOTE_PROBE_TIMEOUT_MS);
+    if (!r || !r.ok) {
+      const dd = r || {};
+      return stampBody({ content: [{ type: 'text', text: JSON.stringify({
+        ok: false, endpoint: tgt.endpoint.label, endpointUrl: tgt.endpoint.url, remote: true,
+        reason: dd.reason === 'endpoint_timeout' ? 'endpoint_timeout' : 'endpoint_unreachable',
+        message: dd.message || 'the endpoint did not answer',
+        elapsedMs: dd.elapsedMs === undefined ? (Date.now() - t0) : dd.elapsedMs,
+        probeTimeoutMs: dd.timeoutMs || REMOTE_PROBE_TIMEOUT_MS,
+        hint: 'a remote endpoint is only used when it is explicitly named; a local call is never redirected to it'
+      }, null, 2) }], isError: true }, null, snap.contractVersion);
+    }
+    const pickR = pickTarget([r.candidate], tgt.selector || null, { remoteScope: true, explicit: explicit });
+    if (!pickR.ok) return stampBody({ content: [{ type: 'text', text: JSON.stringify(refusalBody(pickR, [r.candidate], []), null, 2) }], isError: false }, null, snap.contractVersion);
+    return forwardPicked(pickR, name, args, snap, explicit, rawRequest);
+  }
+
+  // ---- local / unqualified -------------------------------------------------------------------
+  const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
+  const tRes = Date.now();
+  let merged = null;
+  let pick;
+  if (tgt.kind === 'endpoint') {                       // "local:<selector>"
+    pick = pickTarget(localD.instances, tgt.selector || null, { remoteScope: false, explicit: explicit });
+  } else if (tgt.kind === 'local') {                   // bare selector (path | pid | port | name)
+    pick = pickTarget(localD.instances, tgt.selector, { remoteScope: false, explicit: explicit });
+  } else if (localD.instances.length) {                // auto, LOCAL FIRST
+    pick = pickTarget(localD.instances, null, { remoteScope: false, explicit: false });
+  } else if (REMOTE_ENDPOINTS.length) {                // auto with ZERO local IDEs: LOCAL ONLY, never remote
+    // P1b (author ruling): an UNQUALIFIED call may only ever pick a LOCAL IDE.  The pre-P1b rule
+    // 6r ("else the ONLY live IDE overall") auto-targeted a lone REMOTE IDE - that silent machine
+    // jump is what this refuses.  The remote face is still PROBED here, but only so the refusal
+    // can name the endpoint-qualified keys the caller must use; nothing is routed anywhere.
+    merged = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
+    const remoteLive = merged.instances.filter(function (i) { return !!i.remote; });
+    if (remoteLive.length) {
+      dbg('handleCall: REFUSED unqualified call - 0 local IDEs, ' + remoteLive.length + ' live remote IDE(s); an endpoint-qualified key is required');
+      return stampBody({ content: [{ type: 'text', text: JSON.stringify(remoteRequiresEndpointBody(remoteLive, merged.conflicts), null, 2) }], isError: false }, null, snap.contractVersion);
+    }
+    pick = pickTarget(merged.instances, null, { remoteScope: false, explicit: false });
+  } else {
+    pick = pickTarget(localD.instances, null, { remoteScope: false, explicit: false });
+  }
+  const tPick = Date.now();
+  dbg('forward phases: discoverSoft=' + (tRes - tDisc) + 'ms resolveDiscovery=' + (tPick - tRes) + 'ms instances=' + localD.instances.length + (merged ? ' merged=' + merged.instances.length : ''));
+  // The direct-target escape hatch ("discovery is blind but the add-in is reachable") is NOT
+  // allowed to rescue a CONFLICT: a selector that matches several live IDEs on one endpoint
+  // must be reported, never silently resolved to the first registry hit (that is the exact
+  // silent pick the path key exists to prevent).
+  if (!pick.ok && !pick.conflict) {
+    const want = explicit ? (tgt.selector || null) : (state.target || null);
+    const dt = want ? await directTarget(want) : null;
+    if (dt) { dbg('handleCall: directTarget bypass used for ' + want + ' -> port ' + dt.port); pick = dt; }
+  }
+  if (!pick.ok) {
+    const insts = (merged ? merged.instances : localD.instances);
+    const cf = (merged ? merged.conflicts : localD.conflicts);
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(refusalBody(pick, insts, cf), null, 2) }], isError: false }, null, snap.contractVersion);
+  }
+  return forwardPicked(pick, name, args, snap, explicit, rawRequest);
 }
 
 function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
@@ -991,7 +1643,7 @@ async function handle(line) {
       protocolVersion: v,
       capabilities: { tools: {} },
       serverInfo: SERVER,
-      instructions: buildInstructions(await resolveDiscovery(d), snap),
+      instructions: await buildInstructions(await resolveDiscovery(d), snap),
       faceSource: st.faceSource,
       contractVersion: st.contractVersion,
       toolCount: st.toolCount
@@ -1006,6 +1658,8 @@ async function handle(line) {
 
 // Warm the discovery cache as soon as the process starts (background; never blocks a reply).
 setTimeout(function () { discover().catch(function () { }); }, 0);
+// Warm the lessons cache too, so the FIRST initialize does not pay the python spawn.
+setTimeout(function () { lessonsText().catch(function () { }); }, 0);
 
 let buf = '';
 let inFlight = 0;

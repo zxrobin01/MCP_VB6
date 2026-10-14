@@ -308,9 +308,6 @@ Private Function HandlePromptGet(ByVal obj As Object, ByVal id As Variant) As St
                "3) preview_edit, then edit_by_anchor / apply_edits - anchors, never line numbers." & vbCrLf & _
                "4) verify (IDE == DISK + lint), then build for the authoritative compile." & vbCrLf & _
                "5) project open in the IDE -> make_project; project closed -> build." & vbCrLf & vbCrLf
-        On Error Resume Next
-        text = text & Lessons.Instructions()
-        On Error GoTo 0
     ElseIf nm = "release-checklist" Then
         text = "VB6 release checklist" & vbCrLf & _
                "1) validate_code + build: the tree must compile clean." & vbCrLf & _
@@ -537,8 +534,8 @@ Private Function BuildInitializeResult(ByVal clientVersion As String) As Object
     Set d("serverInfo") = info
     ' contract v1.3.0: which tool-face contract this server implements
     d("contractVersion") = VB6MCP_CONTRACT_VERSION
-    ' Lessons are published through initialize.instructions so the agent reads
-    ' them before calling anything.
+    ' The instructions banner is published through initialize.instructions so the
+    ' agent reads it before calling anything.
     On Error Resume Next
     d("instructions") = m_tools.BuildInstructions()
     On Error GoTo 0

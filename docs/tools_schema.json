@@ -642,7 +642,7 @@
     },
     {
       "name": "write_file",
-      "description": "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits).",
+      "description": "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1598,7 +1598,7 @@
     },
     {
       "name": "write_source",
-      "description": "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE).",
+      "description": "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1916,7 +1916,7 @@
     },
     {
       "name": "dependency_graph",
-      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component.",
+      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount).",
       "inputSchema": {
         "type": "object",
         "properties": {}
@@ -1981,98 +1981,6 @@
           "text": {
             "type": "string",
             "description": "Current text to compare against the recorded fixture"
-          }
-        },
-        "required": [
-          "path"
-        ]
-      }
-    },
-    {
-      "name": "list_lessons",
-      "description": "List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "includeDisabled": {
-            "type": "boolean",
-            "description": "Include disabled lessons (default false)"
-          }
-        }
-      }
-    },
-    {
-      "name": "add_lesson",
-      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Stable lesson id (optional; auto custom-N)"
-          },
-          "scenario": {
-            "type": "string",
-            "description": "When this applies"
-          },
-          "trap": {
-            "type": "string",
-            "description": "The pitfall"
-          },
-          "do": {
-            "type": "string",
-            "description": "What to do instead"
-          },
-          "scope": {
-            "type": "string",
-            "description": "all | mcp | vb6 (optional)"
-          },
-          "enabled": {
-            "type": "boolean",
-            "description": "Enabled (default true)"
-          }
-        }
-      }
-    },
-    {
-      "name": "delete_lesson",
-      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false).",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Lesson id"
-          }
-        }
-      }
-    },
-    {
-      "name": "export_lessons",
-      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md).",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "includeDisabled": {
-            "type": "boolean",
-            "description": "Include disabled lessons (default false)"
-          }
-        }
-      }
-    },
-    {
-      "name": "import_lessons_md",
-      "description": "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Markdown file to import"
-          },
-          "dryRun": {
-            "type": "boolean",
-            "description": "Parse only, do not write (default false)"
           }
         },
         "required": [
@@ -2384,7 +2292,7 @@
     },
     {
       "name": "project_meta",
-      "description": "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept.",
+      "description": "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).",
       "inputSchema": {
         "type": "object",
         "properties": {

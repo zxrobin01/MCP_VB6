@@ -1,7 +1,7 @@
 # VB6MCP 工具总览（工具面契约沙箱）
 
-- 来源：docs/tools_schema.json（由维护者侧的快照工具从运行中的 add-in 抓取；本文件是生成物，勿手改）
-- 数量：115
+- 来源：docs/tools_schema.json（由维护者侧的快照工具从运行中的 add-in 抓取；本文件是生成物，勿手改） + bridge/hub_tools.json（hub 自有工具：ide_* 以及在 v1.11.0 迁到 tools/lessons.py 的 lessons 工具；同名时以 hub 定义为准）
+- 数量：120（快照 110 + hub 追加 10；hub 覆盖同名 0）
 
 ## 使用顺序（工具集/描述变化后，按序执行并原样回贴输出）
 
@@ -9,7 +9,7 @@
 rem 1. 抓 live 快照并重冻：需要运行中的 add-in（自有实例；--url 必须显式给出），且需先经契约广播授权
 rem --freeze 会写 docs/tools_schema.json 与冻结基线 tools/schema_baseline.json；只想预览就改用 --out 指向临时路径。
 python tools/dump_tools_schema.py --freeze --url http://127.0.0.1:<your own port>/rpc
-rem 2. 从 docs/tools_schema.json 重新生成本文件
+rem 2. 从 docs/tools_schema.json + bridge/hub_tools.json 重新生成本文件
 python tools/export_tool_catalog.py
 rem 3-4. 离线只读，可直接运行
 python tools/check_schema_baseline.py
@@ -22,7 +22,7 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 
 - `tools/schema_baseline.json` 是**冻结件**：快照默认**不写**它；只有显式 `--freeze` 才写，且必须**先经契约广播**（版本号递增 + 每个受影响方的确认）。
 - 禁止为了得到 `schema_changes=0` 就 `--freeze`——那会让基线比对退化为恒真。
-- 数据源以 `docs/tools_schema.json`（live 快照）为准；**不要**解析 `integration/CodeTools.cls`（沙箱副本会滞后，曾致数量失真）。
+- 数据源以 `docs/tools_schema.json`（live 快照）+ `bridge/hub_tools.json`（hub 自有工具）为准；**不要**解析 `integration/CodeTools.cls`（沙箱副本会滞后，曾致数量失真）。
 
 | 工具 | 说明 |
 |---|---|
@@ -54,7 +54,7 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 | activate_component | Bring a component to the front: open its code pane or designer window. |
 | list_files | List files below a directory. Returns relative paths. Skips .git/.svn/.hg/node_modules. |
 | read_file | Read a text file from disk (UTF-8 / UTF-16 / ANSI auto-detected) and return its content. |
-| write_file | Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). |
+| write_file | Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading). |
 | search_in_files | Search text or regex across files below a directory. Returns file, line number and line text for each match. |
 | save_project | Save the project and all modified components to disk. |
 | make_project | Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure). |
@@ -88,7 +88,7 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 | edit_by_anchor | Replace one uniquely-matched line by content anchor (no line numbers). Rejects if the anchor is missing or ambiguous. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here). |
 | apply_edits | Apply a batch of anchor edits atomically (any failure leaves the component unchanged). snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here). |
 | preview_edit | Return a unified-style diff for a batch of anchor edits without writing anything. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs / fallback-too-large / none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written. |
-| write_source | Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). |
+| write_source | Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading). |
 | verify | Aggregate verdict for one component: IDE==DISK + lint diagnostics + optional baseline filter. |
 | inject_trace | Insert a McpTrace call at the start of a procedure. The guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen; inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints). |
 | remove_trace | Remove a previously injected trace block; sha256 returns to the pre-injection value. The modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason="kept_by_design" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists. |
@@ -103,16 +103,11 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 | vba6_probe_plan | Ordered plan for the VBA6.DLL debug-engine probes (read-only first, writes last) with preconditions. Run only inside the IDE process. |
 | export_public_api | Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped. |
 | check_public_api | Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[]. |
-| dependency_graph | Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component. |
+| dependency_graph | Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount). |
 | purity_check | Purity classification of one component (can it go into an offline test host): reasons such as new / createobject / fileio / apideclare / shell / gui. |
 | generate_stub | Generate a compilable stub module from a component: public declarations kept verbatim, public bodies emptied, private members dropped. |
 | record_fixture | Record a deterministic sample (fixture) as raw ANSI bytes for later regression comparison. |
 | compare_fixture | Compare text against a recorded fixture: same / added / removed / firstDiffLine. |
-| list_lessons | List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state. |
-| add_lesson | Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup. |
-| delete_lesson | Remove a user lesson, or disable a shipped one (writes enabled=false). |
-| export_lessons | Export the merged lesson library as Markdown (re-importable via import_lessons_md). |
-| import_lessons_md | Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines. |
 | ext_list | List installed extension packs with enabled state, tool count and file path. |
 | ext_enable | Enable an extension pack; its tools appear in tools/list. |
 | ext_disable | Disable an extension pack; its tools disappear from tools/list. |
@@ -122,7 +117,7 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 | project_changes | Poll the IDE change journal instead of re-reading the whole model: project/component/control add, remove and rename plus component reload, each with a monotonically increasing revision. Keep the last revision and pass it as since on the next call. |
 | get_callstack | Read the engine's OWN call stack while the program is stopped at a breakpoint: for EVERY frame the project, the MODULE and the PROCEDURE name, indexed 0 (innermost) to count-1 (outermost). Closes the G1 gap (per-frame procedure name) with the same EbGetCallstackFunction call that the IDE's own Call Stack window uses. Requires break mode; otherwise returns broken=false with a note. Implementation note: the call uses the corrected machine-code thunk prototype with the frame index CLAMPED to 0..count-1; the naive ByRef-String declaration of EbGetCallstackFunction is a different, IDE-killing path and is never used. |
 | vba6_probe | Call the VBA6.DLL debug engine from inside the IDE process: EbMode / EbGetStepMode / callstack / current function / EbIsValidIdent, or (exec_probe=true) the Immediate-window executor EbExecuteLine. Read-only probes run by default; break-only probes and the executor are gated. |
-| project_meta | Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. |
+| project_meta | Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading). |
 | app_manifest | Generate or inspect an application manifest next to an exe/dll (UAC requestedExecutionLevel plus DPI awareness). Writes <path>.manifest, which Windows reads automatically for an unembedded external manifest. |
 | check_references | List the active project's references and flag any whose file is missing on disk - the classic missing-reference failure of older VB6 projects. Built-in references (VBA/VBRUN/VB) are always treated as resolved because VB6 reports a synthetic path for them. |
 | vbg_group | Read or edit a .vbg project group: list its projects (with existence flags) or add/remove one. Text level, so it works whether or not the IDE has the group open. |
@@ -141,3 +136,13 @@ python tools/mcp_strict_audit.py --url http://127.0.0.1:<your own port>/mcp
 | immediate_eval | Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:"value_not_parsed"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression). |
 | immediate_run | RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open. The statement body may also be supplied through code_file (mutually exclusive with code). |
 | ide_quiet_mode | Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:"activate"} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour. The foreground/desktop state is reported as a LIVE structured value (see desktop_probe): the handle can be 0 on a non-interactive or locked desktop and that is reported as-is, so foregroundReadable=false means the handle could not be read - never read that as "the focus was left alone". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight. |
+| ide_list | List VB6 IDE instances discovered on this machine (port scan 8766..8799 plus VB6MCP_PORT and HKCU\Software\VB6MCP\Port). Reports faceSource (live/snapshot), the snapshot contractVersion/toolCount, each instance's pid/project/port, and any conflict (two instances on one project). Read-only. |
+| ide_target | Set or clear the default IDE target used when a tools/call has no _target. target = pid / project name / "auto". Hub-local state only. |
+| ide_start | Start a VB6 IDE for the given project (.vbp). Minimal mode: needs VB6MCP_AUTOSTART_PROJECT or an explicit project plus a resolvable VB6.EXE; otherwise returns a structured not_implemented with the reason. |
+| ide_stop | Stop an IDE instance. It only stops instances started by this hub; otherwise returns a structured not_allowed with the reason. |
+| ide_restart | RECOVER a wedged IDE by stopping OUR OWN instance and starting it again on the same project. Sequence: best-effort save_project -> graceful quit_ide -> confirm the process is gone (force kill only if it will not go) -> clear our own instances/<pid>.json registry entry -> start VB6.EXE on the same .vbp -> wait for the new instance -> prove three-way readiness (add-in answers, mcp_info answers, project matches). It NEVER stops an instance below port 8767: 8766 belongs to an EXTERNAL process on this machine (discipline 107). Every path returns the same key set: {ok,restarted,stoppedPid,newPid,port,project,targetSource,ownership,refused_reason,stopConfirmed,saveAttempted,saveOk,registryCleared,lockCleared,three_way_ok,threeWay,vb6Exe,vb6ExeSource,waitMs,instances,steps,note}. |
+| list_lessons | List the VB6MCP lessons (experience library): scenario / trap / do with scope and enabled state. |
+| add_lesson | Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup. |
+| delete_lesson | Remove a user lesson, or disable a shipped one (writes enabled=false). |
+| export_lessons | Export the merged lesson library as Markdown (re-importable via import_lessons_md). |
+| import_lessons_md | Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines. |
