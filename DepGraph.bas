@@ -20,6 +20,22 @@ Private m_sp As Long
 Private m_seen As Object
 Private m_cyc As String
 
+' TASK-42 (MCP-lead-19): the whole-graph build runs under ONE wall-clock budget.
+' Default 8000 ms - well under the 60 s MCP client timeout; VB6MCP_BUDGET_MS (an
+' environment variable) overrides it for one process. Every scan loop calls
+' DepBudgetHit and, when it turns True, the builder STOPS and serialises what it
+' has: partial output with budgetExhausted/elapsedMs/stage, never a wedged IDE.
+Public Const DEP_BUDGET_DEFAULT_MS As Long = 8000
+Private Const DEP_TICK_MASK As Long = 63
+Private m_budgetMs As Long
+Private m_t0 As Long
+Private m_started As Boolean
+Private m_exhausted As Boolean
+Private m_budgetIter As Long
+Private m_stage As String
+Private m_tokenized As Long
+Private m_edgeScan As Long
+
 Public Sub DepReset()
     m_cnt = 0
     ReDim m_nm(0 To 63)
@@ -41,20 +57,130 @@ Public Sub DepAdd(ByVal name As String, ByVal text As String)
     ExtractProcs name, text
 End Sub
 
-Public Function DepGraphJson() As String
-    Dim i As Long, j As Long, out As String
-    If m_cnt = 0 Then
-        DepGraphJson = "{" & Qs("nodes") & ":[]," & Qs("edges") & ":[]," & Qs("cycles") & ":[]," & Qs("purity") & ":[]," & Qs("procNodes") & ":[]," & Qs("procEdges") & ":[]," & Qs("procCount") & ":0}"
+' ---------------------------------------------------------------------------
+' TASK-42: the budget API. ToolDependencyGraph calls DepBudgetStart once per
+' call; DepGraphJson auto-starts if a caller forgets, so a budget can never be
+' silently absent (m_budgetMs = 0 would otherwise mean "expired at once").
+' ---------------------------------------------------------------------------
+Public Sub DepBudgetStart(Optional ByVal ms As Long = 0)
+    m_budgetMs = ms
+    If m_budgetMs <= 0 Then m_budgetMs = EnvLongOr("VB6MCP_BUDGET_MS", DEP_BUDGET_DEFAULT_MS)
+    If m_budgetMs <= 0 Then m_budgetMs = DEP_BUDGET_DEFAULT_MS
+    m_t0 = TickMs()
+    m_started = True
+    m_exhausted = False
+    m_budgetIter = 0
+    m_tokenized = 0
+    m_edgeScan = 0
+    m_stage = "start"
+End Sub
+
+' True once the budget is spent. Cheap (one increment + a mask), so it is called
+' from inside every scan loop.
+Public Function DepBudgetHit() As Boolean
+    If m_exhausted Then
+        DepBudgetHit = True
         Exit Function
     End If
+    m_budgetIter = m_budgetIter + 1
+    If (m_budgetIter And DEP_TICK_MASK) <> 0 Then Exit Function
+    If (TickMs() - m_t0) >= m_budgetMs Then
+        m_exhausted = True
+        DepBudgetHit = True
+    End If
+End Function
+
+Public Sub DepSetStage(ByVal s As String)
+    m_stage = s
+End Sub
+
+' Additive receipt fragment: always present, so a caller can see the cost and
+' whether the answer is complete.
+Private Function BudgetSuffix() As String
+    If Not m_started Then DepBudgetStart 0
+    Dim e As Long
+    e = TickMs() - m_t0
+    If e < 0 Then e = 0
+    BudgetSuffix = "," & Qs("budgetExhausted") & ":" & LCase$(CStr(m_exhausted)) _
+        & "," & Qs("budgetMs") & ":" & CStr(m_budgetMs) _
+        & "," & Qs("elapsedMs") & ":" & CStr(e) _
+        & "," & Qs("stage") & ":" & Js(m_stage) _
+        & "," & Qs("tokenizedComponents") & ":" & CStr(m_tokenized) _
+        & "," & Qs("edgeScannedComponents") & ":" & CStr(m_edgeScan)
+End Function
+
+Public Function DepGraphJson() As String
+    Dim i As Long, j As Long, out As String
+    If Not m_started Then DepBudgetStart 0
+    If m_cnt = 0 Then
+        DepGraphJson = "{" & Qs("nodes") & ":[]," & Qs("edges") & ":[]," & Qs("cycles") & ":[]," & Qs("purity") & ":[]," & Qs("procNodes") & ":[]," & Qs("procEdges") & ":[]," & Qs("procCount") & ":0" & BudgetSuffix() & "}"
+        Exit Function
+    End If
+    ' TASK-42 (MCP-lead-19): ONE token pass per module, plus ONE lowercased name
+    ' table for the membership test. The component-edge phase used to call
+    ' HasTok(tk(i), LCase$(m_nm(j))) for EVERY (i,j) pair - a Like over the WHOLE
+    ' module token string, i.e. ~12,100 whole-text scans on 110 components. That is
+    ' the 60 s. Cost is now O(total tokens) dictionary lookups.
+    m_stage = "tokenize"
     Dim tk() As String
+    Dim lname() As String
     ReDim tk(0 To m_cnt)
+    ReDim lname(0 To m_cnt - 1)
+    Dim tb As Long
+    tb = 0
     For i = 0 To m_cnt - 1
         MaybePump
+        If DepBudgetHit() Then Exit For
         tk(i) = Toks(Sanitize(m_tx(i)))
+        If m_exhausted Then Exit For
+        lname(i) = LCase$(m_nm(i))
+        tb = tb + 1
+    Next
+    m_tokenized = tb
+    Dim byName As Object
+    Set byName = CreateObject("Scripting.Dictionary")
+    For j = 0 To m_cnt - 1
+        If Not byName.Exists(lname(j)) Then byName.Add lname(j), ""
+        byName(lname(j)) = CStr(byName(lname(j))) & CStr(j) & ","
     Next
     Dim adj() As Boolean
     ReDim adj(0 To m_cnt - 1, 0 To m_cnt - 1)
+    Dim lst As String, owners() As String
+    Dim oi As Long, j2 As Long
+    Dim tp As Long, sp As Long, tn As Long, tok As String
+    Dim edgeChk As Long
+    m_stage = "edges"
+    For i = 0 To tb - 1
+        MaybePump
+        If DepBudgetHit() Then Exit For
+        tn = Len(tk(i))
+        tp = 1
+        edgeChk = 0
+        Do While tp <= tn
+            sp = InStr(tp, tk(i), " ")
+            If sp = 0 Then sp = tn + 1
+            If sp > tp Then
+                edgeChk = edgeChk + 1
+                If (edgeChk And 4095) = 0 Then
+                    If DepBudgetHit() Then Exit Do
+                End If
+                tok = Mid$(tk(i), tp, sp - tp)
+                If byName.Exists(tok) Then
+                    lst = CStr(byName(tok))
+                    owners = Split(lst, ",")
+                    For j2 = 0 To UBound(owners) - 1
+                        If Len(owners(j2)) > 0 Then
+                            oi = CLng(owners(j2))
+                            If oi <> i Then adj(i, oi) = True
+                        End If
+                    Next
+                End If
+            End If
+            tp = sp + 1
+        Loop
+        m_edgeScan = m_edgeScan + 1
+        If m_exhausted Then Exit For
+    Next
     out = "{" & Qs("nodes") & ":["
     For i = 0 To m_cnt - 1
         If i > 0 Then out = out & ","
@@ -63,12 +189,14 @@ Public Function DepGraphJson() As String
     out = out & "]," & Qs("edges") & ":["
     Dim first As Boolean
     first = True
+    ' Emitted from the adjacency matrix in the ORIGINAL (i,j) order, so a complete
+    ' run is byte-identical AND a module that names a component twice still yields
+    ' exactly ONE edge (the old HasTok form was one boolean per pair).
     For i = 0 To m_cnt - 1
         For j = 0 To m_cnt - 1
             MaybePump
             If i <> j Then
-                If HasTok(tk(i), LCase$(m_nm(j))) Then
-                    adj(i, j) = True
+                If adj(i, j) Then
                     If Not first Then out = out & ","
                     first = False
                     out = out & "{" & Qs("from") & ":" & Js(m_nm(i)) & "," & Qs("to") & ":" & Js(m_nm(j)) & "}"
@@ -77,7 +205,8 @@ Public Function DepGraphJson() As String
         Next
     Next
     out = out & "]," & Qs("cycles") & ":[" & CyclesJson(adj) & "]," & Qs("purity") & ":["
-    For i = 0 To m_cnt - 1
+    m_stage = "purity"
+    For i = 0 To tb - 1
         If i > 0 Then out = out & ","
         out = out & "{" & Qs("name") & ":" & Js(m_nm(i)) & "," & Qs("pure") & ":" & LCase$(CStr(PurityOf(tk(i))))
         out = out & "," & Qs("reasons") & ":[" & ReasonsJson(tk(i)) & "]}"
@@ -86,6 +215,7 @@ Public Function DepGraphJson() As String
     out = out & Qs("procNodes") & ":[" & ProcNodesJson() & "],"
     out = out & Qs("procEdges") & ":[" & ProcEdgesJson() & "],"
     out = out & Qs("procCount") & ":" & CStr(m_pcnt)
+    out = out & BudgetSuffix()
     out = out & "}"
     DepGraphJson = out
 End Function
@@ -118,6 +248,9 @@ Private Sub ExtractProcs(ByVal comp As String, ByVal text As String)
     pStart = -1
     For i = 0 To UBound(lines)
         MaybePump
+        If (i And 255) = 0 Then
+            If DepBudgetHit() Then Exit For
+        End If
         low = LCase$(Trim$(lines(i)))
         If Not inProc Then
             If ProcHeaderName(low, nm) Then
@@ -238,12 +371,15 @@ Private Function ProcEdgesJson() As String
     Next
     out = ""
     first = True
+    m_stage = "procEdges"
     For i = 0 To m_pcnt - 1
         MaybePump
+        If DepBudgetHit() Then Exit For
         body = m_pb(i)
         nl = InStr(body, vbLf)
         If nl > 0 Then body = Mid$(body, nl + 1)
         tkStr = Toks(Sanitize(body))
+        If m_exhausted Then Exit For
         parts = Split(tkStr, " ")
         For k = 0 To UBound(parts)
             key = parts(k)
@@ -292,6 +428,7 @@ End Function
 
 Private Function CyclesJson(ByRef adj() As Boolean) As String
     Dim i As Long
+    m_stage = "cycles"
     m_cyc = ""
     Set m_seen = CreateObject("Scripting.Dictionary")
     ReDim m_color(0 To m_cnt - 1)
@@ -299,6 +436,7 @@ Private Function CyclesJson(ByRef adj() As Boolean) As String
     m_sp = 0
     For i = 0 To m_cnt - 1
         MaybePump
+        If DepBudgetHit() Then Exit For
         If m_color(i) = 0 Then DfsV i, adj
     Next
     CyclesJson = m_cyc
@@ -311,6 +449,7 @@ Private Sub DfsV(ByVal v As Long, ByRef adj() As Boolean)
     m_sp = m_sp + 1
     For w = 0 To m_cnt - 1
         MaybePump
+        If DepBudgetHit() Then Exit Sub
         If adj(v, w) Then
             If m_color(w) = 1 Then
                 AddCycle w
@@ -356,6 +495,14 @@ Private Function Toks(ByVal s As String) As String
     buf = String$(n, " ")
     For i = 1 To n
         MaybePump
+        ' TASK-42: one huge module must not be able to overrun the budget on its own,
+        ' so the character loop is a budget point (every 8192 characters).
+        If (i And 8191) = 0 Then
+            If DepBudgetHit() Then
+                Toks = Left$(buf, i - 1)
+                Exit Function
+            End If
+        End If
         ch = Mid$(s, i, 1)
         If (ch >= "a" And ch <= "z") Or (ch >= "0" And ch <= "9") Or ch = "_" Then
             Mid$(buf, i, 1) = ch
@@ -380,6 +527,12 @@ Private Function Sanitize(ByVal s As String) As String
     i = 1
     Do While i <= n
         MaybePump
+        If (i And 8191) = 0 Then
+            If DepBudgetHit() Then
+                Sanitize = LCase$(Left$(buf, o))
+                Exit Function
+            End If
+        End If
         ch = Mid$(s, i, 1)
         If ch = """" Then
             inS = Not inS

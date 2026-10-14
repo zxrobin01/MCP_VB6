@@ -1,4 +1,27 @@
-"""Comprehensive tool test battery against the live VB6MCP add-in."""
+"""Comprehensive tool test battery against the live VB6MCP add-in.
+
+WHAT IT NEEDS
+  * a LIVE, OWNED VB6 IDE whose add-in port is passed as argv[1] (default 8766).
+    NEVER point it at 8766 when 8766 belongs to another process/project - start your
+    own IDE on 8767 or above.
+  * the IDE in DESIGN state. No particular starting project is required: the first
+    call is add_project, which REPLACES whatever is open (VBProjects.Add with
+    Exclusive=True) with a fresh StandardExe, so the battery builds its own fixture.
+
+WHAT IT CREATES / WRITES
+  * a project named 工程1 (the IDE's default new-project name) whose components are
+    the built-in Form1 plus a class TestCls1 and a module TestMod1 that add_component
+    creates and rename_component later turns into TestModRenamed.
+  * it calls save_project({path: <repo root>/_test_proj.vbp}): the scratch project at
+    the repo root is this battery's OUTPUT (the public tree does not ship it), and the
+    battery also writes <repo root>/_test_export.bas and <repo root>/_mcp_test.txt.
+  * it starts and stops the program (run / break / restart / full_compile cycles), so
+    the instance must be disposable and owned by the caller.
+
+EXIT CODE
+  * 0 when every check passed, 1 when any check failed, so a caller/CI can branch.
+  * stdout keeps its original format: one line per check, then the totals.
+"""
 import json
 import os
 import sys
@@ -86,9 +109,17 @@ t("replace_code", {"name": "TestMod1", "operation": "insert",
                    "start_line": 1,
                    "code": "' header comment line"},
   expect='"insertedLines":1')
+# Contract v1.8.0 made expected_sha256 REQUIRED for replace/delete; without it the
+# add-in answers a structured {ok:false, reason:"expected_sha256_required",
+# currentSha256:...} refusal. Fetch the CURRENT pane hash from get_component_code
+# first and pass it, so this case still exercises a REAL replace and its
+# replacedLines receipt instead of testing a refusal.
+_ok, _code = call_tool("get_component_code", {"name": "TestMod1"})
+_mod_sha = json.loads(_code).get("textSha256", "")
 t("replace_code", {"name": "TestMod1", "operation": "replace",
                    "start_line": 2, "end_line": 2,
-                   "code": "' replaced comment"},
+                   "code": "' replaced comment",
+                   "expected_sha256": _mod_sha},
   expect='"replacedLines"')
 t("add_code", {"component": "TestMod1",
                "code": "Public Function SubOne(ByVal n As Long) As Long\r\n    SubOne = n - 1\r\nEnd Function"},
@@ -230,3 +261,6 @@ print("结果: 通过 %d, 失败 %d" % (PASS, FAIL))
 if FAILED_NAMES:
     print("失败项:", ", ".join(FAILED_NAMES))
 print("=" * 78)
+# Packaging gap: the old script always exited 0, so a caller could not tell a green
+# run from a red one. stdout format is unchanged - only the exit code is.
+sys.exit(1 if FAIL else 0)

@@ -56,6 +56,13 @@ const REMOTE_FORWARD_TIMEOUT_MS = parseInt(process.env.VB6MCP_REMOTE_FORWARD_TIM
 const REMOTE_TTL_MS = parseInt(process.env.VB6MCP_REMOTE_TTL_MS || String(DISCOVERY_TTL_MS), 10);
 const REMOTE_GRACE_MS = parseInt(process.env.VB6MCP_REMOTE_GRACE_MS || '1500', 10);
 // The canonical identity rule, restated VERBATIM in every receipt that uses it.
+// ---- forward-failure classification (ADDITIVE; MCP-lead-21(3), evidence MCP-lead-19/-20) -----
+// After a wedge the add-in still LISTENS, so a forwarded call fails in 1-68 ms with
+// "forward_failed / fetch failed" - which reads like "the tool does not exist" or "the
+// parameter is wrong", while the truth is a host that is there but not answering.
+// failureKind turns that into a MACHINE decision; the legacy `reason` values never change.
+// The rule is restated VERBATIM in every receipt that uses it (same convention as TARGET_KEY_RULE).
+const FAILURE_KIND_RULE = 'failureKind = noIde (there is nothing to talk to: no live IDE, no route - unqualified call / unknown or unreachable endpoint, or the peer refused the connection) | wedged (a peer WAS found and did not answer: discovery saw it but the probe failed, or the forward timed out / the connection died mid-call - RemoteDisconnected) | toolError (the add-in ANSWERED with a structured error: a JSON-RPC error, result.isError=true, or an ok:false body). The legacy reason values are unchanged; failureKind is additive and is NOT injected when the add-in already classified the failure itself (e.g. desktop_probe failureKind=api_unavailable).';
 const TARGET_KEY_RULE = 'target key = [endpoint:]projectPath; endpoint omitted = local. Bare pid / bare project NAME stay accepted as LEGACY aliases and are never reported as the canonical key. Normalization: case-insensitive, "/" -> "\\", duplicate + trailing separators trimmed; a LOCAL path is additionally fs.realpathSync.native when the file exists; a REMOTE path is string-normalized only, because the endpoint marker is what disambiguates two machines holding the same path. The same normalized path on ONE endpoint is a conflict (VB6 cannot open the same .vbp twice); the same path on TWO endpoints is NOT a conflict.';
 function readEndpointConfig() {
   const out = [], errors = [];
@@ -151,9 +158,14 @@ function candidateIdentity(c) {
 function localCandidate(i) {
   const cp = canonicalProjectPath(i.projectPath || '', false);
   const ppath = cp.path || null;
+  // projectPathAsGiven (ADDITIVE): the spelling the REGISTRY published, next to the canonical
+  // realpath.  On this machine the same .vbp is published through junctions
+  // (a directory junction that is an alias of the same real directory), so the alias is real information the caller
+  // needs to see, not noise to be swallowed by normalization.
   return Object.assign({}, i, {
     endpoint: LOCAL_ENDPOINT, remote: false, endpointUrl: null,
     projectPath: ppath, pathKey: cp.key, pathVia: cp.via,
+    projectPathAsGiven: i.projectPath || null,
     targetKey: LOCAL_ENDPOINT + ':' + (ppath || ('pid=' + i.pid))
   });
 }
@@ -453,6 +465,7 @@ async function probeRemoteEndpoint(ep, timeoutMs) {
     endpoint: ep.label, remote: true, endpointUrl: url, note: ep.note,
     pid: pid, pids: pid ? [pid] : [], port: port, project: project || null,
     projectPath: cp.path || null, pathKey: cp.key, pathVia: cp.via,
+    projectPathAsGiven: rawPath || null,
     targetKey: ep.label + ':' + (cp.path || ('pid=' + pid)),
     discoveredBy: 'remote_probe', probeStatus: 'ok', pending: false,
     liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools,
@@ -677,6 +690,94 @@ function candidateDesc(insts, isRemoteScope) {
 function candidateBrief(i) {
   return { pid: i.pid, port: i.port, project: i.project, projectPath: i.projectPath || null,
            endpoint: i.endpoint || LOCAL_ENDPOINT, remote: !!i.remote, targetKey: i.targetKey || null };
+}
+// ---- caller-spelling (ALIAS) echo for ide_list (MCP-lead-22(3)) -----------------------------
+// VB6 refuses to open the same .vbp twice, so ONE project can be spelled several ways: through
+// a directory junction that is an alias of the same real directory, through the junction's
+// target, with "/" instead of "\", with different case, or with an 8.3
+// name.  The hub normalizes ALL of them to ONE identity (realpathSync.native) - and then the
+// RECEIPT hides which spelling the caller actually used.  ide_list now echoes it back next to
+// the canonical path, so "the same project under three aliases" is visible instead of having to
+// be re-derived.  A spelling is echoed when it resolves to a discovered candidate:
+//   * project_path   - the canonical path key is equal (any separator/case/8.3/junction form);
+//   * alias_directory- the spelling is an existing DIRECTORY and the candidate's realpath
+//                      project path lives under it (that is exactly what a junction dir is);
+//   * project_name   - the legacy bare-NAME alias.
+// A bare pid/port is an address, not a project alias, and is deliberately NOT echoed.
+const ALIAS_RULE = 'aliasAsGiven/projectPathAsGiven are ADDITIVE echoes, not selectors: projectPathReal (projectPath) is the canonical identity (realpathSync.native, MCP-lead-22(3)); projectPathAsGiven is the spelling the registry/probe PUBLISHED; aliasAsGiven is the caller-supplied spelling (_target / ide_target default) that resolves to the SAME candidate - by canonical path key, or as an existing directory that realpath-contains the project (a junction alias). Junction/alias spellings of one .vbp are ONE candidate, never a conflict.';
+function callerSpellings(rawTarget) {
+  const out = [];
+  const push = function (v, source) {
+    if (v === undefined || v === null) return;
+    if (Array.isArray(v)) { for (const x of v) push(x, source); return; }
+    const s = String(v).trim();
+    if (!s || s.toLowerCase() === 'auto') return;
+    if (out.some(function (x) { return x.asGiven === s && x.source === source; })) return;
+    out.push({ asGiven: s, source: source });
+  };
+  push(rawTarget, '_target');
+  push(state.target, 'ide_target');
+  return out;
+}
+// Does ONE caller spelling resolve to ONE candidate?  Returns null (not this candidate) or the
+// matchedBy evidence.  The endpoint scope is honoured: a bare spelling only ever addresses THIS
+// machine, and an endpoint-qualified spelling only its own endpoint.
+function aliasHitFor(sp, inst) {
+  const t = sp.target;
+  if (!t || t.kind === 'endpoint_unknown') return null;
+  if (t.kind === 'endpoint') {
+    const ep = String(inst.endpoint || LOCAL_ENDPOINT).toLowerCase();
+    if (ep !== String(t.endpoint.label).toLowerCase()) return null;
+  } else if (inst.remote) return null;
+  const sel = String(t.selector || '');
+  if (!sel) return null;
+  const cp = canonicalProjectPath(sel, t.kind === 'endpoint' ? !!t.endpoint.remote : false);
+  if (cp.key && inst.pathKey && cp.key === inst.pathKey) return { matchedBy: 'project_path', via: cp.via, normalized: cp.path };
+  if (cp.path && inst.projectPath) {
+    const dir = normalizePathString(cp.path).toLowerCase().replace(/\\+$/, '') + '\\';
+    const proj = normalizePathString(inst.projectPath).toLowerCase();
+    if (proj.indexOf(dir) === 0) return { matchedBy: 'alias_directory', via: cp.via, normalized: cp.path };
+  }
+  if (inst.project && String(inst.project) === sel) return { matchedBy: 'project_name', via: 'string', normalized: sel };
+  return null;
+}
+// The receipt-level echo: EVERY spelling the caller supplied, what it resolved to, and whether
+// all of them land on the SAME candidate (that is the property the caller needs to see).
+function buildAliasEcho(spellings, insts) {
+  const supplied = [];
+  const candidates = new Map();
+  for (const sp of spellings || []) {
+    const t = parseTarget(sp.asGiven);
+    const row = { asGiven: sp.asGiven, source: sp.source, targetKind: t.kind };
+    if (t.kind === 'auto') { row.matched = 0; row.reason = 'auto'; supplied.push(row); continue; }
+    if (t.kind === 'endpoint_unknown') { row.matched = 0; row.reason = 'endpoint_unknown'; row.endpoint = t.label; supplied.push(row); continue; }
+    if (t.kind === 'endpoint') { row.endpoint = t.endpoint.label; row.remote = !!t.endpoint.remote; }
+    const hits = [];
+    for (const i of (insts || [])) {
+      const h = aliasHitFor(Object.assign({}, sp, { target: t }), i);
+      if (h) hits.push(Object.assign({ pid: i.pid, port: i.port, project: i.project, projectPathReal: i.projectPath || null,
+                                       endpoint: i.endpoint || LOCAL_ENDPOINT, remote: !!i.remote, targetKey: i.targetKey || null,
+                                       projectPathAsGiven: i.projectPathAsGiven || null }, h));
+    }
+    row.matched = hits.length;
+    row.matches = hits;
+    row.sameCandidate = hits.length === 1;
+    if (!hits.length) row.reason = 'no_match';
+    if (hits.length === 1) {
+      row.normalized = hits[0].normalized; row.via = hits[0].via; row.matchedBy = hits[0].matchedBy;
+      row.projectPathReal = hits[0].projectPathReal; row.resolvedPid = hits[0].pid; row.resolvedPort = hits[0].port;
+      candidates.set(hits[0].endpoint + '\u0000' + String(hits[0].pid) + '\u0000' + String(hits[0].port), { pid: hits[0].pid, port: hits[0].port, endpoint: hits[0].endpoint, projectPathReal: hits[0].projectPathReal });
+    }
+    supplied.push(row);
+  }
+  const sameCandidateCount = supplied.filter(function (r) { return r.sameCandidate; }).length;
+  return {
+    rule: ALIAS_RULE,
+    supplied: supplied,
+    sameCandidateCount: sameCandidateCount,
+    sameCandidate: sameCandidateCount === supplied.length && supplied.length > 0,
+    resolvedCandidates: Array.from(candidates.values())
+  };
 }
 // Selection inside ONE endpoint scope.  target = a resolved selector (or null); explicit =
 // the selector came from _target (a miss is an error) vs from the ide_target DEFAULT (a miss
@@ -998,7 +1099,7 @@ async function resolveDiscovery(d) {
   dbg('resolveDiscovery: NOTHING found (snapshot fallback)');
   return { instances: [], conflicts: [], staleRegistry: [], registryDir: instancesDir(), registryUnreadable: false, scanTruncated: true };
 }
-async function faceState(d) {
+async function faceState(d, spellings) {
   d = await resolveDiscovery(d);
   // A cached/persisted face must NEVER freeze a dead instance: re-validate pid + port here,
   // on every request, before it is reported.  A REMOTE candidate is validated by its endpoint
@@ -1030,6 +1131,17 @@ async function faceState(d) {
   d.instances.forEach(function (i) { const k = candidateIdentity(i); idCount[k] = (idCount[k] || 0) + 1; });
   const conflicts = (d.conflicts || []).slice();
   identityConflicts(d.instances).forEach(function (m) { if (conflicts.indexOf(m) < 0) conflicts.push(m); });
+  // ---- caller-spelling (alias) echo ----------------------------------------------------------
+  // Per instance: the caller's spelling FIRST, then every spelling that lands on it.
+  const aliasEcho = buildAliasEcho(spellings || [], d.instances);
+  const aliasPerInstance = d.instances.map(function () { return []; });
+  (aliasEcho.supplied || []).forEach(function (row) {
+    if (!row.sameCandidate) return;
+    d.instances.forEach(function (i, idx) {
+      const hit = (row.matches || []).filter(function (m) { return m.pid === i.pid && m.port === i.port && m.endpoint === (i.endpoint || LOCAL_ENDPOINT); })[0];
+      if (hit) aliasPerInstance[idx].push({ asGiven: row.asGiven, source: row.source, matchedBy: hit.matchedBy, via: hit.via, normalized: hit.normalized });
+    });
+  });
   return {
     // Existence comes from the registry (pid alive + port listening), NOT from
     // whether the MCP probe has answered yet.  A pending probe is still a live IDE.
@@ -1038,7 +1150,7 @@ async function faceState(d) {
     toolCount: live ? live.length : snap.tools.length,
     snapshot: { contractVersion: snap.contractVersion, toolCount: snap.tools.length, generatedFrom: snap.generatedFrom,
                 contractDeclaredToolCount: snap.contractDeclaredToolCount, versionToolCountMismatch: !!snap.versionToolCountMismatch },
-    instances: d.instances.map(function (i) { return {
+    instances: d.instances.map(function (i, idx) { return {
       pid: i.pid, port: i.port, project: i.project, projectPath: i.projectPath || null, pids: i.pids,
       startedAt: i.startedAt || null,
       probeStatus: i.probeStatus || (i.pending ? 'pending' : 'ok'),
@@ -1053,6 +1165,14 @@ async function faceState(d) {
       endpointUrl: i.endpointUrl || null,
       targetKey: i.targetKey || null,
       pathVia: i.pathVia || null,
+      // ---- MCP-lead-22(3): the canonical path NEXT TO the alias spellings (ADDITIVE) ----------
+      projectPathReal: i.projectPath || null,
+      projectPathAsGiven: i.projectPathAsGiven || i.projectPath || null,
+      projectPathIsAlias: !!(i.projectPathAsGiven && normalizePathString(i.projectPathAsGiven).toLowerCase() !== String(i.projectPath || '').toLowerCase()),
+      aliasAsGiven: (aliasPerInstance[idx] && aliasPerInstance[idx].length) ? aliasPerInstance[idx][0].asGiven : null,
+      aliasSource: (aliasPerInstance[idx] && aliasPerInstance[idx].length) ? aliasPerInstance[idx][0].source : null,
+      aliasMatchedBy: (aliasPerInstance[idx] && aliasPerInstance[idx].length) ? aliasPerInstance[idx][0].matchedBy : null,
+      aliasesAsGiven: (aliasPerInstance[idx] || []).map(function (a) { return a.asGiven; }),
       identityConflict: (idCount[candidateIdentity(i)] || 0) > 1
     }; }),
     conflicts: conflicts,
@@ -1069,6 +1189,8 @@ async function faceState(d) {
     registryUnreadable: !!d.registryUnreadable,
     selectionRule: '_target (EXPLICIT) > ide_target default > the ONLY live instance; a STALE default is ignored (never vetoes); otherwise refuse with ambiguous_target / target_mismatch (never guess). The canonical selector is [endpoint:]projectPath; bare pid / bare NAME are legacy aliases.',
     targetKeyRule: TARGET_KEY_RULE,
+    aliasEcho: aliasEcho,
+    failureKindRule: FAILURE_KIND_RULE,
     endpointLabels: endpointLabels(),
     target: state.target,
     liveVsSnapshot: diff,
@@ -1124,13 +1246,16 @@ function resolveVb6Exe() {
   return { exe: '', source: '', tried: tried };
 }
 
-async function hubState() {
+async function hubState(opts) {
   // ide_list is the ONE read that shows the whole set (local + configured remote endpoints).
   // tools/list + initialize deliberately stay on the LOCAL path so a slow remote can never
   // push the MCP handshake towards its 1s budget.
   const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
   const d = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
-  const st = await faceState(d);
+  // The caller's spelling (an explicit _target on this call, else the ide_target default) is
+  // echoed back per instance (MCP-lead-22(3)); with no spelling supplied the receipt still shows
+  // projectPathAsGiven next to projectPathReal.
+  const st = await faceState(d, callerSpellings(opts && opts.requestTarget));
   if (REMOTE_ENDPOINTS.length) {
     st.remote = {
       configured: REMOTE_ENDPOINTS.length,
@@ -1144,7 +1269,7 @@ async function hubState() {
 
 async function hubTool(name, args) {
   const snap = snapshot();
-  if (name === 'ide_list') return textResult(await hubState(), snap.contractVersion);
+  if (name === 'ide_list') return textResult(await hubState({ requestTarget: args && args._target }), snap.contractVersion);
   if (name === 'ide_target') {
     const t = args && args.target;
     state.target = (t === 'auto' || t === '') ? null : t;
@@ -1411,6 +1536,43 @@ async function toolsListResult(d) {
   return { tools: merged };
 }
 
+// ---- failureKind: the machine-readable distinction of a forward failure ----------------------
+// See FAILURE_KIND_RULE.  Everything here is ADDITIVE: reason / ok / message keep their values.
+function transportFailureKind(e) {
+  if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) return 'wedged';
+  const code = String((e && (e.code || (e.cause && e.cause.code))) || '').toUpperCase();
+  const msg = String((e && (e.message || e)) || '');
+  if (/timed?\s?out|abort/i.test(msg)) return 'wedged';
+  // Only a REFUSED/failed lookup proves there is nobody there.  A reset / EPIPE / closed socket
+  // proves the opposite: something accepted the connection and then went away -> wedged.
+  if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH' || code === 'ERR_INVALID_URL') return 'noIde';
+  return 'wedged';
+}
+// A refusal means no candidate could be ROUTED to.  When every discovered candidate is a
+// failed probe (registry alive + port listening, but the add-in never answered) this is not
+// "there is no IDE" - it is the wedge MCP-lead-19/-20 described, and it is reported as wedged.
+function refusalFailureKind(insts) {
+  const live = (insts || []).filter(function (i) { return !!i && i.pending !== true; });
+  if (live.length && live.every(function (i) { return i.probeStatus === 'failed' || !!i.probeReason; })) return 'wedged';
+  return 'noIde';
+}
+function firstBodyObject(result) {
+  const c = result && result.content;
+  const txt = (Array.isArray(c) && c[0] && typeof c[0].text === 'string') ? c[0].text : null;
+  if (!txt) return null;
+  try { const j = JSON.parse(txt); return (j && typeof j === 'object' && !Array.isArray(j)) ? j : null; } catch (e) { return null; }
+}
+// Did the add-in ANSWER with a structured error?  Only then is the host known to be alive.
+function answerFailureKind(resp) {
+  if (!resp || typeof resp !== 'object') return null;
+  if (resp.error) return 'toolError';
+  const r = resp.result;
+  if (!r || typeof r !== 'object') return null;
+  if (r.isError === true) return 'toolError';
+  const obj = firstBodyObject(r);
+  if (obj && obj.ok === false) return 'toolError';
+  return null;
+}
 // The refusal body keeps EVERY legacy key (ok/reason/message/instances/conflicts) in the same
 // order and ADDS the candidate detail the path key needs (candidates[], identityConflict).
 function refusalBody(pick, insts, conflicts) {
@@ -1432,6 +1594,8 @@ function refusalBody(pick, insts, conflicts) {
     body.candidates = (pick.hits && pick.hits.length) ? pick.hits : (insts || []).map(candidateBrief);
   }
   if (REMOTE_ENDPOINTS.length) { body.endpoints = endpointLabels(); body.targetKeyRule = TARGET_KEY_RULE; }
+  body.failureKind = refusalFailureKind(insts);
+  body.failureKindRule = FAILURE_KIND_RULE;
   return body;
 }
 // P1b (author ruling 2026-10-14: only an endpoint-qualified key may address a remote IDE).
@@ -1458,7 +1622,9 @@ function remoteRequiresEndpointBody(remoteInsts, conflicts) {
     candidates: (remoteInsts || []).map(candidateBrief),
     routed: false,
     endpoints: endpointLabels(),
-    targetKeyRule: TARGET_KEY_RULE
+    targetKeyRule: TARGET_KEY_RULE,
+    failureKind: 'noIde',
+    failureKindRule: FAILURE_KIND_RULE
   };
 }
 // The ONLY forward path: local goes to 127.0.0.1:<port> over the same wire the hub always used;
@@ -1473,6 +1639,7 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
     return stampBody({ content: [{ type: 'text', text: JSON.stringify({
       ok: false, reason: 'global_state_is_control_plane_only', tool: name,
       endpoint: pick.endpoint || (pick.remote ? 'remote' : LOCAL_ENDPOINT), remote: !!pick.remote,
+      failureKind: 'toolError', failureKindRule: FAILURE_KIND_RULE,
       message: 'lesson tools read/write the SINGLE control-plane store (mcp_lessons/); an endpoint must never serve them and must never create a local copy of that store'
     }, null, 2) }], isError: true }, null, snap.contractVersion);
   }
@@ -1499,14 +1666,20 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
   catch (e) {
     const ms = Date.now() - tFwd;
     const isTimeout = !!(e && (e.name === 'TimeoutError' || /abort/i.test(String(e && e.message))));
-    const errBody = { ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed', message: String(e && e.message || e), elapsedMs: ms, budgetMs: timeoutMs };
+    const errBody = { ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed', message: String(e && e.message || e), elapsedMs: ms, budgetMs: timeoutMs,
+                      failureKind: transportFailureKind(e), failureKindRule: FAILURE_KIND_RULE };
     if (isRemote) { errBody.endpoint = pick.endpoint; errBody.endpointUrl = pick.endpointUrl; errBody.remote = true; }
     else if (isTimeout) { errBody.hint = 'raise VB6MCP_FORWARD_TIMEOUT_MS for legitimately long calls'; }
     return stampBody({ content: [{ type: 'text', text: JSON.stringify(errBody) }], isError: true }, ideStamp, snap.contractVersion, pickNote);
   }
   dbg('forward phases: rpc=' + (Date.now() - tFwd) + 'ms tool=' + name + ' ' + (isRemote ? 'endpoint=' + pick.endpoint : 'port=' + pick.port));
   const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
-  return stampBody(result, ideStamp, snap.contractVersion, pickNote);
+  // The add-in ANSWERED.  If that answer is a structured error it is toolError (the host is
+  // alive; the tool/params are the story) - injected additively, and NEVER over an envelope the
+  // add-in already classified itself (bodyOf only adds keys that are undefined).
+  const answeredKind = answerFailureKind(resp);
+  const note = answeredKind ? Object.assign({}, pickNote, { failureKind: answeredKind, failureKindRule: FAILURE_KIND_RULE }) : pickNote;
+  return stampBody(result, ideStamp, snap.contractVersion, note);
 }
 
 async function handleCall(params) {
@@ -1551,6 +1724,7 @@ async function handleCall(params) {
   if (tgt.kind === 'endpoint_unknown') {
     return stampBody({ content: [{ type: 'text', text: JSON.stringify({
       ok: false, reason: 'endpoint_unknown', endpoint: tgt.label, endpoints: endpointLabels(),
+      failureKind: 'noIde', failureKindRule: FAILURE_KIND_RULE,
       message: 'endpoint "' + tgt.label + '" is not configured; configured endpoints: ' + endpointLabels().join(', ')
     }, null, 2) }], isError: false }, null, snap.contractVersion);
   }
@@ -1561,9 +1735,13 @@ async function handleCall(params) {
     const r = await probeEndpointCached(tgt.endpoint.label, REMOTE_PROBE_TIMEOUT_MS);
     if (!r || !r.ok) {
       const dd = r || {};
+      // A remote endpoint that accepts TCP but never answers is a WEDGED peer; one that refuses
+      // the connection / cannot be resolved is simply not there.
+      const epKind = dd.reason === 'endpoint_timeout' ? 'wedged' : 'noIde';
       return stampBody({ content: [{ type: 'text', text: JSON.stringify({
         ok: false, endpoint: tgt.endpoint.label, endpointUrl: tgt.endpoint.url, remote: true,
         reason: dd.reason === 'endpoint_timeout' ? 'endpoint_timeout' : 'endpoint_unreachable',
+        failureKind: epKind, failureKindRule: FAILURE_KIND_RULE,
         message: dd.message || 'the endpoint did not answer',
         elapsedMs: dd.elapsedMs === undefined ? (Date.now() - t0) : dd.elapsedMs,
         probeTimeoutMs: dd.timeoutMs || REMOTE_PROBE_TIMEOUT_MS,

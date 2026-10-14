@@ -7,7 +7,7 @@
     "intro": "VB6MCP usage notes (read before calling tools):",
     "rules": [
       "Compile before you trust: use build (offline /make) or make_project (in-IDE) and check the result; a passing lint is not a compile.",
-      "validate_code BEFORE writing: it is a local rule engine, not the VB6 compiler, and it reports a stable ruleId + line.",
+      "validate_code BEFORE writing: it runs INSIDE the add-in (a live IDE is required - it is NOT an offline check), it is not the VB6 compiler, and it reports a stable ruleId + line.",
       "Editing is IDE-side: edit_by_anchor/apply_edits change the in-memory CodeModule; verify() reports IDE vs DISK, it does not save.",
       "make_project pins the build target and deletes the stale output first, which is what keeps VB6's Make/overwrite dialogs away.",
       "The project must be closed before rebuilding THIS add-in DLL, otherwise /make cannot overwrite the loaded DLL.",
@@ -110,6 +110,14 @@
       "scenario": "Calling the VBA6.DLL debug-engine exports to read the VB6 callstack",
       "trap": "Three separate mistakes all produce access violations that look like 'the API is unusable': (1) EbGetCallstackFunction arg5 is a POINTER (out long*), passing ByVal 0 writes to address 0; (2) frame indices are 0-BASED, so asking for frame == count walks past the list and reads [NULL+4]; (3) the out string is UTF-16 while the BSTR length is a byte count, so names come back with NULs between characters.",
       "do": "Declare arg5 ByRef Long, iterate frames 0..count-1 and clamp, and decode the name by taking every other character when NULs are present. EbGetCallstackCount only walks the list when EbMode()==2; otherwise it writes the sentinel 1."
-    }
+    },
+  {
+    "id": "vb6-err-stale-after-return",
+    "scope": "vb6",
+    "enabled": true,
+    "scenario": "VB6 add-in: a Declare-based helper (or any guarded code) ran just before you inspect Err",
+    "trap": "Err is NOT cleared by a normal return, so reading Err.Number after a successful call can see a stale or phantom error (measured: a queued 17 KB response was aborted by a phantom error 5, and a GetLastError() probe read 0 instead of 87 because the Declare epilogue clobbered the thread last-error)",
+    "do": "Never branch on Err after a normal return: only an error that ESCAPES the guarded call is a real failure. Wrap the call so its own handler reports that escaping error, clear or ignore Err unconditionally afterwards, and for Win32 last-error use Err.LastDllError (VB6 keeps it per-call) or a Toolhelp32 snapshot instead of a GetLastError() Declare."
+  }
   ]
 }

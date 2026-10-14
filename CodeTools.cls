@@ -993,9 +993,10 @@ Public Function BuildToolsListResult() As Object
 
     Dim pEa As Object
     Set pEa = CreateObject("Scripting.Dictionary")
-    Set pEa("name") = Prop("string", "Component name")
+    Set pEa("name") = Prop("string", "Component name. OMITTED or EMPTY = bounded whole-project export (TASK-42): every component is parsed under a wall-clock budget and the receipt carries per-component counts + budgetExhausted/elapsedMs, instead of scanning 110 components unbounded (MCP-lead-20).")
+    Set pEa("membersOnly") = Prop("boolean", "Light mode (default false): return only the member list (kind/name/sig) and skip the TSV spec text, which also skips a second parse of the same text. ADDITIVE (TASK-42).")
     tools.Add MakeTool("export_public_api", _
-        "Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped.", _
+        "Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped. With no name, exports every component of the project under a wall-clock budget (partial result + budgetExhausted/elapsedMs); membersOnly=true skips the spec text.", _
         SchemaWith(pEa))
 
     Dim pCa As Object
@@ -1012,8 +1013,9 @@ Public Function BuildToolsListResult() As Object
     ' treats as a defect (D-1107-04/05), and it would delete the classification P1-108 delivered.
     ' NO BEHAVIOUR CHANGE: a missing baseline was refused before and is refused now; only the
     ' DECLARATION moves (see 内部证据 section (1)).
+    Set pCa("membersOnly") = Prop("boolean", "Light mode (default false): return only the member list (kind/name/sig) of the scanned component(s) and skip the violations/added text generation. ADDITIVE (TASK-42).")
     tools.Add MakeTool("check_public_api", _
-        "Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[].", _
+        "Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[]. With no name, checks every component of the project under a wall-clock budget (per-component counts, partial result + budgetExhausted/elapsedMs); membersOnly=true skips the violations text.", _
         SchemaWith(pCa, Req("baseline")))
 
     Dim pDg As Object
@@ -2014,6 +2016,77 @@ Private Function IdeBusyBreakJson(ByVal tool As String, ByVal rawErr As String, 
 End Function
 
 ' ===========================================================================
+' TASK-53: the IDE's extensibility object model answers a DESIGN-TIME member call with
+' native VB 438 ("Object doesn't support this property or method") while the IDE is not
+' yet in an editable design state - measured 2026-10-15 on freshly started IDE instances:
+' the FIRST one or two calls after the add-in began listening raised 438 on
+' add_project / add_component / replace_code, and the SAME call succeeded immediately after
+' (audit %TEMP%\vb6mcp_audit.log 01:00:04 and 01:03:18). The raising member is inside the
+' VBIDE object model (VBProjects.Add / VBComponent.CodeModule); that add-in code path is
+' unchanged since 2026-08-28, and task-49 touched only ServerForm.frm + WinsockTransport.cls.
+'
+' WHAT IS FIXED HERE IS THE ENVELOPE, NOT THE STATE: the Fail handler had NO branch for a
+' 438, so it fell through to UnexpectedErrorJson and the caller received a bare
+' {ok:false, reason:"unexpected_error"} that is not branchable. It now answers a STRUCTURED
+' refusal carrying the RAW IDE message plus a retry hint.
+'
+' BOUNDS (all three are load-bearing):
+'   * 438 ONLY - no other VB error number is classified here;
+'   * WRITE-CLASS CALLS ONLY (IsMutatingTool) - a read that fails this way keeps the
+'     unexpected_error envelope it has always had;
+'   * it runs AFTER the MCPREASON / IDE-busy / ClassifiedRefusalJson branches, so every
+'     existing structured refusal stays byte-identical and only calls that used to answer
+'     unexpected_error can reach it.
+' It is NOT a state-based prevention guard: add_project / add_component were measured to WORK
+' in run and break mode on this build, so refusing write-class calls by IDE state would turn
+' working calls into refusals. Nothing is prevented here - only the receipt is made honest.
+' ===========================================================================
+Private Function IsIdeModelNotReadyError(ByVal tool As String, ByVal vbErr As Long, ByVal msg As String) As Boolean
+    On Error Resume Next
+    ' Native VB 438 is the primary, number-based signal.
+    If vbErr = 438 Then
+        If IsMutatingTool(tool) Then IsIdeModelNotReadyError = True
+        Exit Function
+    End If
+    ' Fallback ONLY: if the captured Err.Number was 0 (an inner handler cleared Err before the
+    ' Fail handler ran) the number test alone would miss the error this card is about. The two
+    ' known 438 texts are matched verbatim, still gated on a write-class tool.
+    If IsMutatingTool(tool) Then
+        If InStr(1, msg, "Object doesn't support this property or method", vbTextCompare) > 0 Then
+            IsIdeModelNotReadyError = True
+            Exit Function
+        End If
+        If InStr(msg, ChrW$(&H5BF9) & ChrW$(&H8C61) & ChrW$(&H4E0D) & ChrW$(&H652F) & ChrW$(&H6301) & ChrW$(&H8BE5) & ChrW$(&H5C5E) & ChrW$(&H6027) & ChrW$(&H6216) & ChrW$(&H65B9) & ChrW$(&H6CD5)) > 0 Then
+            IsIdeModelNotReadyError = True
+        End If
+    End If
+End Function
+
+' Empty string unless this is the 438-on-a-write path, so the caller keeps the byte-identical
+' unexpected_error envelope for every other error.
+Private Function IdeModelNotReadyJson(ByVal tool As String, ByVal rawErr As String, ByVal vbErr As Long) As String
+    On Error Resume Next
+    If Not IsIdeModelNotReadyError(tool, vbErr, rawErr) Then
+        IdeModelNotReadyJson = ""
+        Exit Function
+    End If
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = "ide_model_not_ready"
+    d("tool") = tool
+    ' the RAW message from the IDE is preserved verbatim - never replaced by prose
+    d("message") = rawErr
+    d("vbErrorCode") = 438
+    d("ideState") = GetIdeState()
+    d("retryHint") = "wait for the IDE to finish loading the project (or leave run/break mode), then repeat the SAME call - a freshly started IDE was measured to succeed on the very next attempt"
+    d("advice") = "the VBIDE extensibility model refused a member call while the design-time model was not yet editable; nothing here is a claim about the component or the project state, and no write was accepted"
+    d("classifiedBy") = "IdeModelNotReadyJson (native VB 438 on a write-class call)"
+    d("sideEffects") = "none: the IDE refused the member call, so this is a refusal and not a completed mutation"
+    IdeModelNotReadyJson = JsonStringify(d)
+End Function
+
+' ===========================================================================
 ' TASK-P1-066: re-entrancy gate around tool dispatch.
 '
 ' DoEvents hands the IDE message queue back, which means a NEW HTTP request can
@@ -2882,9 +2955,9 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "project_changes"
             outText = Changes.RevisionJson(JsonGetLong(args, "since", 0), JsonGetBool(args, "clear", False))
         Case "export_public_api"
-            outText = ToolExportPublicApi(JsonGetStr(args, "name"))
+            outText = ToolExportPublicApi(JsonGetStr(args, "name"), JsonGetBool(args, "membersOnly", False))
         Case "check_public_api"
-            outText = ToolCheckPublicApi(JsonGetStr(args, "name"), JsonGetStr(args, "baseline"))
+            outText = ToolCheckPublicApi(JsonGetStr(args, "name"), JsonGetStr(args, "baseline"), JsonGetBool(args, "membersOnly", False))
         Case "dependency_graph"
             outText = ToolDependencyGraph()
         Case "purity_check"
@@ -3002,6 +3075,21 @@ Fail:
     End If
     ' TASK-P1-062: structured envelope for an unexpected VB error (the tagged-guard and
     ' break-mode branches above are unchanged).
+    ' TASK-53: a native VB 438 on a WRITE-class call is answered with a STRUCTURED refusal
+    ' (reason:"ide_model_not_ready") carrying the RAW IDE message and a retry hint, instead of
+    ' the unexpected_error catch-all below. It sits AFTER the ClassifiedRefusalJson branch so
+    ' every already-classified condition is untouched, and an empty return means "not this
+    ' case" - the old envelope then stays byte-identical.
+    Dim modelRefusalJson As String
+    modelRefusalJson = IdeModelNotReadyJson(name, failMsg, failVbErr)
+    If Len(modelRefusalJson) > 0 Then
+        item("text") = StampMcp(SealedReceipt(name, modelRefusalJson))
+        content.Add item
+        Set res("content") = content
+        res("isError") = False
+        Set CallToolInner = res
+        Exit Function
+    End If
     item("text") = StampMcp(SealedReceipt(name, UnexpectedErrorJson(name, failMsg, failVbErr)))
     content.Add item
     Set res("content") = content
@@ -9483,7 +9571,23 @@ Private Function ToolControlExecution(ByVal mode As String) As String
     If m = "run" Then
         If GetIdeState() = "break" Then m = "continue"
     End If
-    If m = "run" Or m = "full_compile" Or m = "fullcompile" Or m = "restart" Then
+    ' TASK-53 (D-1107 restart): "restart" is deliberately NOT part of this pre-run FLUSH.
+    ' A restart is End + a DEFERRED Start (m_server.RequestRestart -> McpServer.ConsumeRestart
+    ' -> McpServer.DoRestart -> CodeTools.DoDeferredStart, which only clicks Start), and it is
+    ' issued exactly WHILE THE PROGRAM IS RUNNING - which is precisely when the full
+    ' save_project path below CANNOT work: in run mode the IDE refuses every source write with
+    ' the localized "permission denied", so the flush raised
+    ' "Could not save the project before running: <denied>" and the caller got
+    ' {ok:false, reason:"ide_busy_in_run_mode"} instead of the documented restartPending:true
+    ' (measured 2026-10-15; tests/battery_test.py expects restartPending).
+    ' WHERE THE PERSISTENCE GUARANTEE STILL COMES FROM (so nothing is silently lost): a
+    ' restart can only follow a run, and run/full_compile BOTH still go through this flush
+    ' (unchanged below), which writes the .vbp and every component through ToolSaveProject.
+    ' The design-time project is FROZEN while the program runs, so a restart cannot introduce
+    ' new unsaved edits - the on-disk project is already at least as new as the one being
+    ' restarted, and the deferred Start has nothing left to persist. The FileName guard below
+    ' still applies to run/full_compile exactly as before.
+    If m = "run" Or m = "full_compile" Or m = "fullcompile" Then
         ' Running an unsaved project makes VB6 pop a modal Save dialog which
         ' blocks the IDE and the MCP server. Saving only the .vbp is NOT enough:
         ' a component that has never been written to disk still makes the IDE
@@ -17819,9 +17923,12 @@ Private Function ToolDependencyGraph() As String
     Dim cm As VBIDE.CodeModule
     Dim chars As Double
     DepGraph.DepReset
+    DepGraph.DepBudgetStart 0
+    DepGraph.DepSetStage "collect"
     On Error Resume Next
     For Each comp In p.VBComponents
         MaybePump
+        If DepGraph.DepBudgetHit() Then Exit For
         Err.Clear
         Set cm = comp.CodeModule
         If Not cm Is Nothing Then
@@ -17843,17 +17950,149 @@ End Function
 
 Private Function ToolPurityCheck(ByVal name As String) As String
     DepGraph.DepReset
+    DepGraph.DepBudgetStart 0
     DepGraph.DepAdd name, CompText(name)
     ToolPurityCheck = DepGraph.DepGraphJson()
 End Function
 
-Private Function ToolExportPublicApi(ByVal name As String) As String
-    ToolExportPublicApi = ApiSig.ApiExportJson(CompText(name))
+' TASK-42 (MCP-lead-20): both public-API tools now run under the SAME wall-clock
+' budget as dependency_graph. With `name` they scan exactly that component (the
+' result is unchanged, plus additive cost fields). With NO name they used to be
+' unbounded; now they walk the components under the budget and return
+' per-component counts plus budgetExhausted/elapsedMs/stage.
+' membersOnly=true is the light mode: only members[] is produced, which also skips
+' the second CollectMembers parse that ApiExportJson/ApiSpecText pays for.
+Private Function ToolExportPublicApi(ByVal name As String, ByVal membersOnly As Boolean) As String
+    Dim t0 As Long
+    t0 = Util.TickMs()
+    Dim js As String
+    If Len(name) > 0 Then
+        If membersOnly Then
+            js = ApiSig.ApiMembersJson(CompText(name))
+        Else
+            js = ApiSig.ApiExportJson(CompText(name))
+        End If
+        ToolExportPublicApi = "{" & Q2("component") & ":" & J2(name) _
+            & "," & Q2("elapsedMs") & ":" & CStr(Util.TickMs() - t0) _
+            & "," & Q2("budgetExhausted") & ":false" _
+            & "," & Q2("membersOnly") & ":" & LCase$(CStr(membersOnly)) _
+            & "," & Mid$(js, 2)
+        Exit Function
+    End If
+    ToolExportPublicApi = ApiProjectJson(t0, membersOnly, "", False)
 End Function
 
-Private Function ToolCheckPublicApi(ByVal name As String, ByVal baseline As String) As String
+Private Function ToolCheckPublicApi(ByVal name As String, ByVal baseline As String, ByVal membersOnly As Boolean) As String
     If Len(baseline) = 0 Then Err.Raise vbObjectError + 95, "CodeTools", "baseline spec is required"
-    ToolCheckPublicApi = ApiSig.ApiDiffSpecJson(baseline, CompText(name))
+    Dim t0 As Long
+    t0 = Util.TickMs()
+    Dim js As String
+    If Len(name) > 0 Then
+        If membersOnly Then
+            js = ApiSig.ApiMembersJson(CompText(name))
+        Else
+            js = ApiSig.ApiDiffSpecJson(baseline, CompText(name))
+        End If
+        ToolCheckPublicApi = "{" & Q2("component") & ":" & J2(name) _
+            & "," & Q2("elapsedMs") & ":" & CStr(Util.TickMs() - t0) _
+            & "," & Q2("budgetExhausted") & ":false" _
+            & "," & Q2("membersOnly") & ":" & LCase$(CStr(membersOnly)) _
+            & "," & Mid$(js, 2)
+        Exit Function
+    End If
+    ToolCheckPublicApi = ApiProjectJson(t0, membersOnly, baseline, True)
+End Function
+
+' TASK-42: the BOUNDED whole-project walk shared by both tools above. It never
+' runs longer than the budget, and it always says how far it got (scanned vs
+' componentCount) plus whether it stopped early.
+Private Function ApiProjectJson(ByVal t0 As Long, ByVal membersOnly As Boolean, _
+        ByVal baseline As String, ByVal isDiff As Boolean) As String
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    Dim budgetMs As Long, elapsed As Long, scanned As Long, total As Long
+    Dim chars As Double
+    Dim exhausted As Boolean
+    budgetMs = Util.EnvLongOr("VB6MCP_BUDGET_MS", DepGraph.DEP_BUDGET_DEFAULT_MS)
+    If budgetMs <= 0 Then budgetMs = DepGraph.DEP_BUDGET_DEFAULT_MS
+    total = p.VBComponents.Count
+    Dim body As String, entry As String, tx As String
+    Dim first As Boolean
+    Dim comp As VBIDE.VBComponent
+    Dim cm As VBIDE.CodeModule
+    Dim bC As Long, aC As Long, rm As Long, cg As Long, ad As Long
+    body = ""
+    first = True
+    On Error Resume Next
+    For Each comp In p.VBComponents
+        MaybePump
+        elapsed = GetTickCount() - t0
+        If elapsed < 0 Then elapsed = 0
+        If elapsed >= budgetMs Then
+            exhausted = True
+            Exit For
+        End If
+        Err.Clear
+        Set cm = Nothing
+        Set cm = comp.CodeModule
+        tx = ""
+        If Not cm Is Nothing Then
+            If cm.CountOfLines > 0 Then tx = cm.Lines(1, cm.CountOfLines)
+        End If
+        chars = chars + Len(tx)
+        If isDiff Then
+            bC = 0
+            aC = 0
+            rm = 0
+            cg = 0
+            ad = 0
+            entry = ApiSig.ApiDiffSpecCountsJson(baseline, tx, bC, aC, rm, cg, ad)
+            entry = Q2("component") & ":" & J2(comp.Name) & "," & Q2("count") & ":" & CStr(aC) & "," & Q2("diff") & ":" & entry
+        ElseIf membersOnly Then
+            entry = ApiSig.ApiMembersJson(tx)
+            ' Mid$(entry, 2, Len(entry) - 2) drops the object's BOTH braces: the wrapper
+            ' below adds its own pair, and keeping the trailing one produced {{"..."}}
+            ' (malformed JSON, caught by the small-project regression).
+            entry = Q2("component") & ":" & J2(comp.Name) & "," & Mid$(entry, 2, Len(entry) - 2)
+        Else
+            entry = ApiSig.ApiExportJson(tx)
+            entry = Q2("component") & ":" & J2(comp.Name) & "," & Mid$(entry, 2, Len(entry) - 2)
+        End If
+        If Not first Then body = body & ","
+        first = False
+        body = body & "{" & entry & "}"
+        scanned = scanned + 1
+    Next
+    On Error GoTo 0
+    elapsed = GetTickCount() - t0
+    If elapsed < 0 Then elapsed = 0
+    If scanned >= total Then exhausted = False
+    ApiProjectJson = "{" & Q2("scope") & ":" & Q2("project") _
+        & "," & Q2("components") & ":[" & body & "]" _
+        & "," & Q2("scanned") & ":" & CStr(scanned) _
+        & "," & Q2("componentCount") & ":" & CStr(total) _
+        & "," & Q2("chars") & ":" & CStr(CLng(chars)) _
+        & "," & Q2("membersOnly") & ":" & LCase$(CStr(membersOnly)) _
+        & "," & Q2("budgetExhausted") & ":" & LCase$(CStr(exhausted)) _
+        & "," & Q2("budgetMs") & ":" & CStr(budgetMs) _
+        & "," & Q2("elapsedMs") & ":" & CStr(elapsed) _
+        & "," & Q2("stage") & ":" & Q2("project") & "}"
+End Function
+
+' TASK-42: minimal JSON string helpers for the two record builders above.
+' PRIVATE, so nothing else in this module changes.
+Private Function Q2(ByVal s As String) As String
+    Q2 = Chr$(34) & s & Chr$(34)
+End Function
+
+Private Function J2(ByVal s As String) As String
+    Dim t As String, b As String
+    b = Chr$(92)
+    t = Replace(s, b, b & b)
+    t = Replace(t, Chr$(34), b & Chr$(34))
+    t = Replace(t, vbCr, "")
+    t = Replace(t, vbLf, " ")
+    J2 = Chr$(34) & t & Chr$(34)
 End Function
 
 Private Function ToolExecutionState(ByVal pid As Long) As String

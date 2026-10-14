@@ -327,10 +327,10 @@ python tests/smoke_test.py --port 8766
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity | - |
+| `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity; the whole run is bounded by a wall-clock budget (default 8000 ms, overridable with `VB6MCP_BUDGET_MS`) and the receipt always carries `budgetExhausted`/`elapsedMs`/`stage` | - |
 | `purity_check` | Classify whether a component can enter an offline test host | `name` |
-| `export_public_api` | Freeze a component's public API into a comparable spec | `name` |
-| `check_public_api` | Compare against a frozen spec: removed, changed, added members | `baseline`, `name` |
+| `export_public_api` | Freeze a component's public API into a comparable spec; omit `name` for a bounded whole-project export | `name`, `membersOnly` |
+| `check_public_api` | Compare against a frozen spec: removed, changed, added members; omit `name` for a bounded whole-project check | `baseline`, `name`, `membersOnly` |
 | `generate_stub` | Generate a compilable stub: declarations kept, bodies emptied | `name` |
 
 ### 7. Build & delivery artifacts
@@ -464,13 +464,13 @@ running. The five lesson tools only touch a local JSON store, so they **work wit
   which may override, disable or add entries by id). The merged result is published to clients through
   `initialize.instructions`, so an agent can read it before calling any tool; `add`/`delete`/`import` write
   `user.json` with a `.bak` backup.
-- **IDE instance management**: `ide_list` scans this machine (including the conflict where two instances
+- **IDE instance management**: `ide_list` lists every VB6 IDE the hub can address: local instances (including the conflict where two instances
   hold the same project), `ide_target` remembers the default target, and `ide_start` / `ide_stop` /
-  `ide_restart` only ever act on **instances this hub started**.
+  `ide_restart` only ever act on **instances this hub started**. It also lists every configured **remote endpoint** (allow-list only, never discovered; unreachable ones are still listed with their probe status) and echoes the one-set identity (endpoint / targetKey / pathVia), the canonical real path beside the registry spelling, and the caller's alias spelling that resolves to the same identity.
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `ide_list` | List VB6 IDE instances found on this machine, plus port conflicts | - |
+| `ide_list` | List **every** VB6 IDE the hub can address: local instances plus each **configured remote endpoint** (allow-list only, never discovered; unreachable ones still listed with their probe status). Reports pid/port/project, the one-set identity (endpoint / targetKey / pathVia), the canonical real path beside the registry spelling, and echoes the caller's alias that resolves to the same identity; includes stale entries and same-identity conflicts | - |
 | `ide_target` | Set or clear the default IDE target: pid, project or auto | `target` |
 | `ide_start` | Start a VB6 IDE instance for a .vbp project | `project` |
 | `ide_stop` | Stop an IDE instance that this hub started | `pid`, `force` |

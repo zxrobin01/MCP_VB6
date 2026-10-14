@@ -35,6 +35,14 @@ Private Declare Function WsaGetCurrentProcessId Lib "kernel32" Alias "GetCurrent
 Private Const RECV_CHUNK As Long = 65536
 Private Const IDLE_TIMEOUT_SEC As Long = 30
 
+' TASK-49: in-flight request tracking, mirroring ServerForm. A socket whose request
+' is being served (or whose response is not yet fully flushed - QueueSend is
+' asynchronous and DoFlush runs on FD_WRITE) is never swept.
+Private Const IDLE_BUSY_CAP_SEC_DEF As Long = 300
+Private m_idleBusyCapSec As Long
+Private m_busy As New Collection        ' CStr(sock) -> True while its request is served
+Private m_busySince As New Collection   ' CStr(sock) -> Date the flag was set
+
 Private m_mcp As McpServer
 Private m_listen As Long
 Private m_port As Long
@@ -67,6 +75,7 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
     m_tried = ""
     m_tries = 0
     m_listening = False
+    m_idleBusyCapSec = IdleBusyCapFromEnv()
     If Not WsaStart() Then
         LogLine "winsock transport: WSAStartup failed"
         Exit Sub
@@ -94,6 +103,8 @@ Public Sub StopListening()
         WsaClose CLng(m_conns.Item(i))
     Next
     Set m_conns = New Collection
+    Set m_busy = New Collection
+    Set m_busySince = New Collection
     Set m_out = New Collection
     Set m_sendPos = New Collection
     Set m_lastActive = New Collection
@@ -199,6 +210,10 @@ Private Sub RegisterInstance()
     m_instProjectPath = ppath
     m_instSha = sha
     WriteInstanceFile WsaGetCurrentProcessId(), m_port, proj, ppath, sha, m_instStartedAt
+    ' TASK-48: a successful registration proves THIS process is alive - the right
+    ' moment to drop the registrations left behind by instances that died without
+    ' running their exit path (crash / Stop-Process -Force / taskkill).
+    PruneDeadInstanceFiles WsaGetCurrentProcessId()
 End Sub
 
 ' TASK-P1-064: the entry is published when the port comes up, which can precede VB6 opening
@@ -315,7 +330,20 @@ Private Sub DoRead(ByVal s As Long)
     Dim conn As HttpConn
     Set conn = GetConn(s)
     conn.AppendBytes b
-    If conn.Ready Then HandleRequest s, conn
+    If conn.Ready Then
+        ' TASK-49: in-flight from here until ServeRequest returns; BUSY is cleared on
+        ' BOTH paths because VB6 has no finally.
+        MarkBusy s
+        Dim serveOk As Boolean
+        serveOk = ServeRequest(s, conn)
+        ClearBusy s
+        TouchActive s
+        If Not serveOk Then
+            LogLine "winsock DoRead error #" & CStr(s) & ": " & CStr(Err.Number)
+            If Not m_mcp Is Nothing Then QueueSend s, m_mcp.BuildHttpResponse("500 Internal Server Error", "text/plain", "internal error while handling the request", "", False)
+            CloseConn s
+        End If
+    End If
     Exit Sub
 Fail:
     ' Card TASK-P1-010 root cause: this handler used to CloseConn with NO response,
@@ -323,6 +351,7 @@ Fail:
     ' the caller (a bare "closed connection without response" while the add-in stayed
     ' alive) - the shape of both the native_breakpoint comment-line incident and the
     ' reported first-RPC drop. Answer with a 500 instead of dropping the socket.
+    ClearBusy s
     LogLine "winsock DoRead error #" & CStr(s) & ": " & CStr(Err.Number)
     If Not m_mcp Is Nothing Then QueueSend s, m_mcp.BuildHttpResponse("500 Internal Server Error", "text/plain", "internal error while handling the request", "", False)
     CloseConn s
@@ -411,6 +440,7 @@ End Sub
 
 Private Sub CloseConn(ByVal s As Long)
     On Error Resume Next
+    ClearBusy s
     LogLine "winsock CloseConn " & CStr(s)
     WsaClose s
     m_conns.Remove CStr(s)
@@ -445,13 +475,90 @@ Private Function IsSseSock(ByVal s As Long) As Boolean
     Next
 End Function
 
+' TASK-49: BUSY bookkeeping (mirror of ServerForm; collection-keyed because a WSA
+' socket handle is not a 1..16 index).
+Private Sub MarkBusy(ByVal s As Long)
+    On Error Resume Next
+    If s = 0 Then Exit Sub
+    m_busy.Remove CStr(s)
+    m_busy.Add True, CStr(s)
+    m_busySince.Remove CStr(s)
+    m_busySince.Add Now, CStr(s)
+End Sub
+
+Private Sub ClearBusy(ByVal s As Long)
+    On Error Resume Next
+    m_busy.Remove CStr(s)
+    m_busySince.Remove CStr(s)
+End Sub
+
+Private Function IsBusy(ByVal s As Long) As Boolean
+    On Error Resume Next
+    Dim v As Variant
+    v = m_busy(CStr(s))
+    IsBusy = Not IsEmpty(v)
+End Function
+
+Private Function BusySince(ByVal s As Long) As Date
+    On Error Resume Next
+    BusySince = m_busySince(CStr(s))
+    If Err.Number <> 0 Then BusySince = Now
+End Function
+
+' TASK-49: is a response still waiting to be handed to the kernel? DoFlush runs on
+' FD_WRITE, so a queued response is part of the in-flight window.
+Private Function HasPendingOut(ByVal s As Long) As Boolean
+    On Error Resume Next
+    Dim pending As String
+    Dim pos As Long
+    pending = OutGet(s, pos)
+    HasPendingOut = (Len(pending) > pos)
+End Function
+
+' TASK-49: run ONE request/response serve. Same contract as the ServerForm twin: it
+' makes the BUSY clear unconditional and it reports only an error that ESCAPES
+' HandleRequest. Err is never read after a normal return (a guarded Collection.Remove
+' on a missing key leaves Err set by design - a phantom error would abort a queued reply).
+Private Function ServeRequest(ByVal s As Long, ByRef conn As HttpConn) As Boolean
+    On Error GoTo ServeFail
+    HandleRequest s, conn
+    ServeRequest = True
+    Exit Function
+ServeFail:
+    ServeRequest = False
+End Function
+
+Private Function IdleBusyCapFromEnv() As Long
+    On Error Resume Next
+    IdleBusyCapFromEnv = IDLE_BUSY_CAP_SEC_DEF
+    Dim s As String
+    s = Trim$(Environ$("VB6MCP_IDLE_BUSY_CAP_SEC"))
+    If Len(s) = 0 Then Exit Function
+    If Not IsNumeric(s) Then Exit Function
+    Dim v As Long
+    v = CLng(Val(s))
+    If v > 0 Then IdleBusyCapFromEnv = v
+End Function
+
 Private Sub SweepIdle()
     On Error Resume Next
     Dim i As Long
     For i = m_conns.Count To 1 Step -1
         Dim s As Long
         s = CLng(m_conns.Item(i))
-        If IsCloseAfterSend(s) Then
+        Dim busyF As Boolean
+        busyF = IsBusy(s) Or HasPendingOut(s)
+        If busyF Then
+            ' TASK-49: never swept while in flight. The ONLY exception is the
+            ' leaked-flag backstop, and it applies only to a flag actually SET.
+            If IsBusy(s) Then
+                If DateDiff("s", BusySince(s), Now) > m_idleBusyCapSec Then
+                    LogLine "Idle-sweep: busy slot #" & CStr(s) & " exceeded hard cap; reclaiming"
+                    ClearBusy s
+                    CloseConn s
+                End If
+            End If
+        ElseIf IsCloseAfterSend(s) Then
             If DateDiff("s", GetLastActive(s), Now) > 15 Then CloseConn s
         ElseIf Not IsSseSock(s) Then
             If DateDiff("s", GetLastActive(s), Now) > IDLE_TIMEOUT_SEC Then
@@ -620,3 +727,13 @@ Private Function QueryParam(ByVal path As String, ByVal name As String) As Strin
         End If
     Next
 End Function
+
+
+' TASK-48: belt-and-braces deregistration. StopListening already deletes our own
+' <pid>.json on a clean exit; Class_Terminate covers a teardown that skips it.
+' DeleteInstanceFile is idempotent and only ever touches OUR pid, so a double
+' delete is harmless.
+Private Sub Class_Terminate()
+    On Error Resume Next
+    DeleteInstanceFile WsaGetCurrentProcessId()
+End Sub

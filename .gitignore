@@ -30,3 +30,6 @@ __pycache__/
 *.vspscc
 Thumbs.db
 Desktop.ini
+VB6MCP.pdb
+VB6MCP.dll.prev
+bridge/hub_remotes.json

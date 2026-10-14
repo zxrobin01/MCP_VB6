@@ -71,6 +71,21 @@ Private m_instSha As String
 Private m_instStartedAt As String
 Private Const IDLE_TIMEOUT_SEC As Long = 30
 
+' TASK-49: in-flight (BUSY) request tracking. A connection whose request is being
+' SERVED must never be closed by the idle sweeper: the serve runs on this same
+' single thread, and every Util.MaybePump -> DoEvents inside a long tool call lets
+' the 5 s watchdog fire SweepIdleConnections. Before this, a call that legitimately
+' ran longer than IDLE_TIMEOUT_SEC lost its response (task-47: client EOF at
+' 32.236 s with ZERO bytes). BUSY is set only when a COMPLETE request is in hand,
+' and cleared on the OUTERMOST return of the serve, on the error path, and on every
+' teardown, so a slot can never become permanently unsweepable.
+Private m_busy(1 To MAX_CONNECTIONS) As Boolean
+Private m_busySince(1 To MAX_CONNECTIONS) As Date
+' Leaked-flag backstop: a BUSY slot older than this becomes sweepable again AND
+' logs (unlike a normal busy skip, which is silent). Overridable for testing.
+Private Const IDLE_BUSY_CAP_SEC_DEF As Long = 300
+Private m_idleBusyCapSec As Long
+
 Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Long = DEFAULT_PORT, Optional ByVal explicitPort As Boolean = False)
     Randomize
     Set m_mcp = mcp
@@ -83,6 +98,7 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
     For i = 1 To MAX_CONNECTIONS
         Load sck(i)
     Next
+    m_idleBusyCapSec = IdleBusyCapFromEnv()
     TryListen
 End Sub
 
@@ -96,6 +112,7 @@ Public Sub StopListening()
     On Error Resume Next
     sck(0).Close
     For i = 1 To MAX_CONNECTIONS
+        ClearBusy i
         sck(i).Close
     Next
     Set m_conns = Nothing
@@ -137,6 +154,10 @@ Private Sub RegisterInstance()
     m_instProjectPath = ppath
     m_instSha = sha
     WriteInstanceFile FormProcessId(), m_port, proj, ppath, sha, m_instStartedAt
+    ' TASK-48: a successful registration proves THIS process is alive - the right
+    ' moment to drop the registrations left behind by instances that died without
+    ' running their exit path (crash / Stop-Process -Force / taskkill).
+    PruneDeadInstanceFiles FormProcessId()
 End Sub
 
 ' TASK-P1-064: the registry entry is published the moment the port is up, which can be
@@ -235,7 +256,7 @@ Private Sub SweepIdleConnections()
         marked = Empty
         marked = m_closeAfterSend(CStr(i))
         If Not IsEmpty(marked) Then
-            If sck(i).State <> sckConnected Or DateDiff("s", GetLastActive(i), Now) > 15 Then
+            If (Not IsBusy(i)) And (sck(i).State <> sckConnected Or DateDiff("s", GetLastActive(i), Now) > 15) Then
                 LogLine "Force closing deferred-close socket #" & CStr(i)
                 m_closeAfterSend.Remove CStr(i)
                 CloseConn i
@@ -243,11 +264,21 @@ Private Sub SweepIdleConnections()
         End If
         If sck(i).State = sckConnected Then
             If Not IsSseIndex(i) Then
-                Dim last As Date
-                last = GetLastActive(i)
-                If DateDiff("s", last, Now) > IDLE_TIMEOUT_SEC Then
-                    LogLine "Closing idle connection #" & CStr(i)
-                    CloseConn i
+                If IsBusy(i) Then
+                    ' TASK-49: a normal busy skip is SILENT. Only the leaked-flag
+                    ' backstop logs, because it closes a socket we believe in flight.
+                    If DateDiff("s", m_busySince(i), Now) > m_idleBusyCapSec Then
+                        LogLine "Idle-sweep: busy slot #" & CStr(i) & " exceeded hard cap; reclaiming"
+                        ClearBusy i
+                        CloseConn i
+                    End If
+                Else
+                    Dim last As Date
+                    last = GetLastActive(i)
+                    If DateDiff("s", last, Now) > IDLE_TIMEOUT_SEC Then
+                        LogLine "Closing idle connection #" & CStr(i)
+                        CloseConn i
+                    End If
                 End If
             End If
         End If
@@ -261,6 +292,7 @@ End Sub
 Private Sub ResetSocket(ByVal idx As Integer)
     On Error Resume Next
     If idx <= 0 Then Exit Sub
+    ClearBusy idx
     m_conns.Remove CStr(idx)
     m_closeAfterSend.Remove CStr(idx)
     Dim k As Long
@@ -295,6 +327,58 @@ Private Sub TouchActive(ByVal idx As Integer)
     m_lastActive.Add Now, CStr(idx)
 End Sub
 
+' TASK-49: BUSY bookkeeping. MarkBusy/ClearBusy are cheap and idempotent so they can
+' be called from every teardown path; IsBusy is what the sweeper consults.
+Private Sub MarkBusy(ByVal idx As Integer)
+    On Error Resume Next
+    If idx < 1 Or idx > MAX_CONNECTIONS Then Exit Sub
+    m_busy(idx) = True
+    m_busySince(idx) = Now
+End Sub
+
+Private Sub ClearBusy(ByVal idx As Integer)
+    On Error Resume Next
+    If idx < 1 Or idx > MAX_CONNECTIONS Then Exit Sub
+    m_busy(idx) = False
+End Sub
+
+Private Function IsBusy(ByVal idx As Integer) As Boolean
+    On Error Resume Next
+    If idx < 1 Or idx > MAX_CONNECTIONS Then Exit Function
+    IsBusy = m_busy(idx)
+End Function
+
+' TASK-49: run ONE request/response serve. It exists so the caller can clear BUSY on
+' BOTH paths (VB6 has no finally) AND so an error that ESCAPES HandleRequest is still
+' reported: HandleRequest answers ordinary errors itself with a 500.
+' WHY Err IS NOT READ AFTER THIS RETURNS: MEASURED - guarded code inside the serve
+' (Collection.Remove on a missing key in MarkCloseAfterSend/TouchActive) leaves Err
+' set BY DESIGN, so a caller that inspects Err after a normal return reads a PHANTOM
+' error 5 and aborts a response that SendData had already queued.
+Private Function ServeRequest(ByVal Index As Integer, ByRef conn As HttpConn) As Boolean
+    On Error GoTo ServeFail
+    HandleRequest Index, conn
+    ServeRequest = True
+    Exit Function
+ServeFail:
+    ServeRequest = False
+End Function
+
+' TASK-49: the busy hard cap, overridable for tests (VB6MCP_IDLE_BUSY_CAP_SEC, e.g.
+' 35) so the backstop can be exercised without waiting 5 minutes. A leaked BUSY flag
+' must never be able to wedge a pool slot forever.
+Private Function IdleBusyCapFromEnv() As Long
+    On Error Resume Next
+    IdleBusyCapFromEnv = IDLE_BUSY_CAP_SEC_DEF
+    Dim s As String
+    s = Trim$(Environ$("VB6MCP_IDLE_BUSY_CAP_SEC"))
+    If Len(s) = 0 Then Exit Function
+    If Not IsNumeric(s) Then Exit Function
+    Dim v As Long
+    v = CLng(Val(s))
+    If v > 0 Then IdleBusyCapFromEnv = v
+End Function
+
 ' ---------- Winsock events ----------
 
 Private Sub sck_ConnectionRequest(Index As Integer, ByVal requestID As Long)
@@ -304,6 +388,7 @@ Private Sub sck_ConnectionRequest(Index As Integer, ByVal requestID As Long)
         For i = 1 To MAX_CONNECTIONS
             If sck(i).State = sckClosed Then
                 sck(i).Accept requestID
+                ClearBusy i
                 TouchActive i
                 ' loopback-only policy: LocalIP is read-only in MSWINSCK.OCX,
                 ' so the listener binds all interfaces; reject any peer that
@@ -339,16 +424,30 @@ Private Sub sck_DataArrival(Index As Integer, ByVal bytesTotal As Long)
     ' pipelined bytes via AdvanceToNext; /sse marks explicitly
     conn.AppendBytes b
     If conn.Ready Then
-        HandleRequest Index, conn
+        ' TASK-49: from here until the OUTERMOST return of the serve this slot is IN
+        ' FLIGHT and the idle sweeper must not touch it. VB6 has no finally, so the
+        ' serve runs through ServeRequest() and BUSY is cleared unconditionally after it.
+        ' NB: Err is NOT inspected after a normal return - see ServeRequest.
+        MarkBusy Index
+        Dim serveOk As Boolean
+        serveOk = ServeRequest(Index, conn)
+        ClearBusy Index
+        TouchActive Index
+        If Not serveOk Then
+            LogLine "DataArrival error #" & CStr(Index) & ": " & CStr(Err.Number) & " " & Err.Description
+            CloseConn Index
+        End If
     End If
     Exit Sub
 DataFail:
+    ClearBusy Index
     LogLine "DataArrival error #" & CStr(Index) & ": " & CStr(Err.Number) & " " & Err.Description
     CloseConn Index
 End Sub
 
 Private Sub sck_Close(Index As Integer)
     On Error Resume Next
+    ClearBusy Index
     m_conns.Remove CStr(Index)
     Dim k As Long
     For k = m_sessions.Count To 1 Step -1
@@ -563,6 +662,7 @@ End Sub
 Private Sub CloseConn(ByVal Index As Integer)
     If Index <= 0 Then Exit Sub
     On Error Resume Next
+    ClearBusy Index
     LogLine "CloseConn #" & CStr(Index) & " state before=" & CStr(sck(Index).State)
     sck(Index).Close
     m_conns.Remove CStr(Index)
@@ -595,4 +695,11 @@ Private Sub SendResponse(ByVal Index As Integer, ByVal response As String, ByVal
 End Sub
 
 Private Sub Form_Terminate()
+    ' TASK-48: belt-and-braces deregistration. StopListening already deletes our
+    ' <pid>.json on a clean exit; this covers a teardown that skips it. The delete
+    ' is for OUR OWN pid and DeleteInstanceFile is idempotent (FileExists check +
+    ' swallowed errors), so a double delete is harmless and no other instance's
+    ' registration can be touched.
+    On Error Resume Next
+    DeleteInstanceFile FormProcessId()
 End Sub

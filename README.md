@@ -300,10 +300,10 @@ python tests/smoke_test.py --port 8766
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类 | - |
+| `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类；全程受墙钟预算约束（默认 8000 ms，`VB6MCP_BUDGET_MS` 可覆盖），回执恒带 `budgetExhausted`/`elapsedMs`/`stage` | - |
 | `purity_check` | 判定组件能否进离线测试宿主及原因 | `name` |
-| `export_public_api` | 把组件公开 API 冻结成可比对规格 | `name` |
-| `check_public_api` | 与冻结规格比对，报移除、变更、新增成员 | `baseline`, `name` |
+| `export_public_api` | 把组件公开 API 冻结成可比对规格；省略 `name` 时做有界整工程导出 | `name`, `membersOnly` |
+| `check_public_api` | 与冻结规格比对，报移除、变更、新增成员；省略 `name` 时做有界整工程核验 | `baseline`, `name`, `membersOnly` |
 | `generate_stub` | 生成可编译桩模块：留声明、清过程体 | `name` |
 
 ### 7. 编译与交付产物
@@ -432,12 +432,12 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 
 - **经验库** `mcp_lessons/`：`defaults.json`（随包发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
   合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。
-- **IDE 实例管理**：`ide_list` 扫描本机实例（含同一工程被两个实例打开的冲突），`ide_target` 记住默认目标，
-  `ide_start` / `ide_stop` / `ide_restart` 只操作**本 hub 自己启动的**实例。
+- **IDE 实例管理**：`ide_list` 列出 hub 能寻址的全部 VB6 IDE：本机实例（含同一工程被两个实例打开的冲突），`ide_target` 记住默认目标，
+  `ide_start` / `ide_stop` / `ide_restart` 只操作**本 hub 自己启动的**实例；同时列出**已配置的远端端点**（只探白名单、**绝不自动发现**；连不上也照样列出并带探测状态），并回显实例的**唯一身份**（endpoint / targetKey / pathVia）、真实路径与登记表拼写、以及**解析到同一身份的调用者别名**（junction / 别名写法）。
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `ide_list` | 列出本机发现的 VB6 IDE 实例、端口与冲突 | - |
+| `ide_list` | 列出 hub 能寻址的**全部** VB6 IDE：本机实例 + **已配置的远端端点**（只探白名单、绝不自动发现；连不上也列出并带探测状态）；回报 pid/端口/工程、唯一身份（endpoint / targetKey / pathVia）、真实路径与登记表拼写，并回显解析到同一身份的**调用者别名**；含过期登记项与「同一身份两个实例」冲突 | - |
 | `ide_target` | 设置或清除默认 IDE 目标：pid、工程名或 auto | `target` |
 | `ide_start` | 按 .vbp 启动一个 VB6 IDE 实例 | `project` |
 | `ide_stop` | 停止本 hub 启动的 IDE 实例 | `pid`, `force` |

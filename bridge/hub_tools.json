@@ -4,7 +4,7 @@
   "tools": [
     {
       "name": "ide_list",
-      "description": "List VB6 IDE instances discovered on this machine (port scan 8766..8799 plus VB6MCP_PORT and HKCU\\Software\\VB6MCP\\Port). Reports faceSource (live|snapshot), the snapshot contractVersion/toolCount, each instance's pid/project/port, and any conflict (two instances on one project). Read-only.",
+      "description": "List every VB6 IDE the hub can address: this machine (instance registry %TEMP%\\vb6mcp\\instances, then a port scan of 8766..8799 plus VB6MCP_PORT and HKCU\\Software\\VB6MCP\\Port) AND each configured REMOTE endpoint (allow-list from VB6MCP_REMOTES / bridge/hub_remotes.json -- never discovered, listed with its probe status even when it does not answer). Reports faceSource (live|snapshot), the snapshot contractVersion/toolCount, per instance pid/port/project plus the ONE-set identity endpoint/remote/targetKey/pathVia, projectPathReal (canonical realpath) beside projectPathAsGiven (the spelling the registry published) and aliasAsGiven (the caller-supplied spelling that resolves to the same identity -- junction/alias spellings of one .vbp are ONE candidate, echoed in aliasEcho), the configured endpoints with their probe status, stale registry entries with a reason, and any conflict (two live IDEs publishing the same project identity on one endpoint). Read-only.",
       "inputSchema": {
         "type": "object",
         "properties": {},

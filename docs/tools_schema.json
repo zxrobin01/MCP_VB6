@@ -1883,20 +1883,24 @@
     },
     {
       "name": "export_public_api",
-      "description": "Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped.",
+      "description": "Freeze the component public API as a spec (JSON members[] plus a TSV spec field). Text level; parameter names are dropped. With no name, exports every component of the project under a wall-clock budget (partial result + budgetExhausted/elapsedMs); membersOnly=true skips the spec text.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
-            "description": "Component name"
+            "description": "Component name. OMITTED or EMPTY = bounded whole-project export (TASK-42): every component is parsed under a wall-clock budget and the receipt carries per-component counts + budgetExhausted/elapsedMs, instead of scanning 110 components unbounded (MCP-lead-20)."
+          },
+          "membersOnly": {
+            "type": "boolean",
+            "description": "Light mode (default false): return only the member list (kind/name/sig) and skip the TSV spec text, which also skips a second parse of the same text. ADDITIVE (TASK-42)."
           }
         }
       }
     },
     {
       "name": "check_public_api",
-      "description": "Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[].",
+      "description": "Compare the current component public API against a frozen spec; returns violations[] (removed / changed) and added[]. With no name, checks every component of the project under a wall-clock budget (per-component counts, partial result + budgetExhausted/elapsedMs); membersOnly=true skips the violations text.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1907,6 +1911,10 @@
           "baseline": {
             "type": "string",
             "description": "Baseline spec TSV previously returned by export_public_api (its spec field)"
+          },
+          "membersOnly": {
+            "type": "boolean",
+            "description": "Light mode (default false): return only the member list (kind/name/sig) of the scanned component(s) and skip the violations/added text generation. ADDITIVE (TASK-42)."
           }
         },
         "required": [

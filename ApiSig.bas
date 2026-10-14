@@ -27,6 +27,24 @@ Public Function ApiExportJson(ByVal text As String) As String
     ApiExportJson = out
 End Function
 
+' TASK-42 (MCP-lead-20): the LIGHT variant. Same members[] as ApiExportJson, but
+' the TSV spec text is never built - which skips the SECOND CollectMembers pass
+' that ApiExportJson pays for (ApiSpecText re-parses the whole text). ADDITIVE:
+' ApiExportJson itself is untouched, so its bytes are unchanged.
+Public Function ApiMembersJson(ByVal text As String) As String
+    Dim i As Long, out As String
+    CollectMembers text
+    out = "{" & Qs("count") & ":" & CStr(m_cnt) & "," & Qs("members") & ":["
+    For i = 0 To m_cnt - 1
+        If i > 0 Then out = out & ","
+        out = out & "{" & Qs("kind") & ":" & Js(m_kind(i))
+        out = out & "," & Qs("name") & ":" & Js(m_name(i))
+        out = out & "," & Qs("sig") & ":" & Js(m_sig(i)) & "}"
+    Next
+    out = out & "]}"
+    ApiMembersJson = out
+End Function
+
 Public Function ApiSpecText(ByVal text As String) As String
     Dim i As Long, out As String
     CollectMembers text
@@ -53,6 +71,48 @@ Public Function ApiDiffSpecJson(ByVal specText As String, ByVal afterText As Str
     CollectMembers afterText
     SaveSnap ak, an, ag, ac
     ApiDiffSpecJson = DiffCore(bk, bn, bs, bc, ak, an, ag, ac)
+End Function
+
+' TASK-42: COUNTS-ONLY diff - the same classification algorithm as DiffCore
+' (removed / changed / added), but it never builds the violations[] and added[]
+' JSON lists, so it can be applied to EVERY component of a project inside a
+' wall-clock budget. The counts are handed back through ByRef because the
+' whole-project caller needs them for its per-component entry.
+Public Function ApiDiffSpecCountsJson(ByVal specText As String, ByVal afterText As String, _
+        ByRef beforeCount As Long, ByRef afterCount As Long, ByRef removed As Long, _
+        ByRef changed As Long, ByRef added As Long) As String
+    Dim bk() As String, bn() As String, bs() As String, bc As Long
+    Dim ak() As String, an() As String, ag() As String, ac As Long
+    ParseSpec specText, bk, bn, bs, bc
+    CollectMembers afterText
+    SaveSnap ak, an, ag, ac
+    beforeCount = bc
+    afterCount = ac
+    Dim i As Long, j As Long, kkey As String
+    Dim di As Object
+    Set di = CreateObject("Scripting.Dictionary")
+    For i = 0 To bc - 1
+        kkey = bk(i) & ":" & LCase$(bn(i))
+        If Not di.Exists(kkey) Then di.Add kkey, i
+    Next
+    Dim used() As Boolean
+    ReDim used(0 To bc)
+    For i = 0 To ac - 1
+        kkey = ak(i) & ":" & LCase$(an(i))
+        If di.Exists(kkey) Then
+            j = di(kkey)
+            used(j) = True
+            If bs(j) <> ag(i) Then changed = changed + 1
+        Else
+            added = added + 1
+        End If
+    Next
+    For i = 0 To bc - 1
+        If Not used(i) Then removed = removed + 1
+    Next
+    ApiDiffSpecCountsJson = "{" & Qs("before") & ":" & CStr(bc) & "," & Qs("after") & ":" & CStr(ac) _
+        & "," & Qs("removed") & ":" & CStr(removed) & "," & Qs("changed") & ":" & CStr(changed) _
+        & "," & Qs("added") & ":" & CStr(added) & "," & Qs("violations") & ":" & CStr(removed + changed) & "}"
 End Function
 
 Private Function DiffCore(ByRef bk() As String, ByRef bn() As String, ByRef bs() As String, ByVal bc As Long, _

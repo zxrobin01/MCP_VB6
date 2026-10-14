@@ -15,6 +15,41 @@ Public Const VB6MCP_PRODUCT As String = "vb6-mcp"
 ' a module-unique name (CodeTools declares GetCurrentProcessId privately too).
 Private Declare Function UtilProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 Private Declare Function PumpTickCount Lib "kernel32" Alias "GetTickCount" () As Long
+
+' TASK-48: process-liveness probes for the instance-registry sweep (see
+' PruneDeadInstanceFiles at the bottom of this module).
+'
+' WHY Toolhelp32 IS THE PRIMARY: OpenProcess + GetLastError was MEASURED broken in
+' this host - a dead pid gives OpenProcess = NULL but the thread last-error reads 0
+' (not ERROR_INVALID_PARAMETER 87), because VB6''s Declare epilogue clobbers it. That
+' made every dead entry look alive and the sweep pruned nothing. A Toolhelp32 process
+' snapshot needs NO error code and also sees processes owned by OTHER users, which
+' OpenProcess can refuse with ERROR_ACCESS_DENIED. The OpenProcess path is kept as a
+' fallback for the case where the snapshot is unusable, and it can only ever make the
+' verdict MORE conservative.
+Private Type UTIL_PROCESSENTRY32
+    dwSize As Long
+    cntUsage As Long
+    th32ProcessID As Long
+    th32DefaultHeapID As Long
+    th32ModuleID As Long
+    cntThreads As Long
+    th32ParentProcessID As Long
+    pcPriClassBase As Long
+    dwFlags As Long
+    szExeFile As String * 260
+End Type
+Private Const UTIL_TH32CS_SNAPPROCESS As Long = &H2
+Private Const UTIL_INVALID_HANDLE As Long = -1
+Private Const UTIL_STILL_ACTIVE As Long = 259
+Private Const UTIL_ERROR_INVALID_PARAMETER As Long = 87
+Private Const UTIL_PROCESS_QUERY_LIMITED As Long = &H1000
+Private Declare Function UtilCreateToolhelp32Snapshot Lib "kernel32" Alias "CreateToolhelp32Snapshot" (ByVal dwFlags As Long, ByVal th32ProcessID As Long) As Long
+Private Declare Function UtilProcess32First Lib "kernel32" Alias "Process32First" (ByVal hSnapshot As Long, ByRef lppe As UTIL_PROCESSENTRY32) As Long
+Private Declare Function UtilProcess32Next Lib "kernel32" Alias "Process32Next" (ByVal hSnapshot As Long, ByRef lppe As UTIL_PROCESSENTRY32) As Long
+Private Declare Function UtilOpenProcess Lib "kernel32" Alias "OpenProcess" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As Long
+Private Declare Function UtilCloseHandle Lib "kernel32" Alias "CloseHandle" (ByVal hObject As Long) As Long
+Private Declare Function UtilGetExitCodeProcess Lib "kernel32" Alias "GetExitCodeProcess" (ByVal hProcess As Long, ByRef lpExitCode As Long) As Long
 Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 
 ' TASK-P1-042: THE contract banner - a single source of truth. The first line of
@@ -26,7 +61,7 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 ' TASK-P1-089: the P1-087 snapshot parameter is an inputSchema change, so the contract
 ' version moves with it. It is ADDITIVE (optional parameter, default off), but a tool-face
 ' change still has to be named by a version - the rule above is "bump it HERE, in one line".
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.0"
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.1"
 ' TASK-P1-066: message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
@@ -145,6 +180,224 @@ Public Sub DeleteInstanceFile(ByVal pid As Long)
     path = InstancesDir() & "\" & CStr(pid) & ".json"
     If fso.FileExists(path) Then fso.DeleteFile path, True
 End Sub
+
+' ---------------------------------------------------------------------------
+' TASK-48: prune DEAD instance registrations.
+'
+' StopListening already deletes our own <pid>.json on a CLEAN exit, but when the
+' IDE crashes or is killed (Stop-Process -Force / taskkill) that code never runs
+' and the entry stays in %TEMP%\vb6mcp\instances forever. MEASURED before this
+' change: 50 entries, registrySummary {entries:50, live:0, stale:50,
+' staleByReason:{pid_dead:50}}. The cleanup must therefore not depend on the
+' dying process: the next instance that REGISTERS sweeps the directory.
+'
+' CONSERVATIVE BY DESIGN - an entry is deleted ONLY when its pid is PROVABLY
+' gone. Everything else is KEPT:
+'   * our own pid is always skipped;
+'   * only file names that are digits + .json are considered at all;
+'   * an entry whose pid IS alive is never touched;
+'   * an entry that cannot be parsed, has no digits-only "pid", or whose pid
+'     disagrees with its own <pid>.json file name is KEPT (counted and reported);
+'   * a probe that cannot prove the pid is gone (no usable process snapshot, a
+'     failed OpenProcess, an empty enumeration) counts as ALIVE;
+'   * a delete that fails (file held open) is swallowed and does not fail the
+'     registration path - the sweep is best effort.
+' ---------------------------------------------------------------------------
+Public Sub PruneDeadInstanceFiles(ByVal ownPid As Long)
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then Exit Sub
+    Dim dir As String
+    dir = InstancesDir()
+    If Not fso.FolderExists(dir) Then Exit Sub
+    ' Pass 1 decides from a SNAPSHOT of the folder: deleting while enumerating a
+    ' live Files collection is not defined behaviour.
+    Dim doomedPath As New Collection
+    Dim doomedName As New Collection
+    Dim badName As String
+    Dim f As Object
+    Dim pid As Long
+    Dim kept As Long
+    Dim unreadable As Long
+    kept = 0
+    unreadable = 0
+    badName = ""
+    For Each f In fso.GetFolder(dir).Files
+        If UtilInstanceFileName(fso, f.Name) Then
+            pid = 0
+            If Not InstanceFilePid(fso, f.Path, pid) Then
+                ' KEEP it: we do not understand this entry, so we never delete it.
+                unreadable = unreadable + 1
+                If Len(badName) < 300 Then
+                    If Len(badName) > 0 Then badName = badName & ", "
+                    badName = badName & f.Name
+                End If
+            ElseIf pid = ownPid Then
+                kept = kept + 1
+            ElseIf UtilPidAlive(pid) Then
+                kept = kept + 1
+            Else
+                doomedPath.Add f.Path
+                doomedName.Add f.Name
+            End If
+        End If
+    Next
+    ' Pass 2 deletes only what pass 1 proved dead; each delete is best effort.
+    Dim i As Long
+    Dim n As Long
+    Dim prunedName As String
+    n = 0
+    prunedName = ""
+    For i = 1 To doomedPath.Count
+        If Len(prunedName) < 400 Then
+            If Len(prunedName) > 0 Then prunedName = prunedName & ", "
+            prunedName = prunedName & doomedName.Item(i)
+        End If
+        Err.Clear
+        fso.DeleteFile doomedPath.Item(i), True
+        If Err.Number = 0 Then n = n + 1 Else Err.Clear
+    Next
+    LogLine "Pruned " & CStr(n) & " stale instance registration(s): " & prunedName
+    If unreadable > 0 Then LogLine "Kept " & CStr(unreadable) & " unreadable instance registration(s): " & badName
+End Sub
+
+' TRUE only for an instance-registry FILE NAME: digits only, .json suffix. Any
+' other file in the folder is ignored entirely.
+Private Function UtilInstanceFileName(ByVal fso As Object, ByVal fname As String) As Boolean
+    On Error Resume Next
+    If fso Is Nothing Then Exit Function
+    If LCase$(fso.GetExtensionName(fname)) <> "json" Then Exit Function
+    Dim b As String
+    b = fso.GetBaseName(fname)
+    If Len(b) = 0 Then Exit Function
+    Dim i As Long
+    Dim ch As String
+    For i = 1 To Len(b)
+        ch = Mid$(b, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Function
+    Next
+    UtilInstanceFileName = True
+End Function
+
+' Reads the "pid" field of ONE registry file. Returns False whenever the content
+' cannot be trusted: unreadable, empty, not JSON, no digits-only "pid", a
+' non-positive pid, or a pid that disagrees with the <pid>.json file name. The
+' caller MUST treat False as "KEEP this file".
+Private Function InstanceFilePid(ByVal fso As Object, ByVal path As String, ByRef pidOut As Long) As Boolean
+    On Error Resume Next
+    pidOut = 0
+    If fso Is Nothing Then Exit Function
+    Dim ts As Object
+    Set ts = fso.OpenTextFile(path, 1)
+    If ts Is Nothing Then Exit Function
+    Dim s As String
+    s = ""
+    Do While Not ts.AtEndOfStream
+        s = s & ts.ReadLine
+        If Len(s) > 100000 Then Exit Do
+    Loop
+    ts.Close
+    If Len(s) = 0 Then Exit Function
+    Dim root As Variant
+    If Not JsonParse(s, root) Then Exit Function
+    If Not IsObject(root) Then Exit Function
+    Dim d As Object
+    Set d = root
+    Dim v As Variant
+    Dim isObj As Boolean
+    isObj = False
+    If Not JsonGet(d, "pid", v, isObj) Then Exit Function
+    If isObj Then Exit Function
+    If IsNull(v) Then Exit Function
+    ' The pid field must be DIGITS ONLY: Val() alone is lenient ("12abc" -> 12), and
+    ' the promise above is that anything we cannot parse exactly is KEPT.
+    Dim sv As String
+    sv = Trim$(CStr(v))
+    If Len(sv) = 0 Then Exit Function
+    Dim i As Long
+    Dim ch As String
+    For i = 1 To Len(sv)
+        ch = Mid$(sv, i, 1)
+        If ch < "0" Or ch > "9" Then Exit Function
+    Next
+    Dim p As Long
+    p = 0
+    p = CLng(Val(sv))
+    If p <= 0 Then Exit Function
+    ' WriteInstanceFile always publishes <pid>.json with d("pid") = pid, so a name
+    ' that disagrees is a corrupt or foreign file - never deleted.
+    If StrComp(fso.GetBaseName(path), CStr(p), vbTextCompare) <> 0 Then Exit Function
+    pidOut = p
+    InstanceFilePid = True
+End Function
+
+' TRUE only when the pid is PROVABLY gone. Every inconclusive outcome counts as
+' ALIVE (fail closed): a live registration must never be deleted on doubt.
+Private Function UtilPidAlive(ByVal pid As Long) As Boolean
+    On Error Resume Next
+    UtilPidAlive = True
+    If pid <= 0 Then
+        UtilPidAlive = False
+        Exit Function
+    End If
+    Dim r As Long
+    r = UtilPidInSnapshot(pid)
+    If r = 1 Then Exit Function                    ' in the snapshot => alive
+    If r = 0 Then                                  ' snapshot read OK and pid absent => gone
+        UtilPidAlive = False
+        Exit Function
+    End If
+    ' r = -1: no trustworthy snapshot. Fall back to OpenProcess, which can only
+    ' make the verdict MORE conservative (any failure we cannot attribute to a
+    ' missing pid keeps the entry).
+    Dim h As Long
+    h = UtilOpenProcess(UTIL_PROCESS_QUERY_LIMITED, 0, pid)
+    If h = 0 Then
+        Dim le As Long
+        le = Err.LastDllError
+        If le = UTIL_ERROR_INVALID_PARAMETER Then UtilPidAlive = False
+        Exit Function
+    End If
+    Dim code As Long
+    code = 0
+    If UtilGetExitCodeProcess(h, code) <> 0 Then
+        UtilPidAlive = (code = UTIL_STILL_ACTIVE)
+    End If
+    UtilCloseHandle h
+End Function
+
+' 1 = the pid is in the Toolhelp32 process snapshot (ALIVE)
+' 0 = the snapshot was read and the pid is NOT in it (provably GONE)
+' -1 = the snapshot could not be read (UNKNOWN => the caller KEEPS the entry)
+Private Function UtilPidInSnapshot(ByVal pid As Long) As Long
+    On Error Resume Next
+    UtilPidInSnapshot = -1
+    Dim snap As Long
+    snap = UtilCreateToolhelp32Snapshot(UTIL_TH32CS_SNAPPROCESS, 0)
+    If snap = 0 Or snap = UTIL_INVALID_HANDLE Then Exit Function
+    Dim pe As UTIL_PROCESSENTRY32
+    pe.dwSize = Len(pe)
+    Dim n As Long
+    Dim hit As Boolean
+    n = 0
+    hit = False
+    If UtilProcess32First(snap, pe) <> 0 Then
+        Do
+            n = n + 1
+            If pe.th32ProcessID = pid Then hit = True
+        Loop While UtilProcess32Next(snap, pe) <> 0
+    End If
+    UtilCloseHandle snap
+    ' An enumeration that returned fewer than two processes is not evidence that
+    ' anything is dead (a struct-layout mistake must never turn into a delete).
+    If n < 2 Then Exit Function
+    If hit Then
+        UtilPidInSnapshot = 1
+    Else
+        UtilPidInSnapshot = 0
+    End If
+End Function
 
 ' Structured bind conflict: a second IDE on the SAME explicit port must fail loudly.
 Public Sub WriteBindConflict(ByVal reason As String, ByVal tried As String, ByVal advice As String)
@@ -638,3 +891,41 @@ Public Sub SeNoteBackup(ByVal path As String)
     g_seBackups.Add path
     Err.Clear
 End Sub
+
+' ===========================================================================
+' TASK-42 (consumer ledger MCP-lead-19 / -20): SHARED WALL-CLOCK BUDGET.
+'
+' WHY. dependency_graph and export_public_api/check_public_api scan the whole
+' project on the IDE's single UI thread. On a real 110-component project the
+' component-edge phase was O(components^2) whole-module string scans, so the call
+' ran past the 60 s MCP client timeout and left the add-in permanently wedged
+' (VB6 alive, Responding=False, every later call failing in 1-2 ms). A READ-ONLY
+' tool must never be able to do that, so every whole-project scan now runs under
+' a deadline and RETURNS WHAT IT HAS when the deadline expires - partial, with
+' budgetExhausted / budgetMs / elapsedMs / stage in the receipt.
+'
+' OVERRIDE. VB6MCP_BUDGET_MS (a positive integer of milliseconds) overrides the
+' per-tool default for one process; the default lives in DepGraph.bas.
+'
+' The clock is GetTickCount (already declared above, milliseconds since boot).
+' Nothing here runs unless a budgeted scan starts, so no existing behaviour moves.
+' ===========================================================================
+
+Public Function TickMs() As Long
+    TickMs = PumpTickCount()
+End Function
+
+' A positive Long from an environment variable, else the caller's default.
+' Defensive on purpose: a malformed value must fall back, never raise.
+Public Function EnvLongOr(ByVal name As String, ByVal dflt As Long) As Long
+    Dim s As String, d As Double
+    EnvLongOr = dflt
+    On Error Resume Next
+    s = Trim$(Environ$(name))
+    If Len(s) = 0 Then Exit Function
+    d = Val(s)
+    If d < 1# Then Exit Function
+    If d > 2147483000# Then d = 2147483000#
+    EnvLongOr = CLng(d)
+    Err.Clear
+End Function
