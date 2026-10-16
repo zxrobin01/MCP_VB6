@@ -241,6 +241,26 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
   sent to a remote.**
 - The old generation's direct port (8766) **no longer exists** - a client still pointing at it fails to connect.
 
+### Remote endpoints: reachability comes from a forwarding layer, and credentials go only to loopback endpoints
+
+- **The middle service binds loopback only** (a non-loopback bind is refused, exit code 6, no override switch)
+  => **it does not provide cross-machine reachability itself.** To let a hub on another machine reach it, put a
+  **relay / port forward** in front of it, exposing the loopback-only service as a base the hub can address:
+  `http://<host>:<port>` (the RPC path is `.../rpc`).
+- **The hub sends credentials automatically only to loopback endpoints**: the single automatic mechanism requires
+  both that the endpoint is a loopback address (`127.0.0.1` / `localhost` / `::1`) **and** that it explicitly asks
+  with `401 token_missing` - so a credential never leaves this machine that way.
+- **To a remote endpoint from the allow-list the hub sends no token** => a remote endpoint either
+  **does not authenticate**, or authenticates at the **forwarding layer** (the relay / port forward).
+- Exception (be deliberate about it): whichever base `VB6MCP_BRIDGE_URL` names is treated as **the hub's own
+  middle service**, loopback or not - so the hub attaches the token to a remote base only when you
+  **explicitly** configure that base as the bridge URL.
+- **Remote endpoints come from an allow-list**: the `VB6MCP_REMOTES` environment variable, or `hub_remotes.json`
+  in the hub directory (the repository ships a `hub_remotes.example.json` template); each entry is
+  `{label, url, note?}`. Only allow-listed endpoints are probed and hosts are **never auto-discovered**; an
+  endpoint that does not answer is **still listed**, with its probe status. Unknown labels, unreachable hosts and
+  timeouts are refused structurally as `endpoint_unknown` / `endpoint_unreachable` / `endpoint_timeout`.
+
 ### Claude Desktop
 
 Let Claude Desktop start the hub over **stdio** (replace the path with your own):

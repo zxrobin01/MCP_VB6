@@ -1,0 +1,13 @@
+{
+  "_comment": "Optional endpoint allow-list for bridge/vb6mcp_hub.mjs. COPY to bridge/hub_remotes.json (that is the file the hub reads) or pass the same JSON array through the VB6MCP_REMOTES environment variable. An endpoint is only ever PROBED when it is listed here - the hub never discovers hosts. Empty/absent => every remote code path is inert and the hub behaves exactly as before.",
+  "_shape": "array of {label, url, note}. label: 2..32 chars of [A-Za-z0-9_.-]; 'local' is reserved and cannot be configured. url: http(s)://host:port (an explicit path such as http://host:8796/rpc wins over the add-in default /rpc).",
+  "_target_syntax": "[endpoint:]selector. endpoint omitted = local. selector = normalized project path (canonical) | pid | port | project NAME (the last three are legacy aliases).",
+  "_example": "replace <remote-host> with the host that runs the IDE you want to reach; keep the port your relay listens on.",
+  "remotes": [
+    {
+      "label": "example-remote",
+      "url": "http://<remote-host>:8796",
+      "note": "the remote machine's IDE behind a loopback relay"
+    }
+  ]
+}

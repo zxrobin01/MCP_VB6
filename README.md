@@ -210,6 +210,22 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
   省略 `endpoint` 即本机；**没有 `_target` 的调用不会被送到远端**。
 - 旧代的直连端口（8766）在新一代**不再存在** —— 仍指向它的客户端会直接连接失败。
 
+### 远端端点：可达性来自转发层，凭据只发回环端点
+
+- **中间服务只绑回环**（非回环绑定被直接拒绝、退出码 6、无覆盖开关）⇒ **跨机可达性不由它提供**。
+  要让另一台机器上的 hub 连到本机的中间服务，需要在它**前面**放一层**中继 / 端口转发**，把「只绑回环的」
+  服务暴露成一个 hub 可访问的 base：`http://<host>:<port>`（RPC 路径即 `…/rpc`）。
+- **hub 只对回环端点自动发送凭据**：唯一的自动机制要求「端点是回环地址（`127.0.0.1` / `localhost` / `::1`）」
+  且「该端点用 `401 token_missing` 明确索要」两者同时成立 —— 因此 token 不会经这条路径离开本机。
+- **对白名单里的远端端点，hub 不带 token** ⇒ 远端端点要么**自身不鉴权**，要么把鉴权做在**转发层**
+  （中继 / 端口转发那一层）。
+- ★例外（要清楚自己在做什么）：`VB6MCP_BRIDGE_URL` 指到哪个 base，hub 就把它当作**自己的中间服务**，
+  不论它是否回环 —— 所以只有当你**显式**把一个远端 base 配成 bridge URL 时，hub 才会给它带 token。
+- **远端端点来自白名单**：环境变量 `VB6MCP_REMOTES`，或 hub 目录下的 `hub_remotes.json`（仓库附带
+  `hub_remotes.example.json` 模板），每条是 `{label, url, note?}`。**只探白名单、绝不自动发现主机**；
+  连不上的端点**照样列出**并带**探测状态**；未知 label / 连不上 / 超时分别是结构化拒绝
+  `endpoint_unknown` / `endpoint_unreachable` / `endpoint_timeout`。
+
 ### Claude Desktop
 
 让 Claude Desktop 以 **stdio** 启动 hub（路径换成你自己的）：
