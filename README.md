@@ -13,11 +13,14 @@ VB6 工程，并控制编译与运行。
  MCP 客户端 (Claude Desktop / Cursor / ...)
         │  stdio (JSON-RPC, 每行一条)
         ▼
- bridge/mcp_stdio_bridge.py   (Python 3, 仅标准库)
-        │  HTTP POST /rpc  (http://127.0.0.1:8766)
+ bridge/vb6mcp_hub.mjs      (Node，零依赖；MCP 线协议 + ide_* / 经验库共 10 个工具)
+        │  HTTP  http://127.0.0.1:8767  (配了凭据时需 bearer token)
         ▼
- VB6MCP.dll  ← 运行在 VB6.EXE 进程内
-   ├─ Winsock 控制: 本地 HTTP 服务器 (也支持 /sse + /message)
+ bridge/vb6mcp_bridge.py    (Python 3，仅标准库；本机唯一的 TCP 监听者)
+        │  命名管道 (每个 IDE 实例一条)
+        ▼
+ VB6MCP.dll  ← 运行在 VB6.EXE 进程内 (自身不再监听 TCP)
+   ├─ 命名管道服务端
    ├─ 自研 JSON 解析/序列化 (JsonLib.bas, 零外部依赖)
    └─ VBIDE 扩展对象模型: 读取/修改代码、保存、编译、运行控制
 ```
@@ -86,7 +89,8 @@ MCP_VB6/
 ├─ unregister.reg         卸载插件
 ├─ build.bat              一键编译 + regsvr32 注册 + 导入插件注册表
 ├─ mcp_config.example.json    Claude Desktop 配置示例
-├─ bridge/mcp_stdio_bridge.py stdio 桥接器（Python 3 标准库）
+├─ bridge/vb6mcp_hub.mjs   MCP 入口（Node，stdio；ide_* 与经验库工具）
+├─ bridge/vb6mcp_bridge.py 中间服务：本机唯一的 TCP 监听者（默认 8767），转发到命名管道
 └─ tests/smoke_test.py     直接打 HTTP 端点的冒烟测试
 ```
 
@@ -108,7 +112,7 @@ MCP_VB6/
 - 只做这一件事。不要顺手改我别的工程、别的插件或别的注册表项。
 - 禁止破坏性或不可逆的操作：不要删除/覆盖非你创建的文件和目录，不要改动我已有的 VB6 工程，不要卸载或禁用我其它插件，不要"清理"进程或注册表。
 - 不要杀进程。不要结束 VB6.EXE 或任何进程；需要关闭 IDE 时先问我（我可能有没保存的改动）。
-- 端口只碰你探测到的那个。默认 127.0.0.1:8766；被占用时插件会自己向上探测（最多 +40），真实端口以 http://127.0.0.1:<端口>/health 返回的 port 字段为准，也可以看 %TEMP%\vb6mcp_port.txt。不要扫描、占用或改动其它端口，也不要把这个服务暴露到回环地址之外。
+- 端口只碰你探测到的那个。这一代里**中间服务**是唯一的 TCP 监听者：默认 127.0.0.1:8767（用 --port 或 VB6MCP_BRIDGE_PORT 改），插件自身不再监听 TCP。真实端口以 http://127.0.0.1:<端口>/health 返回的 port 字段为准；python bridge/vb6mcp_bridge.py --print-config 也会打印生效端口、传输与 authEnabled。不要扫描、占用或改动其它端口，也不要把这个服务暴露到回环地址之外（非回环绑定会被直接拒绝并以退出码 6 结束，没有覆盖开关）。
 - 任何可能弄坏我现有 VB6 环境的动作（机器级重新注册 OCX/类型库、改 HKCU\Software\VB6MCP、改 VB6 的引用设置等），先停下来问我：你要改什么、为什么、怎么撤回。
 - 所有产物只放在你新建的工作目录里；每个结论都要有可复现的命令和原始输出，不要用"应该成功了"下结论。需要我手工点的地方，直接告诉我。
 
@@ -121,7 +125,7 @@ MCP_VB6/
    - 如果没有 VB6：立刻停下并如实告诉我——VB6MCP 是 VB6 IDE 的插件，没有 VB6 就既不能编译也不能运行，没有绕过办法；仓库也不分发任何微软文件，必须用我自己合法的 VB6 安装。不要试图用别的工具链"伪造"VB6，也不要在没有 VB6 的机器上继续后面的步骤。
    - 如果缺 MSWINSCK.OCX / MSADDNDR.DLL，按仓库 README 的 FAQ 处理；要写系统目录先问我。
 
-2) 取源码。git clone <REPO_URL> 到你/我约定的工作目录（或下载仓库 ZIP 解压）。确认目录里有 MCP_VB6.vbp、build.bat、register.reg、bridge/mcp_stdio_bridge.py、tests/smoke_test.py。
+2) 取源码。git clone <REPO_URL> 到你/我约定的工作目录（或下载仓库 ZIP 解压）。确认目录里有 MCP_VB6.vbp、build.bat、register.reg、bridge/vb6mcp_bridge.py、bridge/vb6mcp_hub.mjs、tests/smoke_test.py。
 
 3) 编译。优先直接运行 build.bat（它会先注册 MSADDNDR.DLL，再编译出 VB6MCP.dll）。如果 VB6 不在默认位置，改 build.bat 里的 VB6 变量，不要另处硬编码路径。
    注意：不要在 IDE 已经加载了这个插件 DLL 时原地重编译——DLL 被占用会让编译失败。先关掉 IDE（关之前先问我有没有没保存的东西），或用另一个 VB6 实例构建。
@@ -134,16 +138,16 @@ MCP_VB6/
    然后启动 VB6 IDE（它本来就开着且没加载插件时，先问我要不要重开，不要自己杀进程），在菜单 外接程序(Add-Ins) -> 外接程序管理器 里确认 "VB6 MCP Server" 已勾选（LoadBehavior=3 通常会自动加载）。
 
 5) 真实验证服务器（关键一步，不能只看"进程起来了"）：
-   - GET http://127.0.0.1:8766/health，直到返回 {"ok":true,...}；以响应里的 port 为准（端口被占用时插件会向上探测），并与 %TEMP%\vb6mcp_port.txt 对照。下面把这个端口记作 <端口>。
+   - GET http://127.0.0.1:8767/health，直到返回 {"ok":true,...}；以响应里的 port 为准，并与 python bridge/vb6mcp_bridge.py --print-config 的 port 对照。下面把这个端口记作 <端口>。**若你（或用户）配置了 token，这个请求也要带 `Authorization: Bearer <token>`**，否则会得到 401。
    - 对它发一次真正的 MCP 调用：POST http://127.0.0.1:<端口>/rpc，Content-Type: application/json
      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"install-check","version":"1.0"}}}
      然后 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
    - 数 tools/list 里的工具个数，并与仓库自己的权威清单对比：docs/TOOL_CATALOG.md 里记录的数量，以及 tools/schema_baseline.json 里 tools 数组的长度。不要写死任何数字——就用你刚克隆下来的仓库里的数字。也可以调用 mcp_info 工具，看服务端自报的 contract 与 toolCount。
    - 三者一致就通过并记录数字；不一致就如实报告差多少、多了/少了哪些，不要改仓库、也不要"凑数字"。如果 tools/list 根本拿不到，把原始响应和 HTTP 状态码贴出来。
 
-6) 接客户端。把 mcp_config.example.json 里的 mcpServers.vb6 条目合并进目标客户端的配置（Claude Desktop 是 %APPDATA%\Claude\claude_desktop_config.json；Cursor 用它的 MCP 配置），把里面的占位路径换成这台机器上的真实路径：command 指向本机 Python，args 指向 bridge/mcp_stdio_bridge.py；JSON 里用 / 或写成 \\。其它 stdio 客户端同理；Cursor 也可以按 README 第 3 节直连 HTTP 端点。改配置前先备份原文件。
+6) 接客户端（新一代推荐 stdio 启动 hub）：command 指向 node，args 指向 <仓库>/bridge/vb6mcp_hub.mjs，并给它两个环境变量 —— VB6MCP_BRIDGE_URL=http://127.0.0.1:<中间服务端口>（hub 源码默认 http://127.0.0.1:8767，服务端口不同时必须显式给出）与 token（VB6MCP_TOKEN 或 VB6MCP_TOKEN_FILE，仅当服务端配置了凭据时）。Claude Desktop 是 %APPDATA%\Claude\claude_desktop_config.json；Cursor 用它的 MCP 配置（也可以 streamable HTTP 直连 http://127.0.0.1:<端口>/mcp，配了 token 时带 Authorization: Bearer <token> 头）。把占位路径换成这台机器上的真实路径；JSON 里用 / 或写成 \\。改配置前先备份原文件。
 
-7) 跑冒烟测试：python tests/smoke_test.py --port <端口>。这一步必须在 VB6 IDE 已打开且插件已加载的前提下跑，它不是离线自检。
+7) 跑冒烟测试：python tests/smoke_test.py --port <端口>（<端口> 指中间服务端口）。这一步必须在 VB6 IDE 已打开且插件已加载的前提下跑，它不是离线自检。注意该脚本**不发送 token**，仅在服务端未配置凭据时可用；配了 token 时请用 python bridge/vb6mcp_bridge.py --print-config 查看状态，并改用 --selftest 做进程内自检。
 
 8) 汇报（最重要）。给我：
    - 你实际执行过的命令（原样）与实际观察到的结果（关键输出、health 响应、工具数、冒烟测试结果）；
@@ -154,7 +158,7 @@ MCP_VB6/
 再次强调：不要杀进程；不要动你没被要求动的端口、服务、注册表、工程文件；任何可能破坏我现有环境的事，先问再做。我需要的是"确实成功了"，或者"诚实地说清卡在哪里"。
 ```
 
-想手动来一遍 → 见下面「一、构建」「二、端口与多实例」「三、接入 MCP 客户端」。两条路任选其一即可。
+想手动来一遍 → 见下面「一、构建」「二、连接模型、端口与多实例」「三、接入 MCP 客户端」。两条路任选其一即可。
 
 ## 一、构建
 
@@ -172,54 +176,77 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
 > ⚠️ 不要把 VB6MCP 工程自身作为当前活动工程去"生成"——插件 DLL 正被 IDE 加载占用，
 > 会因文件锁导致编译失败。请关掉 IDE 用 build.bat 编译，或用另一个工程测试。
 
-## 二、端口与多实例
+## 二、连接模型、端口与多实例
 
-- 默认监听 `http://127.0.0.1:8766`（MSWINSCK 的 LocalIP 只读，监听器绑定全部本机接口，
-  但接受连接时校验对端 IP 必须为 127.0.0.1，非回环连接立即拒绝）。
-- 端口占用时自动向上探测（最多 +40）。
-- 实际端口写入 `%TEMP%\vb6mcp_port.txt`，桥接器自动读取。
-- 自定义端口：环境变量 `VB6MCP_PORT`，或注册表 `HKCU\Software\VB6MCP\Port` (DWORD)。
-- 同时开多个 VB6 实例时，每个实例各占一个端口；端口文件记录最后启动的实例。
-- 运行状态查询：IDE 菜单 **Add-Ins → VB6 MCP Status...**；
-  或浏览器访问 `http://127.0.0.1:8766/health`。
-- 日志：`%TEMP%\vb6mcp.log`。
+**新一代：一个监听端口 + 每个 IDE 实例一条命名管道。**
+
+- 客户端不再直连插件。本机由**中间服务** `bridge/vb6mcp_bridge.py` 持有**唯一一个 TCP 端口**：
+  默认 `http://127.0.0.1:8767`（用 `--port` 或环境变量 `VB6MCP_BRIDGE_PORT` 改；`VB6MCP_BRIDGE_HOST` 只接受回环地址）。
+- **非回环绑定不可能**：绑定到非回环地址会被拒绝，并以**退出码 6** 结束，**没有覆盖开关**。
+- MCP 客户端经 **hub** `bridge/vb6mcp_hub.mjs`（Node，零依赖，stdio）接入：hub 提供 `ide_*` 与经验库共 10 个工具，
+  并把插件面的 110 个工具转发给中间服务；hub 用环境变量 `VB6MCP_BRIDGE_URL` 找中间服务（源码默认 `http://127.0.0.1:8767`）。
+- 插件只接受**命名管道**（每个 IDE 实例一条；同一条管道**不允许并发连接**）⇒ 客户端应在**同一条连接上复用请求 id**，
+  或把调用串行化；管道忙时回执给 `pipeBusy`，而不是「没有 IDE」。
+- **传输选择** `VB6MCP_TRANSPORT=auto|pipe|tcp`（默认 `auto`：优先管道，不可用时**可见地**回退到插件的 HTTP；
+  `pipe` 为严格管道、缺管道是显式错误；`tcp` 只走插件 HTTP，用于回滚与过渡）。
+- **自定义端口**：`--port N`、`VB6MCP_BRIDGE_PORT`（或同一台机器上的 `VB6MCP_PORT`）。
+  同时开多个 VB6 实例时**仍然只有一个服务端口**；多实例靠 `_target` 寻址（见第三节）。
+- 运行状态查询：IDE 菜单 **Add-Ins → VB6 MCP Status...**；或 `GET http://127.0.0.1:<端口>/health`
+  （配了凭据时该请求也要带 token）；`python bridge/vb6mcp_bridge.py --print-config` 打印生效端口 / 传输 / `authEnabled`。
+- 日志：中间服务的日志路径见 `--print-config` 的 `logPath`；插件自身日志仍是 `%TEMP%\vb6mcp.log`。
 
 ## 三、接入 MCP 客户端
 
+### 连接与鉴权（新一代）
+
+- **推荐**：客户端以 **stdio** 启动 hub —— `command: node`，`args: ["<仓库>/bridge/vb6mcp_hub.mjs"]`，
+  环境变量给 `VB6MCP_BRIDGE_URL=http://127.0.0.1:8767`（中间服务端口不同时必须显式给出）。
+- **HTTP 直连**（streamable HTTP）：`POST http://127.0.0.1:<端口>/mcp`（`/rpc` 是同一面）。
+- **鉴权**：一旦服务端配置了凭据（`VB6MCP_TOKEN`，或 `VB6MCP_TOKEN_FILE` 指向一个仅属主可读的文件），
+  **所有 HTTP 面**（`/rpc`、`/mcp`、`/health` …）都需要 bearer token：`Authorization: Bearer <token>`，
+  或 `X-VB6MCP-Token: <token>`。**把凭据放进 URL 会被拒绝**（401 `token_in_url_rejected`）；
+  **未配置凭据时服务照常运行**，但 `/health` 会明确标注 `auth.enabled=false` —— 多用户机器上不要这样长期运行。
+- **寻址**：调用用 `_target` 指定目标工程，规范写法 `[endpoint:]projectPath`（例如 `C:/work/MyProj.vbp`），
+  省略 `endpoint` 即本机；**没有 `_target` 的调用不会被送到远端**。
+- 旧代的直连端口（8766）在新一代**不再存在** —— 仍指向它的客户端会直接连接失败。
+
 ### Claude Desktop
 
-把 `mcp_config.example.json` 里的 `mcpServers.vb6` 合并进
-`%APPDATA%\Claude\claude_desktop_config.json`（`command` 用你机器上的
-python/py 路径），重启 Claude Desktop 即可。
-
-> ★**配置里的路径都要换成你自己机器上的**：`mcp_config.example.json`（以及下面「其它 stdio 客户端」的示例）用的是**占位路径** —— `command` 的 python/py、`args` 指向的 `bridge/mcp_stdio_bridge.py` 都要改成你的实际安装位置。JSON 里建议统一用正斜杠 `/`；若要写 Windows 反斜杠，必须写成 `\\`。
-
-### Cursor（SSE / streamable HTTP 模式）
-
-Cursor 可直接连 HTTP 端点，无需桥接器：
-
-```
-类型: sse     URL: http://127.0.0.1:8766/sse
-```
-
-### 其它 stdio 客户端
+让 Claude Desktop 以 **stdio** 启动 hub（路径换成你自己的）：
 
 ```json
 {
   "mcpServers": {
     "vb6": {
-      "command": "python",
-      "args": ["D:/path/to/VB6MCP/bridge/mcp_stdio_bridge.py"]
+      "command": "node",
+      "args": ["C:/path/to/VB6MCP/bridge/vb6mcp_hub.mjs"],
+      "env": { "VB6MCP_BRIDGE_URL": "http://127.0.0.1:8767" }
     }
   }
 }
 ```
 
-验证链路是否打通（需要**先打开 VB6 IDE 并加载插件**；这不是离线自检）：
+服务端配了 token 时，在 `env` 里再加 `VB6MCP_TOKEN`（或 `VB6MCP_TOKEN_FILE`）。
+
+> ★**配置里的路径都要换成你自己机器上的**：示例（包括 `mcp_config.example.json`）用的是**占位路径** —— `command` 的 node/python、`args` 指向的仓库脚本（如 `bridge/vb6mcp_hub.mjs`）都要改成你的实际安装位置。JSON 里建议统一用正斜杠 `/`；若要写 Windows 反斜杠，必须写成 `\\`。
+
+### Cursor（streamable HTTP）
+
+Cursor 也可以直接连中间服务的 streamable HTTP 面：
 
 ```
-python tests/smoke_test.py --port 8766
+类型: streamable HTTP
+URL: http://127.0.0.1:8767/mcp
+请求头: Authorization: Bearer <token>    # 仅当服务端配置了 token
 ```
+
+（用 stdio 启动 hub 也可以，见上。）
+
+### 其它 stdio 客户端
+
+与 Claude Desktop 相同：`command: node`、`args: ["<仓库>/bridge/vb6mcp_hub.mjs"]`，按需设置 `VB6MCP_BRIDGE_URL` 与 `VB6MCP_TOKEN` / `VB6MCP_TOKEN_FILE`。
+
+验证链路是否打通：`python tests/smoke_test.py --port <中间服务端口>`（该脚本**不发送 token**，只在服务端未配置凭据时可用；且需要**先打开 VB6 IDE 并加载插件** —— 这不是离线自检）。
 
 ## 四、工具列表（插件面 110 + hub 面 10 = 120 个）
 
@@ -300,7 +327,7 @@ python tests/smoke_test.py --port 8766
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类；全程受墙钟预算约束（默认 8000 ms，`VB6MCP_BUDGET_MS` 可覆盖），回执恒带 `budgetExhausted`/`elapsedMs`/`stage` | - |
+| `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类；主截止是**确定性字符配额**（`VB6MCP_CHAR_QUOTA`，默认 900000），墙钟只作最后手段（`VB6MCP_BUDGET_MS`，默认 30000）。回执带 `partial` / `*StageCompleted` / `budgetExhausted` / `timingTruncated` / `procEdgesFound` 等完整性字段 —— **默认档是确定性的部分结果** | - |
 | `purity_check` | 判定组件能否进离线测试宿主及原因 | `name` |
 | `export_public_api` | 把组件公开 API 冻结成可比对规格；省略 `name` 时做有界整工程导出 | `name`, `membersOnly` |
 | `check_public_api` | 与冻结规格比对，报移除、变更、新增成员；省略 `name` 时做有界整工程核验 | `baseline`, `name`, `membersOnly` |
@@ -310,7 +337,7 @@ python tests/smoke_test.py --port 8766
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `make_project` | 编译工程并回权威产物判定，可选真日志诊断 | `output_path`, `laa`, `diagnose` |
+| `make_project` | 编译工程并回权威产物判定，可选真日志诊断；构建状态可查询（`buildState`） | `output_path`, `laa`, `diagnose`, `wait_for_build` |
 | `build` | 用隔离的 VB6.EXE /make 编译并回编译器日志 | `project`, `defines`, `laa` |
 | `package_app` | 组装交付目录：exe、清单、依赖表、安装脚本 | `path`, `exe_path`, `out_dir` |
 | `app_manifest` | 生成或读取 exe/dll 旁清单（UAC 与 DPI） | `action`, `path`, `level` |
@@ -415,7 +442,7 @@ python tests/smoke_test.py --port 8766
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `mcp_info` | 读服务器版本戳、契约、工具数与构建哈希 | - |
+| `mcp_info` | 读服务器版本戳、契约、工具数与构建哈希；`build.sourceHash` / `sourceAlgo` 是源码输入集合的指纹与算法标识 | - |
 | `ide_state` | 即时读 IDE 模式与在飞、取消、释放闸门状态 | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
 | `desktop_probe` | 测量宿主进程桌面与可交互性，且不抢焦点 | - |
 | `ide_quiet_mode` | 开或关安静模式：不抢前台，回执附提示 | `on`, `ttl_ms` |
@@ -503,8 +530,8 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 - `MSWINSCK.OCX` 的 `LocalIP` 只读：监听绑定全部本机接口，接受连接时校验对端为 127.0.0.1；
   若 OCX 未注册，`build.bat` 前先 `"%SystemRoot%\SysWOW64\regsvr32.exe" "%SystemRoot%\SysWOW64\MSWINSCK.OCX"`
   ★**32 位控件的注册必须用「本机」`%SystemRoot%\SysWOW64\regsvr32.exe`，绝不硬编码 `C:\Windows`**：
-  本机 `SystemRoot=B:\Windows`，而 `C:\Windows` 是一份**陈旧的第二安装** ⇒ 用它会让**任何** 32 位 DLL
-  注册失败（`0xC0000139`）且 `/s` **静默**（纪律 29；`build.bat` 已用 `%REGSVR%` 显式指向本机 SysWOW64）。
+  在部分机器上 `SystemRoot` **不是** `C:\Windows`，而 `C:\Windows` 可能是**一份陈旧的第二安装** ⇒ 用它会让
+  **任何** 32 位 DLL 注册失败（`0xC0000139`）且 `/s` **静默**（`build.bat` 已用 `%REGSVR%` 显式指向本机的 SysWOW64）。
   （或在工程目录放一份 OCX 文件）。
 - VB6EXT 中 `CodePane.CodePaneView`、`Window.Caption` 为只读，相应设置请求会被忽略并说明。
 - `VBProjects.StartProject` 只有 Put 访问器，需用无 Set 的对象赋值。
@@ -517,7 +544,7 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 
 **加载时报 MSWINSCK.OCX 缺失**
 → 从 VB6 安装源找到 `MSWINSCK.OCX` 放到 `%SystemRoot%\SysWOW64` 并
-`"%SystemRoot%\SysWOW64\regsvr32.exe" MSWINSCK.OCX`（★不要硬编码 `C:\Windows`，理由见上文纪律 29）。
+`"%SystemRoot%\SysWOW64\regsvr32.exe" MSWINSCK.OCX`（★不要硬编码 `C:\Windows`，理由见上文）。
 
 **桥接器报 "VB6 MCP server unreachable"**
 → 确认 VB6 IDE 已打开且插件已加载（Add-Ins → VB6 MCP Status... 查看端口），
@@ -582,9 +609,8 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 - 实现 MCP 核心：`initialize` / `ping` / `tools/list` / `tools/call` / 通知。
 - 协议版本**协商**：服务端支持 2025-11-25 等版本，按客户端 `initialize` 回显其请求的版本
   （未带则用最新；见 `McpServer.NegotiateProtocol`）。
-- 传输：`POST /rpc`、`POST /mcp`（streamable HTTP）、`POST /message`；请求头带
-  `Accept: text/event-stream` 时用 SSE 帧返回单条消息。**不提供** `GET /sse` 长连订阅，
-  因此不使用服务端主动通知（notifications）——客户端按需 `tools/list` 拉取即可。
+- 传输：中间服务提供 `POST /rpc` 与 `POST /mcp`（streamable HTTP）；请求头带 `Accept: text/event-stream` 时用 SSE 帧返回单条消息。旧代的 `GET /sse` + `POST /message` 长连订阅**不再实现**（返回 501），因此不使用服务端主动通知（notifications）——客户端按需 `tools/list` 拉取即可。
+- 鉴权：配置了凭据后**所有 HTTP 面**都要 `Authorization: Bearer <token>` 或 `X-VB6MCP-Token`；把凭据放进 URL 一律 401 `token_in_url_rejected`。
 - 实现了 `resources/list|read`（`vb6://project` + 每个组件的 `vb6://component/<name>`）
   与 `prompts/list|get`（`edit-checklist` / `release-checklist`）；未知 uri/prompt 回 `-32602`。
 - JSON-RPC 通知返回 HTTP 202 空响应；工具错误按 MCP 规范以

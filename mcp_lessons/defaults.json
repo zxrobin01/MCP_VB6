@@ -111,13 +111,69 @@
       "trap": "Three separate mistakes all produce access violations that look like 'the API is unusable': (1) EbGetCallstackFunction arg5 is a POINTER (out long*), passing ByVal 0 writes to address 0; (2) frame indices are 0-BASED, so asking for frame == count walks past the list and reads [NULL+4]; (3) the out string is UTF-16 while the BSTR length is a byte count, so names come back with NULs between characters.",
       "do": "Declare arg5 ByRef Long, iterate frames 0..count-1 and clamp, and decode the name by taking every other character when NULs are present. EbGetCallstackCount only walks the list when EbMode()==2; otherwise it writes the sentinel 1."
     },
-  {
-    "id": "vb6-err-stale-after-return",
-    "scope": "vb6",
-    "enabled": true,
-    "scenario": "VB6 add-in: a Declare-based helper (or any guarded code) ran just before you inspect Err",
-    "trap": "Err is NOT cleared by a normal return, so reading Err.Number after a successful call can see a stale or phantom error (measured: a queued 17 KB response was aborted by a phantom error 5, and a GetLastError() probe read 0 instead of 87 because the Declare epilogue clobbered the thread last-error)",
-    "do": "Never branch on Err after a normal return: only an error that ESCAPES the guarded call is a real failure. Wrap the call so its own handler reports that escaping error, clear or ignore Err unconditionally afterwards, and for Win32 last-error use Err.LastDllError (VB6 keeps it per-call) or a Toolhelp32 snapshot instead of a GetLastError() Declare."
-  }
+    {
+      "id": "vb6-err-stale-after-return",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "VB6 add-in: a Declare-based helper (or any guarded code) ran just before you inspect Err",
+      "trap": "Err is NOT cleared by a normal return, so reading Err.Number after a successful call can see a stale or phantom error (measured: a queued 17 KB response was aborted by a phantom error 5, and a GetLastError() probe read 0 instead of 87 because the Declare epilogue clobbered the thread last-error)",
+      "do": "Never branch on Err after a normal return: only an error that ESCAPES the guarded call is a real failure. Wrap the call so its own handler reports that escaping error, clear or ignore Err unconditionally afterwards, and for Win32 last-error use Err.LastDllError (VB6 keeps it per-call) or a Toolhelp32 snapshot instead of a GetLastError() Declare."
+    },
+    {
+      "id": "vb6-declare-without-alias-late-453",
+      "scenario": "Writing kernel32/user32 Declare statements in VB6 (e.g. named-pipe or Win32 transport code)",
+      "trap": "A Declare without the Alias clause compiles fine and only fails at the FIRST CALL with run-time error 453 (cannot find the entry point in the DLL) - 17 occurrences in one card.",
+      "do": "Always give the Alias form for kernel32/user32 functions and make the first use fail-loud (log event=start_failed err=453), otherwise the failure looks like \"no transport is running at all\".",
+      "scope": "vb6",
+      "enabled": true
+    },
+    {
+      "id": "vb6-disconnectnamedpipe-drops-buffered-frames",
+      "scenario": "A VB6 named-pipe server that writes a reply frame and then closes the pipe",
+      "trap": "DisconnectNamedPipe discards frames already written into the buffer, so the client sees a bare EOF and the reply reason is lost.",
+      "do": "After writing the frame, let the client read it (or wait a short grace period, e.g. 750 ms) and then CloseHandle; do not call DisconnectNamedPipe for this path. Also never call FlushFileBuffers if it can block until the client drains.",
+      "scope": "vb6",
+      "enabled": true
+    },
+    {
+      "id": "vb6-utf16-string-breaks-ansi-buffers",
+      "scenario": "Passing a VB6 string to a Win32 API that expects an ANSI/byte buffer (e.g. a security descriptor)",
+      "trap": "VB6 strings are UTF-16; copying ANSI bytes straight into StrPtr(s) corrupts the data - a SID became garbage, ConvertStringSecurityDescriptor returned ERROR_INVALID_SID (1337) and the ACL silently fell back to the default DACL.",
+      "do": "Build a Byte() array and convert with StrConv in the documented direction; never assume StrPtr gives an ANSI buffer, and treat a silent ACL fallback as a bug, not a default.",
+      "scope": "vb6",
+      "enabled": true
+    },
+    {
+      "id": "pipe-single-instance-no-concurrency",
+      "scope": "all",
+      "enabled": true,
+      "scenario": "Calling a pipe-transport MCP over more than one connection at a time.",
+      "trap": "The pipe is defined with a single instance: a second concurrent connection is refused as busy (ERROR_PIPE_BUSY 231) and there is no TCP fallback, so the second call fails even though the service is healthy. Opening a parallel connection to read while a write is in flight cannot work.",
+      "do": "Multiplex requests on ONE connection (the protocol already carries request ids) or serialise your calls. If you must observe progress during a long call, use the same connection."
+    },
+    {
+      "id": "hub-only-tools-not-on-http-face",
+      "scope": "all",
+      "enabled": true,
+      "scenario": "Reaching the management tools by talking HTTP to the middle service.",
+      "trap": "The management tools (list, target, start, stop, restart the IDE, plus the lesson tools) live on the hub face only; the HTTP face exposes the add-in tools. A client that speaks HTTP to the service simply does not have them.",
+      "do": "Drive those tools through the hub (stdio). Check which face you are on before concluding a tool is missing."
+    },
+    {
+      "id": "ide-restart-needs-interactive-session",
+      "scope": "vb6",
+      "enabled": true,
+      "scenario": "Recovering a wedged IDE with the restart tool while the service or hub was started outside a desktop session.",
+      "trap": "The restart path saves, asks the IDE to quit and force-kills it, then relaunches - but processes launched from a non-interactive context land in session 0, so no usable IDE appears and readiness waits out its budget while reporting only a refusal.",
+      "do": "Run the service or hub inside the interactive session (user logon / interactive scheduled task). Supply the project path explicitly when the transport is a pipe, and treat a refusal as 'no usable IDE came back', not as 'nothing happened'."
+    },
+    {
+      "id": "read-your-own-receipt-not-console",
+      "scope": "all",
+      "enabled": true,
+      "scenario": "Concluding that a long tool call produced no result because the console showed nothing.",
+      "trap": "Long-running calls are usually driven detached and write their receipt to a file; an empty console is not evidence of a missing receipt. Declaring 'no result' when the receipt is on disk wastes a whole round and can hide a real answer.",
+      "do": "Read the evidence file (and the service log) before concluding either way; state which file you read and what it contained."
+    }
   ]
 }

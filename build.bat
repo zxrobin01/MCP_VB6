@@ -81,6 +81,21 @@ goto addndr_done
 >&2 echo "Microsoft Add-In Designer" reference. Install it from your VB6/VS media.
 :addndr_done
 
+rem --- TASK-67: the SOURCE STAMP must exist BEFORE the compiler runs ----------------
+rem BuildStamp.bas carries I = sha256 over the .vbp's component inputs (strict mode,
+rem docs/SOURCE_STAMP.md) and is EXCLUDED from that input set, so writing it cannot
+rem change I. A build must never ship a stale or absent stamp, so a missing or failing
+rem generator is FATAL here - never a skipped step (spec section 6: no stamp => FAIL).
+>&2 echo Emitting the source stamp (tools\srcstamp.py emit) ...
+if not exist "%~dp0tools\srcstamp.py" goto stamp_nogen
+rem Exact CLI agreed with the generator author (task-67 B3/B4): emit writes BOTH
+rem BuildStamp.bas and the .vbp Comments= line, so the two read points cannot drift.
+rem Relative paths are safe here: line 30 already did cd /d "%~dp0".
+python "tools\srcstamp.py" emit . --vbp "MCP_VB6.vbp" --out "BuildStamp.bas"
+set "STAMPRC=%ERRORLEVEL%"
+if not "%STAMPRC%"=="0" goto stamp_failed
+if not exist "%~dp0BuildStamp.bas" goto stamp_nogen
+
 >&2 echo Building VB6MCP.dll with VB6 ...
 if exist "%LOG%" del /q "%LOG%"
 "%VB6%" /make "%~dp0MCP_VB6.vbp" /out "%LOG%"
@@ -118,6 +133,15 @@ if "%A_TIME%%A_SIZE%"=="%B_TIME%%B_SIZE%" goto failed
 set "FRESH=1"
 
 :built
+rem --- TASK-67: the artifact must carry the SAME I as this source tree ----------
+rem check reads I back from the ARTIFACT (mcp_info when an IDE is running, otherwise
+rem the version resource Comments=algo=..;src=..) and recomputes it from the tree; the
+rem two read points must agree (spec section 7). A mismatch is FATAL, not a warning.
+>&2 echo Checking the artifact's source stamp (tools\srcstamp.py check) ...
+python "tools\srcstamp.py" check "%DLL%" "."
+set "CHECKRC=%ERRORLEVEL%"
+if not "%CHECKRC%"=="0" goto stamp_check_failed
+
 rem --- register, then report refreshed-or-unchanged --------------------------
 rem NOTE: this block is deliberately written with LABELS instead of one big
 rem "if (...) else (...)" block: an unescaped ')' anywhere inside a parenthesised
@@ -162,6 +186,31 @@ rem --- OK: the artifact's bytes changed ---------------------------------------
 >&2 echo the Add-In Manager (Add-Ins menu). It is set to auto-load.
 >&2 echo The MCP server listens on http://127.0.0.1:8766 (see README.md).
 endlocal & exit /b 0
+
+:stamp_nogen
+>&2 echo.
+>&2 echo Build FAILED - tools\srcstamp.py or BuildStamp.bas is missing, so the SOURCE
+>&2 echo   STAMP could not be emitted. A build must never ship a stale/absent stamp.
+>&2 echo   fix : restore tools\srcstamp.py, then run it once (see docs\SOURCE_STAMP.md).
+>"%STATUS%" 2>nul echo FAILED-STAMP-NOGEN
+endlocal & exit /b 1
+
+:stamp_failed
+>&2 echo.
+>&2 echo Build FAILED - tools\srcstamp.py emit returned rc=%STAMPRC%.
+>&2 echo   fix : python tools\srcstamp.py emit .   ^(read its diagnostics^)
+>"%STATUS%" 2>nul echo FAILED-STAMP-EMIT rc=%STAMPRC%
+endlocal & exit /b 1
+
+:stamp_check_failed
+>&2 echo.
+>&2 echo Build FAILED - the artifact's SOURCE STAMP does not match this source tree.
+>&2 echo   artifact : %DLL%
+>&2 echo   sha256   : %A_SHA%
+>&2 echo   reason   : tools\srcstamp.py check returned rc=%CHECKRC% ^(see its per-file diff^)
+>&2 echo   note     : an artifact with a stale stamp must NOT be released (spec section 6).
+>"%STATUS%" 2>nul echo FAILED-STAMP-CHECK rc=%CHECKRC% size=%A_SIZE% sha=%A_SHA%
+endlocal & exit /b 1
 
 :no_regsvr
 >&2 echo.

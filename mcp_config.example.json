@@ -1,8 +1,12 @@
 {
   "mcpServers": {
     "vb6": {
-      "command": "python",
-      "args": ["C:/path/to/MCP_VB6/bridge/mcp_stdio_bridge.py"]
+      "command": "node",
+      "args": ["C:/path/to/MCP_VB6/bridge/vb6mcp_hub.mjs"],
+      "env": {
+        "VB6MCP_BRIDGE_URL": "http://127.0.0.1:8767",
+        "VB6MCP_TOKEN_FILE": "C:/path/to/vb6mcp_token.txt"
+      }
     }
   }
 }

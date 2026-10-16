@@ -230,7 +230,7 @@
     },
     {
       "name": "replace_code",
-      "description": "Edit a component's code in IDE memory (line based). replace: overwrite start_line..end_line. insert: before start_line. append: after last line. delete: remove range. set: replace the whole module with code. Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default).",
+      "description": "Edit a component's code in IDE memory (line based). replace: overwrite start_line..end_line. insert: before start_line. append: after last line. delete: remove range. set: replace the whole module with code. TASK-99 (MCP-07): replace and delete REQUIRE expected_sha256. The chosen remedy is the SHA PIN, not a proc: address space: a whole-pane sha detects ANY drift (a proc-relative address only detects drift across procedure boundaries within the same pane, and it would have to be re-derived from the very text it is meant to pin) - so a drifted pane is refused with sha256_mismatch + the current sha in one retry, and the receipt additionally echoes procBefore/procAfter{proc,startLine,endLine,firstLine,lastLine} so the targeted procedure is visible on both sides. TASK-99 (MCP-06): the submitted block is checked BEFORE the write - a redundant trailing End <Sub|Function|Property> is refused as extra_procedure_end (with block line numbers, the header/End pairs it did match and a suggestedText), set/append must be self-contained (missing_procedure_end), and any edit that would leave the pane unbalanced is refused as predicted_procedure_imbalance instead of becoming a compile-time E105. Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -739,7 +739,7 @@
     },
     {
       "name": "make_project",
-      "description": "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).",
+      "description": "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}. After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure). TASK-99 (MCP-03): the receipt carries ONE queryable build state - buildState (blocked_by_host_modal | pending | completed | completed_without_artifact_change | failed | no_artifact), derived from the same facts as verdict. pending means the compile started but the artifact had not landed inside this call's wait window: re-read output{exists,size,mtime,sha256} (and confirm MZ) before treating it as done - compiled/ok are never completion evidence, and clearing a host modal box is not either. wait_for_build=<ms> extends this call's own wait (default 0 = 15000 ms, cap 120000); the receipt reports waitRequestedMs/waitUsedMs.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -766,6 +766,10 @@
           "laa": {
             "type": "boolean",
             "description": "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\\.vb6mcp.json {\"laa\": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned. WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section."
+          },
+          "wait_for_build": {
+            "type": "integer",
+            "description": "TASK-99 (MCP-03): milliseconds this call waits for the artifact to land before reporting buildState=pending (default 0 = the historical 15000 ms; a smaller value is raised to 15000; cap 120000). The wait is what makes buildState trustworthy: a pending build is NEVER reported as completed. After clearing a host modal box you must re-read output{exists,size,mtime,sha256} - clearing the box is not completion."
           },
           "diagnose": {
             "type": "boolean",
@@ -1387,7 +1391,7 @@
     },
     {
       "name": "validate_code",
-      "description": "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).",
+      "description": "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given). TASK-99 (MCP-04): linter != compiler. These rules are LEXICAL + STRUCTURAL only - they never resolve types or symbols, so a CLEAN receipt is NOT a compile pass and this tool can never report a call to a method that does not exist (that needs type information; a cheap approximation would be guessing) - an explicit NON-GOAL. For a real compile verdict use build (isolated VB6.EXE /make, real compiler log + firstError{file,line,text}) or make_project.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1435,7 +1439,7 @@
     },
     {
       "name": "check_component",
-      "description": "Lint the current in-IDE text of a component (same diagnostics as validate_code, evaluated on IDE memory).",
+      "description": "Lint the current in-IDE text of a component (same diagnostics as validate_code, evaluated on IDE memory). TASK-99 (MCP-04): linter != compiler - lexical + structural only, no type resolution, so it can never report a call to a method that does not exist (NON-GOAL) and a clean receipt is not a compile pass. Use build for a real compiler log and firstError{file,line,text}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1480,7 +1484,7 @@
     },
     {
       "name": "edit_by_anchor",
-      "description": "Replace one uniquely-matched line by content anchor (no line numbers). Rejects if the anchor is missing or ambiguous. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
+      "description": "Replace one uniquely-matched line by content anchor (no line numbers). TASK-99 (MCP-05): the anchor may SPAN MULTIPLE LINES - a pasted block matches when all its lines match consecutively (normalized by default) and the WHOLE matched block is replaced; when the anchor is missing or ambiguous the refusal carries hits[] with the candidate {line, proc, text} of every match (plus coords/lineSpace), so pick one with occurrence=<n> or narrow it with scope instead of guessing. TASK-99 (MCP-06): a new block that carries a redundant trailing End <Sub|Function|Property> is refused BEFORE the write (reason=extra_procedure_end, with the offending block line numbers, the pairs it did match, and a suggestedText), and an edit that would leave the pane unbalanced is refused as predicted_procedure_imbalance - instead of becoming a compile-time E105. TASK-99 (MCP-07): the receipt echoes the affected procedure as procBefore/procAfter{proc,startLine,endLine,firstLine,lastLine}. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1535,7 +1539,7 @@
     },
     {
       "name": "apply_edits",
-      "description": "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
+      "description": "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). TASK-99 (MCP-05): every op takes the same multi-line block anchors as edit_by_anchor (a block match replaces the whole matched block), and a failing op answers with failedOpIndex + hits[] {line, proc, text} for candidate selection (occurrence/scope, or per-op match). TASK-99 (MCP-06): each op's new text is checked for a redundant trailing End <Sub|Function|Property> before anything is written, and a batch that would leave the pane unbalanced is refused as predicted_procedure_imbalance. TASK-99 (MCP-07): the receipt echoes procBefore/procAfter for the affected procedure. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1577,7 +1581,7 @@
     },
     {
       "name": "preview_edit",
-      "description": "Return a unified-style diff for a batch of anchor edits without writing anything. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written.",
+      "description": "Return a unified-style diff for a batch of anchor edits without writing anything. TASK-99 (MCP-05): it walks the SAME resolution as apply_edits (per-op match/occurrence, MULTI-LINE block anchors that replace the whole matched block) and applies the same structural refusals, so previewing and then writing the same batch cannot disagree. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1924,7 +1928,7 @@
     },
     {
       "name": "dependency_graph",
-      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount).",
+      "description": "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount). v1.11.3: the build is bounded by a DETERMINISTIC character quota (env VB6MCP_CHAR_QUOTA, default 900000), so the SAME input always returns the SAME receipt; every phase keeps a reserved share of that quota, so a default run reports nodes AND some procedure edges. Large projects are PARTIALLY covered by default - read partial, budgetExhausted (the deterministic quota fired) vs timingTruncated (the wall clock fired - the LAST resort, and NOT reproducible), componentsScanned/componentsTotal, procEdgesFound and the *StageCompleted flags (a stage that was cut reports false; a stage whose input was itself cut reports false too). Raise VB6MCP_CHAR_QUOTA (and VB6MCP_BUDGET_MS, since the clock is what would stop it first) for a complete graph; a complete run is reproducible.",
       "inputSchema": {
         "type": "object",
         "properties": {}

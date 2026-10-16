@@ -61,7 +61,26 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 ' TASK-P1-089: the P1-087 snapshot parameter is an inputSchema change, so the contract
 ' version moves with it. It is ADDITIVE (optional parameter, default off), but a tool-face
 ' change still has to be named by a version - the rule above is "bump it HERE, in one line".
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.1"
+' TASK-67 (Lead batch ruling 2026-10-15): mcp_info.build{} gains two ADDITIVE keys,
+' sourceHash/sourceAlgo (the SOURCE STAMP of docs/SOURCE_STAMP.md). No tool name,
+' description or inputSchema changes, and no existing receipt key changes - the bump
+' exists because a NEW receipt field is a contract-visible addition, exactly as v1.11.1
+' was for its ADDED receipt fields.
+' TASK-95 (v1.11.3): dependency_graph gained ADDITIVE coverage fields (partial /
+' charQuota / charsProcessed / componentsScanned / componentsTotal / procEdgesFound /
+' edgeStageCompleted / purityStageCompleted / cyclesStageCompleted / timingTruncated /
+' completeHint) and its cutoff became DETERMINISTIC (a character quota) so the same
+' input returns the same receipt. No existing key changed.
+' TASK-99 (v1.11.4, MCP-台账批): the write-class and build tools gain behaviour and
+' receipts: a PRE-WRITE structural pairing gate on every block-writing tool plus a
+' result-level guard (extra_procedure_end / missing_procedure_end /
+' predicted_procedure_imbalance, with block/pane line numbers), candidate hits[] for an
+' ambiguous anchor on the batch path, MULTI-LINE block anchors in preview_edit (already
+' in edit_by_anchor/apply_edits), procBefore/procAfter on replace_code and apply_edits,
+' make_project buildState + wait_for_build, and the linter!=compiler clarification in
+' validate_code/check_component. No tool added or removed; inputSchema gains ONE optional
+' parameter (make_project.wait_for_build), so the frozen face must be re-frozen.
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.4"
 ' TASK-P1-066: message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
@@ -141,6 +160,55 @@ Public Function InstancesDir() As String
     InstancesDir = Vb6mcpDir() & "\instances"
 End Function
 
+' TASK-68: the instance registration MUST stay pure ASCII. This writer uses FSO
+' CreateTextFile (ANSI / system ACP), so a project name such as 工程1 was written as
+' GBK bytes; a strict UTF-8 reader (the Python bridge) then failed to decode the whole
+' entry and dropped it. Escaping every non-ASCII UTF-16 code unit as \uXXXX makes the
+' file ASCII-only, so the ANSI writer, a strict UTF-8 reader and JSON.parse all decode
+' the SAME characters.
+' It is applied to the SERIALIZED text, never to JsonStringify itself: JsonStringify's
+' structural characters are ASCII and any quote/backslash/control character inside a
+' string value has already been escaped by it, so a >127 character in its output is
+' always inside a string literal and a blanket per-code-unit rewrite is correct
+' (astral characters become the standard \uD83D\uDE00 surrogate-pair form).
+' Pure-ASCII input is returned byte-for-byte unchanged (zero behaviour change).
+Public Function AsciiEscapeJson(ByVal s As String) As String
+    Dim n As Long
+    n = Len(s)
+    If n = 0 Then Exit Function
+    Dim i As Long
+    Dim cc As Long
+    Dim need As Boolean
+    need = False
+    For i = 1 To n
+        ' AscW returns a SIGNED 16-bit value, so mask to get the true code unit.
+        cc = AscW(Mid$(s, i, 1)) And &HFFFF&
+        If cc > 127 Then
+            need = True
+            Exit For
+        End If
+    Next i
+    If Not need Then
+        AsciiEscapeJson = s
+        Exit Function
+    End If
+    Dim out As String
+    Dim j As Long
+    out = Space$(n * 6)
+    j = 0
+    For i = 1 To n
+        cc = AscW(Mid$(s, i, 1)) And &HFFFF&
+        If cc > 127 Then
+            Mid$(out, j + 1, 6) = "\u" & Right$("0000" & Hex$(cc), 4)
+            j = j + 6
+        Else
+            Mid$(out, j + 1, 1) = Chr$(cc)
+            j = j + 1
+        End If
+    Next i
+    AsciiEscapeJson = Left$(out, j)
+End Function
+
 Public Sub WriteInstanceFile(ByVal pid As Long, ByVal port As Long, ByVal project As String, _
                              ByVal projectPath As String, ByVal dllSha As String, _
                              Optional ByVal startedAt As String = "")
@@ -167,7 +235,8 @@ Public Sub WriteInstanceFile(ByVal pid As Long, ByVal port As Long, ByVal projec
     d("startedByHub") = (Environ$("VB6MCP_STARTED_BY_HUB") = "1")
     Dim ts As Object
     Set ts = fso.CreateTextFile(InstancesDir() & "\" & CStr(pid) & ".json", True)
-    ts.WriteLine JsonStringify(d)
+    ' TASK-68: ASCII-only output so every reader (ANSI / strict UTF-8 / JSON.parse) agrees.
+    ts.WriteLine AsciiEscapeJson(JsonStringify(d))
     ts.Close
 End Sub
 

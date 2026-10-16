@@ -28,6 +28,124 @@ const HUBCFG = path.join(HERE, 'hub_tools.json');
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOLS[0];
 const SERVER = { name: 'vb6mcp-hub', version: '0.1.0' };
+// ---- thin shell: the Python middle service layer owns the ONE local TCP port ----------------
+// Author ruling (ADR sec 0.1 three layers): the mjs side keeps the MCP wire protocol, the
+// guardians and the degradation; discovery / addressing / named-pipe multiplexing move to
+// bridge/vb6mcp_bridge.py, which holds exactly ONE port for every IDE on the machine.
+//
+//   VB6MCP_BRIDGE=python (default) -> ask the bridge for the add-in face
+//   VB6MCP_BRIDGE=inproc           -> the PRE-CHANGE path, byte for byte: local discovery
+//                                     (netstat + port scan) and a direct rpc() to the add-in.
+//                                     EVERY bridge branch below is guarded by this mode, so
+//                                     nothing new is reached and nothing old is bypassed.
+const BRIDGE_MODE = (process.env.VB6MCP_BRIDGE || 'python').toLowerCase();
+const BRIDGE_URL = (process.env.VB6MCP_BRIDGE_URL || 'http://127.0.0.1:8767').replace(/\/+$/, '');
+const BRIDGE_HEALTH_TTL_MS = parseInt(process.env.VB6MCP_BRIDGE_HEALTH_TTL_MS || '5000', 10);
+const BRIDGE_LIST_TIMEOUT_MS = parseInt(process.env.VB6MCP_BRIDGE_LIST_TIMEOUT_MS || '5000', 10);
+// A forwarded call may be LONG (build / make_project): the shell must never be TIGHTER than the
+// pre-change budget, so its bridge read timeout is FORWARD_TIMEOUT_MS plus a margin.  It is a
+// FUNCTION on purpose: FORWARD_TIMEOUT_MS is declared below this block, so reading it here at
+// module-evaluation time would be a temporal-dead-zone error.
+function bridgeCallTimeoutMs() {
+  return parseInt(process.env.VB6MCP_BRIDGE_CALL_TIMEOUT_MS || String(FORWARD_TIMEOUT_MS + 10000), 10);
+}
+// task-71 (threat model: bridge/TOKEN_THREAT_MODEL.md).  PURELY ADDITIVE: with no credential
+// configured bridgeAuthHeaders() returns {}, so every request this shell makes is byte-identical
+// to before.  The VALUE is never logged - only presence and length are ever reported, and a
+// value read from a file is never copied into a child process environment.
+const BRIDGE_TOKEN = (process.env.VB6MCP_TOKEN || '').trim()
+  || (process.env.VB6MCP_TOKEN_FILE ? readBridgeTokenFile(process.env.VB6MCP_TOKEN_FILE) : '');
+function readBridgeTokenFile(p) {
+  try { return String(fs.readFileSync(p, 'utf8')).trim(); } catch (e) { return ''; }
+}
+function bridgeAuthHeaders() {
+  return BRIDGE_TOKEN ? { Authorization: 'Bearer ' + BRIDGE_TOKEN } : {};
+}
+function bridgeAuthState() {
+  return BRIDGE_TOKEN ? ('on(len=' + BRIDGE_TOKEN.length + ')') : 'off';
+}
+let bridgeHealthCache = { at: 0, data: null, promise: null };
+// Startup breadcrumb, deferred like the endpoint one below: dbg()/DEBUG are declared further
+// down, so calling this at module-evaluation time would be a temporal-dead-zone error.
+setTimeout(function () {
+  dbg('bridge mode=' + BRIDGE_MODE + ' url=' + BRIDGE_URL
+      + (BRIDGE_MODE === 'inproc' ? ' (inproc = the PRE-CHANGE path; no bridge branch is entered)' : ''));
+}, 0);
+// GET /health, cached.  null means "the bridge is not answering" (then the pre-change snapshot /
+// local path is used, which is what keeps the tool face complete with no IDE and no bridge).
+function bridgeHealth() {
+  if (BRIDGE_MODE === 'inproc') return Promise.resolve(null);
+  const now = Date.now();
+  if (bridgeHealthCache.data && now - bridgeHealthCache.at < BRIDGE_HEALTH_TTL_MS) return Promise.resolve(bridgeHealthCache.data);
+  if (bridgeHealthCache.promise) return bridgeHealthCache.promise;
+  bridgeHealthCache.promise = (async function () {
+    try {
+      const res = await fetch(BRIDGE_URL + '/health', { signal: AbortSignal.timeout(800), headers: bridgeAuthHeaders() });
+      const j = await res.json();
+      bridgeHealthCache = { at: Date.now(), data: j, promise: null };
+      dbg('bridge health ok port=' + (j && j.port) + ' instances=' + ((j && j.instances) || []).length + ' faceTools=' + (j && j.faceTools) + ' auth=' + bridgeAuthState());
+      return j;
+    } catch (e) {
+      bridgeHealthCache = { at: Date.now(), data: null, promise: null };
+      dbg('bridge health FAILED url=' + BRIDGE_URL + ' err=' + String((e && e.message) || e));
+      return null;
+    }
+  })();
+  return bridgeHealthCache.promise;
+}
+// One JSON-RPC POST to the bridge - the SAME wire shape rpcAt() uses against an add-in, so the
+// bridge is just another endpoint as far as this file is concerned.
+async function bridgeRpc(method, params, timeoutMs) {
+  const body = { jsonrpc: '2.0', id: (Date.now() % 100000) + 1, method: method };
+  if (params !== undefined) body.params = params;
+  const res = await fetch(BRIDGE_URL + '/rpc', {
+    method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, bridgeAuthHeaders()),
+    body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs || BRIDGE_LIST_TIMEOUT_MS)
+  });
+  return decodeRpcBody(await res.text());
+}
+// The hub-provided names WIN over the face (the pre-change rule, restated here so the bridge
+// path produces the SAME 120-name face: 10 hub + 110 add-in, each name once).
+function mergeHubFace(faceTools) {
+  const merged = [];
+  const seenNames = {};
+  for (const t of hubTools().concat(faceTools || [])) {
+    if (!t || !t.name || seenNames[t.name]) continue;
+    seenNames[t.name] = true;
+    merged.push(t);
+  }
+  return merged;
+}
+// Forward ONE tools/call to the bridge.  Returns a stamped result, or null when the bridge is
+// not answering (the caller then uses the pre-change local path, so a dead bridge degrades to
+// exactly today's behaviour instead of failing).
+//
+// The arguments are handed over VERBATIM, _target included - stripping it and resolving it is
+// the bridge's job (addressing moved to the Python layer).  stampBody() below only fills keys
+// that are undefined, so the bridge's transport / transportReason / *Fallback / pipeBusy marks
+// SURVIVE into the receipt and are never overwritten.
+async function bridgeForwardCall(name, argsIn, snap) {
+  const h = await bridgeHealth();
+  if (!h) return null;
+  const t0 = Date.now();
+  let resp;
+  try {
+    resp = await bridgeRpc('tools/call', { name: name, arguments: argsIn }, bridgeCallTimeoutMs());
+  } catch (e) {
+    const ms = Date.now() - t0;
+    const isTimeout = !!(e && (e.name === 'TimeoutError' || /abort/i.test(String(e && e.message))));
+    dbg('bridge forward FAILED tool=' + name + ' ms=' + ms + ' err=' + String((e && e.message) || e));
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify({
+      ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed',
+      message: String((e && e.message) || e), elapsedMs: ms, budgetMs: bridgeCallTimeoutMs(),
+      transport: 'bridge', transportReason: 'bridge_unreachable',
+      failureKind: isTimeout ? 'wedged' : 'noIde', failureKindRule: FAILURE_KIND_RULE
+    }, null, 2) }], isError: true }, null, snap.contractVersion);
+  }
+  dbg('bridge forward ok tool=' + name + ' ms=' + (Date.now() - t0));
+  const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
+  return stampBody(result, null, snap.contractVersion);
+}
 // Latency budget: the DSH client must get initialize/tools/list in <1s.
 const DISCOVERY_TTL_MS = 15000;     // cached (re-validated) discovery is reused for this long
 const DISCOVERY_BUDGET_MS = 500;    // hard cap on one discovery pass
@@ -225,6 +343,21 @@ async function isListening(port, listening) {
   if (t) dbg('isListening port=' + port + ' netstat=absent tcp=YES');
   return t;
 }
+// Liveness of ONE instance, transport aware (task-105).  A TCP instance keeps the pre-change test
+// byte for byte (pid alive AND port listening).  A PIPE-only instance has NO port to listen on -
+// the pipe IS the transport and the middle service owns it - so its liveness is the pid; asking
+// "is port null listening?" answered "no" for every live pipe IDE and silently dropped it from
+// every re-validation (cachedDiscovery, faceState), which flipped ide_list to faceSource=snapshot
+// with the IDE running.  A pipe instance that ALSO has a TCP port (tcpEnabled) is still held to
+// the port test.
+async function instanceAlive(i, listening) {
+  if (!i || !i.pid) return false;
+  if (!pidAlive(i.pid)) return false;
+  const isPipe = String(i.transport || '') === 'pipe';
+  if (isPipe && !i.port) return true;
+  if (!i.port) return false;
+  return await isListening(i.port, listening || null);
+}
 let listeningCache = { at: 0, map: null };
 function listeningPortsCached() {
   if (listeningCache.map && Date.now() - listeningCache.at < 2000) return listeningCache.map;
@@ -345,6 +478,15 @@ function readRegistry() {
       file: full,
       pid: parseInt(j.pid, 10) || null,
       port: parseInt(j.port, 10) || null,
+      // task-105: the TRANSPORT is part of an instance's identity, not decoration.  A pipe-only IDE
+      // publishes port 0 ON PURPOSE (the pipe IS the transport), so "no port" must never be read as
+      // "no instance" - dropping this field here is what made every live pipe IDE look stale and sent
+      // discovery off to the PORT SCAN, which then adopted an unrelated listener as a fake IDE.
+      transport: j.transport || null,
+      pipe: j.pipe || null,
+      tcpEnabled: j.tcpEnabled === undefined || j.tcpEnabled === null ? null : !!j.tcpEnabled,
+      sessionId: j.sessionId || null,
+      instanceId: j.instanceId || null,
       project: j.project || j.projectName || null,
       projectPath: j.projectPath || j.path || null,
       startedAt: j.startedAt || null,
@@ -359,41 +501,150 @@ function readRegistry() {
 // One JSON-RPC POST against an absolute endpoint base ("http://host:port") - the SAME wire
 // shape the local add-in uses, so a remote IDE is reached exactly like a local one.  An
 // explicit path in the base (http://host:8796/rpc) wins over the add-in default.
+// task-104: is this endpoint base the configured middle service?  Normalised the same way
+// BRIDGE_URL is (trailing slashes stripped, case-insensitive) so an operator's spelling cannot
+// silently take the un-authenticated path.
+function isBridgeBase(base) {
+  return !!base && String(base).replace(/\/+$/, '').toLowerCase() === BRIDGE_URL.toLowerCase();
+}
+// ---- credentials for a LOOPBACK endpoint that ASKS for them (task-106) ------------------------
+// The middle service that fronts pipe-only IDEs can be reached WITHOUT any configuration - the
+// legacy LOCAL path finds it by PORT SCAN - and EVERY one of its surfaces requires the token.  The
+// pre-change hub attached the credential only to the CONFIGURED bridge base (isBridgeBase), so a
+// scanned-but-unconfigured service answered 401 (a pretty-printed body, the second half of the
+// task-105 defect) and the caller saw a misleading answer instead of the IDE.
+//
+// The rule is SELF-LIMITING - it is NOT an identity guess and NOT "send the token to any 401":
+//   * the endpoint must be LOOPBACK, so a credential never leaves this machine, AND
+//   * the answer must be HTTP 401 carrying OUR OWN envelope reason "token_missing".
+// Only then is the request repeated ONCE with the credential, and the verdict is remembered per
+// endpoint base so the double POST happens at most once.  An add-in (or any other service) never
+// answers token_missing, so the legacy path keeps issuing exactly the same single request.
+const authVerdict = new Map();   // endpoint base -> true (this endpoint asked for OUR token)
+function isLoopbackBase(base) {
+  try {
+    const h = String(new URL(base).hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '0:0:0:0:0:0:0:1';
+  } catch (e) { return false; }
+}
+function asksForOurToken(base, status, raw) {
+  if (status !== 401) return false;
+  if (!BRIDGE_TOKEN) return false;                 // nothing to retry WITH
+  if (!isLoopbackBase(base)) return false;         // never send it off this machine
+  const j = parseRpcBody(raw);
+  return !!(j && typeof j === 'object' && !Array.isArray(j) && j.reason === 'token_missing');
+}
+
+// ---- ONE decoder for every JSON-RPC body this file reads ------------------------------------
+// task-105 (measured on the local SP6 box, 2026-10-16): the middle service answers with
+// PRETTY-PRINTED JSON (json.dumps(..., indent=2)), so the FIRST line of its body is just "{".  The
+// old line-by-line reader took the first line that STARTED with "{" and ran JSON.parse("{") on it,
+// which throws the V8 message
+//   "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+// - and every forwarded tool reported exactly that as reason=forward_failed / failureKind=wedged
+// while a direct Invoke-WebRequest against the same endpoint (reading the WHOLE body) succeeded.
+// The order below is ADAPTIVE: each step either yields a value or is abandoned, never thrown.
+//   1. the WHOLE body - the compact single-line add-in answer (the pre-change result, byte for
+//      byte) and the whole-body fallback the old code already had as its LAST statement;
+//   2. SSE: every "data:" payload joined, then each payload on its own (the streamable-HTTP /mcp
+//      face frames its JSON that way);
+//   3. any single line that is valid JSON on its own (a pretty body, a preamble line before the
+//      JSON, or a one-line SSE frame);
+//   4. null - "this body carries no JSON at all"; the CALLER decides whether that is an error
+//      (decodeRpcBody below keeps the pre-change error contract).
+function parseRpcBody(raw) {
+  const text = String(raw === undefined || raw === null ? '' : raw);
+  if (!text.trim()) return null;
+  try { return JSON.parse(text); } catch (e) { }
+  const lines = text.split(/\r?\n/);
+  const data = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.indexOf('data:') === 0) data.push(t.slice(5).trim());
+  }
+  if (data.length) {
+    // One SSE payload may itself be PRETTY JSON framed line by line ("data: {" / 'data: "a": 1' /
+    // "data: }"), so the payloads are joined first; a single-frame stream is then handled by step 3.
+    try { return JSON.parse(data.join('\n')); } catch (e) { }
+  }
+  for (const line of lines) {
+    const t = line.trim();
+    const s = t.indexOf('data:') === 0 ? t.slice(5).trim() : t;
+    if (!s || (s[0] !== '{' && s[0] !== '[')) continue;   // the old "starts with {" rule, both shapes
+    try { return JSON.parse(s); } catch (e) { }
+  }
+  return null;
+}
+// The pre-change ERROR contract, kept on purpose: an EMPTY body was null before and stays null,
+// but a NON-EMPTY body that carries no JSON still THROWS.  Callers classify a failed call on that
+// throw (transportFailureKind -> wedged; probeRemoteEndpoint -> endpoint_unreachable), so quietly
+// returning null would turn "the peer answered with garbage" into "the peer answered, with no
+// tools" - a false success.  Only the message is the hub's own now; the class (SyntaxError) and
+// therefore every downstream classification is unchanged.
+function decodeRpcBody(raw) {
+  const j = parseRpcBody(raw);
+  const text = String(raw === undefined || raw === null ? '' : raw);
+  if (j === null && text.trim()) throw new SyntaxError('no JSON in the response body (' + text.length + ' bytes)');
+  return j;
+}
+
 async function rpcAt(base, method, params, proto, timeoutMs, rpcPath) {
   const target = endpointRpcTarget(base);
   const body = { jsonrpc: '2.0', id: (Date.now() % 100000) + 1, method: method };
   if (params !== undefined) body.params = params;
   const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
   if (proto) headers['MCP-Protocol-Version'] = proto;
-  const res = await fetch(target.base + (rpcPath || target.path), {
-    method: 'POST', headers: headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs || FORWARD_TIMEOUT_MS)
-  });
-  const raw = await res.text();
-  for (const line of raw.split(/\r?\n/)) {
-    const t = line.trim();
-    const s = t.startsWith('data:') ? t.slice(5).trim() : t;
-    if (s.startsWith('{')) return JSON.parse(s);
+  // The endpoint may BE the local middle service, whose every surface requires the token.  This
+  // path (rpcAt -> rpc/probe/discovery/ide_* control) used to send NO credential, so with auth on
+  // it got 401 token_missing: ide_list reported probeStatus=failed and ide_restart refused with
+  // project_path_unknown.  Only attached for the bridge itself, and bridgeAuthHeaders() is {} with
+  // no token configured, so a legacy add-in endpoint sees byte-identical traffic.  Nothing here
+  // weakens the check - it only lets the hub present the credential it already had.
+  const credential = isBridgeBase(target.base) || authVerdict.get(target.base) === true;
+  if (credential) Object.assign(headers, bridgeAuthHeaders());
+  const url = target.base + (rpcPath || target.path);
+  const payload = JSON.stringify(body);
+  const ms = timeoutMs || FORWARD_TIMEOUT_MS;
+  let res = await fetch(url, { method: 'POST', headers: headers, body: payload, signal: AbortSignal.timeout(ms) });
+  let raw = await res.text();
+  // A LOOPBACK endpoint that answered 401 with OUR OWN reason asked for the credential: repeat the
+  // request ONCE with it (and remember the verdict per endpoint, so this costs one extra POST per
+  // endpoint, not per call).  See asksForOurToken for the three conditions.
+  if (!credential && asksForOurToken(target.base, res.status, raw)) {
+    authVerdict.set(target.base, true);
+    dbg('rpcAt ' + target.base + ': 401 token_missing -> repeating ONCE with the credential');
+    res = await fetch(url, { method: 'POST', headers: Object.assign({}, headers, bridgeAuthHeaders()), body: payload, signal: AbortSignal.timeout(ms) });
+    raw = await res.text();
   }
-  return raw.trim() ? JSON.parse(raw) : null;
+  return decodeRpcBody(raw);
 }
 async function rpc(port, method, params, proto, timeoutMs, rpcPath) {
   return rpcAt('http://127.0.0.1:' + port, method, params, proto, timeoutMs, rpcPath);
 }
 
+// The probe's ONE wire call, transport aware (task-105).  A port-bearing instance is reached
+// exactly as before.  A PIPE-ONLY instance has no port and the middle service is the ONLY addresser
+// for it, so the same JSON-RPC goes over the bridge; with the bridge unreachable this rejects just
+// like a dead port does, so the caller's "probe failed" path is unchanged.
+function instanceRpc(port, transport, method, params, proto, timeoutMs, rpcPath) {
+  if (port) return rpc(port, method, params, proto, timeoutMs, rpcPath);
+  if (BRIDGE_MODE === 'inproc') return Promise.reject(new Error('a pipe-only instance is addressable only through the middle service (VB6MCP_BRIDGE=python)'));
+  return bridgeRpc(method, params, timeoutMs || PROBE_TIMEOUT_MS);
+}
 // Runs in the BACKGROUND (never on a response path): a slow add-in must not delay the hub.
-async function probe(port, knownProject, pids) {
+async function probe(port, knownProject, pids, transport) {
   pids = pids || [];
   if (!pids.length) return null;
   let tools = [];
   try {
-    const tl = await rpc(port, 'tools/list', {}, null, 8000);
+    const tl = await instanceRpc(port, transport, 'tools/list', {}, null, 8000);
     tools = (tl && tl.result && tl.result.tools) || [];
   } catch (e) { return null; }
   if (!tools.length) return null;
   let project = knownProject || null;
   if (!project) {
     try {
-      const g = await rpc(port, 'tools/call', { name: 'get_project_info', arguments: {} }, null, 1500);
+      const g = await instanceRpc(port, transport, 'tools/call', { name: 'get_project_info', arguments: {} }, null, 1500);
       const c = g && g.result && g.result.content;
       const txt = Array.isArray(c) && c[0] && c[0].text;
       if (txt) { try { const j = JSON.parse(txt); project = j.project || j.name || null; } catch (e2) { } }
@@ -403,7 +654,7 @@ async function probe(port, knownProject, pids) {
   // BACKGROUND so a slow /mcp cannot keep the instance "pending".
   const instructions = instructionsCache[port] || null;
   if (!instructions) {
-    rpc(port, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
+    instanceRpc(port, transport, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
       .then(function (init) { const v = init && init.result && init.result.instructions; if (v) { instructionsCache[port] = v; dbg('instructions cached for port ' + port); } })
       .catch(function () { dbg('instructions fetch failed for port ' + port); });
   }
@@ -549,8 +800,10 @@ async function discoverBounded() {
   // Existence first (registry + pid alive + port listening); the probe only ENRICHES.
   pendingCands.forEach(function (c) { insts.push(Object.assign({ pending: true, probeStatus: 'pending' }, c)); });
   for (const c of pendingCands) {
-    const it = await probe(c.port, c.project, c.pids).catch(function () { return null; });
-    const idx0 = insts.findIndex(function (x) { return x.port === c.port; });
+    const it = await probe(c.port, c.project, c.pids, c.transport).catch(function () { return null; });
+    // Keyed by pid AS WELL as port: every pipe-only instance has port=null, so a port-only key
+    // would hand one pipe IDE's probe result to another (TCP instances keep a unique port here).
+    const idx0 = insts.findIndex(function (x) { return x.port === c.port && x.pid === c.pid; });
     if (!it) {
       stale.push({ file: c.registryFile, pid: c.pid, port: c.port, reason: 'registry_port_not_mcp_probe_failed' });
       // Terminal, explicit state: the probe ran and failed -> not pending any more, the tool
@@ -572,7 +825,7 @@ async function discoverBounded() {
       const pids = listening[port] || [];
       if (!pids.length) continue;
       let it = null;
-      try { it = await withTimeout(probe(port, null, pids), 8000); } catch (e) { it = null; }
+      try { it = await withTimeout(probe(port, null, pids, null), 8000); } catch (e) { it = null; }
       seenPorts.add(port);
       if (it) {
         insts.push(Object.assign({}, it, { discoveredBy: 'portscan', registryFile: null, pending: false, probeStatus: 'ok' }));
@@ -1019,8 +1272,9 @@ async function cachedDiscovery() {
   if (!c) { dbg('cachedDiscovery: no face cache file'); return null; }
   const checked = [];
   for (const i of c.instances) {
-    // TCP-only: no netstat on a response path
-    const okp = pidAlive(i.pid) && await isListening(i.port, null);
+    // TCP-only: no netstat on a response path.  Transport aware: a pipe-only entry has no port
+    // (task-105) and used to be re-validated as dead here.
+    const okp = await instanceAlive(i, null);
     if (okp) checked.push(localCandidate(i));
   }
   dbg('cachedDiscovery: file instances=' + c.instances.length + ' still-alive=' + checked.length);
@@ -1048,13 +1302,23 @@ async function scanRegistry(listening) {
   for (const e of reg.entries) {
     const base = path.basename(e.file);
     if (e.parseError) { stale.push({ file: base, reason: 'unparsable_json' }); continue; }
-    if (!e.pid || !e.port) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'missing_pid_or_port' }); continue; }
+    // task-104 (measured on the local SP6 box, 2026-10-16): a PIPE-transport instance publishes
+    // port 0 ON PURPOSE - the pipe IS the transport.  Requiring a port here classified every live
+    // pipe-only IDE as 'missing_pid_or_port' -> live=0, and ide_list fell back to
+    // faceSource=snapshot even though the service answered (instances=1) and the add-in was
+    // reachable through the pipe.  Liveness is now transport-aware: pipe => pid alive (the probe
+    // still enriches it), tcp => pid alive AND port listening (unchanged).
+    const isPipe = String(e.transport || '') === 'pipe';
+    if (!e.pid || (!isPipe && !e.port)) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'missing_pid_or_port' }); continue; }
     const alive = pidAlive(e.pid);
-    const listeningNow = await isListening(e.port, listening || null);
+    const listeningNow = e.port ? await isListening(e.port, listening || null) : true;
     dbg('registry ' + base + ' pid=' + e.pid + ' port=' + e.port + ' startedAt=' + (e.startedAt || '-') + ' pidAlive=' + alive + ' listening=' + listeningNow);
     if (!alive) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'pid_dead' }); continue; }
     if (!listeningNow) { stale.push({ file: base, pid: e.pid, port: e.port, reason: 'port_not_listening' }); continue; }
-    const prev = seen[e.port];
+    // A pipe instance has no port, so key the duplicate check by pid (two live pipe IDEs must not
+    // be mistaken for a duplicate-port pair).
+    const dkey = e.port || ('pipe:' + e.pid);
+    const prev = seen[dkey];
     // The LOSER goes to staleRegistry, never the winner.
     if (prev && !(String(e.startedAt || '') > String(prev.at || ''))) {
       stale.push({ file: base, pid: e.pid, port: e.port, reason: 'duplicate_port_in_registry' });
@@ -1064,12 +1328,21 @@ async function scanRegistry(listening) {
       // we are newer: the PREVIOUS owner is the one that gets demoted
       stale.push({ file: prev.file, pid: prev.pid, port: e.port, reason: 'superseded_older_duplicate_port' });
     }
-    seen[e.port] = { at: String(e.startedAt || ''), file: base, pid: e.pid };
-    let pids = (listening && listening[e.port]) || [];
+    seen[dkey] = { at: String(e.startedAt || ''), file: base, pid: e.pid };
+    let pids = (e.port && listening && listening[e.port]) || [];
     if (!pids.length) pids = [e.pid];
-    byPort.delete(e.port);
-    byPort.set(e.port, {
+    byPort.delete(dkey);
+    byPort.set(dkey, {
       port: e.port, pid: e.pid, pids: pids,
+      // The TRANSPORT has to survive into the CANDIDATE, not just the registry decision: every
+      // later re-validation (faceState / cachedDiscovery) asks the transport, because a pipe-only
+      // instance has no port to test.  Without this the instance was re-validated as DEAD and
+      // ide_list fell back to faceSource=snapshot with the IDE alive and reachable (measured).
+      transport: e.transport || null,
+      pipe: e.pipe || null,
+      tcpEnabled: e.tcpEnabled === undefined ? null : e.tcpEnabled,
+      sessionId: e.sessionId || null,
+      instanceId: e.instanceId || null,
       project: e.project || null, projectPath: e.projectPath || null,
       version: e.version || null, dllSha256: e.dllSha256 || null,
       startedAt: e.startedAt || null, discoveredBy: 'registry', registryFile: base,
@@ -1109,8 +1382,8 @@ async function faceState(d, spellings) {
     const alive = [];
     for (const i of d.instances) {
       if (i.remote) { alive.push(i); continue; }
-      const okp = pidAlive(i.pid) && await isListening(i.port, null);
-      if (okp) alive.push(i); else dbg('faceState: dropped dead instance pid=' + i.pid + ' port=' + i.port);
+      const okp = await instanceAlive(i, null);
+      if (okp) alive.push(i); else dbg('faceState: dropped dead instance pid=' + i.pid + ' port=' + i.port + ' transport=' + (i.transport || '-'));
     }
     if (alive.length !== d.instances.length) d = Object.assign({}, d, { instances: alive, revalidated: true });
   }
@@ -1263,6 +1536,30 @@ async function hubState(opts) {
       endpoints: (d.endpoints || []).map(function (e) { return Object.assign({}, e, { allowList: 'VB6MCP_REMOTES / bridge/hub_remotes.json (never discovered)' }); }),
       configErrors: d.endpointConfigErrors || ENDPOINT_CFG_ERRORS || []
     };
+  }
+  // ---- thin shell (d): the bridge's own instance / transport facts, ADDITIVE --------------
+  // When the bridge is online it is authoritative about local IDEs (it is the only addresser),
+  // so its transport / pipeAvailable / staleRegistry are merged in.  NEW keys only; no existing
+  // key is removed or renamed (ADR sec 4.2.3 / sec 6: ide_list only ever grows).
+  if (BRIDGE_MODE !== 'inproc') {
+    const h = await bridgeHealth();
+    if (h && h.instances) {
+      st.bridge = {
+        url: BRIDGE_URL, port: (h && h.port) || null, transport: (h && h.transport) || null,
+        netstat: false, faceTools: (h && h.faceTools) || null,
+        liveInstances: ((h && h.liveInstances) || []).length,
+        instances: h.instances || [], staleRegistry: (h && h.staleRegistry) || []
+      };
+      const bridgeByPid = {};
+      for (const bi of (h.instances || [])) { if (bi && bi.pid) bridgeByPid[String(bi.pid)] = bi; }
+      for (const i of (st.instances || [])) {
+        const bi = bridgeByPid[String(i.pid)];
+        if (!bi) continue;
+        if (i.transport === undefined) i.transport = bi.transport;
+        if (i.pipeAvailable === undefined) i.pipeAvailable = bi.pipeAvailable;
+        if (i.pipeState === undefined) i.pipeState = bi.pipeState;
+      }
+    }
   }
   return st;
 }
@@ -1508,6 +1805,25 @@ async function hubTool(name, args) {
 }
 
 async function toolsListResult(d) {
+  // ---- thin shell (b): the bridge owns the add-in face ---------------------------------
+  // Bridge ONLINE  -> its 110-tool face + the 10 hub tools (each name once) = the SAME 120.
+  // Bridge OFFLINE -> fall THROUGH to the pre-change path below, which publishes the COMPLETE
+  // face from bridge/hub_schema.generated.json (110) + hub_tools.json (10): a dead Python
+  // layer must never cost the caller the tool list.
+  if (BRIDGE_MODE !== 'inproc') {
+    const h = await bridgeHealth();
+    if (h) {
+      try {
+        const tl = await bridgeRpc('tools/list', {}, BRIDGE_LIST_TIMEOUT_MS);
+        const tools = (tl && tl.result && tl.result.tools) || null;
+        if (tools && tools.length) {
+          dbg('bridge tools/list tools=' + tools.length);
+          return { tools: mergeHubFace(tools) };     // strict: EXACTLY {tools}
+        }
+      } catch (e) { dbg('bridge tools/list FAILED: ' + String((e && e.message) || e)); }
+    }
+    dbg('bridge offline: serving the complete face from ' + SNAP + ' + ' + HUBCFG);
+  }
   d = await resolveDiscovery(d);
   const snap = snapshot();
   let faceTools = snap.tools;
@@ -1727,6 +2043,16 @@ async function handleCall(params) {
       failureKind: 'noIde', failureKindRule: FAILURE_KIND_RULE,
       message: 'endpoint "' + tgt.label + '" is not configured; configured endpoints: ' + endpointLabels().join(', ')
     }, null, 2) }], isError: false }, null, snap.contractVersion);
+  }
+
+  // ---- thin shell (c): a LOCAL / unqualified call is handed to the bridge ------------------
+  // argsIn (NOT the _target-stripped args above) goes over verbatim: the bridge strips _target
+  // and resolves it.  An endpoint-qualified REMOTE target is deliberately NOT delegated - the
+  // remote path below is unchanged.
+  if (BRIDGE_MODE !== 'inproc' && !(tgt.kind === 'endpoint' && tgt.endpoint && tgt.endpoint.remote)) {
+    const stamped = await bridgeForwardCall(name, argsIn, snap);
+    if (stamped) return stamped;
+    dbg('bridge offline: falling back to the pre-change local path for tool=' + name);
   }
 
   // ---- endpoint-qualified REMOTE target: probe THAT endpoint; never fall back to local ------

@@ -13,11 +13,14 @@ is open in the IDE, and drive compilation and execution.
  MCP client (Claude Desktop / Cursor / ...)
         |  stdio (JSON-RPC, one message per line)
         v
- bridge/mcp_stdio_bridge.py   (Python 3, standard library only)
-        |  HTTP POST /rpc  (http://127.0.0.1:8766)
+ bridge/vb6mcp_hub.mjs      (Node, zero dependencies; MCP wire protocol + 10 ide_* / lesson tools)
+        |  HTTP  http://127.0.0.1:8767  (bearer token required once a credential is configured)
         v
- VB6MCP.dll  <- runs inside the VB6.EXE process
-   |-- Winsock control: local HTTP server (/sse + /message also supported)
+ bridge/vb6mcp_bridge.py    (Python 3, standard library only; the machine's ONLY TCP listener)
+        |  named pipe (one per IDE instance)
+        v
+ VB6MCP.dll  <- runs inside the VB6.EXE process (no TCP listener of its own)
+   |-- named-pipe server
    |-- home-grown JSON parser/serializer (JsonLib.bas, zero external dependencies)
    +-- VBIDE extensibility object model: read/modify code, save, compile, control execution
 ```
@@ -100,7 +103,8 @@ MCP_VB6/
 |-- unregister.reg         remove the add-in registration
 |-- build.bat              one-click build + regsvr32 registration + import the add-in registry file
 |-- mcp_config.example.json    Claude Desktop configuration example
-|-- bridge/mcp_stdio_bridge.py stdio bridge (Python 3 standard library)
+|-- bridge/vb6mcp_hub.mjs   MCP entry point (Node, stdio; ide_* and lesson tools)
+|-- bridge/vb6mcp_bridge.py middle service: the machine's only TCP listener (default 8767), forwards to the named pipe
 +-- tests/smoke_test.py     smoke test that talks to the HTTP endpoint directly
 ```
 
@@ -125,7 +129,7 @@ Boundaries (read these before touching anything):
 - Do this one job only. Do not also change my other projects, other add-ins or other registry entries.
 - No destructive or irreversible actions: do not delete or overwrite files and directories you did not create, do not modify any VB6 project I already have, do not uninstall or disable my other add-ins, do not "clean up" processes or registry keys.
 - Do not kill processes. Never terminate VB6.EXE or anything else; if the IDE has to be closed, ask me first (I may have unsaved work).
-- Touch only the port you detect. The default is 127.0.0.1:8766; when that is taken the add-in probes upwards by itself (up to +40). The real port is the port field returned by http://127.0.0.1:<port>/health, and %TEMP%\vb6mcp_port.txt. Do not scan, occupy or change any other port, and never expose this server beyond the loopback address.
+- Touch only the port you detect. In this generation the **middle service** is the only TCP listener: default 127.0.0.1:8767 (change it with --port or VB6MCP_BRIDGE_PORT); the add-in no longer listens on TCP at all. The real port is the port field returned by http://127.0.0.1:<port>/health; python bridge/vb6mcp_bridge.py --print-config also prints the effective port, transport and authEnabled. Do not scan, occupy or change any other port, and never expose this service beyond the loopback address (a non-loopback bind is refused outright and the process exits with code 6 - there is no override).
 - Stop and ask me before anything that could break my existing VB6 setup (machine-wide re-registration of OCX files or type libraries, changes under HKCU\Software\VB6MCP, changes to VB6's references, ...): tell me what you would change, why, and how to undo it.
 - Keep every artifact inside a working directory you create. Every conclusion must rest on a reproducible command and its raw output; "it should have worked" is not a conclusion. If something needs me to click it, just tell me.
 
@@ -138,7 +142,7 @@ Steps (in order; give evidence for each):
    - If VB6 is absent: stop immediately and tell me the truth - VB6MCP is an add-in for the VB6 IDE, so without VB6 it can neither be built nor run, and there is no workaround; the repository redistributes no Microsoft files, so my own licensed VB6 installation is required. Do not try to fake VB6 with another toolchain, and do not continue with the later steps on a machine that has no VB6.
    - If MSWINSCK.OCX or MSADDNDR.DLL is missing, follow the repository README's FAQ; ask me before writing into system directories.
 
-2) Get the source. git clone <REPO_URL> into the working directory we agree on (or download and unpack the repository ZIP). Confirm the tree contains MCP_VB6.vbp, build.bat, register.reg, bridge/mcp_stdio_bridge.py and tests/smoke_test.py.
+2) Get the source. git clone <REPO_URL> into the working directory we agree on (or download and unpack the repository ZIP). Confirm the tree contains MCP_VB6.vbp, build.bat, register.reg, bridge/vb6mcp_bridge.py, bridge/vb6mcp_hub.mjs and tests/smoke_test.py.
 
 3) Build. Prefer running build.bat directly (it registers MSADDNDR.DLL first, then compiles VB6MCP.dll). If VB6 is not in the default location, edit the VB6 variable inside build.bat rather than hardcoding a path anywhere else.
    Note: do not rebuild in place while the IDE already has this add-in DLL loaded - the file lock makes the build fail. Close the IDE first (ask me whether anything is unsaved), or build from another VB6 instance.
@@ -151,16 +155,16 @@ Steps (in order; give evidence for each):
    Then start the VB6 IDE (if it is already open but the add-in is not loaded, ask me whether to restart it - do not kill the process yourself) and confirm "VB6 MCP Server" is ticked under Add-Ins -> Add-In Manager (LoadBehavior=3 usually loads it automatically).
 
 5) Really verify the server (the key step: "the process is running" is not evidence):
-   - GET http://127.0.0.1:8766/health until it returns {"ok":true,...}; trust the port field in that response (the add-in probes upwards when the port is taken) and compare with %TEMP%\vb6mcp_port.txt. Call that port <port> below.
+   - GET http://127.0.0.1:8767/health until it returns {"ok":true,...}; trust the port field in that response and compare it with the port printed by python bridge/vb6mcp_bridge.py --print-config. Call that port <port> below. **If a token is configured, this request needs `Authorization: Bearer <token>` too** - otherwise it returns 401.
    - Make a real MCP call to it: POST http://127.0.0.1:<port>/rpc with Content-Type: application/json
      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"install-check","version":"1.0"}}}
      then {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
    - Count the tools in tools/list and compare against the repository's own authoritative catalog: the number recorded in docs/TOOL_CATALOG.md, and the length of the tools array in tools/schema_baseline.json. Do not hardcode any number - use the numbers from the repository you just cloned. You may also call the mcp_info tool and read the contract and toolCount the server reports about itself.
    - If all three agree, pass the step and record the number. If they disagree, report the exact difference and which tools are extra or missing; do not edit the repository to make it match and do not fudge the number. If tools/list cannot be obtained at all, paste the raw response and the HTTP status code.
 
-6) Wire up the client. Merge the mcpServers.vb6 entry from mcp_config.example.json into the target client's configuration (Claude Desktop: %APPDATA%\Claude\claude_desktop_config.json; Cursor: its MCP configuration) and replace the placeholder paths with the real paths on this machine: command must point at this machine's Python, args at bridge/mcp_stdio_bridge.py; in JSON use / or write \\. The same entry works for any other stdio client; for Cursor the HTTP endpoint documented in section 3 of the README is also available. Back up the configuration file before changing it.
+6) Wire up the client (this generation recommends starting the hub over stdio): point command at node, args at <repo>/bridge/vb6mcp_hub.mjs, and give it two environment variables - VB6MCP_BRIDGE_URL=http://127.0.0.1:<middle-service port> (the hub's source default is http://127.0.0.1:8767; give it explicitly whenever the service runs on another port) and a token (VB6MCP_TOKEN or VB6MCP_TOKEN_FILE, only when the server has a credential configured). Claude Desktop: %APPDATA%\Claude\claude_desktop_config.json; Cursor: its MCP configuration (streamable HTTP against http://127.0.0.1:<port>/mcp also works, with an Authorization: Bearer <token> header when a token is configured). Replace placeholder paths with the real paths on this machine; in JSON use / or write \\. Back up the configuration file before changing it.
 
-7) Run the smoke test: python tests/smoke_test.py --port <port>. It requires the VB6 IDE to be open with the add-in loaded; it is not an offline self-check.
+7) Run the smoke test: python tests/smoke_test.py --port <port> (the middle service's port). It requires the VB6 IDE to be open with the add-in loaded; it is not an offline self-check. Note that this script sends **no token**, so it only works while the server has no credential configured; with a token configured use python bridge/vb6mcp_bridge.py --print-config to read the state, and --selftest for the in-process self-check.
 
 8) Report back (this is the most important step). Give me:
    - the commands you actually ran (verbatim) and what you actually observed (key output, the health response, the tool count, the smoke-test result);
@@ -171,7 +175,7 @@ Steps (in order; give evidence for each):
 One more time: do not kill processes; do not touch ports, services, registry keys or project files you were not asked to touch; ask before anything that could damage my existing setup. I want a real success, or an honest statement of where it is stuck.
 ```
 
-Prefer to do it by hand → see "1. Building", "2. Ports and multiple instances" and "3. Connecting an MCP
+Prefer to do it by hand → see "1. Building", "2. Connection model, ports and multiple instances" and "3. Connecting an MCP
 client" below. Either route works; you only need one.
 
 ## 1. Building
@@ -193,56 +197,87 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
 > DLL is loaded and held by that very IDE, so the file lock makes the build fail. Close the IDE
 > and use build.bat, or test from a different project.
 
-## 2. Ports and multiple instances
+## 2. Connection model, ports and multiple instances
 
-- Listens on `http://127.0.0.1:8766` by default (MSWINSCK's LocalIP is read-only and the
-  listener binds every local interface, but incoming connections are validated: the peer IP
-  must be 127.0.0.1, and non-loopback connections are rejected immediately).
-- If the port is taken it probes upwards (up to +40).
-- The actual port is written to `%TEMP%\vb6mcp_port.txt`, which the bridge reads automatically.
-- Custom port: the `VB6MCP_PORT` environment variable, or the registry value
-  `HKCU\Software\VB6MCP\Port` (DWORD).
-- With several VB6 instances open, each takes its own port; the port file records the most
-  recently started instance.
-- Status: IDE menu **Add-Ins -> VB6 MCP Status...**, or `http://127.0.0.1:8766/health`.
-- Log: `%TEMP%\vb6mcp.log`.
+**This generation: one listening port + one named pipe per IDE instance.**
+
+- Clients no longer connect to the add-in directly. The **middle service** `bridge/vb6mcp_bridge.py`
+  owns **the single TCP port**: default `http://127.0.0.1:8767` (change it with `--port` or the
+  `VB6MCP_BRIDGE_PORT` environment variable; `VB6MCP_BRIDGE_HOST` accepts loopback addresses only).
+- **Non-loopback binding is impossible**: binding to a non-loopback address is refused and the process
+  exits with **code 6** - there is **no override switch**.
+- MCP clients come in through the **hub** `bridge/vb6mcp_hub.mjs` (Node, zero dependencies, stdio): the
+  hub serves the 10 `ide_*` and lesson tools and forwards the add-in face (110 tools) to the middle
+  service; it finds the service through `VB6MCP_BRIDGE_URL` (source default `http://127.0.0.1:8767`).
+- The add-in accepts only a **named pipe** (one per IDE instance; a single pipe **does not allow
+  concurrent connections**) => clients should multiplex by request id **on one connection** or
+  serialize their calls; a busy pipe answers `pipeBusy` instead of "no IDE".
+- **Transport selection** `VB6MCP_TRANSPORT=auto|pipe|tcp` (default `auto`: prefer the pipe and fall back
+  to the add-in's HTTP **visibly**; `pipe` is strict, so a missing pipe is an explicit error; `tcp` uses
+  only the add-in's HTTP, for rollback and transition).
+- **Custom port**: `--port N`, `VB6MCP_BRIDGE_PORT` (or `VB6MCP_PORT` on the same machine). With several
+  VB6 instances open there is **still only one service port**; instances are addressed with `_target`
+  (see section 3).
+- Status: IDE menu **Add-Ins -> VB6 MCP Status...**, or `GET http://127.0.0.1:<port>/health` (that request
+  needs the token too once a credential is configured); `python bridge/vb6mcp_bridge.py --print-config`
+  prints the effective port / transport / `authEnabled`.
+- Log: the middle service's log path is `logPath` in `--print-config`; the add-in's own log stays `%TEMP%\vb6mcp.log`.
 
 ## 3. Connecting an MCP client
 
+### Connection and authentication (this generation)
+
+- **Recommended**: start the hub over **stdio** - `command: node`, `args: ["<repo>/bridge/vb6mcp_hub.mjs"]`,
+  with `VB6MCP_BRIDGE_URL=http://127.0.0.1:8767` in the environment (give it explicitly whenever the
+  middle service runs on another port).
+- **Direct HTTP** (streamable HTTP): `POST http://127.0.0.1:<port>/mcp` (`/rpc` is the same face).
+- **Authentication**: once the server has a credential configured (`VB6MCP_TOKEN`, or `VB6MCP_TOKEN_FILE`
+  pointing at an owner-only file), **every HTTP surface** (`/rpc`, `/mcp`, `/health`, ...) requires a
+  bearer token: `Authorization: Bearer <token>`, or `X-VB6MCP-Token: <token>`. **A credential inside the
+  URL is rejected** (401 `token_in_url_rejected`). **With no credential configured the service still runs**,
+  but `/health` reports `auth.enabled=false` - do not run it that way on a multi-user machine.
+- **Addressing**: a call names its target project with `_target`, canonically `[endpoint:]projectPath`
+  (for example `C:/work/MyProj.vbp`); omitting `endpoint` means local. **A call without `_target` is never
+  sent to a remote.**
+- The old generation's direct port (8766) **no longer exists** - a client still pointing at it fails to connect.
+
 ### Claude Desktop
 
-Merge the `mcpServers.vb6` entry from `mcp_config.example.json` into
-`%APPDATA%\Claude\claude_desktop_config.json` (point `command` at the python/py path on your
-machine) and restart Claude Desktop.
-
-> **Replace every path with one from your own machine**: the paths in `mcp_config.example.json` (and in the "Other stdio clients" example below) are **placeholders** - both `command` (python/py) and the `args` path to `bridge/mcp_stdio_bridge.py` must point at your own installation. In JSON prefer forward slashes `/`; a Windows backslash must be written as `\\`.
-
-### Cursor (SSE / streamable HTTP)
-
-Cursor can talk to the HTTP endpoint directly, with no bridge:
-
-```
-type: sse     url: http://127.0.0.1:8766/sse
-```
-
-### Other stdio clients
+Let Claude Desktop start the hub over **stdio** (replace the path with your own):
 
 ```json
 {
   "mcpServers": {
     "vb6": {
-      "command": "python",
-      "args": ["D:/path/to/VB6MCP/bridge/mcp_stdio_bridge.py"]
+      "command": "node",
+      "args": ["C:/path/to/VB6MCP/bridge/vb6mcp_hub.mjs"],
+      "env": { "VB6MCP_BRIDGE_URL": "http://127.0.0.1:8767" }
     }
   }
 }
 ```
 
-To check the whole chain (**needs the VB6 IDE open with the add-in loaded** - this is not an offline self-check):
+When the server has a token configured, add `VB6MCP_TOKEN` (or `VB6MCP_TOKEN_FILE`) to `env`.
+
+> **Replace every path with one from your own machine**: the examples (including `mcp_config.example.json`) use **placeholder paths** - both `command` (node/python) and the `args` path to the repository script (for example `bridge/vb6mcp_hub.mjs`) must point at your own installation. In JSON prefer forward slashes `/`; a Windows backslash must be written as `\\`.
+
+### Cursor (streamable HTTP)
+
+Cursor can also talk to the middle service's streamable-HTTP face directly:
 
 ```
-python tests/smoke_test.py --port 8766
+type: streamable HTTP
+url: http://127.0.0.1:8767/mcp
+header: Authorization: Bearer <token>    # only when a token is configured
 ```
+
+(Starting the hub over stdio works too - see above.)
+
+### Other stdio clients
+
+The same as Claude Desktop: `command: node`, `args: ["<repo>/bridge/vb6mcp_hub.mjs"]`, plus `VB6MCP_BRIDGE_URL` and `VB6MCP_TOKEN` / `VB6MCP_TOKEN_FILE` as needed.
+
+To check the whole chain: `python tests/smoke_test.py --port <middle-service port>` (that script sends **no token**, so it only works while the server has no credential configured; and it **needs the VB6 IDE open with the add-in loaded** - this is not an offline self-check).
 
 ## 4. Tool list (add-in face 110 + hub face 10 = 120 tools)
 
@@ -327,7 +362,7 @@ python tests/smoke_test.py --port 8766
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity; the whole run is bounded by a wall-clock budget (default 8000 ms, overridable with `VB6MCP_BUDGET_MS`) and the receipt always carries `budgetExhausted`/`elapsedMs`/`stage` | - |
+| `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity; the main deadline is a **deterministic character quota** (`VB6MCP_CHAR_QUOTA`, default 900000) and the wall clock is only the last resort (`VB6MCP_BUDGET_MS`, default 30000). The receipt carries completeness fields such as `partial` / `*StageCompleted` / `budgetExhausted` / `timingTruncated` / `procEdgesFound` - **the default setting delivers a deterministic partial result** | - |
 | `purity_check` | Classify whether a component can enter an offline test host | `name` |
 | `export_public_api` | Freeze a component's public API into a comparable spec; omit `name` for a bounded whole-project export | `name`, `membersOnly` |
 | `check_public_api` | Compare against a frozen spec: removed, changed, added members; omit `name` for a bounded whole-project check | `baseline`, `name`, `membersOnly` |
@@ -337,7 +372,7 @@ python tests/smoke_test.py --port 8766
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `make_project` | Compile and return the authoritative artifact verdict; diagnose gives a real log | `output_path`, `laa`, `diagnose` |
+| `make_project` | Compile and return the authoritative artifact verdict; diagnose gives a real log; the build state is queryable (`buildState`) | `output_path`, `laa`, `diagnose`, `wait_for_build` |
 | `build` | Compile via an isolated VB6.EXE /make and return the log | `project`, `defines`, `laa` |
 | `package_app` | Assemble a delivery folder: exe, manifest, dependencies, installer | `path`, `exe_path`, `out_dir` |
 | `app_manifest` | Generate or read the app manifest beside an exe or dll | `action`, `path`, `level` |
@@ -444,7 +479,7 @@ python tests/smoke_test.py --port 8766
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `mcp_info` | Read the server version stamp, contract, tool count and build hash | - |
+| `mcp_info` | Read the server version stamp, contract, tool count and build hash; `build.sourceHash` / `sourceAlgo` are the source input set's fingerprint and algorithm id | - |
 | `ide_state` | Read IDE mode plus in-flight, cancel and gate-release state | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
 | `desktop_probe` | Measure the host's desktop and interactivity without stealing focus | - |
 | `ide_quiet_mode` | Toggle session quiet mode: no focus stealing, advisory appended | `on`, `ttl_ms` |
@@ -616,10 +651,8 @@ Write-class tools therefore carry guards (all of them visible in the receipts):
 - Protocol version **negotiation**: the server understands 2025-11-25 and others, and echoes
   whatever version the client requests in `initialize` (the newest one when none is given; see
   `McpServer.NegotiateProtocol`).
-- Transports: `POST /rpc`, `POST /mcp` (streamable HTTP) and `POST /message`; when the request
-  carries `Accept: text/event-stream`, a single message is returned as an SSE frame. There is
-  **no** `GET /sse` long-lived subscription, so server-initiated notifications are not used -
-  clients pull `tools/list` when they need it.
+- Transports: the middle service provides `POST /rpc` and `POST /mcp` (streamable HTTP); when the request carries `Accept: text/event-stream`, a single message is returned as an SSE frame. The old generation's `GET /sse` + `POST /message` long-lived subscription is **no longer implemented** (it answers 501), so server-initiated notifications are not used - clients pull `tools/list` when they need it.
+- Authentication: once a credential is configured, **every HTTP surface** needs `Authorization: Bearer <token>` or `X-VB6MCP-Token`; a credential inside the URL is always 401 `token_in_url_rejected`.
 - Implements `resources/list|read` (`vb6://project` plus `vb6://component/<name>` per component)
   and `prompts/list|get` (`edit-checklist` / `release-checklist`); unknown uris/prompts return
   `-32602`.

@@ -65,6 +65,17 @@ Private m_instProject As String
 Private m_instProjectPath As String
 Private m_instSha As String
 Private m_instStartedAt As String
+' TASK-57 (ADR section 0 / 7): the named-pipe track. This class is the TCP
+' track's pure-Winsock host, but the pipe is kernel32-only and its servicing pass
+' rides this transport's own Win32 timer. PipeTransport itself never touches
+' ws2_32 (WSACleanup is process-wide - spike trap 6 - and it killed the HTTP
+' listener of this add-in).
+Private m_pipe As PipeTransport
+Private m_mode As String
+Private m_portPublished As Boolean
+' TASK-57: true only in the pipe-only shape, where this host deliberately does
+' NOT call WSAStartup - so it must not call the matching WSACleanup either.
+Private m_pipeOnlyHost As Boolean
 
 ' --- public surface --------------------------------------------------------
 
@@ -76,6 +87,33 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
     m_tries = 0
     m_listening = False
     m_idleBusyCapSec = IdleBusyCapFromEnv()
+    ' TASK-57 transport switch (ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
+    ' pipe). This host is only selected for the TCP track, but an explicit env
+    ' value wins over the registry, so the mode is resolved here as well: a
+    ' pipe-only mode must never load ws2_32 at all.
+    m_mode = PipeTransport.ResolveMode()
+    If m_mode = "pipe" Or m_mode = "auto" Then
+        Set m_pipe = New PipeTransport
+        ' "auto" keeps the TCP listener below as the hub's fallback leg; "pipe"
+        ' does not, so this IDE then occupies no TCP port at all (rule 1).
+        m_pipe.StartServer m_mcp, m_mode, (m_mode = "auto")
+        RegisterInstance
+    End If
+    If m_mode = "pipe" Then
+        ' Pipe only: no socket, no WSAStartup, no port. The message-only window and
+        ' its Win32 timer are still needed to drive the pipe from the UI thread,
+        ' and both are pure user32 (WsaMessageWindow never touches ws2_32).
+        m_pipeOnlyHost = True
+        WsaSetSink Me
+        If WsaMessageWindow() = 0 Then
+            LogLine "pipe transport: could not create message window"
+            Exit Sub
+        End If
+        m_started = True
+        WsaSetTimer m_pipe.TickMs
+        LogLine "transport=pipe reason=forced_pipe tcpEnabled=false pipe=" & m_pipe.PipeNameRedacted() & " via=winsockhost tickMs=" & CStr(m_pipe.TickMs)
+        Exit Sub
+    End If
     If Not WsaStart() Then
         LogLine "winsock transport: WSAStartup failed"
         Exit Sub
@@ -95,8 +133,13 @@ Public Sub StopListening()
     WsaSetSink Nothing
     If m_listen <> 0 Then WsaClose m_listen
     m_listen = 0
-    ' TASK-P1-037: normal exit must deregister the instance file
-    If m_listening Then DeleteInstanceFile WsaGetCurrentProcessId()
+    ' TASK-P1-037: normal exit must deregister the instance file. TASK-57: the
+    ' pipe-only track never publishes a port, so it is covered separately.
+    If m_listening Or (Not m_pipe Is Nothing) Then DeleteInstanceFile WsaGetCurrentProcessId()
+    If Not m_pipe Is Nothing Then
+        m_pipe.StopServer
+        Set m_pipe = Nothing
+    End If
     m_listening = False
     Dim i As Long
     For i = m_conns.Count To 1 Step -1
@@ -111,9 +154,13 @@ Public Sub StopListening()
     Set m_closeAfterSend = New Collection
     Set m_sessions = New Collection
     If m_started Then
-        ClearPortFileIfOurs m_port
+        ' TASK-57: only clear the port file when THIS instance published one, and
+        ' never run WSACleanup in pipe-only mode: that path never called
+        ' WSAStartup, and WSACleanup is process-wide (spike trap 6 - it took down
+        ' a co-resident add-in's HTTP listener).
+        If m_portPublished Then ClearPortFileIfOurs m_port
         WsaDestroyWindow
-        WsaStop
+        If Not m_pipeOnlyHost Then WsaStop
         m_started = False
     End If
     m_listening = False
@@ -183,9 +230,16 @@ Private Sub TryListen()
             m_listening = True
             If Not m_mcp Is Nothing Then m_mcp.Port = m_port
             WritePortFile m_port
+            m_portPublished = True
             RegisterInstance
             LogLine "winsock transport listening on http://127.0.0.1:" & CStr(m_port) & " (explicitPortOverride=" & CStr(m_explicitPort) & ")"
-            WsaSetTimer 5000
+            ' TASK-57: keep the watchdog fast enough to service the pipe track; the
+            ' TCP track alone keeps the historical 5000 ms cadence.
+            If m_pipe Is Nothing Then
+                WsaSetTimer 5000
+            Else
+                WsaSetTimer m_pipe.TickMs
+            End If
             Exit Sub
         End If
         WsaClose m_listen
@@ -209,6 +263,17 @@ Private Sub RegisterInstance()
     m_instProject = proj
     m_instProjectPath = ppath
     m_instSha = sha
+    If Not m_pipe Is Nothing Then
+        If m_pipe.Active() Then
+            ' TASK-57: ADR section 4.1 - the pipe identity triplet has to live in the
+            ' SAME registration entry or the hub has nothing to pair against. The
+            ' legacy writer below stays byte-for-byte unchanged for the TCP track
+            ' (ADR section 4.2 rule 1: missing transport/pipe means tcp).
+            m_pipe.PublishInstance PipeRegistryPort(), m_pipe.TcpEnabled(), proj, ppath, sha, m_instStartedAt
+            PruneDeadInstanceFiles WsaGetCurrentProcessId()
+            Exit Sub
+        End If
+    End If
     WriteInstanceFile WsaGetCurrentProcessId(), m_port, proj, ppath, sha, m_instStartedAt
     ' TASK-48: a successful registration proves THIS process is alive - the right
     ' moment to drop the registrations left behind by instances that died without
@@ -233,6 +298,16 @@ Private Sub RefreshInstanceIfChanged()
         RegisterInstance
     End If
 End Sub
+
+' TASK-57: 0 means "this instance has no TCP leg" (pipe-only); the hub decides
+' from tcpEnabled, not from the port number.
+Private Function PipeRegistryPort() As Long
+    If m_listening Then
+        PipeRegistryPort = m_port
+    Else
+        PipeRegistryPort = 0
+    End If
+End Function
 
 Private Sub NextPort()
     ' TASK-P1-037: an EXPLICIT port must never be silently replaced by another one -
@@ -260,6 +335,9 @@ Private Sub TimerTick()
     ' from ServerForm.tmrWatch; do the same here so the armed Add Form confirm (and the
     ' optional wheel rescan) also work when VB6MCP_TRANSPORT=winsock is selected.
     WinOps.WheelTick
+    ' TASK-57: exactly one bounded pipe servicing pass per tick, on this same UI
+    ' thread. PipeTransport handles re-entrancy itself.
+    If Not m_pipe Is Nothing Then m_pipe.Tick
     If m_restartArmed Then
         m_restartArmed = False
         WsaSetTimer 5000
@@ -270,6 +348,14 @@ Private Sub TimerTick()
         m_quitArmed = False
         WsaKillTimer
         If Not m_mcp Is Nothing Then m_mcp.DoQuit
+        Exit Sub
+    End If
+    ' TASK-57: pipe-only mode never created a listener, so it must not fall into
+    ' the port-probing path (and it must still be pumped while idle).
+    If m_mode = "pipe" Then
+        ' WinOps.WheelTick already ran above; the pipe just needs its registration
+        ' refreshed and nothing else.
+        RefreshInstanceIfChanged
         Exit Sub
     End If
     If Not m_listening Then

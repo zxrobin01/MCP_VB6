@@ -69,6 +69,12 @@ Private m_instProject As String
 Private m_instProjectPath As String
 Private m_instSha As String
 Private m_instStartedAt As String
+' TASK-57 (ADR section 0 / 7): the named-pipe track. PipeTransport is kernel32
+' only on purpose - WSACleanup is process-wide and, as measured in the P1-065
+' spike, it killed the HTTP listener of this very add-in.
+Private m_pipe As PipeTransport
+Private m_mode As String
+Private m_portPublished As Boolean
 Private Const IDLE_TIMEOUT_SEC As Long = 30
 
 ' TASK-49: in-flight (BUSY) request tracking. A connection whose request is being
@@ -99,14 +105,41 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
         Load sck(i)
     Next
     m_idleBusyCapSec = IdleBusyCapFromEnv()
+    ' TASK-57 transport switch (ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
+    ' pipe). ResolveMode runs on PipeTransport's predeclared instance, so reading
+    ' the setting does not create a pipe object.
+    m_mode = PipeTransport.ResolveMode()
+    If m_mode = "pipe" Or m_mode = "auto" Then
+        Set m_pipe = New PipeTransport
+        ' "auto" keeps the TCP listener below as the hub's fallback leg; "pipe"
+        ' does not, so this IDE then occupies no TCP port at all (rule 1).
+        m_pipe.StartServer m_mcp, m_mode, (m_mode = "auto")
+        ' Publish now: in auto mode the TCP leg may still be probing for a port,
+        ' and the hub must be able to find the pipe either way.
+        RegisterInstance
+    End If
+    If m_mode = "pipe" Then
+        tmrWatch.Interval = m_pipe.TickMs
+        tmrWatch.Enabled = True
+        LogLine "transport=pipe reason=forced_pipe tcpEnabled=false pipe=" & m_pipe.PipeNameRedacted() & " nonce=" & m_pipe.NoncePrefix() & "... tickMs=" & CStr(m_pipe.TickMs)
+        Exit Sub
+    End If
     TryListen
 End Sub
 
 Public Sub StopListening()
     tmrWatch.Enabled = False
-    ClearPortFileIfOurs m_port
-    ' TASK-P1-037: a normal exit must deregister the instance file
-    If m_listening Then DeleteInstanceFile FormProcessId()
+    ' TASK-57: only clear the port file if THIS instance actually published one -
+    ' in pipe-only mode m_port is just the requested default, and clearing it
+    ' could delete a live instance's file.
+    If m_portPublished Then ClearPortFileIfOurs m_port
+    ' TASK-P1-037: a normal exit must deregister the instance file. TASK-57: the
+    ' pipe-only track never publishes a port, so it has to be covered separately.
+    If m_listening Or (Not m_pipe Is Nothing) Then DeleteInstanceFile FormProcessId()
+    If Not m_pipe Is Nothing Then
+        m_pipe.StopServer
+        Set m_pipe = Nothing
+    End If
     m_listening = False
     Dim i As Integer
     On Error Resume Next
@@ -153,6 +186,18 @@ Private Sub RegisterInstance()
     m_instProject = proj
     m_instProjectPath = ppath
     m_instSha = sha
+    If Not m_pipe Is Nothing Then
+        If m_pipe.Active() Then
+            ' TASK-57: ADR section 4.1 - transport/pipe/sessionId/nonce/instanceId/
+            ' tcpEnabled must be in the SAME entry, or the hub has nothing to pair
+            ' the instance against. In TCP mode the legacy writer below keeps the
+            ' entry byte-for-byte as before (ADR section 4.2 rule 1: a missing
+            ' transport/pipe means tcp).
+            m_pipe.PublishInstance PipeRegistryPort(), m_pipe.TcpEnabled(), proj, ppath, sha, m_instStartedAt
+            PruneDeadInstanceFiles FormProcessId()
+            Exit Sub
+        End If
+    End If
     WriteInstanceFile FormProcessId(), m_port, proj, ppath, sha, m_instStartedAt
     ' TASK-48: a successful registration proves THIS process is alive - the right
     ' moment to drop the registrations left behind by instances that died without
@@ -182,8 +227,23 @@ Private Sub RefreshInstanceIfChanged()
     End If
 End Sub
 
+' TASK-57: 0 means "this instance has no TCP leg" (pipe-only); the hub decides
+' from tcpEnabled, not from the port number.
+Private Function PipeRegistryPort() As Long
+    If m_listening Then
+        PipeRegistryPort = m_port
+    Else
+        PipeRegistryPort = 0
+    End If
+End Function
+
 Private Sub tmrWatch_Timer()
     On Error GoTo TimerFail
+    ' TASK-57: exactly one bounded pipe servicing pass per tick, on this same UI
+    ' thread / same watchdog. PipeTransport handles re-entrancy internally (a
+    ' nested tick, reached from DoEvents during a long tool call, only emits a
+    ' progress frame - it never re-enters request handling).
+    If Not m_pipe Is Nothing Then m_pipe.Tick
     If m_restartArmed Then
         m_restartArmed = False
         tmrWatch.Interval = 5000
@@ -194,6 +254,13 @@ Private Sub tmrWatch_Timer()
         m_quitArmed = False
         tmrWatch.Enabled = False
         If Not m_mcp Is Nothing Then m_mcp.DoQuit
+        Exit Sub
+    End If
+    ' TASK-57: in pipe-only mode no winsock listener was ever created, so the
+    ' port-probing path below must not run (sck() was only Loaded, never Listen-ed).
+    If m_mode = "pipe" Then
+        WinOps.WheelTick
+        RefreshInstanceIfChanged
         Exit Sub
     End If
     If m_listening Then
@@ -209,9 +276,16 @@ Private Sub tmrWatch_Timer()
         m_listening = True
         m_mcp.Port = m_port
         WritePortFile m_port
+        m_portPublished = True
         RegisterInstance
         LogLine "VB6MCP listening on http://127.0.0.1:" & CStr(m_port) & " (explicitPortOverride=" & CStr(m_explicitPort) & ")"
-        tmrWatch.Interval = 5000
+        ' TASK-57: keep the watchdog fast enough to service the pipe track; the TCP
+        ' track alone keeps the historical 5000 ms cadence.
+        If m_pipe Is Nothing Then
+            tmrWatch.Interval = 5000
+        Else
+            tmrWatch.Interval = m_pipe.TickMs
+        End If
         tmrWatch.Enabled = True
     ElseIf m_explicitPort Then
         ' TASK-P1-037: the port was NAMED (VB6MCP_PORT / registry) - never take

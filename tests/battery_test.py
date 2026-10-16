@@ -257,6 +257,238 @@ t("control_execution", {"mode": "end"}, expect='"executed":true', show=120)
 wait_state("design", 10, "wait_state design-fc")
 
 print("=" * 78)
+print("TASK-99 回归: 写前块结构守卫 / 歧义候选 / 多行锚点 / 过程回显")
+print("=" * 78)
+
+T99_FIX = ("Option Explicit\r\n\r\n"
+           "Private x As Long\r\nPrivate a As Long\r\n\r\n"
+           "Public Sub T99Dup()\r\n    a = 1\r\n    a = 1\r\nEnd Sub\r\n\r\n"
+           "Public Sub T99Victim()\r\n    x = 1\r\nEnd Sub\r\n\r\n"
+           "Public Sub T99Frag()\r\n    x = 1\r\nEnd Sub\r\n")
+
+
+def t99(label, tool, args, judge):
+    """judge(obj) -> bool; a FAIL prints the receipt so the miss is diagnosable."""
+    global PASS, FAIL
+    _e, _txt = call_tool(tool, args)
+    try:
+        obj = json.loads(_txt)
+    except Exception:
+        obj = None
+    if (not _e) and isinstance(obj, dict) and judge(obj):
+        print("[OK]  %s | %s" % (label, json.dumps(obj, ensure_ascii=False)[:150]))
+        PASS += 1
+    else:
+        print("[??]  %s | %s" % (label, _txt[:220].replace("\n", " ")))
+        FAIL += 1
+        FAILED_NAMES.append("task99:" + label)
+    return obj
+
+
+def _t99_pane():
+    return (json.loads(call_tool("get_component_code", {"name": "ModT99"})[1]).get("text") or "").split("\n")
+
+
+def _t99_sha():
+    return json.loads(call_tool("get_component_code", {"name": "ModT99"})[1]).get("textSha256", "")
+
+
+t("add_component", {"type": "module", "name": "ModT99", "code": T99_FIX}, expect='"created"')
+
+# --- MCP-06: the pasted block's OWN pairing, with the offending line numbers ---------
+t99("06 extra end refused", "replace_code",
+    {"name": "ModT99", "operation": "append",
+     "code": "Public Function T99Bad() As Long\r\n    T99Bad = 1\r\nEnd Function\r\nEnd Function"},
+    lambda o: o.get("reason") == "extra_procedure_end" and o.get("writePerformed") is False
+              and bool(o.get("extraEndLines")) and bool(o.get("pairs")) and bool(o.get("suggestedText")))
+t99("06 normal block accepted", "replace_code",
+    {"name": "ModT99", "operation": "append",
+     "code": "Public Function T99Good() As Long\r\n    T99Good = 2\r\nEnd Function"},
+    lambda o: o.get("ok") is not False and "newTotalLines" in o)
+t99("06 missing end refused (reverse)", "replace_code",
+    {"name": "ModT99", "operation": "append",
+     "code": "Public Function T99Open() As Long\r\n    T99Open = 3"},
+    lambda o: o.get("reason") == "missing_procedure_end" and o.get("writePerformed") is False
+              and bool(o.get("unclosedHeaderLines")))
+# NOTE: the fragment case uses T99Frag (NOT T99Dup) on purpose - the ambiguity case
+# below needs T99Dup's two identical lines to stay untouched.
+_l = _t99_pane()
+_frag = next((i + 1 for i, x in enumerate(_l) if "Sub T99Frag()" in x), 0)
+t99("06 fragment accepted (no false positive)", "replace_code",
+    {"name": "ModT99", "operation": "replace", "start_line": _frag, "end_line": _frag + 1,
+     "code": "Public Sub T99Frag()\r\n    x = 2", "expected_sha256": _t99_sha()},
+    lambda o: o.get("ok") is not False and "appliedRange" in o)
+
+# --- MCP-05: ambiguity returns candidates and never writes; block anchors work ------
+t99("05 ambiguous anchor -> candidates", "edit_by_anchor",
+    {"name": "ModT99", "anchor": "    a = 1", "new_text": "    a = 9"},
+    lambda o: o.get("reason") == "anchor_not_unique" and len(o.get("hits") or []) == 2
+              and all("line" in h and "proc" in h and "text" in h for h in o["hits"]))
+t99("05 multi-line anchor replaces block", "edit_by_anchor",
+    {"name": "ModT99", "anchor": "Public Sub T99Dup()\r\n    a = 1\r\n    a = 1\r\nEnd Sub",
+     "new_text": "Public Sub T99Dup()\r\n    a = 7\r\nEnd Sub", "expected_sha256": _t99_sha()},
+    lambda o: o.get("ok") is not False and o.get("matchedSpanLines") == 4)
+t99("05/06 preview predicts the refusal", "preview_edit",
+    {"name": "ModT99", "edits": [{"op": "R",
+                                  "anchor": "Public Function T99Good() As Long\r\n    T99Good = 2\r\nEnd Function",
+                                  "text": "Public Function T99Good() As Long\r\n    T99Good = 3"}]},
+    lambda o: o.get("reason") == "predicted_procedure_imbalance" and o.get("tool") == "preview_edit")
+
+# --- MCP-07: a stale sha refuses the line-number edit; the receipt echoes the proc ---
+_stale = _t99_sha()
+call_tool("replace_code", {"name": "ModT99", "operation": "insert", "start_line": 1, "code": "' drift"})
+_l2 = _t99_pane()
+_gl = next((i + 1 for i, x in enumerate(_l2) if "T99Good = 2" in x), 0)
+t99("07 stale sha refuses drift", "replace_code",
+    {"name": "ModT99", "operation": "replace", "start_line": _gl, "end_line": _gl,
+     "code": "    T99Good = 99", "expected_sha256": _stale},
+    lambda o: o.get("reason") == "sha256_mismatch" and bool(o.get("actualSha256")))
+t99("07 proc echo on replace", "replace_code",
+    {"name": "ModT99", "operation": "replace", "start_line": _gl, "end_line": _gl,
+     "code": "    T99Good = 5", "expected_sha256": _t99_sha()},
+    lambda o: (o.get("procBefore") or {}).get("proc") == "T99Good"
+              and (o.get("procAfter") or {}).get("proc") == "T99Good"
+              and (o.get("procBefore") or {}).get("startLine", 0) > 0)
+
+print("=" * 78)
+print("TASK-95 回归: dependency_graph 同输入三次必须给出同一份答案（确定性配额）")
+print("=" * 78)
+
+# A guaranteed CALL GRAPH for the fixture. Without it the fixture's procedures
+# never call each other, so procEdgesFound would be 0 and this regression could
+# not tell "the procedure-edge phase ran" from "it was cut". T95A -> T95B is
+# asserted verbatim below.
+t("add_component", {"type": "module", "name": "ModT95",
+                    "code": "Option Explicit\r\n\r\nPublic Sub T95A()\r\n    T95B\r\nEnd Sub\r\n\r\n"
+                            "Public Sub T95B()\r\n    T95C\r\nEnd Sub\r\n\r\n"
+                            "Public Sub T95C()\r\n    T95A\r\nEnd Sub\r\n"},
+  expect='"created"')
+
+# TASK-95 ENVELOPE MASK LIST -----------------------------------------------------
+# The ONLY fields a receipt may differ on between two calls with the SAME input.
+# Every entry names the field AND why it can never be part of the answer; every
+# other byte must be identical. Masking anything not listed here - or adding a
+# mask without a reason - silently turns this regression into a no-op.
+ENVELOPE_MASK = [
+    (r'"ms":\d+',           "self wall time of THIS call (top level ms)"),
+    (r'"elapsedMs":\d+',    "self wall time, second spelling (budget suffix)"),
+    (r'"stampedCount":\d+', "session receipt counter, +1 per sealed receipt (inflight{})"),
+    (r'"sinceMs":\d+',      "age of the in-flight call at stamp time (inflight{})"),
+    (r'"pid":\d+',          "IDE process id: session identity, changes per IDE restart"),
+    (r'"port":\d+',         "add-in TCP port: session identity"),
+]
+
+
+def _mask_envelope(text):
+    import re
+    for _pat, _why in ENVELOPE_MASK:
+        text = re.sub(_pat, lambda m: m.group(0).split(":")[0] + ":0", text)
+    return text
+
+
+def depgraph_identity(label, strict_partial):
+    """3 x dependency_graph: after masking ONLY the enumerated envelope the answer
+    must be byte-identical, partial must agree with the *StageCompleted flags, and
+    the default path must still yield procedure edges (the defect this guards)."""
+    global PASS, FAIL
+    runs = []
+    for _i in range(3):
+        _iserr, _txt = call_tool("dependency_graph", {})
+        if _iserr:
+            print("[ERR] %s dependency_graph run %d | %s" % (label, _i + 1, _txt[:200]))
+            FAIL += 1
+            FAILED_NAMES.append("dependency_graph-repeat:" + label)
+            return None
+        runs.append(_txt)
+    masked = [_mask_envelope(x) for x in runs]
+    if masked[0] == masked[1] == masked[2]:
+        print("[OK]  %s: 三次逐字节相同（只掩码 %d 个信封字段），bytes=%d"
+              % (label, len(ENVELOPE_MASK), len(runs[0])))
+        PASS += 1
+    else:
+        print("[??]  %s: 三次不一致（掩码后仍不同）" % label)
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-repeat:" + label)
+    o = json.loads(runs[0])
+    flags = {k: bool(o.get(k)) for k in ("edgeStageCompleted", "purityStageCompleted",
+                                         "cyclesStageCompleted", "procEdgeStageCompleted")}
+    partial = bool(o.get("partial"))
+    all_done = all(flags.values())
+    print("      coverage: partial=%s quotaHit=%s timing=%s chars=%s/%s comps=%s/%s "
+          "procEdges=%s procsScanned=%s/%s stages=%s"
+          % (partial, o.get("budgetExhausted"), o.get("timingTruncated"),
+             o.get("charsProcessed"), o.get("charQuota"),
+             o.get("componentsScanned"), o.get("componentsTotal"),
+             o.get("procEdgesFound"), o.get("proceduresScanned"), o.get("procCount"),
+             flags))
+    if partial == (not all_done):
+        print("[OK]  %s: partial 与 *StageCompleted 自洽（阶段被截断 => 其 flag 为 false）" % label)
+        PASS += 1
+    else:
+        print("[??]  %s: partial=%s 但 all_stages_done=%s" % (label, partial, all_done))
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-consistency:" + label)
+    if partial and not (o.get("budgetExhausted") or o.get("timingTruncated")):
+        print("[??]  %s: partial=true 却没有任何截止标志" % label)
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-cutflag:" + label)
+    else:
+        PASS += 1
+    if o.get("procEdgesFound", 0) <= 0:
+        print("[??]  %s: procEdgesFound=0（默认档必须产出边）" % label)
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-noedges:" + label)
+    else:
+        PASS += 1
+    if strict_partial and not partial:
+        print("[??]  %s: 期望部分覆盖（本段覆盖截断路径）却得到完整结果" % label)
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-partial:" + label)
+    if not partial:
+        if o.get("budgetExhausted") or o.get("timingTruncated"):
+            print("[??]  %s: 全部阶段完成却仍有截止标志" % label)
+            FAIL += 1
+            FAILED_NAMES.append("dependency_graph-cutflag2:" + label)
+        else:
+            print("[OK]  %s: 完整结果（budgetExhausted=false 且四阶段 completed）同样三次一致" % label)
+            PASS += 1
+    return o
+
+
+o_fixture = depgraph_identity("fixture", False)
+if o_fixture is not None:
+    # NOTE: procedure names in the graph are LOWERCASED by the extractor (pre-existing
+    # behaviour: the declaration line is matched case-insensitively and m_pn keeps the
+    # lowercased name - e.g. "ServerForm.startlistening"), so compare case-insensitively.
+    _pe = o_fixture.get("procEdges") or []
+    _got = {(str(e.get("from", "")).lower(), str(e.get("to", "")).lower())
+            for e in _pe if isinstance(e, dict)}
+    _want = ("modt95.t95a", "modt95.t95b")
+    if _want in _got:
+        print("[OK]  fixture: 过程边 %s -> %s 已解析（边阶段真的扫过过程体）" % _want)
+        PASS += 1
+    else:
+        print("[??]  fixture: 未找到过程边 %s；实际=%s" % (str(_want), sorted(_got)[:8]))
+        FAIL += 1
+        FAILED_NAMES.append("dependency_graph-procedge")
+
+# PART 2: the SAME contract on the SHIPPED project, where the default quota is
+# really exceeded, so this is the PARTIAL/truncated path (PART 1 above is a tiny
+# fixture and is therefore normally complete). Skipped with a note when the shipped
+# project is not next to this script or does not open (missing references).
+_shipped = os.path.join(ROOT, "MCP_VB6.vbp")
+if os.path.exists(_shipped):
+    t("save_project", {"path": f"{ROOT}/_test_proj.vbp"}, show=60)
+    _iserr2, _txt2 = call_tool("open_project", {"path": _shipped, "exclusive": True})
+    if _iserr2:
+        print("      (skip shipped-project 段: open_project 失败 | %s)"
+              % _txt2[:160].replace("\n", " "))
+    else:
+        depgraph_identity("shipped", True)
+else:
+    print("      (skip shipped-project 段: %s 不存在)" % _shipped)
+
+print("=" * 78)
 print("结果: 通过 %d, 失败 %d" % (PASS, FAIL))
 if FAILED_NAMES:
     print("失败项:", ", ".join(FAILED_NAMES))

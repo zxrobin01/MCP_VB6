@@ -171,6 +171,8 @@ Private m_wheelTopErr As String
 ' TASK-P1-125 (2.4): how long make_project waits for the artifact to land before it
 ' reports pending=true. Bounded, and abandoned early when a compiler error is seen.
 Private Const MAKE_LAND_WAIT_MS As Long = 15000
+' TASK-99 (MCP-03): the upper bound the caller may ask for with wait_for_build=<ms>.
+Private Const MAKE_LAND_WAIT_MAX_MS As Long = 120000
 ' TASK-P1-068: hunk cap for the multi-hunk minimal write, and the hunk count of
 ' the last write (reported in the receipts next to writeCalls).
 Private Const MAX_HUNKS As Long = 16
@@ -360,7 +362,10 @@ Public Function BuildToolsListResult() As Object
     ' exactly its current write cost; pass true when the edit must be rollback-capable.
     Set pRep("snapshot") = Prop("boolean", "true = write the PRE-EDIT pane text into the project's _undo store before this call writes anything (undo_edit can then restore it); default false = no extra file write. The JSON boolean true is expected; the strings on/yes/1 are also accepted")
     tools.Add MakeTool("replace_code", _
-        "Edit a component's code in IDE memory (line based). replace: overwrite start_line..end_line. insert: before start_line. append: after last line. delete: remove range. set: replace the whole module with code. Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default).", _
+        "Edit a component's code in IDE memory (line based). replace: overwrite start_line..end_line. insert: before start_line. append: after last line. delete: remove range. set: replace the whole module with code." & _
+        " TASK-99 (MCP-07): replace and delete REQUIRE expected_sha256. The chosen remedy is the SHA PIN, not a proc: address space: a whole-pane sha detects ANY drift (a proc-relative address only detects drift across procedure boundaries within the same pane, and it would have to be re-derived from the very text it is meant to pin) - so a drifted pane is refused with sha256_mismatch + the current sha in one retry, and the receipt additionally echoes procBefore/procAfter{proc,startLine,endLine,firstLine,lastLine} so the targeted procedure is visible on both sides." & _
+        " TASK-99 (MCP-06): the submitted block is checked BEFORE the write - a redundant trailing End <Sub|Function|Property> is refused as extra_procedure_end (with block line numbers, the header/End pairs it did match and a suggestedText), set/append must be self-contained (missing_procedure_end), and any edit that would leave the pane unbalanced is refused as predicted_procedure_imbalance instead of becoming a compile-time E105." & _
+        " Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default).", _
         SchemaWith(pRep, Req("name", "operation")))
 
     Dim pAddComp As Object
@@ -555,10 +560,12 @@ Public Function BuildToolsListResult() As Object
     Set pMake("allow_host_modal") = Prop("boolean", "Default false. When VB6's own Make Project box is already up, confirming it starts a long host-modal compile that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy until the IDE is restarted. false = leave the box alone and report modal_blocked=true with its hwnd/title/controls instead of clicking it.")
     Set pMake("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned." & _
             " WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section.")
+    Set pMake("wait_for_build") = Prop("integer", "TASK-99 (MCP-03): milliseconds this call waits for the artifact to land before reporting buildState=pending (default 0 = the historical 15000 ms; a smaller value is raised to 15000; cap 120000). The wait is what makes buildState trustworthy: a pending build is NEVER reported as completed. After clearing a host modal box you must re-read output{exists,size,mtime,sha256} - clearing the box is not completion.")
     Set pMake("diagnose") = Prop("boolean", "default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure.")
     tools.Add MakeTool("make_project", _
         "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}." & _
-        " After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure).", _
+        " After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure)." & _
+        " TASK-99 (MCP-03): the receipt carries ONE queryable build state - buildState (blocked_by_host_modal | pending | completed | completed_without_artifact_change | failed | no_artifact), derived from the same facts as verdict. pending means the compile started but the artifact had not landed inside this call's wait window: re-read output{exists,size,mtime,sha256} (and confirm MZ) before treating it as done - compiled/ok are never completion evidence, and clearing a host modal box is not either. wait_for_build=<ms> extends this call's own wait (default 0 = 15000 ms, cap 120000); the receipt reports waitRequestedMs/waitUsedMs.", _
         SchemaWith(pMake))
 
     Dim pExec As Object
@@ -811,7 +818,8 @@ Public Function BuildToolsListResult() As Object
     Set pVal("mode") = Prop("string", "off|warn|strict (default warn)")
     Set pVal("baseline") = Prop("string", "a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new.")
     tools.Add MakeTool("validate_code", _
-        "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given).", _
+        "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given)." & _
+        " TASK-99 (MCP-04): linter != compiler. These rules are LEXICAL + STRUCTURAL only - they never resolve types or symbols, so a CLEAN receipt is NOT a compile pass and this tool can never report a call to a method that does not exist (that needs type information; a cheap approximation would be guessing) - an explicit NON-GOAL. For a real compile verdict use build (isolated VB6.EXE /make, real compiler log + firstError{file,line,text}) or make_project.", _
         SchemaWith(pVal, Req("code")))
 
     Dim pRs As Object
@@ -825,7 +833,8 @@ Public Function BuildToolsListResult() As Object
     Set pCc = CreateObject("Scripting.Dictionary")
     Set pCc("name") = Prop("string", "Component name")
     tools.Add MakeTool("check_component", _
-        "Lint the current in-IDE text of a component (same diagnostics as validate_code, evaluated on IDE memory).", _
+        "Lint the current in-IDE text of a component (same diagnostics as validate_code, evaluated on IDE memory)." & _
+        " TASK-99 (MCP-04): linter != compiler - lexical + structural only, no type resolution, so it can never report a call to a method that does not exist (NON-GOAL) and a clean receipt is not a compile pass. Use build for a real compiler log and firstError{file,line,text}.", _
         SchemaWith(pCc, Req("name")))
 
     Dim pB As Object
@@ -854,7 +863,9 @@ Public Function BuildToolsListResult() As Object
     ' second file).
     Set pEba("snapshot") = Prop("boolean", "true = guarantee a PRE-EDIT pane snapshot exists in the project's _undo store (this tool already writes one by default through the write funnel); default false = unchanged. The JSON boolean true is expected; the strings on/yes/1 are also accepted")
     tools.Add MakeTool("edit_by_anchor", _
-        "Replace one uniquely-matched line by content anchor (no line numbers). Rejects if the anchor is missing or ambiguous. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).", _
+        "Replace one uniquely-matched line by content anchor (no line numbers). TASK-99 (MCP-05): the anchor may SPAN MULTIPLE LINES - a pasted block matches when all its lines match consecutively (normalized by default) and the WHOLE matched block is replaced; when the anchor is missing or ambiguous the refusal carries hits[] with the candidate {line, proc, text} of every match (plus coords/lineSpace), so pick one with occurrence=<n> or narrow it with scope instead of guessing." & _
+        " TASK-99 (MCP-06): a new block that carries a redundant trailing End <Sub|Function|Property> is refused BEFORE the write (reason=extra_procedure_end, with the offending block line numbers, the pairs it did match, and a suggestedText), and an edit that would leave the pane unbalanced is refused as predicted_procedure_imbalance - instead of becoming a compile-time E105." & _
+        " TASK-99 (MCP-07): the receipt echoes the affected procedure as procBefore/procAfter{proc,startLine,endLine,firstLine,lastLine}. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).", _
         SchemaWith(pEba, Req("name", "anchor", "new_text")))
 
     Dim pAe As Object
@@ -869,7 +880,7 @@ Public Function BuildToolsListResult() As Object
     ' second file).
     Set pAe("snapshot") = Prop("boolean", "true = guarantee a PRE-EDIT pane snapshot exists in the project's _undo store (this tool already writes one by default through the write funnel); default false = unchanged. The JSON boolean true is expected; the strings on/yes/1 are also accepted")
     tools.Add MakeTool("apply_edits", _
-        "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).", _
+        "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). TASK-99 (MCP-05): every op takes the same multi-line block anchors as edit_by_anchor (a block match replaces the whole matched block), and a failing op answers with failedOpIndex + hits[] {line, proc, text} for candidate selection (occurrence/scope, or per-op match). TASK-99 (MCP-06): each op's new text is checked for a redundant trailing End <Sub|Function|Property> before anything is written, and a batch that would leave the pane unbalanced is refused as predicted_procedure_imbalance. TASK-99 (MCP-07): the receipt echoes procBefore/procAfter for the affected procedure. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here).", _
         SchemaWith(pAe, Req("name", "edits")))
 
     Dim pPe As Object
@@ -877,7 +888,7 @@ Public Function BuildToolsListResult() As Object
     Set pPe("name") = Prop("string", "Component name")
     Set pPe("edits") = Prop("array", "Array of {op:R|I|D, anchor, text}")
     tools.Add MakeTool("preview_edit", _
-        "Return a unified-style diff for a batch of anchor edits without writing anything. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written.", _
+        "Return a unified-style diff for a batch of anchor edits without writing anything. TASK-99 (MCP-05): it walks the SAME resolution as apply_edits (per-op match/occurrence, MULTI-LINE block anchors that replace the whole matched block) and applies the same structural refusals, so previewing and then writing the same batch cannot disagree. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written.", _
         SchemaWith(pPe, Req("name", "edits")))
 
     Dim pWs As Object
@@ -1021,7 +1032,7 @@ Public Function BuildToolsListResult() As Object
     Dim pDg As Object
     Set pDg = CreateObject("Scripting.Dictionary")
     tools.Add MakeTool("dependency_graph", _
-        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount).", _
+        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount). v1.11.3: the build is bounded by a DETERMINISTIC character quota (env VB6MCP_CHAR_QUOTA, default 900000), so the SAME input always returns the SAME receipt; every phase keeps a reserved share of that quota, so a default run reports nodes AND some procedure edges. Large projects are PARTIALLY covered by default - read partial, budgetExhausted (the deterministic quota fired) vs timingTruncated (the wall clock fired - the LAST resort, and NOT reproducible), componentsScanned/componentsTotal, procEdgesFound and the *StageCompleted flags (a stage that was cut reports false; a stage whose input was itself cut reports false too). Raise VB6MCP_CHAR_QUOTA (and VB6MCP_BUDGET_MS, since the clock is what would stop it first) for a complete graph; a complete run is reproducible.", _
         SchemaWith(pDg))
 
     Dim pPu As Object
@@ -1471,7 +1482,20 @@ Public Function BuildInstructions() As String
     s = s & "- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal" & vbCrLf
     s = s & "- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason" & vbCrLf
     s = s & "- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)" & vbCrLf
-    s = s & "- v1.1.0 added ide_state/current_position/list_breakpoints/find_gui/ui_text; v1.2.0 added workspace_status/verify_scope/todo_status" & vbCrLf
+    ' --- usage guidance: routing + encoding (guidance audit) ------------------
+    s = s & "ROUTING (use the tool; never hand-edit VB project files):" & vbCrLf
+    s = s & "- .vbp version + build metadata (MajorVer / MinorVer / RevisionVer / AutoIncrementVer / CompanyName / FileDescription / ProductName / Title / ExeName32 / CondComp) -> project_meta (text edit, keeps a .bak; close the project first)" & vbCrLf
+    s = s & "- project / IDE options (description / help file / startup object / startup project / output path / read-only) -> set_project_options" & vbCrLf
+    s = s & "- UAC level + DPI awareness -> app_manifest (writes <exe>.manifest; do not hand-write one)" & vbCrLf
+    s = s & "- components: add / remove / import / rename / reload / export -> add_component / remove_component / import_component / rename_component / reload_component / export_component" & vbCrLf
+    s = s & "- COM references -> add_reference / remove_reference / check_references" & vbCrLf
+    s = s & "- forms and controls: list / add / remove / design-time properties -> form_designer / add_control / remove_control / set_control_property / list_component_parts" & vbCrLf
+    s = s & "- lint before writing / static checks / formatting -> validate_code / check_component / format_code / verify / verify_scope" & vbCrLf
+    s = s & "- component text edits (surgical or bulk) -> edit_by_anchor / apply_edits / replace_code / replace_in_files; preview_edit first; snapshot=true or undo_edit to roll back" & vbCrLf
+    s = s & "- project-wide checkpoint / rollback -> project_snapshot (whole project: .vbp + component files)" & vbCrLf
+    s = s & "- build verdict -> build (offline /make) or make_project (in-IDE): judge by artifactChanged + verdict; compiled:true alone is NOT built" & vbCrLf
+    s = s & "- ENCODING: VB project files (.vbp / .frm / .cls / .bas / .ctl / .pag / .dsr / .res / .inc) must stay system ANSI (GBK) WITHOUT a BOM - never hand-edit or re-encode them (a UTF-8 BOM makes VB6 refuse the project: ""invalid keyword""); the tools above already write ANSI for those extensions." & vbCrLf
+    s = s & "- v1.11.4 current (110 tools): the bullets above are historical - call mcp_info once after initialize for the authoritative breaking[] / migrations[] / changelog[]" & vbCrLf
     s = s & "- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)" & vbCrLf
     s = s & "CAPABILITY INDEX (question -> tool; read this before improvising):" & vbCrLf
     s = s & "- impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)" & vbCrLf
@@ -2016,7 +2040,7 @@ Private Function IdeBusyBreakJson(ByVal tool As String, ByVal rawErr As String, 
 End Function
 
 ' ===========================================================================
-' TASK-53: the IDE's extensibility object model answers a DESIGN-TIME member call with
+' TASK-53 / TASK-54: the IDE's extensibility object model answers a member call with
 ' native VB 438 ("Object doesn't support this property or method") while the IDE is not
 ' yet in an editable design state - measured 2026-10-15 on freshly started IDE instances:
 ' the FIRST one or two calls after the add-in began listening raised 438 on
@@ -2024,6 +2048,14 @@ End Function
 ' (audit %TEMP%\vb6mcp_audit.log 01:00:04 and 01:03:18). The raising member is inside the
 ' VBIDE object model (VBProjects.Add / VBComponent.CodeModule); that add-in code path is
 ' unchanged since 2026-08-28, and task-49 touched only ServerForm.frm + WinsockTransport.cls.
+' TASK-54 MEASURED MORE OF THE SAME WINDOW ON THE SHIPPED 77C8277B: on a clean instance whose
+' get_project_info was ALREADY healthy (componentCount=3, ideState=design) about 4 s after
+' start, READ-class tools answered the bare envelope too - ide_state, read_active_dialogs,
+' get_component_code and audit_tail all returned the bare {reason:unexpected_error,
+' vbErrorCode:438, message:<the localized 438 text>} - while replace_code already answered
+' ide_model_not_ready. A get_project_info based settle loop can NEVER detect this window:
+' that tool does not touch the object model, so it stays healthy while the model is still
+' unreachable.
 '
 ' WHAT IS FIXED HERE IS THE ENVELOPE, NOT THE STATE: the Fail handler had NO branch for a
 ' 438, so it fell through to UnexpectedErrorJson and the caller received a bare
@@ -2032,8 +2064,9 @@ End Function
 '
 ' BOUNDS (all three are load-bearing):
 '   * 438 ONLY - no other VB error number is classified here;
-'   * WRITE-CLASS CALLS ONLY (IsMutatingTool) - a read that fails this way keeps the
-'     unexpected_error envelope it has always had;
+'   * EVERY TOOL CLASS (TASK-54): read-class calls 438 in the SAME window, so the tool
+'     class is deliberately NOT a gate any more. The tool parameter is retained for the
+'     receipt and the caller, never as a filter;
 '   * it runs AFTER the MCPREASON / IDE-busy / ClassifiedRefusalJson branches, so every
 '     existing structured refusal stays byte-identical and only calls that used to answer
 '     unexpected_error can reach it.
@@ -2043,23 +2076,21 @@ End Function
 ' ===========================================================================
 Private Function IsIdeModelNotReadyError(ByVal tool As String, ByVal vbErr As Long, ByVal msg As String) As Boolean
     On Error Resume Next
-    ' Native VB 438 is the primary, number-based signal.
+    ' Native VB 438 is the primary, number-based signal - for EVERY tool class (TASK-54).
     If vbErr = 438 Then
-        If IsMutatingTool(tool) Then IsIdeModelNotReadyError = True
+        IsIdeModelNotReadyError = True
         Exit Function
     End If
     ' Fallback ONLY: if the captured Err.Number was 0 (an inner handler cleared Err before the
     ' Fail handler ran) the number test alone would miss the error this card is about. The two
-    ' known 438 texts are matched verbatim, still gated on a write-class tool.
-    If IsMutatingTool(tool) Then
-        If InStr(1, msg, "Object doesn't support this property or method", vbTextCompare) > 0 Then
+    ' known 438 texts are matched verbatim, in EVERY tool class (TASK-54).
+    If InStr(1, msg, "Object doesn't support this property or method", vbTextCompare) > 0 Then
             IsIdeModelNotReadyError = True
             Exit Function
         End If
         If InStr(msg, ChrW$(&H5BF9) & ChrW$(&H8C61) & ChrW$(&H4E0D) & ChrW$(&H652F) & ChrW$(&H6301) & ChrW$(&H8BE5) & ChrW$(&H5C5E) & ChrW$(&H6027) & ChrW$(&H6216) & ChrW$(&H65B9) & ChrW$(&H6CD5)) > 0 Then
             IsIdeModelNotReadyError = True
         End If
-    End If
 End Function
 
 ' Empty string unless this is the 438-on-a-write path, so the caller keeps the byte-identical
@@ -2080,8 +2111,8 @@ Private Function IdeModelNotReadyJson(ByVal tool As String, ByVal rawErr As Stri
     d("vbErrorCode") = 438
     d("ideState") = GetIdeState()
     d("retryHint") = "wait for the IDE to finish loading the project (or leave run/break mode), then repeat the SAME call - a freshly started IDE was measured to succeed on the very next attempt"
-    d("advice") = "the VBIDE extensibility model refused a member call while the design-time model was not yet editable; nothing here is a claim about the component or the project state, and no write was accepted"
-    d("classifiedBy") = "IdeModelNotReadyJson (native VB 438 on a write-class call)"
+    d("advice") = "the VBIDE extensibility model refused a member call while the design-time model was not yet editable; nothing here is a claim about the component or the project state, and no state change was accepted (a read changed nothing; a write was refused)"
+    d("classifiedBy") = "IdeModelNotReadyJson (native VB 438 from the VBIDE object model, every tool class)"
     d("sideEffects") = "none: the IDE refused the member call, so this is a refusal and not a completed mutation"
     IdeModelNotReadyJson = JsonStringify(d)
 End Function
@@ -2738,7 +2769,7 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "save_project"
             outText = ToolSaveProject(JsonGetStr(args, "path"))
         Case "make_project"
-            outText = ToolMakeProject(JsonGetStr(args, "output_path"), JsonGetStr(args, "route"), JsonGetStr(args, "out_path"), JsonGetLong(args, "timeout_ms"), JsonGetBool(args, "allow_host_modal", False), HasArg(args, "laa"), JsonGetBool(args, "laa", True), JsonGetBool(args, "diagnose", False))
+            outText = ToolMakeProject(JsonGetStr(args, "output_path"), JsonGetStr(args, "route"), JsonGetStr(args, "out_path"), JsonGetLong(args, "timeout_ms"), JsonGetBool(args, "allow_host_modal", False), HasArg(args, "laa"), JsonGetBool(args, "laa", True), JsonGetBool(args, "diagnose", False), JsonGetLong(args, "wait_for_build", 0))
         Case "control_execution"
             outText = ToolControlExecution(JsonGetStr(args, "mode"))
         Case "test_host"
@@ -3075,7 +3106,7 @@ Fail:
     End If
     ' TASK-P1-062: structured envelope for an unexpected VB error (the tagged-guard and
     ' break-mode branches above are unchanged).
-    ' TASK-53: a native VB 438 on a WRITE-class call is answered with a STRUCTURED refusal
+    ' TASK-53 / TASK-54: a native VB 438 on ANY tool class is answered with a STRUCTURED refusal
     ' (reason:"ide_model_not_ready") carrying the RAW IDE message and a retry hint, instead of
     ' the unexpected_error catch-all below. It sits AFTER the ClassifiedRefusalJson branch so
     ' every already-classified condition is untouched, and an empty return means "not this
@@ -5284,7 +5315,10 @@ Private Function ToolReplaceCode(ByVal name As String, ByVal operation As String
     ' own header plus a redundant "End Function" used to be WRITTEN (only the linter
     ' complained, VB6-E105) and cost two failed builds.
     Dim pairRef As String
-    pairRef = PreWritePairingRefusal("replace_code", comp.Name, norm, "code (operation=" & op & ")")
+    ' TASK-99 (MCP-06 reverse): set/append must be self-contained (the block IS the whole
+    ' tail of the module), so a header without its End is refused up front. replace/insert
+    ' may legitimately be a fragment - the result-level guard below judges those.
+    pairRef = PreWritePairingRefusal("replace_code", comp.Name, norm, "code (operation=" & op & ")", (op = "set" Or op = "append"))
     If Len(pairRef) > 0 Then
         ToolReplaceCode = pairRef
         Exit Function
@@ -5353,6 +5387,14 @@ Private Function ToolReplaceCode(ByVal name As String, ByVal operation As String
     End If
     Dim predicted As String
     predicted = PredictedReplaceText(curPane, op, adjStart, adjEnd, linesArr, nLines)
+    ' TASK-99 (MCP-06 reverse direction): judge the RESULT, not just the block - refuse
+    ' only when the pane is balanced now and the edit would leave it unbalanced.
+    Dim ppRef As String
+    ppRef = PredictedPairingRefusal("replace_code", comp.Name, curPane, predicted, "operation=" & op)
+    If Len(ppRef) > 0 Then
+        ToolReplaceCode = ppRef
+        Exit Function
+    End If
     tPredict = GetTickCount()
     Dim pack As Object
     ' TASK-P1-051: above the region threshold, lint targets the edited procedure
@@ -5603,6 +5645,11 @@ Private Function ToolReplaceCode(ByVal name As String, ByVal operation As String
     Set summary("appliedRange") = AppliedRangeDict(apStart, apEnd)
     summary("clamped") = clamped
     Set summary("coords") = CoordsDictOfName(comp.Name, apStart, "ide")
+    ' TASK-99 (MCP-07): echo the affected procedure's first/last pane line BEFORE and
+    ' AFTER, so a line-number drift shows up in the receipt instead of silently editing
+    ' another procedure. paneAfter is the post-write pane text already read above.
+    Set summary("procBefore") = ProcEchoDict(curPane, apStart)
+    Set summary("procAfter") = ProcEchoDict(paneAfter, apStart)
     AddPaneDiskFields summary, comp.Name, paneAfter
     CopyLintPack summary, pack
     ' TASK-P1-049: totalMs covers the WHOLE call (entry -> receipt), so a slow call
@@ -7135,6 +7182,14 @@ Private Function ToolAddCode(ByVal component As String, ByVal code As String, By
     predicted = cur
     If Len(predicted) > 0 And Len(body) > 0 Then predicted = predicted & vbCrLf
     predicted = predicted & Replace(Replace(body, vbCrLf, vbLf), vbCr, vbLf)
+    ' TASK-99 (MCP-06 reverse direction): the appended text must not leave the module
+    ' with an open procedure (the block-level gate above would have caught an extra end).
+    Dim ppRefA As String
+    ppRefA = PredictedPairingRefusal("add_code", comp.Name, cur, predicted, "the appended block (addedFrom=" & addedFrom & ")")
+    If Len(ppRefA) > 0 Then
+        ToolAddCode = ppRefA
+        Exit Function
+    End If
     Dim pack As Object
     ' TASK-P1-054: region target = the first line the appended code lands on.
     Dim tPredictA As Long
@@ -8843,11 +8898,20 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
                                  ByVal outPath As String, ByVal timeoutMs As Long, _
                                  ByVal allowHostModal As Boolean, _
                                  ByVal laaGiven As Boolean, ByVal laaParam As Boolean, _
-                                 ByVal diagnoseWant As Boolean) As String
+                                 ByVal diagnoseWant As Boolean, ByVal waitForBuildMs As Long) As String
     Dim t0 As Long
     t0 = GetTickCount()
     Dim p As VBIDE.VBProject
     Set p = GetProject()
+    ' TASK-99 (MCP-03): how long this call waits for the artifact to land. The historical
+    ' 15 s default is unchanged; wait_for_build=<ms> (floor 15000, cap 120000) extends it.
+    ' The same budget feeds the gate backstop below, so a longer wait can never be cut
+    ' short by the single-flight gate release.
+    Dim waitBudget As Long
+    waitBudget = MAKE_LAND_WAIT_MS
+    If waitForBuildMs > 0 Then waitBudget = waitForBuildMs
+    If waitBudget < MAKE_LAND_WAIT_MS Then waitBudget = MAKE_LAND_WAIT_MS
+    If waitBudget > MAKE_LAND_WAIT_MAX_MS Then waitBudget = MAKE_LAND_WAIT_MAX_MS
     ' MakeCompiledFile / the Make menu command open a modal Save dialog for
     ' unsaved projects. Save silently first, or fail with guidance.
     If Len(p.FileName) = 0 Then
@@ -8945,7 +9009,7 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     Dim mgWait As Long
     mgWait = MODAL_GUARD_WAIT_MAKE_MS
     WinOps.WoModalGuardArm "make_project", mgWait, allowHostModal
-    ArmGateRelease "make_project", MAKE_LAND_WAIT_MS + mgWait + 5000
+    ArmGateRelease "make_project", waitBudget + mgWait + 5000
     Dim preRisk As String, preReason As String, preClass As String, preDetails As String
     Dim preNDlg As Long
     preNDlg = WinOps.HostModalRiskProbe("#32770", preRisk, preReason, preClass, preDetails)
@@ -9139,7 +9203,9 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     Dim ceText As String
     Dim hasCompileErr As Boolean
     hasCompileErr = False
-    Do While buildStarted And waited < MAKE_LAND_WAIT_MS
+    root("waitRequestedMs") = waitForBuildMs
+    root("waitUsedMs") = waitBudget
+    Do While buildStarted And waited < waitBudget
         hasCompileErr = WinOps.CompileErrorTextFromDialogs(ceText)
         If hasCompileErr Then Exit Do
         If CBool(after("exists")) Then
@@ -9369,6 +9435,21 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     Else
         root("verdict") = "no-artifact-change"
     End If
+    ' ---- TASK-99 (MCP-03): ONE queryable build state --------------------------
+    If CBool(root("modal_blocked")) Then
+        root("buildState") = "blocked_by_host_modal"
+    ElseIf pending Then
+        root("buildState") = "pending"
+    ElseIf artChanged Then
+        root("buildState") = "completed"
+    ElseIf CBool(after("exists")) And (compiled Or buildStarted) Then
+        root("buildState") = "completed_without_artifact_change"
+    ElseIf Not compiled Then
+        root("buildState") = "failed"
+    Else
+        root("buildState") = "no_artifact"
+    End If
+    root("buildStateNote") = "TASK-99 (MCP-03): buildState is DERIVED from the same facts as verdict (modal_blocked / pending / artifactChanged / compiled) - it is not a second guess. buildState=pending means the compile was started but the artifact had not landed inside this call's wait window (waitUsedMs; default 15000, wait_for_build=<ms> up to 120000): re-read output.exists / output.size / output.mtime / output.sha256 - and confirm the file starts with MZ - before treating the build as done. compiled/ok are never completion evidence. If a host modal box was cleared first, re-read output{} again: clearing the box does not itself prove the artifact landed."
     root("ok") = (artChanged And Not CBool(root("modal_blocked")))
     root("elapsedMs") = GetTickCount() - t0
     If Len(root("note")) = 0 Then
@@ -9509,6 +9590,29 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
                 root("diagnosisNote") = "log/firstError come from the ISOLATED copy compile, not from the in-IDE Make (which has no compiler subprocess). The copy is the state ON DISK: unsaved pane edits are not in it."
             Else
                 root("diagnosisNote") = "the isolated /make wrote no readable log; see diagnosis{} and diagnosisError"
+            End If
+        End If
+    End If
+    ' ---- TASK-99 (MCP-03): a diagnosis that RAN and FAILED is proof of a compile
+    ' failure, so the state must not stay "pending" --------------------------------
+    ' Measured (fixture with no startup object): the in-IDE Make produced no artifact
+    ' and raised no dialog, the isolated copy's log said "必须有启动窗体或 Sub Main()" /
+    ' "编译失败", and the receipt still answered verdict=pending - i.e. it told the
+    ' caller to WAIT AND RE-READ as if the compile were still in flight, hiding a
+    ' failure we could already prove. A pending state is only honest while nothing has
+    ' disproved success.
+    If Len(diagReason) > 0 Then
+        Dim dg2 As Object
+        Set dg2 = root("diagnosis")
+        If Not dg2 Is Nothing Then
+            If CBool(dg2("attempted")) And (Not CBool(dg2("ok"))) And (Not artChanged) Then
+                root("pending") = False
+                root("pendingOverriddenByDiagnosis") = True
+                root("verdict") = "compile_failed"
+                root("buildState") = "failed"
+                root("unbuiltReasonUnknown") = False
+                root("buildStateNote") = "TASK-99 (MCP-03): the ISOLATED copy compile of this project FAILED (diagnosis.ok=false) and the artifact did not change, so this build is FAILED - never pending (which tells the caller to wait and re-read as if the compile were still in flight) and never a completed_* state. The copy is the state ON DISK; unsaved pane edits are not in it. Read diagnosis{}/log/firstError for the cause."
+                root("suggestedAction") = "the compile failed: read log / firstError / diagnosis{}, fix the reported cause, then retry. Do NOT re-read output{} waiting for an artifact that a failed compile cannot produce."
             End If
         End If
     End If
@@ -14615,15 +14719,64 @@ End Function
 '     edit;
 ' (d) baseline_diff for validate_code / check_component.
 ' ===============================================================
+' TASK-P1-126 (MCP-06), extended by TASK-99:
+'   (i)   the block's OWN pairing: a pasted block that carries a redundant trailing
+'         "End Function" is refused with the exact LINE NUMBERS inside the block, the
+'         header/end PAIRS it did match, and a corrected suggestedText;
+'   (ii)  TASK-99: the REVERSE direction (a block that opens a procedure and never
+'         closes it) is refused only when requireComplete=True, i.e. only for the
+'         operations where the block MUST be self-contained (replace_code set/append,
+'         add_code). A replace/insert/anchor block may legitimately be a FRAGMENT
+'         (header + body with the original End left in place), and refusing those
+'         would break real edits - the module-level guard (PredictedPairingRefusal)
+'         covers that case from the RESULT instead of guessing from the block.
 Private Function PreWritePairingRefusal(ByVal toolName As String, ByVal component As String, _
-                                        ByVal blockText As String, ByVal where As String) As String
+                                        ByVal blockText As String, ByVal where As String, _
+                                        Optional ByVal requireComplete As Boolean = False) As String
     PreWritePairingRefusal = ""
     If Len(blockText) = 0 Then Exit Function
     Dim nh As Long, ne As Long, extra As Long
     Dim fixed As String
     Dim why As String
     why = Vb6Lint.BlockPairingProblem(blockText, nh, ne, extra, fixed)
+    Dim missing As Long
+    missing = 0
+    If Len(why) = 0 And requireComplete Then
+        If nh > ne Then
+            why = "missing_procedure_end"
+            missing = nh - ne
+        End If
+    End If
     If Len(why) = 0 Then Exit Function
+    Dim lines() As String, n As Long, i As Long, k As Long
+    lines = PairingLines(blockText)
+    n = UBound(lines) + 1
+    If n < 1 Then n = 1
+    Dim headLines As Object, endLines As Object
+    Set headLines = New Collection
+    Set endLines = New Collection
+    For i = 0 To n - 1
+        If Len(Vb6Lint.LintProcHeaderName(lines(i))) > 0 Then
+            headLines.Add i + 1
+        ElseIf Len(Vb6Lint.LintProcEndKind(lines(i))) > 0 Then
+            endLines.Add i + 1
+        End If
+    Next i
+    ' the pairs that DO match: header k pairs with end k, in file order
+    Dim pairs As Object
+    Set pairs = New Collection
+    Dim np As Long
+    np = nh
+    If ne < np Then np = ne
+    For k = 1 To np
+        Dim pd As Object
+        Set pd = CreateObject("Scripting.Dictionary")
+        pd("headerLine") = CLng(headLines(k))
+        pd("headerText") = Trim$(lines(CLng(headLines(k)) - 1))
+        pd("endLine") = CLng(endLines(k))
+        pd("endText") = Trim$(lines(CLng(endLines(k)) - 1))
+        pairs.Add pd
+    Next k
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
     d("ok") = False
@@ -14632,14 +14785,184 @@ Private Function PreWritePairingRefusal(ByVal toolName As String, ByVal componen
     d("component") = component
     d("where") = where
     d("writePerformed") = False
-    d("note") = "refused BEFORE any write, snapshot or lint pass: the block does not pair its own first and last keywords"
     d("blockProcedureHeaders") = nh
     d("blockProcedureEnds") = ne
-    d("extraEndCount") = extra
-    d("extraEndKeywords") = "the block opens " & CStr(nh) & " procedure(s) and closes " & CStr(ne) & ", so " & CStr(extra) & " trailing End <Sub|Function|Property> line(s) have no matching header. VB6 reports exactly this as VB6-E105 (extra end function) and refuses to compile."
-    d("suggestedAction") = "resubmit the SAME block without the " & CStr(extra) & " extra trailing terminator line(s) - the corrected text is in suggestedText - or split the work so each call carries one header and its own End."
-    d("suggestedText") = fixed
+    d("blockLineCount") = n
+    Set d("headerLines") = headLines
+    Set d("pairs") = pairs
+    d("lineSpace") = "pairs[].headerLine/endLine, headerLines[] and the extra/unclosed line numbers count lines INSIDE THE SUBMITTED BLOCK, 1-based (line 1 = the block's first line); they are NOT pane lines. The pane was never touched."
+    If extra > 0 Then
+        ' The LAST `extra` terminators are the ones with no header. Collect them in ONE
+        ' forward pass and keep the tail: Collection.Add(Item, [Key], [Before]) with
+        ' Before:=1 raises VB error 5 on an EMPTY collection, so never build by prepending.
+        Dim aends As Object
+        Set aends = New Collection
+        For i = 0 To n - 1
+            If Len(Vb6Lint.LintProcEndKind(lines(i))) > 0 Then aends.Add i + 1
+        Next i
+        Dim xa As Object, xt As Object
+        Set xa = New Collection
+        Set xt = New Collection
+        Dim q As Long
+        For q = aends.Count - extra + 1 To aends.Count
+            If q >= 1 Then
+                xa.Add CLng(aends(q))
+                xt.Add Trim$(lines(CLng(aends(q)) - 1))
+            End If
+        Next q
+        d("extraEndCount") = extra
+        Set d("extraEndLines") = xa
+        d("extraEndTexts") = JoinCollection(xt, " | ")
+        d("extraEndKeywords") = "the block opens " & CStr(nh) & " procedure(s) and closes " & CStr(ne) & ", so " & CStr(extra) & " trailing End <Sub|Function|Property> line(s) have no matching header. VB6 reports exactly this as VB6-E105 (extra end function) and refuses to compile."
+        d("suggestedAction") = "resubmit the SAME block without the " & CStr(extra) & " extra trailing terminator line(s) (block line(s) " & JoinCollection(xa, ", ") & ") - the corrected text is in suggestedText - or split the work so each call carries one header and its own End."
+        d("suggestedText") = fixed
+    End If
+    If missing > 0 Then
+        Dim ua As Object
+        Set ua = New Collection
+        For k = np + 1 To nh
+            ua.Add CLng(headLines(k))
+        Next k
+        d("missingEndCount") = missing
+        Set d("unclosedHeaderLines") = ua
+        d("missingEndKeywords") = "the block opens " & CStr(nh) & " procedure(s) but closes only " & CStr(ne) & ", so " & CStr(missing) & " procedure(s) would be left OPEN. VB6 cannot compile that (expected End Sub / End Function / End Property); the following existing End would pair with the wrong header."
+        d("suggestedAction") = "close every header the block opens (unclosed header block line(s) " & JoinCollection(ua, ", ") & "); if you meant to replace only the BODY, send a block that does not open a procedure."
+        If missing = 1 Then
+            Dim fix1 As String
+            fix1 = PairEndKeywordFor(lines(CLng(headLines(nh)) - 1))
+            If Len(fix1) > 0 Then d("suggestedText") = blockText & vbCrLf & fix1
+        End If
+    End If
+    d("note") = "refused BEFORE any write, snapshot or lint pass: " & IIf(extra > 0, "the submitted block pairs " & CStr(nh) & " header(s) with " & CStr(ne) & " terminator(s) and carries " & CStr(extra) & " redundant terminator(s) (block line(s) " & JoinCollection(xa, ", ") & ")", "the submitted block opens " & CStr(nh) & " procedure(s) and closes " & CStr(ne) & " (unclosed header block line(s) " & JoinCollection(ua, ", ") & ")") & ". The component was NOT modified."
     PreWritePairingRefusal = JsonStringify(d)
+End Function
+
+' TASK-99: the block's lines, split on either newline form (same normalisation the
+' linter uses), as a 0-based array.
+Private Function PairingLines(ByVal text As String) As String()
+    PairingLines = Split(Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+End Function
+
+' TASK-99: "End Sub" / "End Function" / "End Property" for a procedure header line.
+Private Function PairEndKeywordFor(ByVal headerLine As String) As String
+    Dim s As String, u As String
+    s = LCase$(Trim$(headerLine))
+    Do
+        If Left$(s, 7) = "public " Then
+            s = Mid$(s, 8)
+        ElseIf Left$(s, 8) = "private " Then
+            s = Mid$(s, 9)
+        ElseIf Left$(s, 7) = "friend " Then
+            s = Mid$(s, 8)
+        ElseIf Left$(s, 7) = "static " Then
+            s = Mid$(s, 8)
+        Else
+            Exit Do
+        End If
+    Loop
+    If Left$(s, 4) = "sub " Then PairEndKeywordFor = "End Sub"
+    If Left$(s, 9) = "function " Then PairEndKeywordFor = "End Function"
+    If Left$(s, 9) = "property " Then PairEndKeywordFor = "End Property"
+End Function
+
+' TASK-99: a Collection joined for a human-readable field (numbers or short text).
+Private Function JoinCollection(ByVal coll As Object, ByVal sep As String) As String
+    Dim i As Long, out As String
+    If coll Is Nothing Then Exit Function
+    For i = 1 To coll.Count
+        If i > 1 Then out = out & sep
+        out = out & CStr(coll(i))
+    Next i
+    JoinCollection = out
+End Function
+
+' TASK-99: count procedure headers and procedure terminators in a whole (predicted)
+' pane text, using exactly the two predicates the linter uses.
+Private Sub CountProcPairs(ByVal text As String, ByRef headers As Long, ByRef ends As Long)
+    Dim lines() As String, i As Long, n As Long
+    headers = 0
+    ends = 0
+    If Len(text) = 0 Then Exit Sub
+    lines = PairingLines(text)
+    n = UBound(lines) + 1
+    For i = 0 To n - 1
+        If Len(Vb6Lint.LintProcHeaderName(lines(i))) > 0 Then
+            headers = headers + 1
+        ElseIf Len(Vb6Lint.LintProcEndKind(lines(i))) > 0 Then
+            ends = ends + 1
+        End If
+    Next i
+End Sub
+
+' TASK-99 (MCP-06, reverse direction): the block-level gate above can only judge the
+' SUBMITTED BLOCK. A fragment-shaped edit is legitimate, so a header without its own
+' End must NOT be refused on its own - the honest question is what the PANE looks like
+' AFTER the edit. This gate runs on the PREDICTED text, just before the write, and
+' refuses only when the pane was BALANCED before and would be UNBALANCED after (so an
+' already-broken module can still be repaired, and a body-only fragment passes).
+Private Function PredictedPairingRefusal(ByVal toolName As String, ByVal component As String, _
+        ByVal beforeText As String, ByVal afterText As String, ByVal where As String) As String
+    PredictedPairingRefusal = ""
+    Dim bh As Long, be As Long, ah As Long, ae As Long
+    CountProcPairs beforeText, bh, be
+    CountProcPairs afterText, ah, ae
+    If bh <> be Then Exit Function
+    If ah = ae Then Exit Function
+    Dim lines() As String, i As Long, n As Long
+    lines = PairingLines(afterText)
+    n = UBound(lines) + 1
+    If n < 1 Then n = 1
+    Dim st As Object
+    Set st = New Collection
+    Dim unmatched As Object, unclosed As Object
+    Set unmatched = New Collection
+    Set unclosed = New Collection
+    For i = 0 To n - 1
+        If Len(Vb6Lint.LintProcHeaderName(lines(i))) > 0 Then
+            st.Add i + 1
+        ElseIf Len(Vb6Lint.LintProcEndKind(lines(i))) > 0 Then
+            If st.Count = 0 Then
+                Dim xd As Object
+                Set xd = CreateObject("Scripting.Dictionary")
+                xd("line") = i + 1
+                xd("text") = Trim$(lines(i))
+                unmatched.Add xd
+            Else
+                st.Remove st.Count
+            End If
+        End If
+    Next i
+    For i = 1 To st.Count
+        Dim ud As Object
+        Set ud = CreateObject("Scripting.Dictionary")
+        ud("line") = CLng(st(i))
+        ud("text") = Trim$(lines(CLng(st(i)) - 1))
+        unclosed.Add ud
+    Next i
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = "predicted_procedure_imbalance"
+    d("tool") = toolName
+    d("component") = component
+    d("where") = where
+    d("writePerformed") = False
+    d("headersBefore") = bh
+    d("endsBefore") = be
+    d("headersAfter") = ah
+    d("endsAfter") = ae
+    d("extraEndCount") = ae - ah
+    d("missingEndCount") = ah - ae
+    Set d("unmatchedEndLines") = unmatched
+    Set d("unclosedHeaderLines") = unclosed
+    d("lineSpace") = "unmatchedEndLines[].line / unclosedHeaderLines[].line are PANE (IDE code-pane) lines of the PREDICTED text"
+    d("note") = "refused BEFORE the write: the pane is balanced now (" & CStr(bh) & " header(s), " & CStr(be) & " terminator(s)) but this edit would leave it unbalanced (" & CStr(ah) & " vs " & CStr(ae) & "). VB6 cannot compile that (E105 extra end, or a procedure left open). Nothing was written; the caller keeps the current text."
+    If ae > ah Then
+        d("suggestedAction") = "the submitted text introduces " & CStr(ae - ah) & " more terminator(s) than header(s); drop the redundant End <Sub|Function|Property> line(s) or send a block that carries its own header for each End."
+    Else
+        d("suggestedAction") = "the submitted text opens " & CStr(ah - ae) & " more procedure(s) than it closes; add the matching End <Sub|Function|Property> or send only the fragment that does not open a procedure."
+    End If
+    PredictedPairingRefusal = JsonStringify(d)
 End Function
 
 ' The target procedure's first/last line, in PANE coordinates, from a pane TEXT
@@ -15681,7 +16004,8 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
         br.reportedLine = 0
         br.diskLine = 0
         br.exitCode = 0
-        ideMakeJson = ToolMakeProject("", "ide", "", 0, False, laaGiven, laaParam, diagnoseWant)
+        ' TASK-99: the 9th argument is wait_for_build; 0 = the historical 15 s default.
+        ideMakeJson = ToolMakeProject("", "ide", "", 0, False, laaGiven, laaParam, diagnoseWant, 0)
         ec = 0
         Build.ApplyArtifactVerdict br, artifact, tBefore
     Else
@@ -16041,6 +16365,14 @@ Private Function ToolEditByAnchor(ByVal name As String, ByVal anchor As String, 
     nx = EditTxn.ApplyLineOps(cur, lineOps, em)
     tPredict = GetTickCount()
     If Len(em) > 0 Then Err.Raise vbObjectError + 82, "CodeTools", em
+    ' TASK-99 (MCP-06 reverse direction): an anchor block may legally be a FRAGMENT, so
+    ' judge the RESULT: refuse only when the pane was balanced and would stop being so.
+    Dim ppRefE As String
+    ppRefE = PredictedPairingRefusal("edit_by_anchor", name, cur, nx, "anchor at line " & CStr(hitLine) & " (" & CStr(nOps) & " line(s))")
+    If Len(ppRefE) > 0 Then
+        ToolEditByAnchor = ppRefE
+        Exit Function
+    End If
     ' ---- TASK-P1-020 beta-3 + TASK-P1-024 gamma-4 ----
     Dim pack As Object
     ' TASK-P1-054: region target = the anchor line that was just edited.
@@ -16289,6 +16621,13 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
         If Len(engTagA) > 0 Then Err.Raise vbObjectError + 84, "CodeTools", engTagA
         Err.Raise vbObjectError + 84, "CodeTools", em
     End If
+    ' TASK-99 (MCP-06 reverse direction): the same result-level judgement for the batch.
+    Dim ppRefB As String
+    ppRefB = PredictedPairingRefusal("apply_edits", name, cur, nx, CStr(n) & " op(s)")
+    If Len(ppRefB) > 0 Then
+        ToolApplyEdits = ppRefB
+        Exit Function
+    End If
     ' ---- TASK-P1-020 beta-3 + TASK-P1-024 gamma-4 ----
     Dim pack As Object
     ' TASK-P1-054: region target = the first edited line of the batch.
@@ -16326,6 +16665,9 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
     Set extra("requestedRange") = rq
     Set extra("appliedRange") = ChangedRegion(cur, nx)
     extra("clamped") = False
+    ' TASK-99 (MCP-07): the affected procedure's first/last pane line before and after.
+    Set extra("procBefore") = ProcEchoDict(cur, firstHit)
+    Set extra("procAfter") = ProcEchoDict(nx, firstHit)
     Set extra("matchedLines") = matches
     If matches.Count > 0 Then
         extra("matchedLine") = matches(1)("line")
@@ -16653,8 +16995,12 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
     ops = BuildOps(edits)
     Dim n As Long, i As Long, parts() As String
     n = UBound(ops) - LBound(ops) + 1
+    ' TASK-99 (MCP-05): a MULTI-LINE anchor replaces the WHOLE matched block - exactly the
+    ' ops apply_edits writes. The preview used to emit only the R at the block's first line,
+    ' so previewing a multi-line anchor disagreed with the write it is supposed to predict.
     Dim lineOps() As String
-    ReDim lineOps(0 To n - 1)
+    Dim colPre As Object
+    Set colPre = New Collection
     Dim curLines() As String
     curLines = TextLines(cur)
     Dim iRaw() As String, iNorm() As String
@@ -16708,8 +17054,24 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
                 Exit Function
             End If
         End If
-        lineOps(i) = op & vbTab & CStr(hitLine) & vbTab & txt
+        colPre.Add op & vbTab & CStr(hitLine) & vbTab & txt
+        ' TASK-99 (MCP-05): the rest of a multi-line anchor match is REMOVED, exactly as
+        ' ToolApplyEdits does, so the preview predicts the write byte for byte.
+        If op = "R" And spanPre > 1 Then
+            Dim dqPre As Long
+            For dqPre = 1 To spanPre - 1
+                colPre.Add "D" & vbTab & CStr(hitLine + dqPre)
+            Next dqPre
+        End If
     Next
+    ' TASK-99 (MCP-05): materialise the (possibly longer) op list once.
+    Dim cNPre As Long, cIPre As Long
+    cNPre = colPre.Count
+    If cNPre < 1 Then cNPre = 1
+    ReDim lineOps(0 To cNPre - 1)
+    For cIPre = 0 To cNPre - 1
+        lineOps(cIPre) = CStr(colPre(cIPre + 1))
+    Next cIPre
     nx = EditTxn.ApplyLineOps(cur, lineOps, em)
     ' TASK-P1-100: a non-resolving anchor is CALLER INPUT and is answered above (structured).
     ' ApplyLineOps receives RESOLVED line ops here, so its only caller-input errMsg is
@@ -16718,6 +17080,14 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
         engTag = EngineRefusalTag(em, ops, cur, "")
         If Len(engTag) > 0 Then Err.Raise vbObjectError + 84, "CodeTools", engTag
         Err.Raise vbObjectError + 84, "CodeTools", em
+    End If
+    ' TASK-99 (MCP-06): the preview must predict the SAME structural refusal the write
+    ' gives - otherwise "preview OK, write refused" comes back one tool later.
+    Dim ppRefP As String
+    ppRefP = PredictedPairingRefusal("preview_edit", name, cur, nx, CStr(n) & " op(s)")
+    If Len(ppRefP) > 0 Then
+        ToolPreviewEdit = ppRefP
+        Exit Function
     End If
     Set root = CreateObject("Scripting.Dictionary")
     root("component") = name
@@ -17941,6 +18311,10 @@ Private Function ToolDependencyGraph() As String
         End If
     Next
     On Error GoTo 0
+    ' TASK-95 r4: tell the builder how many components the project REALLY has, so a
+    ' cut in the collection loop above cannot make componentsTotal collapse to the
+    ' number of components that happened to be collected.
+    DepGraph.DepSetComponentsTotal p.VBComponents.Count
     Dim js As String
     js = DepGraph.DepGraphJson()
     ' additive: splice ms/chars straight after the opening brace
@@ -19662,6 +20036,15 @@ Private Function ToolMcpInfo() As String
     ' for a live one.
     b("path") = BuildPath()
     b("readAt") = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    ' TASK-67 (contract v1.11.2, ADDITIVE): the SOURCE STAMP of docs/SOURCE_STAMP.md.
+    ' build.sha256 above is the ARTIFACT file's own hash - it changes on every rebuild
+    ' even when the sources are identical. sourceHash is instead the sha256 of the
+    ' SOURCE INPUT SET (the .vbp plus every component file it lists, strict mode) and is
+    ' stable across rebuilds and machines. Both values are read from the generated
+    ' BuildStamp.bas, INCLUDING the algorithm id, so a future vb6src/2 propagates here
+    ' without touching this code.
+    b("sourceHash") = VB6MCP_SOURCE_HASH
+    b("sourceAlgo") = VB6MCP_SOURCE_ALGO
     Set d("build") = b
     Set d("breaking") = BreakingList()
     Set d("migrations") = MigrationsList()

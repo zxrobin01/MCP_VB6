@@ -6,7 +6,7 @@ checks that have caught real, shipped defects.
 ## 0. Decide the version
 
 * Package version: `bridge/hub_tools.json` -> `version`.
-* Protocol contract: `docs/CONTRACTS.md` - its version table states the current contract, `v1.10.0` at the time of writing.
+* Protocol contract: `docs/CONTRACTS.md` - its version table states the current contract (`v1.11.1` as of this writing; always read the table, never a copy).
 * Add-in face count and hub-only count are recorded together; the total is the DSH-visible
   tool count.
 
@@ -51,6 +51,8 @@ the add-in will not appear even though registration returned success.
 python tools\check_schema_baseline.py
 python tools\check_hub_alignment.py
 python tools\check_live_tools.py docs\tools_schema.json
+python tools\check_skill_truth.py
+python tools\check_private_tokens.py     # no tracked file may carry a private host/project identifier
 rem the next line needs a running IDE (your own instance, 8767 or above - never 8766)
 python tools\mcp_strict_audit.py --url http://127.0.0.1:8767/mcp
 ```
@@ -59,6 +61,21 @@ Expected: no schema change, no live-tool change, no hub-alignment failure, no st
 If a gate fails because the tool surface intentionally changed, update the frozen artifacts
 (`tools/schema_baseline.json`, `docs/tools_schema.json`, `bridge/hub_schema.generated.json`,
 `bridge/hub_tools.json`, `docs/CONTRACTS.md`) in the same commit.
+
+## 4.5 Lesson-store audit (mandatory before freezing)
+
+A fixed defect that is still described in the lesson store teaches every reader that the tool is broken - and the banner is
+shown to **every** client at initialize. So: audit the store, disable only the entries that assert a defect fixed in this
+release (shipped entry -> `enabled:false`; user entry -> removed), keep language/protocol facts and usage rules, and attach
+the before/after `validate` plus `instructions` outputs. Full procedure: skills/README.md, "Keeping the lesson store current".
+
+
+## 4.6 Stamp freshness (mandatory for any batch that changed a component)
+
+A batch that edits component source **must** re-emit the stamp in the repository and prove it, because a stale stamp row makes
+every locally built artifact fail `check`:  `python tools/srcstamp.py emit . --vbp MCP_VB6.vbp --out BuildStamp.bas --vbp-patch MCP_VB6.vbp`
+then `python tools/check_stamp_current.py --root . --vbp MCP_VB6.vbp` **must exit 0** (all three agree: computed I == `.vbp` src == `BuildStamp.bas`).
+`emit` must NOT change the computed hash - if it does, stop and report (it means an input was pulled into or pushed out of the set).
 
 ## 5. Freeze check
 

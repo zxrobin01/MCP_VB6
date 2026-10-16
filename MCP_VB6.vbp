@@ -10,6 +10,7 @@ Class=McpServer; McpServer.cls
 Class=CodeTools; CodeTools.cls
 Class=HttpConn; HttpConn.cls
 Class=WinsockTransport; WinsockTransport.cls
+Class=PipeTransport; PipeTransport.cls
 Module=ApiSig; ApiSig.bas
 Module=DepGraph; DepGraph.bas
 Module=StubGen; StubGen.bas
@@ -34,6 +35,7 @@ Module=WinOps; WinOps.bas
 Module=Extensions; Extensions.bas
 Module=Vba6Probe; Vba6Probe.bas
 Module=WinsockApi; WinsockApi.bas
+Module=BuildStamp; BuildStamp.bas
 Module=Changes; Changes.bas
 Module=ProjMeta; ProjMeta.bas
 Module=ProjShip; ProjShip.bas
@@ -69,5 +71,6 @@ Retained=0
 ThreadPerObject=0
 MaxNumberOfThreads=1
 
+VersionComments=algo=vb6src/2;src=19f4d5be9f956f3fb5000b9dc70a9b3f4eea7786c31ce5144f0838bf47d18470
 [MS Transaction Server]
 AutoRefresh=1
