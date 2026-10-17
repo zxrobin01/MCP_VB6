@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""vb6mcp_bridge.py - the VB6MCP middle service layer.
 
@@ -2529,7 +2529,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         self._send(401, "application/json", body, {"WWW-Authenticate": 'Bearer realm="vb6mcp"'})
 
     def _send(self, code, ctype, payload, headers=None):
-""": the ONE response exit. Every response (refusals included) is audited once."""
+        """: the ONE response exit. Every response (refusals included) is audited once."""
         try:
             if not getattr(self, "_audited", False):
                 self._audited = True
