@@ -195,6 +195,46 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
   （配了凭据时该请求也要带 token）；`python bridge/vb6mcp_bridge.py --print-config` 打印生效端口 / 传输 / `authEnabled`。
 - 日志：中间服务的日志路径见 `--print-config` 的 `logPath`；插件自身日志仍是 `%TEMP%\vb6mcp.log`。
 
+### 哪些工具免 IDE、哪些必须有活 IDE
+
+**插件面 110 个工具：必须有活的 IDE。** 它们全部由运行在 `VB6.EXE` 进程内的插件实现（读/改代码、静态检查、编译、断点、窗体、快照……），没有可执行的实例就没有执行者。**列出**工具可以在没有 IDE 时进行（hub 会用随包快照回 `tools/list`，标 `faceSource=snapshot`），但**调用**它们需要本机有活实例，或显式寻址一个有活实例的远端端点；没有活实例时的拒绝码见下一小节。
+
+**hub 面 10 个工具：在 IDE 进程之外运行，调用它们不需要加载插件**，但依赖各不相同：
+
+- **完全不需要 IDE**（只读本机状态，或只读写本地 JSON 存储）：
+  - `ide_list` —— 读本机实例登记表 + 端口扫描 + **已配置远端端点的探测状态**；一个实例都没有也照常回执（并说明原因与过期登记项）；
+  - `ide_target` —— 只改 hub 自己的默认目标（本地状态，不碰 IDE）；
+  - `list_lessons` / `add_lesson` / `delete_lesson` / `export_lessons` / `import_lessons_md` —— 只读写 `mcp_lessons/` 下的 JSON（写操作带 `.bak`）。
+- **需要一个目标实例才动手**：`ide_stop`（按 pid 停掉**本 hub 自己启动的**实例，绝不动外来实例）、`ide_restart`（恢复自有实例并验证就绪）。没有任何实例时它们回结构化拒绝，而不是假装成功（`ide_restart` 在「一个实例都没有」时回 `no_ide_running`）。
+- **不需要现有 IDE，但需要能启动 IDE 的条件**：`ide_start`（显式 `project` 或 `VB6MCP_AUTOSTART_PROJECT`，加一个可解析的 `VB6.EXE`；否则回 `not_implemented` / `vb6_exe_not_found` / `project_not_found`）。
+
+> 可离线运行的是 `tools/check_*` 那一组门禁；`tests/smoke_test.py` 与 `mcp_strict_audit` **必须**先打开 IDE 并加载插件 —— 它们不是离线自检。
+
+### 两个「没有 IDE」类拒绝码，各自的前置条件
+
+**`no_ide_running`**：本机**一个活实例都没有** —— 登记表里没有任何「pid 还活着」的条目，也没有实例能被探测到。它**不**用于下面这些情况（各有更精确的形状）：
+
+- 实例**已登记、进程还活着**，只是没有应答探测 ⇒ 回执给出该 pid、判定字段与恢复用的 `nextStep`，而不是 `no_ide_running`；
+- **只有远端**端点上有活 IDE、而这次调用没有显式寻址 ⇒ `remote_requires_explicit_endpoint`；
+- hub 看不到机群是因为**中间服务不可达**或**被鉴权拒绝** ⇒ `bridge_unreachable` / `bridge_auth_failed`（不是「本机空闲」）；
+- 有多个活实例、无法唯一确定 ⇒ `ambiguous_target`（附 `candidates[]` / `suggestion` / `resolution`）。
+  另外：没有 `_target` 且本机**只有一个**活实例时，它会自动被选中，不报错。
+
+**`remote_requires_explicit_endpoint`**：前置条件必须**同时**成立 —— (a) **本机没有活实例**；(b) **至少一个已配置的远端端点**上有活 IDE；(c) 这次调用**没有**给带 endpoint 的目标（`_target` 不带 endpoint，也没有通过 `ide_target` 设过默认）。此时调用**不会被自动路由到远端**（本机也没有实例）⇒ 回执是 `ok:false` + `routed:false` + `qualifiedKeys[]`（可直接照用的 `endpoint:projectPath`）+ `hint`。显式给 `_target="<endpoint>:<path>"`（或先 `ide_target{target:"<endpoint>:<path>"}`）即可寻址。**裸 pid / 裸工程名只寻址本机**，永远不会被解释成远端。
+
+### 工程身份：任意 junction / 别名拼写 = 同一个工程
+
+VB6 不允许同一个 `.vbp` 被打开两次，而同一个工程**可以有很多种拼写**：目录 junction（别名目录）、junction 指向的真实目录、`/` 与 `\`、不同大小写、8.3 短名。hub 用规范实路径把它们**全部归一成同一个身份** —— 这些拼写是**同一个候选，不是冲突**（**同一个身份被两个活实例发布**才是冲突）。
+
+归一化不会抹掉「你用的是哪种拼写」：`ide_list` 对每个实例同时给出
+
+- `projectPathReal` —— **规范身份**（realpath 归一后）；
+- `projectPathAsGiven` —— **登记表/探测发布出来的**拼写（`projectPathIsAlias` 标出它与规范路径不同）；
+- `aliasAsGiven` / `aliasesAsGiven[]` / `aliasSource` / `aliasMatchedBy` —— **调用方传入的**拼写（`_target` 或 `ide_target` 默认值），以及它解析到哪个候选、依据是什么（规范路径相同 / 别名目录包含该工程 / 工程名）；
+- 顶层 `aliasEcho` —— 逐条列出这次调用传入的每个拼写、命中几个候选、是否**全部落到同一个候选**（`sameCandidate`），并附上这条身份规则原文。
+
+**这些是加法回显，不是选择器**：解析目标仍按规范身份与寻址规则（`targetKey = [endpoint:]projectPath`）。**同一个规范路径在同一个端点上出现两次才算冲突，出现在两个端点上则不算**。收益是双向的：任何拼写（junction、真实路径、分隔符差异、大小写、8.3 短名）都落到同一个工程；而「它为什么认成了另一个身份」可以直接从 `aliasEcho` 读出依据，不必猜。
+
 ## 三、接入 MCP 客户端
 
 ### 连接与鉴权（新一代）
@@ -304,10 +344,10 @@ URL: http://127.0.0.1:8767/mcp
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `get_component_code` | 从 IDE 内存读组件代码，可只要某个过程或符号 | `name`, `include_line_numbers`, `coords` |
+| `get_component_code` | 从 IDE 内存读组件代码，可只要某个过程或符号；`proc` / `symbol` 的范围同时给 IDE 行与磁盘行（`startLineDisk` / `endLineDisk`） | `name`, `include_line_numbers`, `coords` |
 | `read_source` | 读磁盘源码：编码识别 + 字节级 sha256 | `path` |
 | `read_file` | 读任意文本文件，UTF-8/UTF-16/ANSI 自动识别 | `path`, `max_lines` |
-| `find_in_component` | 在组件内查找文本：整词、大小写、模式匹配 | `component`, `target`, `start_line` |
+| `find_in_component` | 在组件内查找文本：整词、大小写、模式匹配；回 `hits[]` / `count` / `nextStartLine`，走完报 `no_more_hits` 且**不回绕** | `component`, `target`, `start_line` |
 | `get_selection` | 读 IDE 当前选中的组件、活动窗口与光标 | - |
 | `get_codepane` | 读代码窗格的选区、顶行与可见行数 | `component` |
 | `set_codepane` | 设置代码窗格选区与滚动，并可置前 | `component`, `selection`, `top_line`, `activate` |
@@ -318,10 +358,10 @@ URL: http://127.0.0.1:8767/mcp
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
 | `replace_code` | 行级改代码：替换、插入、追加、删除、整模块替换 | `name`, `operation`, `start_line` |
-| `add_code` | 向组件追加代码，来自字符串或文件主体 | `component`, `code`, `file` |
+| `add_code` | 向组件追加代码，来自字符串或文件主体；落点由**写后回读**给出（`insertedAt{ide,disk}` / `inDeclarationArea`） | `component`, `code`, `file` |
 | `create_event_proc` | 生成事件过程桩，如 Command1_Click | `component`, `object`, `event` |
-| `write_file` | 写文本文件，可选编码、建目录与备份 | `path`, `content`, `encoding` |
-| `write_source` | 写 VB 源码文件：显式编码 + 字节级 sha256 | `path`, `text`, `encoding` |
+| `write_file` | 写文本文件，可选编码、建目录与备份；回执含 `createdDirs[]` / `exists` / `size`，父目录建不出来报 `parent_dir_missing` | `path`, `content`, `encoding` |
+| `write_source` | 写 VB 源码文件：显式编码 + 字节级 sha256；回执含 `createdDirs[]` / `exists` / `size`，父目录建不出来报 `parent_dir_missing` | `path`, `text`, `encoding` |
 | `edit_by_anchor` | 按唯一内容锚点替换整行，不依赖行号 | `name`, `anchor`, `new_text` |
 | `apply_edits` | 原子批量锚点编辑，任一处失败则整批不改 | `name`, `edits`, `expected_sha256` |
 | `preview_edit` | 只回统一 diff 预览，不写任何内容 | `name`, `edits` |
@@ -333,9 +373,9 @@ URL: http://127.0.0.1:8767/mcp
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
 | `validate_code` | 写前静态校验代码，回带稳定指纹的诊断 | `code`, `name`, `kind` |
-| `check_component` | 用同一套规则校验 IDE 里的组件文本 | `name` |
-| `verify` | 组件总判定：IDE 与磁盘一致 + 诊断计数 | `name`, `disk_path`, `baseline` |
-| `verify_scope` | 批量核验多个组件的 IDE 与磁盘一致性 | `components`, `path` |
+| `check_component` | 用同一套规则校验 IDE 里的组件文本；可选 `baseline` 做公开 API 比对（不可解析报 `baseline_unusable`） | `name`, `baseline` |
+| `verify` | 组件总判定：IDE 与磁盘一致 + 诊断计数；**仅隐藏 Attribute 行**的差异单列 `attributeOnlyDiff` / `attributeLineCount` | `name`, `disk_path`, `baseline` |
+| `verify_scope` | 批量核验多个组件的 IDE 与磁盘一致性；UNKNOWN 单列**不算 fail**（`pass + fail + unknown == checked`），build 证据按**项目**判定 | `components`, `path` |
 | `format_code` | 按块结构重排缩进，并证明只改前导空白 | `path`, `indent`, `apply` |
 | `check_references` | 列出工程引用并标出文件缺失的引用 | `include_resolved` |
 
@@ -346,7 +386,7 @@ URL: http://127.0.0.1:8767/mcp
 | `dependency_graph` | 组件与过程级依赖图：边、环、纯度分类；主截止是**确定性字符配额**（`VB6MCP_CHAR_QUOTA`，默认 900000），墙钟只作最后手段（`VB6MCP_BUDGET_MS`，默认 30000）。回执带 `partial` / `*StageCompleted` / `budgetExhausted` / `timingTruncated` / `procEdgesFound` 等完整性字段 —— **默认档是确定性的部分结果** | - |
 | `purity_check` | 判定组件能否进离线测试宿主及原因 | `name` |
 | `export_public_api` | 把组件公开 API 冻结成可比对规格；省略 `name` 时做有界整工程导出 | `name`, `membersOnly` |
-| `check_public_api` | 与冻结规格比对，报移除、变更、新增成员；省略 `name` 时做有界整工程核验 | `baseline`, `name`, `membersOnly` |
+| `check_public_api` | 与冻结规格比对，报移除、变更、新增成员；**给了 `name` 就永远比对**（`membersOnly` 只影响输出大小），不可解析的 baseline 报 `baseline_unusable`；省略 `name` 时做有界整工程核验 | `baseline`, `name`, `membersOnly` |
 | `generate_stub` | 生成可编译桩模块：留声明、清过程体 | `name` |
 
 ### 7. 编译与交付产物
@@ -459,7 +499,7 @@ URL: http://127.0.0.1:8767/mcp
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
 | `mcp_info` | 读服务器版本戳、契约、工具数与构建哈希；`build.sourceHash` / `sourceAlgo` 是源码输入集合的指纹与算法标识 | - |
-| `ide_state` | 即时读 IDE 模式与在飞、取消、释放闸门状态 | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
+| `ide_state` | 即时读 IDE 模式与在飞、取消、释放闸门状态（`cancel_inflight` / `release_inflight` 为**尽力而为**：不能中止陷在宿主模态里的调用） | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
 | `desktop_probe` | 测量宿主进程桌面与可交互性，且不抢焦点 | - |
 | `ide_quiet_mode` | 开或关安静模式：不抢前台，回执附提示 | `on`, `ttl_ms` |
 | `todo_status` | 只读扫描仓库内的任务板与报告 | - |
@@ -468,23 +508,22 @@ URL: http://127.0.0.1:8767/mcp
 | `set_addin_state` | 加载或卸载一个 IDE 插件 | `prog_id`, `connect` |
 | `quit_ide` | 退出 IDE，响应后延迟执行，未保存会丢 | - |
 
-### 17. hub 面：IDE 实例管理与经验库（10 个，无需 IDE 在线）
+### 17. hub 面：IDE 实例管理与经验库（10 个，在 IDE 进程之外运行）
 
-这 10 个工具由 MCP hub（`bridge/vb6mcp_hub.mjs`）提供，**在 IDE 进程之外**运行：客户端不必先加载插件，
-VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，**无需 IDE 在线即可用**。
+这 10 个工具由 MCP hub（`bridge/vb6mcp_hub.mjs`）提供，**在 IDE 进程之外**运行：客户端不必先加载插件。其中 `ide_list`、`ide_target` 与 5 个经验库工具**不依赖任何 IDE**（经验库只读写本地 JSON）；`ide_stop` / `ide_restart` 需要**一个目标实例**，`ide_start` 需要**能启动 VB6 的条件**。逐项清单与两个拒绝码的前置条件见「二、连接模型」里的「哪些工具免 IDE、哪些必须有活 IDE」。
 
 - **经验库** `mcp_lessons/`：`defaults.json`（随包发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
   合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。
 - **IDE 实例管理**：`ide_list` 列出 hub 能寻址的全部 VB6 IDE：本机实例（含同一工程被两个实例打开的冲突），`ide_target` 记住默认目标，
-  `ide_start` / `ide_stop` / `ide_restart` 只操作**本 hub 自己启动的**实例；同时列出**已配置的远端端点**（只探白名单、**绝不自动发现**；连不上也照样列出并带探测状态），并回显实例的**唯一身份**（endpoint / targetKey / pathVia）、真实路径与登记表拼写、以及**解析到同一身份的调用者别名**（junction / 别名写法）。
+  `ide_start` 负责启动；`ide_stop` / `ide_restart` 只操作**本 hub 自己启动的**实例；同时列出**已配置的远端端点**（只探白名单、**绝不自动发现**；连不上也照样列出并带探测状态），并回显实例的**唯一身份**（endpoint / targetKey / pathVia）、真实路径与登记表拼写、以及**解析到同一身份的调用者别名**（junction / 别名写法）。
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
 | `ide_list` | 列出 hub 能寻址的**全部** VB6 IDE：本机实例 + **已配置的远端端点**（只探白名单、绝不自动发现；连不上也列出并带探测状态）；回报 pid/端口/工程、唯一身份（endpoint / targetKey / pathVia）、真实路径与登记表拼写，并回显解析到同一身份的**调用者别名**；含过期登记项与「同一身份两个实例」冲突 | - |
 | `ide_target` | 设置或清除默认 IDE 目标：pid、工程名或 auto | `target` |
 | `ide_start` | 按 .vbp 启动一个 VB6 IDE 实例 | `project` |
-| `ide_stop` | 停止本 hub 启动的 IDE 实例 | `pid`, `force` |
-| `ide_restart` | 重启卡死的自有 IDE 实例并证明已就绪 | `pid`, `project` |
+| `ide_stop` | 停止本 hub 启动的 IDE 实例（需要一个目标实例） | `pid`, `force` |
+| `ide_restart` | 重启卡死的自有 IDE 实例并证明已就绪（需要一个目标实例） | `pid`, `project` |
 | `list_lessons` | 列出经验条目：场景、陷阱、做法（hub 面，无需 IDE 在线） | `includeDisabled` |
 | `add_lesson` | 新增或覆盖一条用户经验，带备份（无需 IDE 在线） | `id`, `scenario`, `trap`, `do` |
 | `delete_lesson` | 删除用户经验，或禁用随包经验（无需 IDE 在线） | `id` |
@@ -515,6 +554,8 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 ## 七、已知限制
 
 - VB6 是单线程 STA：大数据量搜索时会短暂阻塞 IDE 界面（已设 2000 文件上限）。
+- 插件是**单线程**：一次调用还在飞行时，**任何第二次调用（包括只读）都不会被执行**，而是立即收到 **busy 拒绝回执**；回执字段 `readonly_serviceable` **恒为 `false`**。`cancel_inflight` / `release_inflight` 只是**尽力而为**——陷在**宿主模态循环**（例如 VB6 自己的对话框）里的调用**无法被中止**；**唯一可靠出路是等它结束，或从外部终止 VB6 进程**。
+- 超时参数**不是强制预算**：`build` / `make_project` 的 `timeout_ms`（以及 `immediate_*` 的 `timeout_ms`）**不会**在到点时中断正在执行的调用——它们只决定调用方等多久、或作为闸门年龄阈值。实测传入远小于真实耗时的值仍可成功返回（此时 `budgetMs` 可能为 `null`）。要中止正在跑的调用，请**从外部终止 VB6 进程**。
 - 断点状态（break mode）下 `make_project` / `control_execution` 可能失败，
   工具会返回错误文本。
 - `make_project` 对当前活动工程执行；无法静默指定输出路径（跟随 IDE 的工程设置）。
@@ -706,6 +747,33 @@ VB6 也不必在跑。其中 5 个经验库工具只依赖本地 JSON 存储，*
 - **观测字段**：`lastResolveVia`（`caption` / `component` / `active_name` / `none`，这次靠哪条通道找到窗格）、`lastTopStatus`、`lastTopError`、`captionsSource` / `captionsCount`，以及原有的 `lastTopLineBefore/After`、`handled` / `forwarded`、`msgSeen` 等（都在 `ide_state` 与 `mcp_info` 的 `wheel{}` 里）。
 - **立即 / 监视 / 局部变量窗不会被误映射**：它们与代码窗格共用窗口类，但唯一那条「映射到活动窗格」的兜底要求窗口标题里**确实含有**该窗格的组件名，因此这三个非代码窗口结构上不可能被当作代码窗格去滚（只会出现在 `skipped[]` 里）。
 - `lastTopLineBefore/After` 是 VBIDE `CodePane.TopLine`（1 基）；**`-1` 表示「没有值」，不是第 0 行、也不是「没有滚动」**——原因看 `lastTopStatus` / `lastTopError`。要看当前行请读 `paneTopLineNow`（活动窗格的 `TopLine`）。
+
+## 工具回执的失败面与行号口径（v1.11.6 ~ v1.11.7）
+
+这一代给「**没做成的事必须说出来**」补了几处此前会把失败静默掉的地方。
+
+- **未声明的参数名一律拒绝**：`export_public_api` / `check_public_api` / `validate_code` / `check_component` 先查参数名，未声明 ⇒ `ok:false` + `reason:"unknown_argument"` + `unknownArguments[]` + `acceptedArguments[]`（`_target` 是传输上下文，恒接受）。整个工具面做同一件事之后，才不会有「这个工具查、那个工具不查」的盲区；`reason` 还细分 `unknown_argument` / `component_not_found` / `target_has_no_project` / `ide_not_ready`（旧值保留在 `reasonLegacy`）。
+- **比对永不跳过**：`check_public_api` 只要给了 `name` 就**永远比对**，`membersOnly` 只影响输出大小；给了一个不是规格文本的 `baseline` ⇒ `ok:false` + `reason:"baseline_unusable"`（不再回「没有差异」）。组件级与整工程级两个入口回同一组 `comparedAgainstBaseline` / `baselineLines`；`check_component` 也接受可选 `baseline`。
+- **写文件回读**：`write_file` / `write_source` 回执带 `createdDirs[]` / `createdDirsCount` / `exists` / `size`；父目录建不出来 ⇒ `reason:"parent_dir_missing"`（`missingPath` + `reasonLegacy:"parent_not_creatable"`），不再返回一个「写了多少字节」的自洽成功形状。
+- **分页有终点**：`find_in_component` 回 `hits[]` / `count` / `nextStartLine`；走到末尾 ⇒ `found:false` + `reason:"no_more_hits"`，**不回绕**（连续取页不会又把前面的行交回来）。
+- **隐藏 Attribute 行单列**：`verify` 对「只差隐藏 Attribute 行」的面板/文件差异给 `attributeOnlyDiff` / `attributeLineCount`，与真实源码差异**分开计**，比较时跳过这些行。注意：经 VBIDE `SaveAs` 保存会把隐藏 Attribute 行**物化到磁盘**。
+- **两个行号空间**：`get_component_code{proc|symbol}` 的范围字段是 **IDE 行**，另给 `startLineDisk` / `endLineDisk`；`add_code` 的落点由**写后回读**量出，给出 `insertedAt{ide,disk}` 与 `inDeclarationArea`（真正的声明区：`insertedAt.ide` 小于第一个过程头行；**末尾追加为 `false`**）。
+- **范围形状自带模式**：`requestedRange` 每个形状都带 `mode` —— `range`（`replace_code` / `add_code` / 守卫拒绝）、`anchor`（`edit_by_anchor`）、`anchor-batch`（`apply_edits`），调用方一段代码即可判定。
+- **返回信封**：`result.content[0].text` 是**一个 JSON 字符串**（这一条已写入契约）。
+
+## `verify_scope` 的计数口径：UNKNOWN 不是 fail；build 证据是【项目级】
+
+- **UNKNOWN 单列**：`verify_scope` 的三个桶互斥 —— `pass` / `fail` / `unknown`，且不变式 **`pass + fail + unknown == checked`** 恒成立（回执带 `countsConsistent`）；`failures[]` 只装**已证实**的 IDE 与磁盘不一致。`unknown` 的含义是「**没有足够证据**」，不是「不一致」。
+- **build 证据按【项目】判定**：`buildOk` / `buildSource` / `buildNote` 来自**项目级** build 缓存（key 与 hash 都是项目级），**单个组件不可能「仅自己缺 build 证据」**。因此 `unknown` 是**项目级**结论，`pass` 只在**有新鲜 build 缓存的工程**上可达 —— 从未构建过的工程里，任何 IDE 与磁盘一致的组件都会是 `unknown`。
+- **为什么值得单独写**：把 UNKNOWN 当 fail，会让一次「没测到」看起来像一次「不一致」；把项目级证据当组件级用，会读出一个不可能的结论。两种误读都会让调用方去修一个不存在的问题。
+
+## 传输可靠性：间歇断连与大于 64 KiB 的响应截断已修复
+
+- 曾经有两个看起来像「服务偶发不稳定」的症状：**间歇性的 `RemoteDisconnected`**，以及**大响应在 64/96 KiB 处被截断**。它们不是环境噪声，而是三个**确定性**缺陷叠在一起：
+  1. **连接对象未被持久化** ⇒ 一条请求跨 TCP 段到达时会丢掉前半段，要等 30 s 空闲清扫才断开；
+  2. **close-after-send 的判定顺序**放在队列已经清空之后 ⇒ `Connection: close` 的响应会滞留到空闲清扫才被发出；
+  3. **flush 的累积 `Mid$` 起点越过 64 KiB**，且 `send()=-1` 伴随 `WSAGetLastError()=0` 被误判为致命错误 ⇒ 正文被截断。
+- 三处都已修好。**工具面与参数表没有因此变化**（插件 110 + hub 10 = 120 不变）：这是一次**行为修复**，升级后不需要改任何调用方式。
 
 ## 许可证
 

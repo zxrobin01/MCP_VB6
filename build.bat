@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------------
-rem Build VB6MCP.dll.  Card TASK-P1-012.
+rem Build VB6MCP.dll.
 rem
 rem This script used to report a FALSE SUCCESS, for two reasons:
 rem   1. the verdict was only `if not exist VB6MCP.dll`, which passes while a
@@ -16,12 +16,12 @@ rem Now: the artifact must have been FRESHLY WRITTEN AND VB6 must have exited 0.
 rem All diagnostics go to STDERR, so a stdout redirect can no longer clobber
 rem build.log, and a machine-readable build.status is written on both paths.
 rem
-rem TASK-P1-072 - the "freshly written" test is now the artifact's SHA-256 CHANGE
+rem the "freshly written" test is now the artifact's SHA-256 CHANGE
 rem (certutil), with seconds-resolution mtime and size as auxiliary evidence, and
 rem both shas are printed on BOTH the OK and the FAILED path. The old test compared
 rem the DOS timestamp (MINUTE resolution) plus the file size; a same-minute rebuild
 rem whose output kept its size was therefore reported as FAILED even though build.log
-rem said the compile succeeded, rc was 0 and the on-disk sha HAD changed (TASK-P1-069).
+rem said the compile succeeded, rc was 0 and the on-disk sha HAD changed.
 rem A rebuild that changes nothing is now NOCHANGE (exit 0), not FAILED: a stale DLL
 rem that cannot be rewritten is still caught, because VB6 then logs 'permission
 rem denied' and exits non-zero.
@@ -40,9 +40,43 @@ set "DLL=%~dp0VB6MCP.dll"
 set "LOG=%~dp0build.log"
 set "STATUS=%~dp0build.status"
 
-rem --- TASK-P1-103: WHICH regsvr32 -------------------------------------------------
+rem --- BINARY-COMPATIBILITY REFERENCE GUARD --------------------------
+rem .vbp carries CompatibleMode="2" + CompatibleEXE32=<reference>. If that file is
+rem MISSING or has been REPLACED, VB6 does not stop: it silently falls back to No
+rem Compatibility and mints NEW class IDs, so every registration on every machine
+rem goes stale - the exact failure this mode exists to prevent. Fail LOUDLY.
+set "COMPAT_REF=%~dp0dist\compat\VB6MCP_ref.dll"
+set "COMPAT_SHA=%~dp0dist\compat\VB6MCP_ref.sha256"
+if not exist "%COMPAT_REF%" goto compat_ref_missing
+if not exist "%COMPAT_SHA%" goto compat_ref_nosha
+set "WANT_SHA="
+set /p WANT_SHA=<"%COMPAT_SHA%"
+set "GOT_SHA="
+call :sha256 "%COMPAT_REF%" GOT_SHA
+if /i not "%GOT_SHA%"=="%WANT_SHA%" goto compat_ref_swapped
+>&2 echo Binary-compatibility reference OK: dist\compat\VB6MCP_ref.dll sha256=%GOT_SHA%
+goto compat_ref_done
+:compat_ref_missing
+>&2 echo FATAL: dist\compat\VB6MCP_ref.dll is MISSING, but MCP_VB6.vbp says
+>&2 echo        CompatibleMode="2". Building now would mint NEW class IDs and make
+>&2 echo        every existing registration stale. Restore the reference (see
+>&2 echo        dist\compat\README.md) or deliberately set CompatibleMode="0".
+exit /b 1
+:compat_ref_nosha
+>&2 echo FATAL: dist\compat\VB6MCP_ref.sha256 is MISSING; the reference cannot be verified.
+exit /b 1
+:compat_ref_swapped
+>&2 echo FATAL: the binary-compatibility reference was REPLACED.
+>&2 echo        expected sha256=%WANT_SHA%
+>&2 echo        actual   sha256=%GOT_SHA%
+>&2 echo        A different reference re-defines the class IDs of this project.
+>&2 echo        Do NOT build until that is deliberate (see dist\compat\README.md).
+exit /b 1
+:compat_ref_done
+
+rem --- WHICH regsvr32 -------------------------------------------------
 rem This build registers a 32-BIT COM server, so it must use the SysWOW64 copy of THIS
-rem Windows installation. On this host SystemRoot is B:\Windows while C:\Windows is a
+rem Windows installation. On a host whose SystemRoot is not C:, C:\Windows may be a
 rem stale second installation, so a bare "regsvr32" resolves through PATH and can hit the
 rem wrong copy, where every 32-bit registration fails with 0xC0000139 (and fails
 rem SILENTLY: /s prints nothing and a PowerShell caller keeps a STALE $LASTEXITCODE of 0).
@@ -67,7 +101,7 @@ if exist "%DLL%" (
 
 >&2 echo Checking Add-In Designer (MSADDNDR.DLL) registration ...
 set "ADDNDR=%CommonProgramFiles(x86)%\designer\MSADDNDR.DLL"
-rem TASK-P1-103: label-based instead of one parenthesised block - inside a block cmd.exe
+rem label-based instead of one parenthesised block - inside a block cmd.exe
 rem expands %ERRORLEVEL% when the whole block is PARSED, so the rc read would be stale.
 if not exist "%ADDNDR%" goto addndr_missing
 "%REGSVR%" /s "%ADDNDR%"
@@ -81,14 +115,14 @@ goto addndr_done
 >&2 echo "Microsoft Add-In Designer" reference. Install it from your VB6/VS media.
 :addndr_done
 
-rem --- TASK-67: the SOURCE STAMP must exist BEFORE the compiler runs ----------------
+rem --- the SOURCE STAMP must exist BEFORE the compiler runs ----------------
 rem BuildStamp.bas carries I = sha256 over the .vbp's component inputs (strict mode,
 rem docs/SOURCE_STAMP.md) and is EXCLUDED from that input set, so writing it cannot
 rem change I. A build must never ship a stale or absent stamp, so a missing or failing
 rem generator is FATAL here - never a skipped step (spec section 6: no stamp => FAIL).
 >&2 echo Emitting the source stamp (tools\srcstamp.py emit) ...
 if not exist "%~dp0tools\srcstamp.py" goto stamp_nogen
-rem Exact CLI agreed with the generator author (task-67 B3/B4): emit writes BOTH
+rem Exact CLI agreed with the generator author (B3/B4): emit writes BOTH
 rem BuildStamp.bas and the .vbp Comments= line, so the two read points cannot drift.
 rem Relative paths are safe here: line 30 already did cd /d "%~dp0".
 python "tools\srcstamp.py" emit . --vbp "MCP_VB6.vbp" --out "BuildStamp.bas"
@@ -128,12 +162,12 @@ goto built
 :legacy_verdict
 rem Degraded environment (no usable certutil): keep the old minute+size test, but say so.
 >&2 echo WARNING: certutil could not hash the artifact - falling back to the legacy
->&2 echo          minute-resolution timestamp + size test (TASK-P1-072).
+>&2 echo minute-resolution timestamp + size test .
 if "%A_TIME%%A_SIZE%"=="%B_TIME%%B_SIZE%" goto failed
 set "FRESH=1"
 
 :built
-rem --- TASK-67: the artifact must carry the SAME I as this source tree ----------
+rem --- the artifact must carry the SAME I as this source tree ----------
 rem check reads I back from the ARTIFACT (mcp_info when an IDE is running, otherwise
 rem the version resource Comments=algo=..;src=..) and recomputes it from the tree; the
 rem two read points must agree (spec section 7). A mismatch is FATAL, not a warning.
@@ -153,7 +187,7 @@ set "REGRC=%ERRORLEVEL%"
 >&2 echo   regsvr32 rc=%REGRC% ^(informational only - the verdict is read from the registry^)
 >&2 echo Registering VB6 add-in ...
 reg import "%~dp0register.reg" >nul
-rem TASK-P1-103: rc is NOT the verdict. Read the registry and refuse to report success if
+rem rc is NOT the verdict. Read the registry and refuse to report success if
 rem the ProgID does not point at THIS file or the add-in is not set to auto-load.
 >&2 echo Verifying registration by READING THE REGISTRY ...
 call "%~dp0tools\verify_registration.bat" "%DLL%"
@@ -218,7 +252,7 @@ endlocal & exit /b 1
 >&2 echo   expected : %REGSVR%
 >&2 echo   SystemRoot: %SystemRoot%
 >&2 echo   cause    : this build registers a 32-bit COM server; the SysWOW64 regsvr32 is
->&2 echo              required and a bare "regsvr32" is deliberately NOT used (TASK-P1-103).
+>&2 echo required and a bare "regsvr32" is deliberately NOT used .
 endlocal & exit /b 1
 
 :regfailed
@@ -251,7 +285,7 @@ endlocal & exit /b 1
 if exist "%LOG%" type "%LOG%" 1>&2
 endlocal & exit /b 1
 
-rem --- helpers (TASK-P1-072) --------------------------------------------------
+rem --- helpers --------------------------------------------------
 :sha256
 rem %1 = file, %2 = variable name that receives the hex digest.
 rem certutil is present on every supported Windows; findstr drops the "SHA256 hash

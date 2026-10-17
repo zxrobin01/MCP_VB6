@@ -42,8 +42,25 @@ reg import register.reg /reg:32
 tools\verify_registration.bat VB6MCP.dll
 ```
 
-`verify_registration.bat` must print `EXIT=0` **and** report `LoadBehavior=0x3`. A `0x1` means
-the add-in will not appear even though registration returned success.
+`verify_registration.bat` must print `EXIT=0`. It reads **two independent gates, and both must be green:**
+
+* **Gate A (DECISIVE) - `%WINDIR%\VBADDIN.INI`, section `[Add-Ins32]`, key `<ProgID>`.** This is the
+  switch VB6 consults *before* it ever calls `CoCreateInstance`. `0` means the add-in is dead: VB6 does
+  not load it and does not touch `LoadBehavior` (which can still read `0x3`), so every other check stays
+  green while the add-in is silently gone. The `0` is written after ONE failed instantiation and **VB6
+  never retries** - no rebuild, no `regsvr32` and no `reg import` clears it. To recover, set the key to
+  `1` and start the IDE once; **on a successful load VB6 rewrites the value to `3` by itself** (measured:
+  the rewrite happens when the add-in loads, not at IDE exit; it then stays `3`). `1` and `3` are both
+  enabled; `3` is the steady state. A **missing** entry is not an error - VB6 then falls back to the
+  registry and loads - but it is not protection either: one failure creates the entry as `0` and the
+  add-in is dead from then on. **This applies to every box, the t16 sandbox included** (t16 has no entry
+  today, so it is unrestricted for now, but it would die silently on its first failed load).
+  Change the value **in place** (WritePrivateProfileString semantics): measured, VB6's own rewrite touches
+  only the value byte, while rewriting the whole file perturbs unrelated bytes. Export a backup before any
+  experiment on that file and restore it by sha256 afterwards.
+* **Gate B (SECONDARY) - `ProgID -> CLSID -> InprocServer32` plus `AddIns LoadBehavior = 0x3`.** A stale
+  or mismatched registration is exactly what makes VB6 write `LoadBehavior=0` as a *consequence*, so this
+  gate can be red while the add-in still loads - which is why gate A is the one that decides.
 
 ## 4. Tool-face gates (must all be green)
 
@@ -53,6 +70,7 @@ python tools\check_hub_alignment.py
 python tools\check_live_tools.py docs\tools_schema.json
 python tools\check_skill_truth.py
 python tools\check_private_tokens.py     # no tracked file may carry a private host/project identifier
+python tools\run_gates.py                 # THE WHOLE SET in one command (includes the write-call-site ratchet)
 rem the next line needs a running IDE (your own instance, 8767 or above - never 8766)
 python tools\mcp_strict_audit.py --url http://127.0.0.1:8767/mcp
 ```

@@ -5,14 +5,14 @@ Option Explicit
 ' of the LCS DP (bounded work in the IDE process).
 Private Const LCS_MAX_LINES As Long = 1000
 
-' TASK-P1-098: the diff TEXT is emitted through ONE place so it can be CAPPED while it is
+' the diff TEXT is emitted through ONE place so it can be CAPPED while it is
 ' built (never materialising a megabyte the caller cannot use). mDiffCap = 0 means
 ' unlimited, which is what every caller that does not pass a cap gets.
 Private mDiffCap As Long
 Private mDiffLines As Long
 Private mDiffTotal As Long
 
-' TASK-P1-024 (B+C batch, contract invariant 8): preview_edit's diff is a
+' (B+C batch, contract invariant 8): preview_edit's diff is a
 ' LINE-LEVEL LCS with hunk grouping. The A batch only trimmed a common
 ' prefix/suffix, which renders a middle insertion as "delete a region + add a
 ' longer region" - that is not a diff. A pure middle insertion now renders as
@@ -26,14 +26,14 @@ Private mDiffTotal As Long
 ' ops entries (resolved): "R" & TAB & lineNo & TAB & newLine
 '                         "I" & TAB & lineNo & TAB & inserted   (Chr(1) = newline)
 '                         "D" & TAB & lineNo
-' TASK-P1-082: BuildOps (CodeTools) escapes a literal TAB inside a payload as Chr$(2)
+' BuildOps (CodeTools) escapes a literal TAB inside a payload as Chr$(2)
 ' so the TAB-separated record keeps its field count. This is the matching decode for
 ' the preview_edit path, which parses that record right here.
 Private Function OpUnescTxn(ByVal s As String) As String
     OpUnescTxn = Replace(s, Chr$(2), vbTab)
 End Function
 Public Function ApplyLineOps(ByVal text As String, ByRef ops() As String, ByRef errMsg As String) As String
-    ' TASK-P1-097: ONE line array, ONE Join.
+    ' ONE line array, ONE Join.
     '
     ' The old body rebuilt the WHOLE text once per op - ReplaceLineAt / InsertAfterLine /
     ' DeleteLineAt each did Split(AsLf(text), vbLf) ... Join(parts, vbCrLf) - and the range
@@ -54,7 +54,7 @@ Public Function ApplyLineOps(ByVal text As String, ByRef ops() As String, ByRef 
     ' pre-parsed line numbers), and in that order every op only touches the line at its own
     ' position plus the lines it inserts immediately after it. Same-line groups keep their
     ' input order, which is what makes D-spill (D, then another op after the region ran
-    ' empty) behave exactly like the old per-op rebuild - see REP-TASK-P1-097 for the case
+    ' empty) behave exactly like the old per-op rebuild - see REP- for the case
     ' table (R/R, R/I, I/R, I/D, D/D, D-spill).
     Dim i As Long, k As Long, j As Long, n As Long, lb As Long
     Dim order() As Long, tmp As Long, parts() As String
@@ -78,7 +78,7 @@ Public Function ApplyLineOps(ByVal text As String, ByRef ops() As String, ByRef 
     ReDim oPay(0 To n - 1)
     For i = 0 To n - 1
         MaybePump
-        ' TASK-P1-082: limit 3 keeps the payload - the LAST field - intact when it holds
+        ' limit 3 keeps the payload - the LAST field - intact when it holds
         ' literal TABs, so edit_by_anchor / apply_edits no longer truncate at a TAB.
         parts = Split(ops(lb + i), vbTab, 3)
         If UBound(parts) < 1 Then
@@ -210,7 +210,7 @@ Public Function ApplyLineOps(ByVal text As String, ByRef ops() As String, ByRef 
     ApplyLineOps = Join(fwd, vbCrLf)
 End Function
 
-' TASK-P1-097: replace the first line of the current region with the payload's lines (R).
+' replace the first line of the current region with the payload's lines (R).
 ' An EMPTY payload drops the line, exactly like the old ReplaceLineAt (whose inner loop
 ' ran zero times when the payload split came back empty).
 Private Sub RegReplace(ByRef reg() As String, ByRef nReg As Long, ByVal payload As String)
@@ -234,7 +234,7 @@ Private Sub RegReplace(ByRef reg() As String, ByRef nReg As Long, ByVal payload 
     nReg = nReg + ni
 End Sub
 
-' TASK-P1-097: insert the payload's lines right AFTER the region's first line (I). The
+' insert the payload's lines right AFTER the region's first line (I). The
 ' tail moves first so the payload keeps its own order; an empty payload inserts nothing.
 Private Sub RegInsertAfter(ByRef reg() As String, ByRef nReg As Long, ByVal payload As String)
     Dim ins() As String, ni As Long, i As Long
@@ -262,7 +262,7 @@ Private Sub RegEnsure(ByRef reg() As String, ByVal need As Long)
     ReDim Preserve reg(0 To u)
 End Sub
 
-' TASK-P1-097: push the region onto the reverse accumulator. acc is kept in REVERSE
+' push the region onto the reverse accumulator. acc is kept in REVERSE
 ' document order (acc(0) is the LAST line of the result), so reg's last line goes first.
 Private Sub CommitRev(ByRef acc() As String, ByRef nAcc As Long, ByRef reg() As String, ByVal nReg As Long)
     Dim i As Long
@@ -272,7 +272,7 @@ Private Sub CommitRev(ByRef acc() As String, ByRef nAcc As Long, ByRef reg() As 
     Next
 End Sub
 
-' TASK-P1-049: UBound of a Split result, safely -1 for an empty array.
+' UBound of a Split result, safely -1 for an empty array.
 Private Function LineUbound(ByRef arr() As String) As Long
     Dim u As Long
     u = -1
@@ -352,7 +352,7 @@ Public Function DiffPlan(ByVal oldText As String, ByVal newText As String, ByVal
     ns = 0
     i = 0
     j = 0
-    ' TASK-P1-099: the bounds MUST be tested in their own branches. VB6's And/Or are
+    ' the bounds MUST be tested in their own branches. VB6's And/Or are
     ' BITWISE, not short-circuit, so the old single condition
     '     If i < am And j < bm And a(pre + i) = b(pre + j) Then
     ' evaluated a(pre + i) = b(pre + j) even when i = am or j = bm. When the middle block
@@ -464,7 +464,7 @@ Public Function DiffPlan(ByVal oldText As String, ByVal newText As String, ByVal
     Set DiffPlan = plan
 End Function
 
-' TASK-P1-098: every DiffPlan exit that builds a diff text ends here, so the truncation
+' every DiffPlan exit that builds a diff text ends here, so the truncation
 ' markers are reported on exactly the paths that cap. Keys are ONLY added when the cap
 ' actually cut something: an uncapped diff keeps its historical key set byte for byte.
 Private Sub DiffFinish(ByRef plan As Object, ByRef c As Collection)
@@ -574,11 +574,11 @@ Private Function HunkItem2(ByVal kind As String, ByVal startLine As Long, ByVal 
 End Function
 
 Private Function JoinLines(ByVal c As Collection) As String
-    ' TASK-P1-049: collect + ONE Join (the old "s = s & ..." is quadratic). The
+    ' collect + ONE Join (the old "s = s & ..." is quadratic). The
     ' trailing CRLF is preserved by appending "" as a final part, so
     ' Join(parts, vbCrLf) == the old concatenation byte for byte.
     '
-    ' TASK-P1-098: the collection was walked BY INDEX ("parts(i-1) = c(i)") and VB6
+    ' the collection was walked BY INDEX ("parts(i-1) = c(i)") and VB6
     ' Collection index access is a linear walk, so this loop was O(n^2) in the number of
     ' diff lines. MEASURED on the 27,011-line fixture: 7,321 diff lines -> 578 ms, 49,921
     ' diff lines -> 4,738 ms; on the 25,899-line procedure fixture a 1.20 MB diff cost
@@ -631,7 +631,7 @@ Public Function ApplyEdits(ByVal text As String, ByRef ops() As String, ByVal ex
         Exit Function
     End If
     ReDim lineOps(0 To k - 1)
-    ' TASK-P1-094: ONE O(N) normalisation pass for the whole batch. Each op used to call
+    ' ONE O(N) normalisation pass for the whole batch. Each op used to call
     ' VbAnchor.FindHits with the full text, i.e. Split() + a NormLine per line PER OP
     ' (O(s x N) allocations/normalisations: 16,452 ms at s=50 and 33,236 ms at s=500 -
     ' the latter killed the connection). The index answers a unique anchor in O(1); an
@@ -652,7 +652,7 @@ Public Function ApplyEdits(ByVal text As String, ByRef ops() As String, ByVal ex
             Exit Function
         End If
         op = parts(0)
-        ' TASK-P1-082: decode the escaped free-text fields produced by BuildOps.
+        ' decode the escaped free-text fields produced by BuildOps.
         anchor = OpUnescTxn(parts(1))
         payload = ""
         If UBound(parts) >= 2 Then payload = OpUnescTxn(parts(2))

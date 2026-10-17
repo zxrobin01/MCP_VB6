@@ -15,13 +15,13 @@ Private Declare Function EbGetCallstackCount Lib "VBA6.DLL" (ByRef pCount As Lon
 '   mov eax,[ebp+0x18] ; mov dword ptr [eax],1
 ' so passing ByVal 0 wrote to address 0 and raised 0xc0000005. Verified by
 ' disassembling VBA6.DLL RVA 0x13348D..0x133492 against the live crash.
-' RE round 3 搂3.1: arg2 = module/display name (BSTR*), arg3 = PROCEDURE name (BSTR*),
+' arg2 = module/display name (BSTR*), arg3 = PROCEDURE name (BSTR*),
 ' arg4 = 32-bit value written through a pointer, arg5 = success flag (1/0).
 Private Declare Function EbGetCallstackFunction Lib "VBA6.DLL" (ByVal frameIndex As Long, ByRef modName As String, ByRef procName As String, ByRef a4 As Long, ByRef a5 As Long) As Long
 Private Declare Function EbGetCurrentFunction Lib "VBA6.DLL" (ByRef pOut As Long, ByRef pOut2 As Long) As Long
 Private Declare Function EbGetDebWndCallstackIndex Lib "VBA6.DLL" (ByRef pIndex As Long) As Long
 Private Declare Function EbIsInEvalWatch Lib "VBA6.DLL" () As Long
-' R7 solved (RE round 3, 搂1): EbIsValidIdent is a TWO-argument function --
+' R7 solved: EbIsValidIdent is a TWO-argument function --
 ' (LPCWSTR, LONG* out). VB6.EXE's own call sites push &local then the wide string
 ' and read the out slot afterwards. Passing one argument made it write 1 through a
 ' garbage pointer ([ebp+0Ch]) -> 0xc0000005 at VBA6.DLL+0x12719C.
@@ -29,7 +29,7 @@ Private Declare Function EbIsValidIdent Lib "VBA6.DLL" (ByVal pwszName As Long, 
 Private Declare Function SysStringLen Lib "oleaut32" (ByVal pbstr As Long) As Long
 ' ---------------------------------------------------------------------------
 ' EbExecuteLine -- the Immediate-window line executor.
-' RE round 5 (内部逆向记录（EbExecuteLine 复核）) overturned the round-4
+' A recheck of EbExecuteLine overturned the earlier
 ' verdict: the WideCharToMultiByte call at 0x0FBB70AC is only the conversion
 ' prologue; the function then loads the engine singleton and calls the real
 ' executor sub_FB7317A (RVA 0xE317A) = compile + evaluate + print pipeline.
@@ -39,14 +39,14 @@ Private Declare Function SysStringLen Lib "oleaut32" (ByVal pbstr As Long) As Lo
 ' needs NO asm trampoline -- but that global must be non-zero, so the probe
 ' refuses to call when it reads 0. Argument semantics are still candidates.
 Private Declare Function EbExecuteLine Lib "VBA6.DLL" (ByVal pwszLine As Long, ByVal a2 As Long, ByVal a3 As Long, ByVal a4 As Long) As Long
-' P2-1: read the engine global through the real module base (never hardcode the VA).
+' An earlier batch: read the engine global through the real module base (never hardcode the VA).
 Private Declare Function GetModuleHandleW Lib "kernel32" (ByVal lpModuleName As Long) As Long
-' Round-16 搂5 note 1: the BSTR form must use a FRESH, independently allocated BSTR.
+' Note: the BSTR form must use a FRESH, independently allocated BSTR.
 ' Passing a VB string's own buffer (StrPtr) made the worker free it, which then
 ' raised "subscript out of range" in the caller. The copy is deliberately never
 ' freed here: the worker may already have freed it (double free would crash).
 Private Declare Function SysAllocString Lib "oleaut32" (ByVal pwsz As Long) As Long
-' F-3: VB6 cannot call an arbitrary address with 2 arguments, so build a tiny
+' VB6 cannot call an arbitrary address with 2 arguments, so build a tiny
 ' __stdcall thunk in executable memory and call it through CallWindowProcA:
 '     push a2 ; push a1 ; mov eax,addr ; call eax ; ret 16
 ' The callee pops its own 8 bytes (ret 8); the closing "ret 16" removes the four
@@ -58,8 +58,8 @@ Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByRef dst A
 Private Declare Sub CopyMemoryToPtr Lib "kernel32" Alias "RtlMoveMemory" (ByVal dst As Long, ByRef src As Any, ByVal cb As Long)
 
 ' ---------------------------------------------------------------------------
-' RE round-19 item 1: thread identity.
-' The round-19 claim is that every probe that enters the VB6 runtime crashes
+' Thread identity.
+' The claim under test is that every probe that enters the VB6 runtime crashes
 ' because it runs OFF the VB6 main thread (STA/TLS). That claim has to be
 ' MEASURED before any main-thread dispatch machinery is built, so the standard
 ' probe response now always reports the calling thread and the thread that owns
@@ -75,7 +75,7 @@ Private Declare Function FindWindowW Lib "user32" (ByVal lpClassName As Long, By
 Private Declare Function GetWindowThreadProcessId Lib "user32" (ByVal hWnd As Long, ByRef lpdwProcessId As Long) As Long
 
 ' ---------------------------------------------------------------------------
-' RE round-23: CALLER-SIDE addressing (VB6.EXE).
+' CALLER-SIDE addressing (VB6.EXE).
 ' The Add-In runs INSIDE VB6.EXE, so VB6.EXE is the host image and its
 ' internals are reachable with the same thunk used for VBA6.DLL. Legacy
 ' VB6.EXE / VBA6.DLL are linked WITHOUT /DYNAMICBASE, so if hostBase reads
@@ -86,10 +86,10 @@ Private Declare Function GetWindowThreadProcessId Lib "user32" (ByVal hWnd As Lo
 Private Declare Function GetModuleFileNameW Lib "kernel32" (ByVal hModule As Long, ByVal lpFileName As Long, ByVal nSize As Long) As Long
 ' Resolve an export BY NAME, so no probe depends on a hardcoded RVA.
 Private Declare Function GetProcAddress Lib "kernel32" (ByVal hModule As Long, ByVal lpProcName As String) As Long
-' RE round-23 搂1.1: the engine allocates the returned BSTRs, the CALLER frees them.
+' The engine allocates the returned BSTRs, the CALLER frees them.
 Private Declare Sub SysFreeString Lib "oleaut32" (ByVal pbstr As Long)
 
-' RE round-32/33 follow-up: in-process window enumeration. VB6 requires these
+' In-process window enumeration. VB6 requires these
 ' Declare statements to live in the module DECLARATION section, i.e. before the
 ' first procedure -- inserting them next to the code that uses them is a
 ' compile error ("only comments may appear after End Function").
@@ -274,11 +274,11 @@ End Function
 ' Immediate-window executor probe. Returns the two engine globals, the raw
 ' HRESULT and any VB error -- and refuses to call at all when the engine
 ' singleton is 0 (calling then dereferences null inside VBA6).
-' F-1 (内部逆向记录（第 9 轮） 搂1): read-only observation of the two-state
-' difference. Round 9 corrected round 8/6: the evaluation frame is the plain global
+' Read-only observation of the two-state
+' difference. A correction established that the evaluation frame is the plain global
 ' dword_FC0D0A4 (RVA 0x17D0A4), cleared while EbMode()==0 and set to the breakpoint's
 ' frame while broken. This probe only reads: no writes, no EbExecuteLine call.
-' F-3 (内部逆向记录（第 9 轮） 搂1): call the engine's OWN frame setter
+' Call the engine's OWN frame setter
 ' sub_FBC3163(a1, a2) at RVA 0x133163 (__stdcall, ret 8). It walks engine+0x2F0
 ' for the first kind==1 node and then does extra work the raw global write does not
 ' (sub_FAA3E34(1,1,1), sub_FB9A9FF, ...), so it is the authoritative way to bind the
@@ -386,7 +386,7 @@ Public Function CallRvaJson(ByVal rva As Long, ByVal argc As Long, ByVal a1 As L
     CallRvaJson = s & "}"
 End Function
 
-' Round 15 (内部逆向记录（第 15 轮） 搂3.1): the decisive experiment. Call the
+' The decisive experiment. Call the
 ' real worker sub_FB7317A (RVA 0xE317A) the way the IDE's own path does:
 '   __thiscall, ecx = engine (*(VBA6+0x17D15C)), 8 stack args, retn 20h
 '   p0 = ADDRESS of a writable dword that holds the line-text pointer
@@ -416,7 +416,7 @@ Public Function WorkerCallJson(ByVal text As String, ByVal asBstr As Boolean, By
         Exit Function
     End If
     worker = hMod + &HE317A
-    ' Round-16 搂5 note 2: when p1 = 0 (the IDE value) the worker may dereference p2
+    ' Note: when p1 = 0 (the IDE value) the worker may dereference p2
     ' as an object pointer, and p2 = 1 then raises an access violation. The note's
     ' suggested candidate is the engine object itself.
     If p2IsEngine Then p2 = engine
@@ -483,19 +483,19 @@ Public Function WorkerCallJson(ByVal text As String, ByVal asBstr As Boolean, By
     WorkerCallJson = s & "}"
 End Function
 
-' P-series (内部逆向记录（第 17 轮） 搂5): READ-ONLY memory dump, used to locate
+' READ-ONLY memory dump, used to locate
 ' VBA6's ExFrame stack top and to check ExFrame field offsets. addr takes precedence
 ' over rva; length is clamped to 512 bytes. Only addresses that look like real
 ' user-space pointers are accepted - a bad address would fault the IDE.
 ' ---------------------------------------------------------------------------
-' RE round-24 搂1.1 -- EbGetStatusOfItems(BYTE buf[72], int len).
+' EbGetStatusOfItems(BYTE buf[72], int len).
 ' VB6.EXE's command dispatcher sub_510336 (VA 0x00510336) calls this on every
 ' menu command and then tests buf[itemId] to decide whether that command is
 ' enabled, before handing the id to EbInvokeItem(id). The 72 bytes are thus the
 ' engine's OWN capability table -- the authoritative list of what an engine can
 ' be asked to do. Pure read: the callee only fills our buffer.
 '   sub_510336:  EbGetStatusOfItems(v34, 72);  ... if (v34[item]) EbInvokeItem(item)
-' Resolved by name; RVA 0x20BC is only the fallback (RE round-24 evidence).
+' Resolved by name; RVA 0x20BC is only the fallback (measured evidence).
 ' ---------------------------------------------------------------------------
 Public Function EngineItemsJson() As String
     Dim hMod As Long, fn As Long, byRva As Boolean
@@ -561,7 +561,7 @@ Public Function EngineItemsJson() As String
 End Function
 
 ' ---------------------------------------------------------------------------
-' RE round-23 搂1.1 -- EbGetCallstackFunction, called exactly the way VB6.EXE's
+' EbGetCallstackFunction, called exactly the way VB6.EXE's
 ' OWN caller does it (sub_55D10D, VA 0x0055D10D). An explicit thunk is used
 ' instead of a VB Declare so there is no marshalling ambiguity: the three BSTR*
 ' out-slots and arg5 live in memory WE allocated and zeroed, byte-for-byte the
@@ -573,7 +573,7 @@ End Function
 ' them; the IDE does SysFreeString on each.
 ' CRITICAL: only ever call with 0 <= frame <= count-1. The R2 crash was an
 ' OUT-OF-RANGE index (mov eax,[edi+4] with edi=NULL), not a broken function --
-' RE round-23 搂2.1 corrected the valid range from 0..count-2 to 0..count-1.
+' A correction narrowed the valid range from 0..count-2 to 0..count-1.
 ' No VB Declare, no ByRef String: nothing VB can silently marshal.
 ' ---------------------------------------------------------------------------
 Public Function CallstackFunctionJson(ByVal frameIndex As Long) As String
@@ -599,7 +599,7 @@ Public Function CallstackFunctionJson(ByVal frameIndex As Long) As String
     s = s & Q("frame") & ":" & CStr(frameIndex)
     s = s & "," & Q("proc") & ":" & CStr(fn) & "," & Q("viaRva") & ":" & B(byRva)
     ' R23 搂2.1: the valid range is 0..count-1. Refuse anything else -- an
-    ' out-of-range index is exactly what crashed the IDE in round 2.
+    ' out-of-range index is exactly what crashed the IDE before.
     Dim cnt As Long
     cnt = -1
     Call EbGetCallstackCount(cnt)
@@ -742,13 +742,13 @@ End Function
 ' G1 -- per-frame PROCEDURE NAME, as a shippable tool (tool: get_callstack).
 ' Every frame of the IDE's own call-stack window is reproduced here: the engine
 ' returns the project name, the MODULE and the PROCEDURE for each frame.
-' Verified live (RE round-23/24 verification): at a breakpoint in modMain.Probe
+' Verified live: at a breakpoint in modMain.Probe
 ' called from modMain.Main the result was
 '     [0] brk.modMain.Probe      [1] brk.modMain.Main       count = 2
 ' SAFETY: EbGetCallstackCount/Function are only valid while the program is
 ' stopped. This refuses to touch the engine unless EbMode() = 2 (break), and
 ' never indexes past count-1 -- an out-of-range index is what crashed the IDE
-' in round 2, not a defect in the function itself.
+' earlier, not a defect in the function itself.
 ' ---------------------------------------------------------------------------
 Public Function CallstackJson(ByVal maxFrames As Long) As String
     Dim mode As Long, cnt As Long, i As Long, n As Long, rc As Long
@@ -802,7 +802,7 @@ Public Function CallstackJson(ByVal maxFrames As Long) As String
     CallstackJson = s & "}"
 End Function
 ' ---------------------------------------------------------------------------
-' RE round-25/26 verification aid: report the REAL RVA of the VBA6 exports the
+' Verification aid: report the REAL RVA of the VBA6 exports the
 ' RE names, resolved BY NAME through the real PE export table. This turns every
 ' "function X lives at RVA 0xNNNN" claim into a single safe (read-only) call.
 ' ---------------------------------------------------------------------------
@@ -835,7 +835,7 @@ Public Function ExportRvasJson() As String
     ExportRvasJson = s & "}"
 End Function
 ' ---------------------------------------------------------------------------
-' RE round-32 verification: a READ-ONLY dword scanner over a live range.
+' Verification aid: a READ-ONLY dword scanner over a live range.
 ' R32 headline is a NEGATIVE claim -- VB6.EXE contains no absolute constant that
 ' points into the VBA6 engine global area 0x0FC0D000..0x0FC0F000. Replicating a
 ' whole-image scan from the wire would need thousands of mem_dump calls, so the
@@ -905,7 +905,7 @@ Public Function MemScanJson(ByVal addr As Long, ByVal scanLen As Long, ByVal lo 
 End Function
 
 ' ---------------------------------------------------------------------------
-' RE round-32/33 follow-up: WHO OWNS THE IDE WINDOWS?
+' Follow-up: WHO OWNS THE IDE WINDOWS?
 ' R32/R33 prove VB6.EXE never touches VBA6 memory and holds no engine COM
 ' pointer, and conclude the debug windows must be fed through an export or a
 ' callback. That reasoning has one unexamined alternative: the debug windows
@@ -1216,7 +1216,7 @@ Public Function FrameStateJson() As String
     s = s & "," & Q("chain") & ":[" & nodes & "]"
 
     ' -------------------------------------------------------------------------
-    ' P4-1 (RE round 21): locate the current function's ebp.
+    ' An earlier batch: locate the current function's ebp.
     ' Locals/args are addressed as SIGNED 16-bit offsets from ebp (negative =
     ' locals, positive = args); the function's RTMI lives at [ebp-0x50] and
     ' housekeeping occupies ebp-0x94..ebp. ebp is not stored in any ExFrame field
@@ -1268,7 +1268,7 @@ Public Function FrameStateJson() As String
     End If
     s = s & "," & Q("rtmiRef") & ":" & CStr(rtmiRef)
 
-    ' ---- value-driven localisation (RE round 21 P4-2) -----------------------
+    ' ---- value-driven localisation (an earlier batch) -------------------------------------
     ' The RTMI-shape heuristic found no match, so do not guess ebp: at this
     ' breakpoint the Form_Load locals are KNOWN (n = 42 as Long, s = "hello").
     ' A local slot is a 16-byte VARIANT: [+0] = type code, [+8] = data.
@@ -1363,7 +1363,7 @@ Public Function FrameStateJson() As String
     FrameStateJson = s & "}"
 End Function
 
-' Round-6 additions (内部逆向记录（第 6 轮） 搂1.6): the Immediate window's
+' The next finding:
 ' "evaluate inside the current frame" behaviour is a GLOBAL, not an argument --
 ' WORD[VBA6+0x17D076] bit8 (0x100). sub_FBB3D6C sets it before the worker call and
 ' restores it after; EbExecuteLine never touches it. So the caller can try the same
@@ -1413,7 +1413,7 @@ Public Function ExecLineJson(ByVal line As String, ByVal a2 As Long, ByVal a3 As
         CopyMemoryToPtr hMod + &H17D076, wSet, 2
         s = s & "," & Q("scopeWordSet") & ":" & CStr(wSet)
     End If
-    ' F-2: walk engine+0x2F0, take the first kind==1 node's payload (node+8) and make
+    ' Walk engine+0x2F0, take the first kind==1 node's payload (node+8) and make
     ' it the current evaluation frame. This is what the IDE's own sub_FBC3163 does.
     fBefore = 0
     fUse = 0
@@ -1494,7 +1494,7 @@ Public Function ProbeRunJson(ByVal runBreakProbes As Boolean, ByVal force As Boo
     s = s & "," & ModuleInfoJson()
     s = s & ThreadInfoJson()
 
-    ' P2-1: engine global -> the p-code / native branch flag at +0x2F4
+    ' An earlier batch: engine global -> the p-code / native branch flag at +0x2F4
     hMod = GetModuleHandleW(StrPtr("VBA6.DLL"))
     If hMod <> 0 Then
         pGlobal = hMod + &H17D0F4
@@ -1503,7 +1503,7 @@ Public Function ProbeRunJson(ByVal runBreakProbes As Boolean, ByVal force As Boo
         s = s & "," & Q("engine") & ":" & CStr(engineVal)
         s = s & "," & Q("pcodeFlag") & ":" & CStr(pcodeFlag)
 
-        ' P2-3: walk the node list and report each node's kind, so RE can tell
+        ' An earlier batch: walk the node list and report each node's kind, so RE can tell
         ' which name branch the frames actually take
         If runBreakProbes Then
             CopyMemory pHead, engineVal + &H2F0, 4
@@ -1624,11 +1624,11 @@ Public Function ProbeRunJson(ByVal runBreakProbes As Boolean, ByVal force As Boo
 End Function
 
 ' ---------------------------------------------------------------------------
-' RE round-19 item 1: report which thread we are on.
+' Report which thread we are on.
 '   tid          = the thread that is executing this probe
 '   mainTid      = the thread that owns the VB6 IDE main window
 '   onMainThread = true when they are the same thread
-' If onMainThread is already true, the round-19 "must move the payload to the
+' If onMainThread is already true, the "must move the payload to the
 ' main thread" premise is ALREADY satisfied for this call path.
 ' ---------------------------------------------------------------------------
 Private Function ThreadInfoJson() As String
@@ -1681,7 +1681,7 @@ Private Function HexToLong(ByVal h As String) As Long
 End Function
 
 ' ---------------------------------------------------------------------------
-' RE round-19 item 2: an N-argument caller.
+' An N-argument caller.
 ' CreateIExprSrvObj is __stdcall with THREE arguments (retn 0Ch) -- the original
 ' CallRvaJson thunk only builds 0..2, which is exactly why the RE-specified call
 ' could never be made. This variant takes a comma-separated argument list and
@@ -1776,7 +1776,7 @@ Private Function BytesToHex(ByRef b() As Byte, ByVal n As Long) As String
 End Function
 
 Public Function IdeEbMode() As Long
-    ' Card TASK-P1-007 (i18n): expose the VBA6 debug-engine mode so IDE-state
+    ' (i18n): expose the VBA6 debug-engine mode so IDE-state
     ' detection can stop reading the localized main-window caption. EbMode is a
     ' language-independent signal: 2 = break context, 0 = no debug context.
     On Error Resume Next

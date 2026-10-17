@@ -49,7 +49,7 @@ const BRIDGE_LIST_TIMEOUT_MS = parseInt(process.env.VB6MCP_BRIDGE_LIST_TIMEOUT_M
 function bridgeCallTimeoutMs() {
   return parseInt(process.env.VB6MCP_BRIDGE_CALL_TIMEOUT_MS || String(FORWARD_TIMEOUT_MS + 10000), 10);
 }
-// task-71 (threat model: bridge/TOKEN_THREAT_MODEL.md).  PURELY ADDITIVE: with no credential
+// (threat model: bridge/TOKEN_THREAT_MODEL.md).  PURELY ADDITIVE: with no credential
 // configured bridgeAuthHeaders() returns {}, so every request this shell makes is byte-identical
 // to before.  The VALUE is never logged - only presence and length are ever reported, and a
 // value read from a file is never copied into a child process environment.
@@ -65,6 +65,11 @@ function bridgeAuthState() {
   return BRIDGE_TOKEN ? ('on(len=' + BRIDGE_TOKEN.length + ')') : 'off';
 }
 let bridgeHealthCache = { at: 0, data: null, promise: null };
+// WHY the middle service is not answering, kept so the discovery/control receipts can
+// tell 'the credential was rejected' apart from 'there is no IDE' and from 'it did not answer'.
+// Before this, a 401 was logged and then the face reported 'no instance discovered at all' - the
+// caller could not tell an authorization failure from an empty machine.
+let bridgeLastFailure = null;   // {kind:'auth'|'unreachable', reason, status, detail, at}
 // Startup breadcrumb, deferred like the endpoint one below: dbg()/DEBUG are declared further
 // down, so calling this at module-evaluation time would be a temporal-dead-zone error.
 setTimeout(function () {
@@ -81,12 +86,27 @@ function bridgeHealth() {
   bridgeHealthCache.promise = (async function () {
     try {
       const res = await fetch(BRIDGE_URL + '/health', { signal: AbortSignal.timeout(800), headers: bridgeAuthHeaders() });
+      // a NON-2xx answer is not a health report.  The old code cached whatever JSON came
+      // back (a 401 page has no .instances, but it was truthy), so a wrong token still looked like
+      // "the bridge is online" and every forward went on to hand the caller the 401 body.
+      if (!res.ok) {
+        const body = await res.text().catch(function () { return ''; });
+        const af = authFailureEnvelope(res.status, body);
+        bridgeHealthCache = { at: Date.now(), data: null, promise: null };
+        bridgeLastFailure = { kind: 'auth', reason: (af && af.reason) || ('http_' + res.status),
+                              status: res.status, detail: (af && af.message) || null, at: Date.now() };
+        dbg('bridge health REJECTED HTTP ' + res.status + (af ? ' reason=' + af.reason : '') + ' -> bridge treated as offline (authRequired)');
+        return null;
+      }
       const j = await res.json();
       bridgeHealthCache = { at: Date.now(), data: j, promise: null };
+bridgeLastFailure = null; //: a healthy bridge clears the recorded failure
       dbg('bridge health ok port=' + (j && j.port) + ' instances=' + ((j && j.instances) || []).length + ' faceTools=' + (j && j.faceTools) + ' auth=' + bridgeAuthState());
       return j;
     } catch (e) {
       bridgeHealthCache = { at: Date.now(), data: null, promise: null };
+      bridgeLastFailure = { kind: 'unreachable', reason: 'bridge_unreachable', status: 0,
+                            detail: String((e && e.message) || e), at: Date.now() };
       dbg('bridge health FAILED url=' + BRIDGE_URL + ' err=' + String((e && e.message) || e));
       return null;
     }
@@ -102,7 +122,10 @@ async function bridgeRpc(method, params, timeoutMs) {
     method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, bridgeAuthHeaders()),
     body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs || BRIDGE_LIST_TIMEOUT_MS)
   });
-  return decodeRpcBody(await res.text());
+  const raw = await res.text();
+  const authFail = authFailureEnvelope(res.status, raw);
+if (authFail) throw authFailureError(authFail, res.status, BRIDGE_URL); //
+  return decodeRpcBody(raw);
 }
 // The hub-provided names WIN over the face (the pre-change rule, restated here so the bridge
 // path produces the SAME 120-name face: 10 hub + 110 add-in, each name once).
@@ -124,7 +147,7 @@ function mergeHubFace(faceTools) {
 // the bridge's job (addressing moved to the Python layer).  stampBody() below only fills keys
 // that are undefined, so the bridge's transport / transportReason / *Fallback / pipeBusy marks
 // SURVIVE into the receipt and are never overwritten.
-async function bridgeForwardCall(name, argsIn, snap) {
+async function bridgeForwardCall(name, argsIn, snap, note) {
   const h = await bridgeHealth();
   if (!h) return null;
   const t0 = Date.now();
@@ -134,17 +157,25 @@ async function bridgeForwardCall(name, argsIn, snap) {
   } catch (e) {
     const ms = Date.now() - t0;
     const isTimeout = !!(e && (e.name === 'TimeoutError' || /abort/i.test(String(e && e.message))));
-    dbg('bridge forward FAILED tool=' + name + ' ms=' + ms + ' err=' + String((e && e.message) || e));
-    return stampBody({ content: [{ type: 'text', text: JSON.stringify({
-      ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed',
+    // the peer ANSWERED and refused the credential - that is toolError (the tool never
+    // ran), not "noIde"/"wedged".  Legacy reason values are untouched; the new one is additive.
+    const isAuth = !!(e && e.code === 'bridge_auth_failed');
+    dbg('bridge forward FAILED tool=' + name + ' ms=' + ms + (isAuth ? ' auth=' + e.reason : '') + ' err=' + String((e && e.message) || e));
+    let authBlock = {};
+    if (isAuth) authBlock = { authRequired: true, authReason: e.reason, authStatus: e.status, authHint: e.authHint, hubAuth: bridgeAuthState() };
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(Object.assign({
+      ok: false, reason: isAuth ? 'bridge_auth_failed' : (isTimeout ? 'forward_timeout' : 'forward_failed'),
       message: String((e && e.message) || e), elapsedMs: ms, budgetMs: bridgeCallTimeoutMs(),
-      transport: 'bridge', transportReason: 'bridge_unreachable',
-      failureKind: isTimeout ? 'wedged' : 'noIde', failureKindRule: FAILURE_KIND_RULE
-    }, null, 2) }], isError: true }, null, snap.contractVersion);
+      transport: 'bridge', transportReason: isAuth ? 'bridge_auth_failed' : 'bridge_unreachable',
+      failureKind: isAuth ? 'toolError' : (isTimeout ? 'wedged' : 'noIde'), failureKindRule: FAILURE_KIND_RULE
+    }, authBlock), null, 2) }], isError: true }, null, snap.contractVersion);
   }
   dbg('bridge forward ok tool=' + name + ' ms=' + (Date.now() - t0));
   const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
-  return stampBody(result, null, snap.contractVersion);
+// /N11: the hub's OWN liveness/resolution verdict rides along (ADDITIVE - stampBody only
+  // fills keys the body does not already carry).  So a forwarded call that comes back
+  // noIde/wedged can be read next to ide_list's verdict for the SAME instance, with the basis.
+  return stampBody(result, null, snap.contractVersion, note);
 }
 // Latency budget: the DSH client must get initialize/tools/list in <1s.
 const DISCOVERY_TTL_MS = 15000;     // cached (re-validated) discovery is reused for this long
@@ -163,7 +194,7 @@ const ADDIN_RPC_PATH = process.env.VB6MCP_ADDIN_PATH || '/rpc';
 const FACE_CACHE = path.join(HERE, 'hub_face_cache.json');
 // ---- endpoint list: the local machine + a configured allow-list of remote endpoints --------
 // The hub discriminates by IDE, not by machine: LOCAL and REMOTE IDEs are EQUIVALENT members
-// of ONE candidate set and `remote` is only an extra marker (author ruling, task-40).
+// of ONE candidate set and `remote` is only an extra marker (author ruling).
 // Endpoints come from the env (VB6MCP_REMOTES) and/or bridge/hub_remotes.json; with neither
 // configured, every remote code path below is inert and the behaviour is the pre-change one.
 const REMOTES_FILE = path.join(HERE, 'hub_remotes.json');
@@ -174,7 +205,7 @@ const REMOTE_FORWARD_TIMEOUT_MS = parseInt(process.env.VB6MCP_REMOTE_FORWARD_TIM
 const REMOTE_TTL_MS = parseInt(process.env.VB6MCP_REMOTE_TTL_MS || String(DISCOVERY_TTL_MS), 10);
 const REMOTE_GRACE_MS = parseInt(process.env.VB6MCP_REMOTE_GRACE_MS || '1500', 10);
 // The canonical identity rule, restated VERBATIM in every receipt that uses it.
-// ---- forward-failure classification (ADDITIVE; MCP-lead-21(3), evidence MCP-lead-19/-20) -----
+// ---- forward-failure classification (ADDITIVE;(3), evidence/-20) -----
 // After a wedge the add-in still LISTENS, so a forwarded call fails in 1-68 ms with
 // "forward_failed / fetch failed" - which reads like "the tool does not exist" or "the
 // parameter is wrong", while the truth is a host that is there but not answering.
@@ -343,7 +374,7 @@ async function isListening(port, listening) {
   if (t) dbg('isListening port=' + port + ' netstat=absent tcp=YES');
   return t;
 }
-// Liveness of ONE instance, transport aware (task-105).  A TCP instance keeps the pre-change test
+// Liveness of ONE instance, transport aware.  A TCP instance keeps the pre-change test
 // byte for byte (pid alive AND port listening).  A PIPE-only instance has NO port to listen on -
 // the pipe IS the transport and the middle service owns it - so its liveness is the pid; asking
 // "is port null listening?" answered "no" for every live pipe IDE and silently dropped it from
@@ -358,6 +389,205 @@ async function instanceAlive(i, listening) {
   if (!i.port) return false;
   return await isListening(i.port, listening || null);
 }
+// ============================================================================================
+// ONE fact source for liveness / ownership / default target (: N11 + N12 + N14 +)
+// --------------------------------------------------------------------------------------------
+// Three receipts used to answer the same question three different ways:
+//   * ide_list    "is the IDE alive?"      <- the REGISTRY (pid alive + a listening port/pipe)
+//                   plus a probe that asked tools/list, WHICH THE MIDDLE SERVICE ANSWERS FROM ITS
+//                   OWN SNAPSHOT when the add-in cannot be reached.  So a wedged IDE still got
+//                   probeStatus=ok / liveToolCount=110 while a forwarded tools/call came back
+//                   noIde / pipe busy 121  => the diagnostic entrance contradicted the live
+//                   behaviour (N11, measured).
+//   * ide_restart "is this instance OURS?" <- the PORT (port < 8767).  A pipe-only instance
+//                   publishes port 0 ON PURPOSE, so 0 < 8767 refused it as "foreign" although
+//                   ide_list said startedByHub=true and ide_stop acted on it (N12, measured).
+//   * _target     "which instance does an omitted / auto target mean?" <- no rule: one live IDE
+//                   selected itself, two refused with ambiguous_target, and 'auto' was not a
+//                   selector at all, so the caller could not predict the outcome (N14).
+// Everything below is the SINGLE place where those three judgements are made, and every receipt
+// that reports one of them also carries the rule VERBATIM plus the evidence it was derived from.
+const LIVENESS_RULE = 'liveness.state = responding (the ADD-IN ITSELF answered an MCP tools/call (mcp_info) over the SAME route a forwarded call uses) | not_responding (a peer was found but did not answer: probe failed / the pipe is not available - the SAME verdict a forwarded call reports as wedged|noIde) | unknown (no fresh verdict: probe still pending, or only a CACHED verdict older than the discovery TTL). probeStatus is DERIVED from this one verdict (ok <=> responding; not_responding => failed + probeReason), so ide_list and a forwarded call cannot disagree, and a cached ok is never re-published as a fresh one. basis names the evidence, evidenceAgeMs dates it.';
+const OWNERSHIP_RULE = 'ownership = hub_started (the hub that is answering started this pid: in-memory startedByHub) | registry_started_by_hub (the instance REGISTRATION itself says startedByHub=true) | not_owned (neither). owned = the first two. The PORT is NOT an ownership criterion: a pipe-only instance publishes port 0 on purpose, so "no port" never means "not ours" (N12). The port stays a SECOND, independent safety guard: an instance whose KNOWN port is < 8767 is foreign (8766 belongs to an external process on this machine) and is refused even when owned. ide_list / ide_stop / ide_restart all call ownershipOf() and report ownership + ownershipBasis + ownershipRule.';
+const PROCESS_KIND_RULE = 'processKind = vb6_ide (an add-in registration: %TEMP%\\vb6mcp\\instances\\<pid>.json, pid alive and its transport reachable) | middle_service (the loopback TCP listener that IS this hub\'s configured middle service: the port of VB6MCP_BRIDGE_URL, or the process that owns that port) | unknown_listener (a listening port with neither an add-in registration nor a middle-service identity). instances[] is the AUTHORITATIVE IDE view and lists ONLY vb6_ide; every excluded listener is kept in nonIdeListeners[] with the basis that excluded it, so the middle service process can never be read as an IDE .';
+const TARGET_RESOLUTION_RULE = 'default target ladder, used when _target is omitted or "auto" (after the ide_target default has been tried): 1) the ONLY live IDE; 2) else the ONLY hub-owned IDE (see ownershipRule); 3) else the ONLY IDE that is RESPONDING (see livenessRule); 4) else REFUSE with reason=ambiguous_target and list every candidate + a concrete suggestion - never guess. An EXPLICIT _target that matches nothing is target_mismatch (the live set is never silently substituted for it); one that matches several is target_conflict. Every receipt that resolved a target carries resolution{rule,step,liveCount,selectedBy,candidates,ladder}.';
+// The rule ide_list restates verbatim (kept in ONE constant so it cannot drift from the ladder).
+const SELECTION_RULE = '_target (EXPLICIT) > ide_target default > the DOCUMENTED DEFAULT LADDER (the ONLY live IDE -> the ONLY hub-owned IDE -> the ONLY RESPONDING IDE -> REFUSE with candidates[] + suggestion{}; see targetResolutionRule); a STALE ide_target default is IGNORED (never vetoes the live set). An explicit _target that matches nothing is target_mismatch, one that matches several is target_conflict; the live set is never silently substituted. The canonical selector is [endpoint:]projectPath; bare pid / bare NAME are legacy aliases.';
+// The port of the CONFIGURED middle service (no network): a portscan candidate on this port is
+// the middle service itself, not an IDE.  VB6MCP_BRIDGE_URL is what the hub forwards to.
+function bridgePortHint() {
+  const m = /:(\d+)(?:\/|$)/.exec(String(BRIDGE_URL || ''));
+  return m ? parseInt(m[1], 10) : null;
+}
+// GET /health, cached like bridgeHealth() itself: the middle service is authoritative about the
+// TRANSPORT of every instance it can address (pipeAvailable / pipeState / pidAlive).  Those are
+// the facts the hub does NOT have on its own, and they are what closes N11.
+let bridgeIdentityCache = { at: 0, val: null, promise: null };
+function bridgeIdentity() {
+  if (bridgeIdentityCache.val && Date.now() - bridgeIdentityCache.at < BRIDGE_HEALTH_TTL_MS) return Promise.resolve(bridgeIdentityCache.val);
+  if (bridgeIdentityCache.promise) return bridgeIdentityCache.promise;
+  bridgeIdentityCache.promise = (async function () {
+    const val = { ok: false, mode: BRIDGE_MODE, url: BRIDGE_URL, port: bridgePortHint(), pids: [], byPid: {},
+                  instances: [], transport: null, faceTools: null, basis: 'VB6MCP_BRIDGE_URL' };
+    if (BRIDGE_MODE !== 'inproc') {
+      const h = await bridgeHealth();
+      if (h) {
+        val.ok = true;
+        if (h.port) val.port = Number(h.port) || val.port;
+        val.transport = h.transport || null;
+        val.faceTools = h.faceTools || null;
+        val.instances = h.instances || [];
+        for (const bi of val.instances) { if (bi && bi.pid) val.byPid[String(bi.pid)] = bi; }
+        val.basis = 'GET /health (' + BRIDGE_URL + ')';
+      } else {
+        val.basis = 'GET /health unreachable (' + BRIDGE_URL + '): the hub has NO transport verdict from the middle service';
+      }
+    }
+    if (val.port) { try { val.pids = (listeningPortsCached()[val.port] || []).map(Number); } catch (e) { val.pids = []; } }
+    bridgeIdentityCache = { at: Date.now(), val: val, promise: null };
+    return val;
+  })();
+  return bridgeIdentityCache.promise;
+}
+function bridgeIdentitySync() { return bridgeIdentityCache.val || null; }
+// Is this candidate an IDE, the middle service, or an unidentified listener?  Registry provenance
+// WINS (an add-in registration is direct evidence), then the middle service is identified by the
+// port it listens on - the exact confusion measured, where a portscan adopted the python
+// service on 8797 and called it a live IDE with 110 tools.
+function classifyProcess(c, ctx) {
+  if (!c) return { processKind: 'unknown_listener', isIde: false, processKindBasis: 'no_candidate' };
+  if (c.remote) return { processKind: 'vb6_ide', isIde: true, processKindBasis: 'remote_endpoint_probe(' + (c.endpoint || '?') + ')' };
+  if (c.discoveredBy === 'registry' || c.registryFile) {
+    return { processKind: 'vb6_ide', isIde: true,
+      processKindBasis: 'addin_registration(' + (c.registryFile || 'registry') + ')' + (c.discoveredBy === 'bridge_health' ? ' read by the middle service (the hub\'s own registry view was empty)' : '') };
+  }
+  const bp = (ctx && ctx.port) || bridgePortHint();
+  const bpids = ((ctx && ctx.pids) || (bridgeIdentitySync() ? bridgeIdentitySync().pids : []) || []).map(Number);
+  if (bp && Number(c.port) === Number(bp)) return { processKind: 'middle_service', isIde: false, processKindBasis: 'port==bridge_port(' + bp + ')' };
+  if (c.pid && bpids.indexOf(Number(c.pid)) >= 0) return { processKind: 'middle_service', isIde: false, processKindBasis: 'pid_owns_bridge_port(' + bp + ')' };
+  if (c.probeStatus === 'ok' && c.probeBasis) return { processKind: 'vb6_ide', isIde: true, processKindBasis: 'portscan_addin_answered(' + c.probeBasis + ')' };
+  return { processKind: 'unknown_listener', isIde: false, processKindBasis: 'portscan_no_addin_answer' };
+}
+// ONE ownership predicate, shared by ide_list / ide_stop / ide_restart.
+function ownershipOf(inst) {
+  const pid = inst && inst.pid ? Number(inst.pid) : null;
+  const inMap = !!(pid && startedByHub.has(pid));
+  const byReg = !!(inst && inst.startedByHub);
+  const port = Number(inst && inst.port) || 0;
+  const foreignPort = port > 0 && port < 8767;
+  return {
+    owned: inMap || byReg,
+    ownership: inMap ? 'hub_started' : (byReg ? 'registry_started_by_hub' : 'not_owned'),
+    ownershipBasis: inMap
+      ? 'in-memory startedByHub map of THIS hub process lists pid ' + pid
+      : (byReg ? 'instance registration startedByHub=true (' + (inst.registryFile || 'registry') + ')' : 'neither the startedByHub map nor the instance registration marks pid ' + pid + ' as hub-started'),
+    port: port || null,
+    foreignPort: foreignPort,
+    portRuleApplies: port > 0,
+    portBasis: port > 0
+      ? ('known port ' + port + (foreignPort ? ' < 8767 => foreign (8766 belongs to an external process)' : ' >= 8767 => inside the hub-owned range'))
+      : 'port null/0 (pipe-only): the port rule CANNOT apply - "no port" never means "not ours" (N12)'
+  };
+}
+// ONE liveness verdict per instance.  probeStatus is DERIVED from it, never taken from the
+// registry alone, and a fresh add-in answer is required before "responding" is claimed.
+function forwardRouteOf(i) {
+  if (!i) return null;
+  if (i.remote) return i.endpointUrl || ('endpoint:' + (i.endpoint || '?'));
+  if (i.port) return 'http://127.0.0.1:' + i.port + ' (add-in /rpc)';
+  return BRIDGE_MODE === 'inproc'
+    ? 'none (inproc: a pipe-only instance is unreachable by design)'
+    : (BRIDGE_URL + ' -> named pipe (the middle service is the only addresser)');
+}
+function livenessOf(i, ctx) {
+  const byPid = (ctx && ctx.byPid) || {};
+  const bi = (i && i.pid && byPid[String(i.pid)]) || null;
+  const pipeState = bi ? (bi.pipeState || null) : ((i && i.pipeState) || null);
+  const pipeAvailable = bi ? !!bi.pipeAvailable : ((i && i.pipeAvailable !== undefined && i.pipeAvailable !== null) ? !!i.pipeAvailable : null);
+  const rawStatus = (i && i.probeStatus) || ((i && i.pending) ? 'pending' : 'ok');
+  const evidenceAt = (i && (i.probeEvidenceAt || i.evidenceAt)) || null;
+  const ageMs = evidenceAt ? (Date.now() - evidenceAt) : null;
+  const route = { probe: (i && i.probeRoute) || null, forward: forwardRouteOf(i) };
+  let state, basis, status = rawStatus, probeReason = (i && i.probeReason) || null;
+  if (i && String(i.transport || '') === 'pipe' && pipeAvailable === false) {
+    // The middle service - the ONLY addresser - says this instance's pipe is NOT connectable.
+    // That is the same wall a forwarded call hits, so the face must say it too (N11).
+    state = 'not_responding';
+    basis = 'bridge_health:pipe_not_available(pipeState=' + (pipeState || '?') + ')';
+    status = 'failed';
+    probeReason = 'pipe_unavailable';
+  } else if (rawStatus === 'ok') {
+    // An ok verdict is only a LIVE ANSWER when it is DATEABLE and FRESH.  The pre-change hub also
+    // inherited ok from a persisted/cached face (hub_face_cache.json) and re-published it with a
+    // full liveToolCount, which is how ide_list ended up claiming a healthy IDE that had already
+    // wedged (N11).  An undated or stale ok is reported as 'stale', never as 'ok'.
+    if (ageMs === null) {
+      state = 'unknown'; status = 'stale';
+      basis = 'ok_without_evidence_timestamp(the verdict came from a cached/persisted face and cannot be dated, so it is NOT reported as a live answer)';
+      probeReason = probeReason || 'stale_probe_verdict';
+    } else if (ageMs > DISCOVERY_TTL_MS) {
+      state = 'unknown'; status = 'stale';
+      basis = 'stale_evidence(ageMs=' + ageMs + ' > discovery_ttl=' + DISCOVERY_TTL_MS + ')';
+      probeReason = probeReason || 'stale_probe_verdict';
+    } else {
+      state = 'responding';
+      basis = (i && i.probeBasis) || ('addin_answered(' + (route.probe || route.forward) + ')');
+    }
+  } else if (rawStatus === 'pending') {
+    state = 'unknown'; basis = 'probe_pending';
+  } else {
+    state = 'not_responding'; basis = 'probe_failed(' + (probeReason || 'unknown') + ')';
+  }
+  const contradictions = [];
+  if (rawStatus === 'ok' && state !== 'responding') {
+    contradictions.push({ pid: i && i.pid, port: i && i.port, raw: rawStatus, verdict: state,
+      explained_by: basis,
+      note: 'the cached/registry verdict says ok but it is NOT backed by a fresh add-in answer, so this receipt reports it as ' + state + ' (role: ' + basis + ') instead of repeating the ok - a verdict and a forwarded call now agree by construction' });
+  }
+  if (rawStatus !== 'ok' && status === 'failed' && (i && i.liveTools && i.liveTools.length)) {
+    contradictions.push({ pid: i && i.pid, port: i && i.port, raw: rawStatus, verdict: state, explained_by: basis,
+      note: 'the face (tools/list) was readable but the ADD-IN did not answer, so liveToolCount is NOT reported as a live count' });
+  }
+  return { state: state, basis: basis, evidenceAt: evidenceAt, evidenceAgeMs: ageMs,
+           probeStatus: status, probeStatusRaw: rawStatus, probeReason: probeReason, cached: !!(i && i.fromFaceCache),
+           probeRoute: route.probe, forwardRoute: route.forward, pipeState: pipeState, pipeAvailable: pipeAvailable,
+           contradictions: contradictions };
+}
+// The selector handed to the middle service when the hub resolved the target itself.  Both sides
+// match pid | port | project NAME | projectPath; projectPath is the canonical identity, pid is the
+// most precise per-instance address, so both are offered (path first, because it survives a pid
+// recycle inside the middle service's own view).
+function canonicalSelectorFor(pick) {
+  if (!pick || !pick.ok) return '';
+  if (pick.remote) return (pick.endpoint ? pick.endpoint + ':' : '') + (pick.projectPath || pick.pid || '');
+  // The middle service's selector vocabulary is pid | port | project NAME | projectPath.  The PID is
+  // the PREFERRED form: it is the registry key, it is unambiguous when one project is served twice,
+  // and both sides already speak it.  projectPath is only the fallback for an instance whose pid is
+  // unknown, and the port/name follow (the legacy aliases).
+  if (pick.pid) return String(pick.pid);
+  if (pick.projectPath) return String(pick.projectPath);
+  if (pick.port) return String(pick.port);
+  return String(pick.project || '');
+}
+function selectorFormOf(sel, pick) {
+  const s = String(sel === undefined || sel === null ? '' : sel);
+  if (!s) return 'none';
+  if (pick && pick.pid && s === String(pick.pid)) return 'pid';
+  if (pick && pick.projectPath && s.toLowerCase() === String(pick.projectPath).toLowerCase()) return 'projectPath';
+  if (pick && pick.port && s === String(pick.port)) return 'port';
+  if (pick && pick.project && s === String(pick.project)) return 'project_name';
+  return 'verbatim_explicit';
+}
+// The middle service ANSWERED with a target refusal: that is an EXPLICIT failure, so the hub must
+// say so and must never quietly retry another form (or fall back to picking an instance itself).
+function targetRefusalOf(result) {
+  const obj = firstBodyObject(result);
+  if (!obj) return null;
+  return (obj.reason === 'target_mismatch' || obj.reason === 'target_conflict' || obj.reason === 'no_ide_running') ? obj : null;
+}
+function defaultTargetLabel() {
+  return (state.target === undefined || state.target === null || state.target === '') ? null : String(state.target);
+}
 let listeningCache = { at: 0, map: null };
 function listeningPortsCached() {
   if (listeningCache.map && Date.now() - listeningCache.at < 2000) return listeningCache.map;
@@ -365,12 +595,41 @@ function listeningPortsCached() {
   listeningCache = { at: Date.now(), map: m };
   return m;
 }
-function saveFaceCache(d) {
-  try { fs.writeFileSync(FACE_CACHE, JSON.stringify({ at: Date.now(), instances: d.instances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir }, null, 2), 'utf8'); } catch (e) { }
+// the persisted face cache is keyed by the FACE FINGERPRINT (the same sha256
+// tools/gen_hub_snapshot.py writes into bridge/hub_schema.generated.json).  A cache without a
+// key cannot be invalidated: the un-keyed version kept re-publishing a face it had captured
+// under a DIFFERENT frozen face, so ide_list could answer from a face that no longer exists.
+// Rule: a cached entry is used ONLY when its fingerprint equals the CURRENT snapshot's.
+// When the snapshot carries no fingerprint (an older generated file) the cache is not used at
+// all - a rebuild on start/reload is the documented fallback, never a silent reuse.
+function faceFingerprintNow() {
+  const s = snapshot();
+  return (s && typeof s.faceFingerprint === 'string' && s.faceFingerprint) ? s.faceFingerprint : null;
 }
+function saveFaceCache(d) {
+  try {
+    fs.writeFileSync(FACE_CACHE, JSON.stringify({ at: Date.now(), faceFingerprint: faceFingerprintNow(), instances: d.instances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir }, null, 2), 'utf8');
+  } catch (e) { }
+}
+let faceCacheStatus = { reason: 'not_read' };
 function loadFaceCache() {
   const c = readJson(FACE_CACHE, null);
-  if (!c || !Array.isArray(c.instances) || !c.instances.length) return null;
+  if (!c || !Array.isArray(c.instances) || !c.instances.length) {
+    faceCacheStatus = { reason: c ? 'empty' : 'absent' };
+    return null;
+  }
+  const want = faceFingerprintNow();
+  if (!want) {
+    faceCacheStatus = { reason: 'snapshot_has_no_faceFingerprint', cached: c.faceFingerprint || null,
+      note: 'the snapshot cannot key a cache; the face is rebuilt on start/reload instead of reused' };
+    return null;
+  }
+  if (c.faceFingerprint !== want) {
+    faceCacheStatus = { reason: 'face_fingerprint_mismatch', cached: c.faceFingerprint || null, current: want,
+      note: 'the persisted face was captured under a different face fingerprint, so it is INVALID' };
+    return null;
+  }
+  faceCacheStatus = { reason: 'hit', faceFingerprint: want };
   return c;
 }
 const state = { target: null };
@@ -411,8 +670,8 @@ function candidatePorts(listening) {
 // ONE netstat for the whole scan (it used to run once per candidate port: the main
 // reason initialize took ~9s).  Returns { port: [pid, ...] } for LISTENING sockets.
 function netstatPath() {
-  // NEVER guess C:\Windows here.  On this host SystemRoot is
-  // B:\Windows and C:\Windows is a stale second installation whose 32-bit binaries fail
+  // NEVER guess C:\Windows here.  SystemRoot may be on ANOTHER drive, in which case
+  // C:\Windows can be a stale second installation whose 32-bit binaries fail
   // with 0xC0000139, so inventing a drive is worse than degrading to a PATH lookup.  Only
   // authoritative Windows-directory env vars may be used; when neither is set we say so and
   // let PATH resolve netstat (the pre-existing fallback below).
@@ -464,6 +723,23 @@ function pidAlive(pid) {
     return alive;
   }
 }
+// (second half): the hub's own copy of the registry FIELD CONTRACT.  Kept beside
+// readRegistry() so the hub and the middle service can be diffed by eye: the acknowledged
+// set is what the hub actually consumes, the ignored set is the only thing it may drop.
+const REGISTRY_SYNTHETIC_FIELDS = ['file', 'projectName', 'path', 'sha256', 'registryUnknownFields'];
+const REGISTRY_IGNORED_FIELDS = [];
+const REGISTRY_ACKNOWLEDGED_FIELDS = [
+  'pid', 'port', 'transport', 'pipe', 'tcpEnabled', 'sessionId', 'instanceId', 'nonce',
+  'startedAt', 'startedByHub', 'dllSha256', 'version', 'project', 'projectPath',
+  'pipeProto', 'hwnd', 'tid', 'epoch',
+  'ingressMode', 'ingressHwnd', 'ingressBoxHwnd', 'ingressCaption'];
+function registryUnknownFields(e) {
+  return Object.keys(e).filter(function (k) {
+    return REGISTRY_ACKNOWLEDGED_FIELDS.indexOf(k) < 0 &&
+           REGISTRY_IGNORED_FIELDS.indexOf(k) < 0 &&
+           REGISTRY_SYNTHETIC_FIELDS.indexOf(k) < 0;
+  }).sort();
+}
 function readRegistry() {
   const dir = instancesDir();
   const entries = [];
@@ -474,26 +750,34 @@ function readRegistry() {
     const full = path.join(dir, f);
     let j = null;
     try { j = JSON.parse(fs.readFileSync(full, 'utf8')); } catch (e) { entries.push({ file: full, parseError: true }); continue; }
-    entries.push({
-      file: full,
-      pid: parseInt(j.pid, 10) || null,
-      port: parseInt(j.port, 10) || null,
-      // task-105: the TRANSPORT is part of an instance's identity, not decoration.  A pipe-only IDE
-      // publishes port 0 ON PURPOSE (the pipe IS the transport), so "no port" must never be read as
-      // "no instance" - dropping this field here is what made every live pipe IDE look stale and sent
-      // discovery off to the PORT SCAN, which then adopted an unrelated listener as a fake IDE.
-      transport: j.transport || null,
-      pipe: j.pipe || null,
-      tcpEnabled: j.tcpEnabled === undefined || j.tcpEnabled === null ? null : !!j.tcpEnabled,
-      sessionId: j.sessionId || null,
-      instanceId: j.instanceId || null,
-      project: j.project || j.projectName || null,
-      projectPath: j.projectPath || j.path || null,
-      startedAt: j.startedAt || null,
-      version: j.version || null,
-      dllSha256: j.dllSha256 || j.sha256 || null,
-      startedByHub: !!j.startedByHub
-    });
+    // (second half): PASS THROUGH EVERYTHING the file published; this used to be a
+    // hand-written whitelist of 14 keys, so the middle service's ingress identity, the pipe
+    // self-registration record (hwnd/tid/epoch) and the wire stamp (pipeProto) were INVISIBLE
+    // to the hub without any warning.  Nothing is dropped except the explicit list below, and
+    // anything not acknowledged is NAMED in registryUnknownFields on the entry.
+    const e = Object.assign({}, j);
+    for (const d of REGISTRY_IGNORED_FIELDS) delete e[d];
+    e.file = full;
+    e.pid = parseInt(j.pid, 10) || null;
+    e.port = parseInt(j.port, 10) || null;
+    // the TRANSPORT is part of an instance's identity, not decoration.  A pipe-only IDE
+    // publishes port 0 ON PURPOSE (the pipe IS the transport), so "no port" must never be read as
+    // "no instance" - dropping this field here is what made every live pipe IDE look stale and sent
+    // discovery off to the PORT SCAN, which then adopted an unrelated listener as a fake IDE.
+    e.transport = j.transport || null;
+    e.pipe = j.pipe || null;
+    e.tcpEnabled = j.tcpEnabled === undefined || j.tcpEnabled === null ? null : !!j.tcpEnabled;
+    e.sessionId = j.sessionId || null;
+    e.instanceId = j.instanceId || null;
+    e.project = j.project || j.projectName || null;
+    e.projectPath = j.projectPath || j.path || null;
+    e.startedAt = j.startedAt || null;
+    e.version = j.version || null;
+    e.dllSha256 = j.dllSha256 || j.sha256 || null;
+    e.startedByHub = !!j.startedByHub;
+    const unk = registryUnknownFields(e);
+    if (unk.length) e.registryUnknownFields = unk;
+    entries.push(e);
   }
   return { dir: dir, entries: entries, unreadable: false };
 }
@@ -501,18 +785,18 @@ function readRegistry() {
 // One JSON-RPC POST against an absolute endpoint base ("http://host:port") - the SAME wire
 // shape the local add-in uses, so a remote IDE is reached exactly like a local one.  An
 // explicit path in the base (http://host:8796/rpc) wins over the add-in default.
-// task-104: is this endpoint base the configured middle service?  Normalised the same way
+// is this endpoint base the configured middle service?  Normalised the same way
 // BRIDGE_URL is (trailing slashes stripped, case-insensitive) so an operator's spelling cannot
 // silently take the un-authenticated path.
 function isBridgeBase(base) {
   return !!base && String(base).replace(/\/+$/, '').toLowerCase() === BRIDGE_URL.toLowerCase();
 }
-// ---- credentials for a LOOPBACK endpoint that ASKS for them (task-106) ------------------------
+// ---- credentials for a LOOPBACK endpoint that ASKS for them ------------------------
 // The middle service that fronts pipe-only IDEs can be reached WITHOUT any configuration - the
 // legacy LOCAL path finds it by PORT SCAN - and EVERY one of its surfaces requires the token.  The
 // pre-change hub attached the credential only to the CONFIGURED bridge base (isBridgeBase), so a
 // scanned-but-unconfigured service answered 401 (a pretty-printed body, the second half of the
-// task-105 defect) and the caller saw a misleading answer instead of the IDE.
+// defect) and the caller saw a misleading answer instead of the IDE.
 //
 // The rule is SELF-LIMITING - it is NOT an identity guess and NOT "send the token to any 401":
 //   * the endpoint must be LOOPBACK, so a credential never leaves this machine, AND
@@ -534,9 +818,36 @@ function asksForOurToken(base, status, raw) {
   const j = parseRpcBody(raw);
   return !!(j && typeof j === 'object' && !Array.isArray(j) && j.reason === 'token_missing');
 }
+// ---- an AUTH failure is an ERROR, never a tool answer ------------------------------
+// The middle service answers 401 with OUR OWN envelope (reason = token_missing | token_mismatch |
+// token_in_url_rejected - see bridge/vb6mcp_bridge.py).  On the CONFIGURED bridge path that body
+// used to be handed to the caller as a NORMAL tool result: resp.result is absent, so
+// bridgeForwardCall fell through to JSON.stringify(resp) and answered isError=false with the 401
+// page as the "add-in answer" - a WRONG/expired token looked like a successful call (measured).
+// The detector is status + our own vocabulary, so it can never misfire on an add-in (which does
+// not speak it); a non-2xx body that is NOT our envelope is returned to the caller unchanged.
+const AUTH_REASONS = ['token_missing', 'token_mismatch', 'token_in_url_rejected', 'token_required'];
+function authFailureEnvelope(status, raw) {
+  const code = Number(status);
+  if (code !== 401 && code !== 403) return null;
+  const j = parseRpcBody(raw);
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return null;
+  if (j.ok !== false) return null;
+  return AUTH_REASONS.indexOf(String(j.reason || '')) >= 0 ? j : null;
+}
+function authFailureError(j, status, base) {
+  const e = new Error('the middle service REFUSED the credential (reason=' + String(j.reason)
+    + '): ' + String(j.message || 'no message'));
+  e.code = 'bridge_auth_failed';
+  e.status = Number(status);
+  e.reason = String(j.reason);
+  e.base = base;
+  e.authHint = 'the tool was NEVER run; set VB6MCP_TOKEN (or VB6MCP_TOKEN_FILE) for THIS endpoint and retry';
+  return e;
+}
 
 // ---- ONE decoder for every JSON-RPC body this file reads ------------------------------------
-// task-105 (measured on the local SP6 box, 2026-10-16): the middle service answers with
+// (measured on the local SP6 box, 2026-10-16): the middle service answers with
 // PRETTY-PRINTED JSON (json.dumps(..., indent=2)), so the FIRST line of its body is just "{".  The
 // old line-by-line reader took the first line that STARTED with "{" and ran JSON.parse("{") on it,
 // which throws the V8 message
@@ -616,13 +927,20 @@ async function rpcAt(base, method, params, proto, timeoutMs, rpcPath) {
     res = await fetch(url, { method: 'POST', headers: Object.assign({}, headers, bridgeAuthHeaders()), body: payload, signal: AbortSignal.timeout(ms) });
     raw = await res.text();
   }
+  // Still an auth failure AFTER presenting the credential (or when none could be presented): THROW,
+  // so the caller's existing failure classification runs instead of returning the 401 page as data.
+  const authFail = authFailureEnvelope(res.status, raw);
+  if (authFail) {
+    dbg('rpcAt ' + target.base + ': auth failure ' + authFail.reason + ' (HTTP ' + res.status + ') -> throwing');
+    throw authFailureError(authFail, res.status, target.base);
+  }
   return decodeRpcBody(raw);
 }
 async function rpc(port, method, params, proto, timeoutMs, rpcPath) {
   return rpcAt('http://127.0.0.1:' + port, method, params, proto, timeoutMs, rpcPath);
 }
 
-// The probe's ONE wire call, transport aware (task-105).  A port-bearing instance is reached
+// The probe's ONE wire call, transport aware.  A port-bearing instance is reached
 // exactly as before.  A PIPE-ONLY instance has no port and the middle service is the ONLY addresser
 // for it, so the same JSON-RPC goes over the bridge; with the bridge unreachable this rejects just
 // like a dead port does, so the caller's "probe failed" path is unchanged.
@@ -632,15 +950,46 @@ function instanceRpc(port, transport, method, params, proto, timeoutMs, rpcPath)
   return bridgeRpc(method, params, timeoutMs || PROBE_TIMEOUT_MS);
 }
 // Runs in the BACKGROUND (never on a response path): a slow add-in must not delay the hub.
+// (N11): the probe's VERDICT is now an ADD-IN answer, not a face read.
+//   tools/list alone is NOT liveness evidence: the middle service answers it from its OWN snapshot
+//   when the add-in cannot be reached, so a wedged IDE still produced probeStatus=ok with
+//   liveToolCount=110 while a forwarded tools/call answered noIde / pipe busy 121 (measured).
+//   mcp_info is an ADD-IN tool, so an answer to it proves the add-in itself replied over the SAME
+//   route a forwarded call uses - which is what makes ide_list and a forwarded call agree.  The
+//   call is also the LIVE DLL IDENTITY: mcp_info.build.sha256 is hashed from the loaded DLL at
+//   call time, so a receipt can assert which binary answered.
+const PROBE_INFO_TIMEOUT_MS = parseInt(process.env.VB6MCP_PROBE_INFO_TIMEOUT_MS || '1500', 10);
 async function probe(port, knownProject, pids, transport) {
   pids = pids || [];
   if (!pids.length) return null;
+  const route = port ? ('http://127.0.0.1:' + port + ' /rpc')
+                     : (BRIDGE_MODE === 'inproc' ? 'none' : BRIDGE_URL + ' -> pipe');
+  let info = null, infoReason = null;
+  try {
+    const mi = await instanceRpc(port, transport, 'tools/call', { name: 'mcp_info', arguments: {} }, null, PROBE_INFO_TIMEOUT_MS);
+    const txt = firstText(mi);
+    if (txt) {
+      try { info = JSON.parse(txt); } catch (e) { infoReason = 'unparsable_mcp_info'; }
+      // FAIL-CLOSED: a structured ERROR is not the add-in answering.  The middle service returns
+      // exactly this shape when ITS forward failed (e.g. pipe_unavailable), and counting it as a
+      // live answer is how a wedged IDE kept reading probeStatus=ok (N11).  It is also the
+      // FAILURE_KIND_RULE's own rule: result.isError / an ok:false body = the tool did NOT run.
+      if (info && info.ok === false) { infoReason = 'mcp_info_answered_not_ok(' + String(info.reason || info.message || 'unknown') + ')'; info = null; }
+      else if (mi && mi.result && mi.result.isError === true) { infoReason = 'mcp_info_answered_isError'; info = null; }
+    } else if (mi && mi.error) infoReason = 'mcp_info_error(' + String((mi.error && mi.error.message) || mi.error) + ')';
+    else infoReason = 'empty_mcp_info_answer';
+  } catch (e) { infoReason = 'addin_did_not_answer(' + String((e && e.message) || e) + ')'; }
+  // NO add-in answer => NOT a live IDE, whatever the face says.  The caller turns this into
+  // probeStatus=failed + probeReason, which is the SAME verdict a forward reports.  The SENTINEL
+  // (not null) carries the exact reason down to the receipt instead of a generic one.
+  if (!info) return { livenessFailed: true, probeReason: infoReason || 'addin_did_not_answer',
+                      probeEvidenceAt: Date.now(), probeRoute: route,
+                      probeBasis: 'the ADD-IN did not answer mcp_info over ' + route + ' (' + (infoReason || 'unknown') + ')' };
   let tools = [];
   try {
     const tl = await instanceRpc(port, transport, 'tools/list', {}, null, 8000);
     tools = (tl && tl.result && tl.result.tools) || [];
-  } catch (e) { return null; }
-  if (!tools.length) return null;
+  } catch (e) { tools = []; }
   let project = knownProject || null;
   if (!project) {
     try {
@@ -658,7 +1007,25 @@ async function probe(port, knownProject, pids, transport) {
       .then(function (init) { const v = init && init.result && init.result.instructions; if (v) { instructionsCache[port] = v; dbg('instructions cached for port ' + port); } })
       .catch(function () { dbg('instructions fetch failed for port ' + port); });
   }
-  return { port: port, pid: pids[0], pids: pids, project: project, liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools, instructions: instructions };
+  const build = (info && info.build) || {};
+  const ide = (info && info.ide) || null;
+  return { port: port, pid: pids[0], pids: pids, project: project,
+           liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools, instructions: instructions,
+           // ---- the ONE liveness evidence -------------------------------------
+           probeEvidenceAt: Date.now(),
+           probeBasis: 'addin_answered_mcp_info via ' + route,
+           probeRoute: route,
+           addinProduct: (info && info.product) || null,
+           addinContract: (info && info.contract) || null,
+           addinToolCount: (info && info.toolCount) || null,
+           // the LIVE DLL identity of the binary that answered (hashed by the add-in at call time)
+           dllSha256Live: build.sha256 || null,
+           dllSha256LivePath: build.path || null,
+           dllSha256LiveReadAt: build.readAt || null,
+           sourceHash: build.sourceHash || null,
+           ide: ide,
+           probeReason: null,
+           probeWarnings: infoReason ? ['mcp_info carried no parseable body: ' + infoReason] : [] };
 }
 
 // ---- remote endpoints: probe / cache / PER-ENDPOINT single-flight -------------------------
@@ -797,6 +1164,38 @@ async function discoverBounded() {
   dbg('discoverBounded: registry dir=' + scan.dir + ' entries=' + scan.entries + ' live=' + scan.live.length + ' stale=' + scan.stale.length);
   for (const st of scan.stale) stale.push(st);
   for (const c of scan.live) { pendingCands.push(c); seenPorts.add(c.port); }
+// ---- /N11: BRIDGE-ASSISTED discovery
+  // The hub and the middle service do NOT necessarily share a registry view: they are different
+  // USER CONTEXTS, so %TEMP%\vb6mcp\instances can be the interactive user's (where the add-in
+  // registered) while the hub sees an empty directory.  In that case the hub's own registry is
+  // blind, the PORTSCAN then adopts the middle service itself as a fake IDE, and
+  // ide_list contradicts the very calls it is supposed to explain (N11: measured on t16 - ide_list
+  // listed ONLY the bridge process pid 28240/port 8797 while ide_state answered from the REAL IDE
+  // pid 21660 through the pipe).
+  // The middle service IS the only addresser for a pipe-only IDE, so its /health is the
+  // authoritative WITNESS of that IDE's existence.  Only used when the hub's own registry yielded
+  // NOTHING credible (the registry stays the priority path), and every adopted candidate is
+  // labelled discoveredBy=bridge_health with its registration file as the basis.
+  if (!pendingCands.length && BRIDGE_MODE !== 'inproc') {
+    let bctx = bridgeIdentitySync();
+    if (!bctx) { try { bctx = await bridgeIdentity(); } catch (e) { bctx = null; } }
+    for (const bi of ((bctx && bctx.instances) || [])) {
+      if (!bi || !bi.pid || bi.pidAlive === false) continue;
+      const isPipe = bi.pipeState === 'candidate' || String(bi.transport || '') === 'pipe';
+      const bport = Number(bi.port) || 0;
+      if (!isPipe && !bport) continue;
+      pendingCands.push({
+        pid: Number(bi.pid), pids: [Number(bi.pid)], port: bport, transport: isPipe ? 'pipe' : 'tcp',
+        pipe: bi.pipe || null, project: bi.project || null, projectPath: bi.projectPath || null,
+        startedAt: null, version: null, dllSha256: null, startedByHub: false,
+        discoveredBy: 'bridge_health', registryFile: bi.registryFile || null,
+        bridgePipeState: bi.pipeState || null, bridgePipeAvailable: bi.pipeAvailable === true,
+        bridgeRegistryRoot: bi.registryRoot || null
+      });
+      seenPorts.add(bport);
+    }
+    if (pendingCands.length) dbg('discoverBounded: adopted ' + pendingCands.length + ' add-in registration(s) from the middle service /health (the hub\'s own registry view was EMPTY)');
+  }
   // Existence first (registry + pid alive + port listening); the probe only ENRICHES.
   pendingCands.forEach(function (c) { insts.push(Object.assign({ pending: true, probeStatus: 'pending' }, c)); });
   for (const c of pendingCands) {
@@ -804,11 +1203,15 @@ async function discoverBounded() {
     // Keyed by pid AS WELL as port: every pipe-only instance has port=null, so a port-only key
     // would hand one pipe IDE's probe result to another (TCP instances keep a unique port here).
     const idx0 = insts.findIndex(function (x) { return x.port === c.port && x.pid === c.pid; });
-    if (!it) {
+    if (!it || it.livenessFailed) {
       stale.push({ file: c.registryFile, pid: c.pid, port: c.port, reason: 'registry_port_not_mcp_probe_failed' });
       // Terminal, explicit state: the probe ran and failed -> not pending any more, the tool
       // count stays UNKNOWN (null), never a misleading 0.
-      if (idx0 >= 0) insts[idx0] = Object.assign({}, insts[idx0], { pending: false, probeStatus: 'failed', probeReason: 'probe_failed_or_timeout' });
+      if (idx0 >= 0) insts[idx0] = Object.assign({}, insts[idx0], { pending: false, probeStatus: 'failed',
+        probeReason: (it && it.probeReason) || 'probe_failed_or_timeout',
+        probeEvidenceAt: (it && it.probeEvidenceAt) || Date.now(),
+        probeRoute: (it && it.probeRoute) || null,
+        probeBasis: (it && it.probeBasis) || 'addin_did_not_answer_mcp_info (the registry/pid/transport said the instance exists; the ADD-IN did not answer, so this is NOT a live IDE - the same verdict a forwarded call reports)' });
       continue;
     }
     const idx = idx0;
@@ -827,13 +1230,18 @@ async function discoverBounded() {
       let it = null;
       try { it = await withTimeout(probe(port, null, pids, null), 8000); } catch (e) { it = null; }
       seenPorts.add(port);
-      if (it) {
+      if (it && it.livenessFailed) {
+        insts.push({ port: port, pid: pids[0], pids: pids, project: null, discoveredBy: 'portscan', registryFile: null,
+                     pending: false, probeStatus: 'failed', probeReason: it.probeReason || 'probe_failed_or_timeout',
+                     probeEvidenceAt: it.probeEvidenceAt || Date.now(), probeRoute: it.probeRoute || null, probeBasis: it.probeBasis || null });
+      } else if (it) {
         insts.push(Object.assign({}, it, { discoveredBy: 'portscan', registryFile: null, pending: false, probeStatus: 'ok' }));
       } else {
         // The port IS listening, so the instance exists even if the probe fails -
         // report it (unknown face) instead of silently dropping it.
         insts.push({ port: port, pid: pids[0], pids: pids, project: null, discoveredBy: 'portscan', registryFile: null,
-                     pending: false, probeStatus: 'failed', probeReason: 'probe_failed_or_timeout' });
+                     pending: false, probeStatus: 'failed', probeReason: 'probe_failed_or_timeout',
+                     probeEvidenceAt: Date.now(), probeBasis: 'listening port without an add-in answer (NOT a live IDE)' });
       }
     }
   }
@@ -944,7 +1352,7 @@ function candidateBrief(i) {
   return { pid: i.pid, port: i.port, project: i.project, projectPath: i.projectPath || null,
            endpoint: i.endpoint || LOCAL_ENDPOINT, remote: !!i.remote, targetKey: i.targetKey || null };
 }
-// ---- caller-spelling (ALIAS) echo for ide_list (MCP-lead-22(3)) -----------------------------
+// ---- caller-spelling (ALIAS) echo for ide_list ((3)) -----------------------------
 // VB6 refuses to open the same .vbp twice, so ONE project can be spelled several ways: through
 // a directory junction that is an alias of the same real directory, through the junction's
 // target, with "/" instead of "\", with different case, or with an 8.3
@@ -957,7 +1365,7 @@ function candidateBrief(i) {
 //                      project path lives under it (that is exactly what a junction dir is);
 //   * project_name   - the legacy bare-NAME alias.
 // A bare pid/port is an address, not a project alias, and is deliberately NOT echoed.
-const ALIAS_RULE = 'aliasAsGiven/projectPathAsGiven are ADDITIVE echoes, not selectors: projectPathReal (projectPath) is the canonical identity (realpathSync.native, MCP-lead-22(3)); projectPathAsGiven is the spelling the registry/probe PUBLISHED; aliasAsGiven is the caller-supplied spelling (_target / ide_target default) that resolves to the SAME candidate - by canonical path key, or as an existing directory that realpath-contains the project (a junction alias). Junction/alias spellings of one .vbp are ONE candidate, never a conflict.';
+const ALIAS_RULE = 'aliasAsGiven/projectPathAsGiven are ADDITIVE echoes, not selectors: projectPathReal (projectPath) is the canonical identity (realpathSync.native, (3)); projectPathAsGiven is the spelling the registry/probe PUBLISHED; aliasAsGiven is the caller-supplied spelling (_target / ide_target default) that resolves to the SAME candidate - by canonical path key, or as an existing directory that realpath-contains the project (a junction alias). Junction/alias spellings of one .vbp are ONE candidate, never a conflict.';
 function callerSpellings(rawTarget) {
   const out = [];
   const push = function (v, source) {
@@ -1035,17 +1443,51 @@ function buildAliasEcho(spellings, insts) {
 // Selection inside ONE endpoint scope.  target = a resolved selector (or null); explicit =
 // the selector came from _target (a miss is an error) vs from the ide_target DEFAULT (a miss
 // is ignored, never vetoing the live set).
+// The receipt-level record of HOW a target was chosen (N14).  It is attached to every
+// pick - success AND refusal - so the caller can predict the outcome instead of discovering it.
+function suggestionFor(insts) {
+  if (!insts || !insts.length) return null;
+  const c = insts[0];
+  return { _target: c.pid ? String(c.pid) : (c.projectPath || c.project || ''),
+           projectPath: c.projectPath || null, targetKey: c.targetKey || null,
+           ide_target: c.pid ? String(c.pid) : null,
+           note: 'a bare pid is accepted by the hub AND by the middle service; the canonical key is [endpoint:]projectPath' };
+}
+function resolutionOf(step, insts, opts, extra) {
+  const owned = (insts || []).filter(function (i) { return ownershipOf(i).owned; });
+  return Object.assign({
+    rule: TARGET_RESOLUTION_RULE,
+    targetResolutionRule: TARGET_RESOLUTION_RULE,
+    step: step,
+    liveCount: (insts || []).length,
+    requested: (opts && opts.requested !== undefined) ? opts.requested : null,
+    explicit: !!(opts && opts.explicit),
+    ideTargetDefault: defaultTargetLabel(),
+    candidates: (insts || []).map(candidateBrief),
+    ladder: (insts || []).length > 1 ? [
+      { step: 'only_live_ide', verdict: 'skip', liveCount: insts.length },
+      { step: 'sole_hub_owned', verdict: owned.length === 1 ? 'hit' : 'skip', matching: owned.map(function (i) { return i.pid; }) },
+      { step: 'sole_responding', verdict: 'skip', matching: insts.filter(function (i) { return (i.liveness ? i.liveness.state === 'responding' : i.probeStatus === 'ok'); }).map(function (i) { return i.pid; }) }
+    ] : undefined,
+    suggestion: (insts || []).length > 1 ? suggestionFor(insts) : null
+  }, extra || {});
+}
+function respondingOf(insts) {
+  return (insts || []).filter(function (i) { return (i.liveness ? i.liveness.state === 'responding' : i.probeStatus === 'ok'); });
+}
 function pickTarget(insts, target, opts) {
   opts = opts || {};
   const isRemoteScope = !!opts.remoteScope;
   const explicit = !!opts.explicit;
-  if (!insts.length) return { ok: false, message: isRemoteScope ? 'the selected endpoint reports no IDE' : 'no IDE instance listening (scanned ' + DEFAULT_PORTS.length + ' default ports + registry)' };
+  if (!insts.length) return { ok: false, resolution: resolutionOf('no_candidate', insts, opts),
+                              message: isRemoteScope ? 'the selected endpoint reports no IDE' : 'no IDE instance listening (scanned ' + DEFAULT_PORTS.length + ' default ports + registry)' };
   const desc = function () { return candidateDesc(insts, isRemoteScope); };
   if (target !== null && target !== undefined && target !== '') {
     const s = String(target);
     const hit = matchCandidates(insts, s, isRemoteScope);
     if (hit.length === 1) return { ok: true, ...hit[0], selectedBy: (explicit ? 'explicit_target' : 'effective_default'),
-                                   matchedBy: matchedByFor(hit[0], s, isRemoteScope), matchedFrom: s };
+                                   matchedBy: matchedByFor(hit[0], s, isRemoteScope), matchedFrom: s,
+                                   resolution: resolutionOf(explicit ? 'explicit_target' : 'ide_target_default', insts, opts, { selectedBy: explicit ? 'explicit_target' : 'ide_target_default' }) };
     if (hit.length > 1) {
       const keySet = {};
       hit.forEach(function (i) { keySet[candidateIdentity(i)] = 1; });
@@ -1054,6 +1496,8 @@ function pickTarget(insts, target, opts) {
       const ep = hit[0].endpoint || LOCAL_ENDPOINT;
       return { ok: false, conflict: true, identityConflict: sameIdentity, distinctIdentities: ids.length, matchedCount: hit.length,
         hits: hit.map(candidateBrief),
+        candidates: hit.map(candidateBrief), suggestion: suggestionFor(hit),
+        resolution: resolutionOf('refuse_target_conflict', insts, opts, { matchedCount: hit.length, distinctIdentities: ids.length }),
         message: sameIdentity
           ? 'target "' + s + '" is ONE project identity ("' + (hit[0].projectPath || hit[0].project || '?') + '") served by ' + hit.length + ' live IDEs on endpoint "' + ep + '": ' + hit.map(function (i) { return i.pid + '@' + i.port; }).join(',') + ' -- VB6 cannot open the same .vbp twice; refusing to pick one'
           : 'target "' + s + '" is AMBIGUOUS: it matches ' + hit.length + ' live IDEs with ' + ids.length + ' different project identities on endpoint "' + ep + '": ' + hit.map(function (i) { return i.pid + '@' + i.port + ' ' + (i.projectPath || i.project || '?'); }).join(' | ') + ' -- pick one by its projectPath' };
@@ -1062,13 +1506,28 @@ function pickTarget(insts, target, opts) {
     // never veto the live instances - that made every implicit call fail with no_ide_running
     // while the only live IDE was right there.
     if (explicit) {
-      return { ok: false, mismatch: true, message: 'target "' + s + '" not found among ' + desc() + ' -- pick one with _target (pid|project|port) or ide_target' };
+      return { ok: false, mismatch: true, candidates: insts.map(candidateBrief), suggestion: suggestionFor(insts),
+        resolution: resolutionOf('refuse_target_mismatch', insts, opts),
+        message: 'target "' + s + '" not found among ' + desc() + ' -- pick one with _target (pid|project|port) or ide_target' };
     }
-    if (insts.length === 1) return { ok: true, ...insts[0], staleTarget: s, selectedBy: 'unique_live' };
-    return { ok: false, ambiguous: true, staleTarget: s, message: 'the default ide_target "' + s + '" matches no live instance and several are online: ' + desc() + ' -- set _target or ide_target' };
+    if (insts.length === 1) return { ok: true, ...insts[0], staleTarget: s, selectedBy: 'unique_live',
+                                     resolution: resolutionOf('stale_default_ignored_only_live_ide', insts, opts, { selectedBy: 'unique_live' }) };
   }
-  if (insts.length === 1) return { ok: true, ...insts[0], selectedBy: 'unique_live' };
-  return { ok: false, ambiguous: true, message: 'several instances online and no target set: ' + desc() + ' -- set _target (pid|project|port) or ide_target' };
+  // ---- the DOCUMENTED DEFAULT LADDER (N14) ------------------------------------------
+  // Deterministic, predictable, and reported step by step: only live IDE -> sole hub-owned IDE
+  // -> sole RESPONDING IDE -> refuse with every candidate + a suggestion.  It never guesses, and
+  // the caller can predict which rung applies from the receipt fields alone.
+  if (insts.length === 1) return { ok: true, ...insts[0], selectedBy: 'unique_live',
+                                   resolution: resolutionOf('only_live_ide', insts, opts, { selectedBy: 'unique_live', ladderVerdict: 'hit' }) };
+  const owned = insts.filter(function (i) { return ownershipOf(i).owned; });
+  if (owned.length === 1) return { ok: true, ...owned[0], selectedBy: 'sole_hub_owned',
+                                   resolution: resolutionOf('sole_hub_owned', insts, opts, { selectedBy: 'sole_hub_owned', ladderVerdict: 'hit' }) };
+  const resp = respondingOf(insts);
+  if (resp.length === 1) return { ok: true, ...resp[0], selectedBy: 'sole_responding',
+                                  resolution: resolutionOf('sole_responding', insts, opts, { selectedBy: 'sole_responding', ladderVerdict: 'hit' }) };
+  return { ok: false, ambiguous: true, candidates: insts.map(candidateBrief), suggestion: suggestionFor(insts),
+           resolution: resolutionOf('refuse_ambiguous_target', insts, opts, { ladderVerdict: 'refused', ownedCount: owned.length, respondingCount: resp.length }),
+           message: 'several instances online and none of the default ladder rungs is decisive (' + desc() + ') -- set _target (pid|project|port) or ide_target; the ladder and its per-rung verdict are in resolution' };
 }
 
 // Explicit _target can address the add-in WITHOUT discovery - if the target
@@ -1269,11 +1728,21 @@ async function buildInstructions(d, snap) {
 // Instances are re-validated cheaply (pid alive AND port listening) - no RPC.
 async function cachedDiscovery() {
   const c = loadFaceCache();
-  if (!c) { dbg('cachedDiscovery: no face cache file'); return null; }
+  if (!c) {
+    // say WHY the persisted face was not used.  An invalidated cache that is
+    // silently ignored is indistinguishable from a missing one.
+    dbg('cachedDiscovery: face cache not used (' + faceCacheStatus.reason + ')');
+    if (faceCacheStatus.reason === 'face_fingerprint_mismatch' ||
+        faceCacheStatus.reason === 'snapshot_has_no_faceFingerprint') {
+      process.stderr.write('vb6mcp-hub: persisted face cache INVALID (' + faceCacheStatus.reason +
+        '); rebuilding the face from the live add-in.\n');
+    }
+    return null;
+  }
   const checked = [];
   for (const i of c.instances) {
     // TCP-only: no netstat on a response path.  Transport aware: a pipe-only entry has no port
-    // (task-105) and used to be re-validated as dead here.
+    // and used to be re-validated as dead here.
     const okp = await instanceAlive(i, null);
     if (okp) checked.push(localCandidate(i));
   }
@@ -1302,7 +1771,7 @@ async function scanRegistry(listening) {
   for (const e of reg.entries) {
     const base = path.basename(e.file);
     if (e.parseError) { stale.push({ file: base, reason: 'unparsable_json' }); continue; }
-    // task-104 (measured on the local SP6 box, 2026-10-16): a PIPE-transport instance publishes
+    // (measured on the local SP6 box, 2026-10-16): a PIPE-transport instance publishes
     // port 0 ON PURPOSE - the pipe IS the transport.  Requiring a port here classified every live
     // pipe-only IDE as 'missing_pid_or_port' -> live=0, and ide_list fell back to
     // faceSource=snapshot even though the service answered (instances=1) and the add-in was
@@ -1363,7 +1832,26 @@ async function registryCandidates() {
   return { instances: out, conflicts: identityConflicts(out), staleRegistry: s.stale, registryDir: s.dir,
            registryUnreadable: false, scanTruncated: false, fromRegistryCandidates: true };
 }
+// instances[] is the AUTHORITATIVE IDE view.  A discovered listener that is not an
+// add-in registration - above all the middle service itself, which the portscan finds on its own
+// port and which answers tools/list from its snapshot - is NOT an IDE; it moves to
+// nonIdeListeners[] with the basis that excluded it.  ONE place does this, and every local
+// consumer goes through resolveDiscovery().
+function splitByProcessKind(d, ctx) {
+  if (!d || !Array.isArray(d.instances) || d.processKindSplit) return d;
+  const ide = [], non = [];
+  for (const i of d.instances) {
+    const c = classifyProcess(i, ctx);
+    const m = Object.assign({}, i, { processKind: c.processKind, isIde: c.isIde, processKindBasis: c.processKindBasis });
+    (c.isIde ? ide : non).push(m);
+  }
+  if (non.length) dbg('splitByProcessKind: excluded ' + non.length + ' non-IDE listener(s): ' + non.map(function (x) { return x.port + '/' + x.processKind; }).join(','));
+  return Object.assign({}, d, { instances: ide, nonIdeListeners: non, processKindSplit: true, excludedNonIde: non.length });
+}
 async function resolveDiscovery(d) {
+  return splitByProcessKind(await resolveDiscoveryRaw(d), null);
+}
+async function resolveDiscoveryRaw(d) {
   if (d) { dbg('resolveDiscovery: using completed discovery instances=' + d.instances.length); return d; }
   const c = await cachedDiscovery();
   if (c) return c;
@@ -1372,8 +1860,28 @@ async function resolveDiscovery(d) {
   dbg('resolveDiscovery: NOTHING found (snapshot fallback)');
   return { instances: [], conflicts: [], staleRegistry: [], registryDir: instancesDir(), registryUnreadable: false, scanTruncated: true };
 }
-async function faceState(d, spellings) {
+async function faceState(d, spellings, ctx) {
   d = await resolveDiscovery(d);
+  // the ONE liveness/ownership/process-kind pass, done here so EVERY receipt that
+  // reports an instance carries the same fields AND the rule that produced them.
+  if (!ctx) { try { ctx = await bridgeIdentity(); } catch (e) { ctx = bridgeIdentitySync() || {}; } }
+  d = splitByProcessKind(d, ctx);
+  const livenessContradictions = [];
+  (d.instances || []).forEach(function (i) {
+    const live = livenessOf(i, ctx);
+    const own = ownershipOf(i);
+    i.liveness = { state: live.state, basis: live.basis, evidenceAt: live.evidenceAt, evidenceAgeMs: live.evidenceAgeMs,
+                   probeRoute: live.probeRoute, forwardRoute: live.forwardRoute, pipeState: live.pipeState, pipeAvailable: live.pipeAvailable, cached: live.cached };
+    i.probeStatus = live.probeStatus;
+    i.probeStatusRaw = live.probeStatusRaw;
+    if (live.probeReason) i.probeReason = live.probeReason;
+    i.ownership = own.ownership;
+    i.ownershipBasis = own.ownershipBasis;
+    i.ownedByHub = own.owned;
+    i.processKind = i.processKind || 'vb6_ide';
+    i.processKindBasis = i.processKindBasis || 'addin_registration';
+    live.contradictions.forEach(function (c) { livenessContradictions.push(c); });
+  });
   // A cached/persisted face must NEVER freeze a dead instance: re-validate pid + port here,
   // on every request, before it is reported.  A REMOTE candidate is validated by its endpoint
   // probe instead - its pid/port live on ANOTHER machine, so a local pid test is meaningless
@@ -1388,7 +1896,10 @@ async function faceState(d, spellings) {
     if (alive.length !== d.instances.length) d = Object.assign({}, d, { instances: alive, revalidated: true });
   }
   const snap = snapshot();
-  const live = d.instances.length ? d.instances[0].liveTools : null;
+  // The live tool list is evidence ONLY when the add-in answered: a face read that the
+  // middle service served from its own snapshot must not be diffed as if the IDE had replied.
+  const answered = d.instances.filter(function (i) { return i.probeStatus === 'ok' && i.liveTools && i.liveTools.length; })[0] || null;
+  const live = answered ? answered.liveTools : null;
   const snapNames = snap.tools.map(function (t) { return t.name; });
   let diff = null;
   if (live) {
@@ -1415,10 +1926,22 @@ async function faceState(d, spellings) {
       if (hit) aliasPerInstance[idx].push({ asGiven: row.asGiven, source: row.source, matchedBy: hit.matchedBy, via: hit.via, normalized: hit.normalized });
     });
   });
+  const nonIde = d.nonIdeListeners || [];
+  const responseCount = d.instances.filter(function (i) { return i.probeStatus === 'ok'; }).length;
   return {
-    // Existence comes from the registry (pid alive + port listening), NOT from
-    // whether the MCP probe has answered yet.  A pending probe is still a live IDE.
+// /: the face is LIVE only when an ADD-IN instance is present. Existence is
+    // still independent of the probe (a pending probe is a live IDE), but a lone middle-service
+    // listener is NOT an IDE and can no longer make this face look live (that was).
     faceSource: d.instances.length ? 'live' : 'snapshot',
+    faceSourceBasis: d.instances.length
+      ? (d.instances.length + ' add-in instance(s) discovered by registry/port scan; ' + responseCount + ' answered a fresh add-in probe')
+      : (bridgeLastFailure
+        ? ('NO INSTANCE VISIBLE, and this hub is NOT authorized to be sure: the middle service answered ' + bridgeLastFailure.kind + ' (' + bridgeLastFailure.reason + (bridgeLastFailure.status ? ', HTTP ' + bridgeLastFailure.status : '') + '). The empty list below is NOT evidence that no IDE is running.')
+        : (nonIde.length ? 'no add-in instance; ' + nonIde.length + ' non-IDE listener(s) excluded (see nonIdeListeners)' : 'no instance discovered at all')),
+    // the reason the instance view may be empty, in machine-readable form.
+    bridgeFailure: bridgeLastFailure,
+    authRequired: !!(bridgeLastFailure && bridgeLastFailure.kind === 'auth'),
+    authReason: (bridgeLastFailure && bridgeLastFailure.kind === 'auth') ? bridgeLastFailure.reason : null,
     contractVersion: snap.contractVersion,
     toolCount: live ? live.length : snap.tools.length,
     snapshot: { contractVersion: snap.contractVersion, toolCount: snap.tools.length, generatedFrom: snap.generatedFrom,
@@ -1427,18 +1950,40 @@ async function faceState(d, spellings) {
       pid: i.pid, port: i.port, project: i.project, projectPath: i.projectPath || null, pids: i.pids,
       startedAt: i.startedAt || null,
       probeStatus: i.probeStatus || (i.pending ? 'pending' : 'ok'),
-      liveToolCount: (i.pending || i.probeStatus === 'failed') ? null : ((i.liveTools && i.liveTools.length) || null),
+      probeStatusRaw: i.probeStatusRaw === undefined ? null : i.probeStatusRaw,
+      liveToolCount: (i.pending || i.probeStatus !== 'ok') ? null : ((i.liveTools && i.liveTools.length) || null),
       probeReason: i.probeReason || null,
+      // ---- the ONE liveness verdict + the evidence it came from ------------------
+      addinAnswered: i.probeStatus === 'ok',
+      liveness: i.liveness || null,
+      probeEvidenceAt: i.probeEvidenceAt || null,
+      probeBasis: i.probeBasis || null,
+      probeRoute: i.probeRoute || null,
+      probeWarnings: (i.probeWarnings && i.probeWarnings.length) ? i.probeWarnings : null,
+      // ---- the ONE ownership verdict (same predicate as ide_stop/ide_restart) -----
+      ownership: i.ownership || 'not_owned',
+      ownershipBasis: i.ownershipBasis || null,
+      ownedByHub: !!i.ownedByHub,
+      // ---- IDE vs middle service -----------------------------------------------
+      processKind: i.processKind || 'vb6_ide',
+      isIde: i.isIde !== false,
+      processKindBasis: i.processKindBasis || null,
       startedByHub: startedByHub.has(i.pid) || !!i.startedByHub,
       discoveredBy: i.discoveredBy || 'portscan', registryFile: i.registryFile || null,
       version: i.version || null, dllSha256: i.dllSha256 || null, pending: !!i.pending,
+      // the LIVE DLL identity the ADD-IN reported at call time (mcp_info.build.sha256), next to
+      // the registration's own dllSha256 above - two independent readings of the same binary.
+      dllSha256Live: i.dllSha256Live || null,
+      dllSha256LivePath: i.dllSha256LivePath || null,
+      dllSha256LiveReadAt: i.dllSha256LiveReadAt || null,
+      addinProduct: i.addinProduct || null, addinContract: i.addinContract || null,
       // ---- the ONE-set identity (ADDITIVE): a remote IDE is an equal member -----------------
       endpoint: i.endpoint || LOCAL_ENDPOINT,
       remote: !!i.remote,
       endpointUrl: i.endpointUrl || null,
       targetKey: i.targetKey || null,
       pathVia: i.pathVia || null,
-      // ---- MCP-lead-22(3): the canonical path NEXT TO the alias spellings (ADDITIVE) ----------
+      // ---- (3): the canonical path NEXT TO the alias spellings (ADDITIVE) ----------
       projectPathReal: i.projectPath || null,
       projectPathAsGiven: i.projectPathAsGiven || i.projectPath || null,
       projectPathIsAlias: !!(i.projectPathAsGiven && normalizePathString(i.projectPathAsGiven).toLowerCase() !== String(i.projectPath || '').toLowerCase()),
@@ -1457,10 +2002,52 @@ async function faceState(d, spellings) {
       stale: (d.staleRegistry || []).length,
       staleByReason: (d.staleRegistry || []).reduce(function (m, x) { const k = x.reason || 'unknown'; m[k] = (m[k] || 0) + 1; return m; }, {})
     },
+    // the registry side-effect policy is part of the receipt, not folklore.
+    // MEASURED 2026-10-17 on this host: after ide_list the same registration file is byte-identical
+    // (size/mtime/sha256 unchanged) and no .pruned/.bak residue appears. A registration is removed
+    // ONLY by ide_restart, after a CONFIRMED stop of that same target (registryCleared=true).
+    registryWrites: 0,
+    registryPolicy: 'ide_list is READ-ONLY: it never writes, prunes or deletes a registration (%TEMP%\\vb6mcp\\instances\\<pid>.json). Cleanup happens only in ide_restart after a confirmed stop of its own target.',
+// ---- /N11: WHICH source the authoritative IDE view came from
+    // The hub's own registry and the middle service's /health read the SAME registration files but
+    // as DIFFERENT user contexts, so they can disagree; naming the source is what makes the receipt
+    // explain itself instead of "ide_list says X, a forwarded call says Y".
+    instancesSource: (function () {
+      const by = function (k) { return d.instances.filter(function (i) { return (i.discoveredBy || 'portscan') === k; }).length; };
+      const reg = by('registry'), bh = by('bridge_health'), ps = by('portscan');
+      const authoritative = reg ? 'hub_registry' : (bh ? 'middle_service_health' : (ps ? 'port_scan' : 'none'));
+      return { fromRegistry: reg, fromBridgeHealth: bh, fromPortScan: ps, authoritative: authoritative,
+        basis: authoritative === 'hub_registry'
+          ? 'the hub read add-in registrations from its own %TEMP%\\vb6mcp\\instances'
+          : (authoritative === 'middle_service_health'
+            ? 'the hub\'s own registry view was EMPTY, so the add-in registrations were adopted from the middle service GET /health (it is the only addresser for a pipe-only IDE)'
+            : (authoritative === 'port_scan' ? 'no registration was visible to the hub OR reported by the middle service; the candidate came from a listening-port scan' : 'no add-in instance was found at all')) };
+    })(),
+    // ---- the listener(s) that are NOT IDEs, with the basis that excluded them ------
+    nonIdeListeners: (d.nonIdeListeners || []).map(function (i) { return {
+      pid: i.pid, port: i.port, processKind: i.processKind, isIde: false, processKindBasis: i.processKindBasis,
+      probeStatus: i.probeStatus || null, probeReason: i.probeReason || null,
+      discoveredBy: i.discoveredBy || 'portscan', excludedFromSelection: true
+    }; }),
+    excludedNonIde: (d.nonIdeListeners || []).length,
     staleRegistry: d.staleRegistry || [],
     registryDir: d.registryDir || null,
     registryUnreadable: !!d.registryUnreadable,
-    selectionRule: '_target (EXPLICIT) > ide_target default > the ONLY live instance; a STALE default is ignored (never vetoes); otherwise refuse with ambiguous_target / target_mismatch (never guess). The canonical selector is [endpoint:]projectPath; bare pid / bare NAME are legacy aliases.',
+    // ---- the RULES, restated verbatim wherever a verdict is reported --------------
+    processKindRule: PROCESS_KIND_RULE,
+    livenessRule: LIVENESS_RULE,
+    ownershipRule: OWNERSHIP_RULE,
+    targetResolutionRule: TARGET_RESOLUTION_RULE,
+    livenessSummary: {
+      verdict: d.instances.length === 0 ? 'no_ide' : (responseCount === d.instances.length ? 'all_responding' : (responseCount === 0 ? 'none_responding' : 'partly_responding')),
+      instances: d.instances.length,
+      responding: responseCount,
+      notResponding: d.instances.filter(function (i) { return i.liveness && i.liveness.state === 'not_responding'; }).length,
+      unknown: d.instances.filter(function (i) { return i.liveness && i.liveness.state === 'unknown'; }).length,
+      basis: 'one verdict per instance: the ADD-IN must answer mcp_info over the same route a forwarded call uses (see livenessRule); the registry alone is never reported as a live answer'
+    },
+    livenessContradictions: livenessContradictions,
+    selectionRule: SELECTION_RULE,
     targetKeyRule: TARGET_KEY_RULE,
     aliasEcho: aliasEcho,
     failureKindRule: FAILURE_KIND_RULE,
@@ -1524,11 +2111,17 @@ async function hubState(opts) {
   // tools/list + initialize deliberately stay on the LOCAL path so a slow remote can never
   // push the MCP handshake towards its 1s budget.
   const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
+  // the middle service's transport verdict (pipeAvailable/pipeState per pid) is fetched
+  // ONCE here and handed to faceState, which is what lets ONE liveness verdict cover both the
+  // registry and the pipe reality (N11).  bridgeHealth() is cached, so this is not a new per-call
+  // round trip in the steady state.
+  let ctx = bridgeIdentitySync();
+  if (BRIDGE_MODE !== 'inproc' && !ctx) { try { ctx = await bridgeIdentity(); } catch (e) { ctx = null; } }
   const d = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
   // The caller's spelling (an explicit _target on this call, else the ide_target default) is
-  // echoed back per instance (MCP-lead-22(3)); with no spelling supplied the receipt still shows
+  // echoed back per instance ((3)); with no spelling supplied the receipt still shows
   // projectPathAsGiven next to projectPathReal.
-  const st = await faceState(d, callerSpellings(opts && opts.requestTarget));
+  const st = await faceState(d, callerSpellings(opts && opts.requestTarget), ctx);
   if (REMOTE_ENDPOINTS.length) {
     st.remote = {
       configured: REMOTE_ENDPOINTS.length,
@@ -1548,10 +2141,24 @@ async function hubState(opts) {
         url: BRIDGE_URL, port: (h && h.port) || null, transport: (h && h.transport) || null,
         netstat: false, faceTools: (h && h.faceTools) || null,
         liveInstances: ((h && h.liveInstances) || []).length,
-        instances: h.instances || [], staleRegistry: (h && h.staleRegistry) || []
+        instances: h.instances || [], staleRegistry: (h && h.staleRegistry) || [],
+        // the middle service is a PROCESS, not an IDE.  Its address and the pid that
+        // owns its port are named here, and every entry of bridge.instances[] is an add-in
+        // REGISTRATION (the middle service reads the same registry the hub does).
+        middleService: {
+          url: BRIDGE_URL, port: (h && h.port) || ctx && ctx.port || bridgePortHint() || null,
+          pids: (ctx && ctx.pids) || [], processKind: 'middle_service', isIde: false,
+          basis: (ctx && ctx.basis) || 'VB6MCP_BRIDGE_URL'
+        },
+        processKindRule: PROCESS_KIND_RULE
       };
       const bridgeByPid = {};
       for (const bi of (h.instances || [])) { if (bi && bi.pid) bridgeByPid[String(bi.pid)] = bi; }
+      st.bridge.instances = (h.instances || []).map(function (bi) {
+        const isService = !!(bi && bi.pid && (ctx && ctx.pids || []).indexOf(Number(bi.pid)) >= 0);
+        return Object.assign({}, bi, { processKind: isService ? 'middle_service' : 'vb6_ide', isIde: !isService,
+          processKindBasis: isService ? 'pid_owns_bridge_port(' + ((ctx && ctx.port) || '?') + ')' : 'add-in instance REGISTRATION read by the middle service' });
+      });
       for (const i of (st.instances || [])) {
         const bi = bridgeByPid[String(i.pid)];
         if (!bi) continue;
@@ -1570,7 +2177,15 @@ async function hubTool(name, args) {
   if (name === 'ide_target') {
     const t = args && args.target;
     state.target = (t === 'auto' || t === '') ? null : t;
-    return textResult({ ok: true, target: state.target }, snap.contractVersion);
+// /N14: 'auto' is not a selector name, it is the ABSENCE of a default - and the
+    // receipt now states what an absent default resolves to, so the caller can predict it.
+    return textResult({ ok: true, target: state.target,
+      cleared: state.target === null,
+      targetResolutionRule: TARGET_RESOLUTION_RULE,
+      selectionRule: SELECTION_RULE,
+      note: state.target === null
+        ? 'the default target is now UNSET: an omitted _target (or _target="auto") follows the documented ladder - the ONLY live IDE, else the ONLY hub-owned IDE, else the ONLY responding IDE, else a refusal that lists every candidate and a suggestion'
+        : 'every call without an explicit _target now defaults to "' + state.target + '"; a default that matches no live instance is IGNORED (it never vetoes a live set)' }, snap.contractVersion);
   }
   if (name === 'ide_start') {
     const project = (args && args.project) || process.env.VB6MCP_AUTOSTART_PROJECT;
@@ -1591,10 +2206,89 @@ async function hubTool(name, args) {
   if (name === 'ide_stop') {
     const pid = args && args.pid;
     if (!pid) return textResult({ ok: false, reason: 'not_implemented', message: 'ide_stop requires an explicit pid and only stops hub-started instances' }, snap.contractVersion);
-    if (!startedByHub.has(pid)) return textResult({ ok: false, reason: 'not_allowed', message: 'pid ' + pid + ' was not started by this hub; not stopping it' }, snap.contractVersion);
-    try { process.kill(pid); startedByHub.delete(pid); invalidateDiscovery(); return textResult({ ok: true, stopped: pid }, snap.contractVersion); }
-    catch (e) { return textResult({ ok: false, reason: 'kill_failed', message: String(e && e.message || e) }, snap.contractVersion); }
+// /N12 +: the SAME ownership predicate AND the SAME resolver as ide_restart.
+    // The old fallback was '{pid, startedByHub: <in-memory map>}' - it consulted NO registry, so when
+    // discovery was blind (stale TCP entry / unreachable middle service) ide_stop answered 'not_owned'
+    // for the very pid ide_restart called 'registry_started_by_hub', i.e. two tools disagreed about
+    // one process and told the operator to leave OUR OWN wedged instance alone. The registry fallback
+    // below carries the real facts (port, startedByHub, project), so the ownership verdict - and the
+    // port facts that ride with it - are identical on both faces.
+    let inst = null;
+    let instSource = 'none';
+    try {
+      const dd = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
+      inst = (dd.instances || []).filter(function (i) { return Number(i.pid) === Number(pid); })[0] || null;
+      if (inst) instSource = 'discovery';
+    } catch (e) { inst = null; }
+    if (!inst) {
+      const al = registryAliveCandidates(Number(pid));
+      if (al.length) {
+        const a = al[0];
+        inst = { pid: a.pid, port: a.port, transport: a.transport, project: a.project, projectPath: a.projectPath,
+                 startedByHub: a.startedByHub, registryFile: a.registryFile, discoveredBy: 'registry' };
+        instSource = 'registry';
+      }
+    }
+    if (!inst) { inst = { pid: Number(pid), startedByHub: startedByHub.has(Number(pid)) }; instSource = 'in_memory_map'; }
+    const own = ownershipOf(inst);
+    const body = { ok: false, stopped: 0, pid: Number(pid), ownership: own.ownership, ownershipBasis: own.ownershipBasis,
+                   ownedByHub: own.owned, port: own.port, portRuleApplies: own.portRuleApplies, portBasis: own.portBasis,
+                   ownershipRule: OWNERSHIP_RULE, liveness: inst && inst.liveness ? inst.liveness : null,
+                   instanceSource: instSource, registryFile: inst.registryFile || null, startedByHub: !!inst.startedByHub,
+                   alsoForeignPort: !!own.foreignPort };
+    // OWNERSHIP FIRST. The port guard is a SECONDARY veto and must never mask the
+    // ownership verdict: measured on this host, an instance that is simply NOT OURS on a port below
+    // 8767 (any ephemeral listener - 3469/3491 here) was reported as 'foreign_instance_refused',
+    // i.e. the port story stood in for 'not owned'. Both still refuse (nothing is ever stopped), but
+    // the reason now names the real judgement and the port facts ride along as fields.
+    body.alsoForeignPort = !!own.foreignPort;
+    if (!own.owned) {
+      body.reason = 'not_allowed';
+      body.message = 'pid ' + pid + ' is not owned by this hub: ' + own.ownershipBasis + '; not stopping it (the same ownership rule ide_list and ide_restart report)' + (own.foreignPort ? ' The port guard also applies: ' + own.portBasis + '.' : '');
+      return textResult(body, snap.contractVersion);
+    }
+    if (own.foreignPort) {
+      body.reason = 'foreign_instance_refused';
+      body.message = own.portBasis + ' => this instance is not ours; not stopping it';
+      return textResult(body, snap.contractVersion);
+    }
+    try { process.kill(Number(pid)); startedByHub.delete(Number(pid)); invalidateDiscovery();
+          return textResult(Object.assign(body, { ok: true, stopped: Number(pid), message: 'stopped pid ' + pid + ' (' + own.ownership + ')' }), snap.contractVersion); }
+    catch (e) { return textResult(Object.assign(body, { reason: 'kill_failed', message: String(e && e.message || e) }), snap.contractVersion); }
   }
+// an INSTANCE that is REGISTERED and whose PROCESS IS ALIVE, but which did not answer the
+// probe. 'no_ide_running' is reserved for the case where NO such entry exists. Measured (
+// item 10): the wedged IDE held the only pipe instance and ide_list listed it as probeStatus=failed,
+// while ide_restart answered 'no_ide_running' - a falsehood that hid the one pid to kill.
+function registryAliveCandidates(wantPid) {
+  const dir = instancesDir();
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch (e) { return []; }
+  const res = [];
+  for (const f of files) {
+    if (!/\.json$/i.test(f)) continue;
+    let rec = null;
+    try { rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch (e) { continue; }
+    const pid = Number(rec && rec.pid);
+    if (!pid) continue;
+    if (wantPid && pid !== Number(wantPid)) continue;
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+    if (!alive) continue;
+    res.push({ pid: pid, port: Number(rec.port) || 0, transport: rec.transport || null,
+               project: rec.project || null, projectPath: rec.projectPath || null,
+               startedByHub: !!rec.startedByHub, dllSha256: rec.dllSha256 || null,
+               registryFile: f, registryPath: path.join(dir, f) });
+  }
+  return res;
+}
+function registryCandidateView(list) {
+  return (list || []).map(function (a) {
+    return { pid: a.pid, port: a.port, transport: a.transport, project: a.project,
+             projectPath: a.projectPath, startedByHub: a.startedByHub, registryFile: a.registryFile };
+  });
+}
+
   if (name === 'ide_restart') {
     // The executable recovery for a wedged IDE. It only ever
     // touches OUR OWN instance (instances listening on port >= 8767; 8766 belongs to a
@@ -1607,36 +2301,189 @@ async function hubTool(name, args) {
       targetSource: '', ownership: '', refused_reason: '', stopConfirmed: false, pinPort: 0, projectVbp: '',
       saveAttempted: false, saveOk: false, registryCleared: false, lockCleared: false,
       three_way_ok: false, threeWay: { http: false, mcp_info: false, project: false },
-      vb6Exe: '', vb6ExeSource: '', vb6ExeTried: [], waitMs: 0, readyWaitMs: 0, instances: [], steps: [], note: ''
+      vb6Exe: '', vb6ExeSource: '', vb6ExeTried: [], waitMs: 0, readyWaitMs: 0, instances: [], steps: [], note: '',
+// /N12: the ownership verdict and its basis are part of EVERY path's key set.
+      ownershipBasis: '', ownedByHub: false, portRuleApplies: false, portBasis: '', ownershipRule: OWNERSHIP_RULE,
+      liveness: null, processKindRule: PROCESS_KIND_RULE,
+      // the honesty keys - EVERY path carries them (discipline 98), so 'no_ide_running'
+      // can no longer stand in for 'an instance is alive but did not answer'.
+      instanceCount: 0, registryCandidates: [], manualCommand: '', truth: '', nextStep: '',
+      checkedRegistryDir: '',
+      // ONE refusal shape: an ambiguous_target from THIS tool carries the SAME canonical payload a
+      // forwarded call refuses with (candidates / suggestion / resolution + the rule + failureKind),
+      // so the reason does not mean one thing on one entrance and another thing on the other.
+      candidates: [], suggestion: null, resolution: null, targetResolutionRule: TARGET_RESOLUTION_RULE,
+      failureKind: '', failureKindRule: FAILURE_KIND_RULE, conflicts: []
     };
     const wantPid = (args && args.pid) ? Number(args.pid) : 0;
     const wantProject = (args && args.project) || process.env.VB6MCP_AUTOSTART_PROJECT || '';
     const soft = await discoverSoft(LIST_GRACE_MS);
     const d = await resolveDiscovery(soft);
     const insts = (d.instances || []).filter(function (i) { return i.pid; });
-    out.instances = insts.map(function (i) { return { pid: i.pid, port: i.port, project: i.project }; });
+    const rCtx = bridgeIdentitySync();
+    out.instances = insts.map(function (i) {
+      const o = ownershipOf(i);
+      const lv = livenessOf(i, rCtx);
+      return { pid: i.pid, port: i.port, project: i.project,
+               ownership: o.ownership, ownedByHub: o.owned, ownershipBasis: o.ownershipBasis,
+               portRuleApplies: o.portRuleApplies, portBasis: o.portBasis,
+               processKind: i.processKind || 'vb6_ide', processKindBasis: i.processKindBasis || null,
+               liveness: lv.state, livenessBasis: lv.basis };
+    });
     let target = null;
     if (wantPid) {
       target = insts.filter(function (i) { return i.pid === wantPid; })[0] || null;
       out.targetSource = 'explicit_pid';
-      if (!target) { out.refused_reason = 'pid_not_found'; out.note = 'pid ' + wantPid + ' is not a live instance; see instances[]'; return textResult(out, snap.contractVersion); }
+      if (!target) {
+        // a pid that is REGISTERED AND ALIVE but unresponsive is not 'not found'.
+        const a1 = registryAliveCandidates(wantPid);
+        if (a1.length) {
+          const a = a1[0]; const o = ownershipOf(a);
+          out.pid = a.pid; out.port = a.port || 0; out.project = a.project || ''; out.projectVbp = a.projectPath || '';
+          out.ownership = o.ownership; out.ownershipBasis = o.ownershipBasis; out.ownedByHub = o.owned;
+          out.portRuleApplies = o.portRuleApplies; out.portBasis = o.portBasis;
+          out.instanceSource = 'registry'; out.registryFile = a.registryFile; out.startedByHub = !!a.startedByHub;
+          out.alsoForeignPort = !!o.foreignPort;
+          out.liveness = 'not_responding'; out.instanceCount = 1; out.registryCandidates = registryCandidateView(a1);
+          out.checkedRegistryDir = instancesDir();
+          out.manualCommand = 'Stop-Process -Id ' + a.pid + ' -Force';
+          out.truth = 'instance_registered_and_pid_alive';
+          out.refused_reason = o.foreignPort ? 'not_ours_by_red_line' : 'instance_found_but_unresponsive';
+          out.note = 'pid ' + wantPid + ' is not a LIVE instance, but it IS registered (' + a.registryFile + ') and its process is ALIVE, so it is unresponsive rather than absent. ' + (o.foreignPort ? o.portBasis + '; not ours, nothing was stopped.' : 'Ownership: ' + o.ownershipBasis + '. Nothing was stopped.');
+          out.nextStep = 'run "' + out.manualCommand + '" on the machine that owns the pid and retry, or use ide_stop{pid:' + a.pid + '} when the ownership verdict above is owned.';
+          return textResult(out, snap.contractVersion);
+        }
+        out.refused_reason = 'pid_not_found';
+        out.instanceCount = 0;
+        out.checkedRegistryDir = instancesDir();
+        out.truth = 'no_instance_at_all';
+        out.note = 'pid ' + wantPid + ' is not a live instance AND no registration with that pid has an alive process; see instances[]';
+        return textResult(out, snap.contractVersion);
+      }
     } else {
-      if (!insts.length) { out.refused_reason = 'no_ide_running'; out.note = 'nothing to restart: no live instance was discovered'; return textResult(out, snap.contractVersion); }
+      // never report 'no_ide_running' when the truth is 'this hub could not see the fleet'.
+  if (!insts.length && bridgeLastFailure) {
+    out.refused_reason = bridgeLastFailure.kind === 'auth' ? 'bridge_auth_failed' : 'bridge_unreachable';
+    out.authRequired = bridgeLastFailure.kind === 'auth';
+    out.authReason = bridgeLastFailure.kind === 'auth' ? bridgeLastFailure.reason : null;
+    out.authStatus = bridgeLastFailure.status || null;
+    out.authHint = bridgeLastFailure.kind === 'auth'
+      ? 'the middle service rejected this hub; set VB6MCP_TOKEN (or VB6MCP_TOKEN_FILE) for the hub and retry. Nothing was restarted.'
+      : 'the middle service did not answer; the instance list cannot be trusted. Nothing was restarted.';
+    out.instanceCount = registryAliveCandidates(0).length;
+    out.registryCandidates = registryCandidateView(registryAliveCandidates(0));
+    out.checkedRegistryDir = instancesDir();
+    out.truth = out.instanceCount ? 'instance_registered_and_pid_alive_but_the_middle_service_is_not_answering' : 'middle_service_not_answering';
+    out.note = 'no live instance is visible' + (bridgeLastFailure.kind === 'auth' ? ' BECAUSE THE MIDDLE SERVICE REJECTED THIS HUB (' + bridgeLastFailure.reason + (bridgeLastFailure.status ? ', HTTP ' + bridgeLastFailure.status : '') + ')' : ' because the middle service did not answer') + ' - not because the machine is idle';
+    return textResult(out, snap.contractVersion);
+  }
+  if (!insts.length) {
+// HONESTY LADDER. 'no_ide_running' means NO INSTANCE AT ALL. A registration whose pid
+    // is ALIVE but whose probe failed IS an instance: say so, name the pid, and print the command
+    // that actually recovers the machine (the card's requirement (1)).
+    const alive = registryAliveCandidates(0);
+    out.instanceCount = alive.length;
+    out.registryCandidates = registryCandidateView(alive);
+    out.checkedRegistryDir = instancesDir();
+    if (alive.length) {
+      const a0 = alive[0]; const o0 = ownershipOf(a0);
+      out.pid = a0.pid; out.port = a0.port || 0; out.project = a0.project || ''; out.projectVbp = a0.projectPath || '';
+      out.ownership = o0.ownership; out.ownershipBasis = o0.ownershipBasis; out.ownedByHub = o0.owned;
+      out.portRuleApplies = o0.portRuleApplies; out.portBasis = o0.portBasis;
+      out.liveness = 'not_responding';
+      out.manualCommand = 'Stop-Process -Id ' + a0.pid + ' -Force';
+      out.truth = 'instance_registered_and_pid_alive';
+      // the SAME precedence as ide_stop/ide_restart - ownership first, the port guard second.
+      out.alsoForeignPort = !!o0.foreignPort;
+      if (!o0.owned) {
+        out.refused_reason = 'not_owned';
+        out.note = 'pid ' + a0.pid + ' IS REGISTERED AND ALIVE but is not ours (' + o0.ownershipBasis + '), so nothing was stopped'
+          + (o0.foreignPort ? '. The port guard also applies: ' + o0.portBasis + '.' : '.');
+      } else if (o0.foreignPort) {
+        out.refused_reason = 'not_ours_by_red_line';
+        out.note = 'pid ' + a0.pid + ' IS REGISTERED AND ALIVE and IS ours, but ' + o0.portBasis + ' - the red line refuses it. Nothing was stopped.';
+      } else {
+        out.refused_reason = 'instance_found_but_unresponsive';
+        out.note = 'an instance IS running: pid ' + a0.pid + ' (' + (a0.projectPath || a0.project || 'unknown project') + ') is registered in ' + a0.registryFile + ' and its process is ALIVE, but it did not answer the probe. This is NOT an idle machine. Nothing was stopped' + (o0.owned ? '' : ' (ownership: ' + o0.ownershipBasis + ')') + '.';
+      }
+      out.nextStep = 'restart the IDE process: run "' + out.manualCommand + '" on the machine that owns the pid, then call ide_restart again (or use ide_stop{pid:' + a0.pid + '} when the ownership verdict above is owned).';
+      return textResult(out, snap.contractVersion);
+    }
+    out.refused_reason = 'no_ide_running';
+    out.truth = 'no_instance_at_all';
+    out.nextStep = 'start an IDE (ide_start) or pass a pid that exists.';
+    out.note = 'nothing to restart: the registry (' + out.checkedRegistryDir + ') holds no entry whose process is alive - no instance at all';
+    return textResult(out, snap.contractVersion);
+  }
       if (wantProject) {
         target = insts.filter(function (i) { return i.project && String(i.project).toLowerCase() === wantProject.toLowerCase(); })[0] || null;
         if (target) out.targetSource = 'project';
       }
       if (!target) {
         if (insts.length === 1) { target = insts[0]; out.targetSource = 'only_instance'; }
-        else { out.refused_reason = 'ambiguous_target'; out.note = 'several instances online; pass pid or project - ' + out.instances.map(function (i) { return i.pid + '@' + i.port; }).join(', '); return textResult(out, snap.contractVersion); }
+        else {
+          // Any ambiguous_target refusal is built by the ONE builder a forwarded call uses
+          // (refusalBody), so both entrances publish the same candidates[] / suggestion{} /
+          // resolution{} / targetResolutionRule / failureKind.  The tool's legacy per-instance view
+          // stays in out.instances; the canonical payload rides BESIDE it (additive fields).
+          const ownedN = insts.filter(function (x) { return ownershipOf(x).owned; }).length;
+          const pickAmb = { ok: false, ambiguous: true,
+            candidates: insts.map(candidateBrief), suggestion: suggestionFor(insts),
+            resolution: resolutionOf('refuse_ambiguous_target', insts, { requested: null, explicit: false },
+              { ladderVerdict: 'refused', ownedCount: ownedN, respondingCount: respondingOf(insts).length }),
+            message: 'several instances online; pass pid or project (or one of the candidate targetKey values) -- ' + candidateDesc(insts, false) };
+          const canon = refusalBody(pickAmb, insts, (d.conflicts || []));
+          out.refused_reason = canon.reason;
+          out.note = canon.message;
+          out.candidates = canon.candidates;
+          out.suggestion = canon.suggestion;
+          out.resolution = canon.resolution;
+          out.targetResolutionRule = canon.targetResolutionRule;
+          out.failureKind = canon.failureKind;
+          out.failureKindRule = canon.failureKindRule;
+          out.conflicts = canon.conflicts;
+          out.instanceCount = insts.length;
+          return textResult(out, snap.contractVersion);
+        }
       }
     }
-    if (Number(target.port) < 8767) {
-      out.refused_reason = 'foreign_instance_refused';
-      out.note = 'port ' + target.port + ' is below 8767, so this instance is not ours (8766 belongs to an external process on this machine). Refusing to stop it.';
+// /N12: ONE ownership predicate, shared with ide_list and ide_stop. The port is a
+    // SECONDARY guard and it can only apply when a port is actually KNOWN: a pipe-only instance
+    // publishes port 0 ON PURPOSE, and reading that 0 as "below 8767 => foreign" is exactly the
+    // defect that refused this recovery tool its own wedged IDE while ide_list called it ours.
+    const own = ownershipOf(target);
+    out.ownership = own.ownership;
+    out.ownershipBasis = own.ownershipBasis;
+    out.ownedByHub = own.owned;
+    out.portRuleApplies = own.portRuleApplies;
+    out.portBasis = own.portBasis;
+    out.liveness = target.liveness || null;
+    // a refusal that already KNOWS the pid must name it and print what recovers the
+    // machine (the same honesty keys as the unresponsive path). 'Nothing was stopped' is only half
+    // an answer - the operator still has to know WHICH pid is sitting there.
+    out.pid = target.pid;
+    out.port = target.port || 0;
+    out.checkedRegistryDir = instancesDir();
+    out.instanceCount = insts.length;
+    out.registryCandidates = registryCandidateView(registryAliveCandidates(0));
+    out.manualCommand = 'Stop-Process -Id ' + target.pid + ' -Force';
+    out.nextStep = 'this tool will not touch pid ' + target.pid + '; if you own it, run "' + out.manualCommand + '" and start a fresh IDE (ide_start).';
+    // OWNERSHIP FIRST (same rule as ide_stop, so both answer the same way about the same
+    // pid). The port guard stays a SECONDARY veto: it can only fire for an instance that IS ours and
+    // whose KNOWN port is below 8767 (the reserved range); it can never stand in for 'not owned'.
+    out.alsoForeignPort = !!own.foreignPort;
+    if (!own.owned) {
+      out.refused_reason = 'not_owned';
+      out.truth = 'instance_found_but_not_owned';
+      out.note = 'this instance is not ours (' + own.ownershipBasis + '), so NOTHING was stopped. The ownership rule is shared with ide_list and ide_stop, so all three agree about pid ' + target.pid + '.' + (own.foreignPort ? ' The port guard also applies: ' + own.portBasis + '.' : '');
       return textResult(out, snap.contractVersion);
     }
-    out.ownership = startedByHub.has(target.pid) ? 'hub_started' : 'self_instance_port>=8767';
+    if (own.foreignPort) {
+      out.refused_reason = 'foreign_instance_refused';
+      out.truth = 'instance_found_but_not_ours';
+      out.note = own.portBasis + ': refusing to stop it.';
+      return textResult(out, snap.contractVersion);
+    }
     out.stoppedPid = target.pid;
     out.project = target.project || wantProject;
     out.port = target.port;
@@ -1866,7 +2713,7 @@ function transportFailureKind(e) {
 }
 // A refusal means no candidate could be ROUTED to.  When every discovered candidate is a
 // failed probe (registry alive + port listening, but the add-in never answered) this is not
-// "there is no IDE" - it is the wedge MCP-lead-19/-20 described, and it is reported as wedged.
+// "there is no IDE" - it is the wedge /-20 described, and it is reported as wedged.
 function refusalFailureKind(insts) {
   const live = (insts || []).filter(function (i) { return !!i && i.pending !== true; });
   if (live.length && live.every(function (i) { return i.probeStatus === 'failed' || !!i.probeReason; })) return 'wedged';
@@ -1891,23 +2738,26 @@ function answerFailureKind(resp) {
 }
 // The refusal body keeps EVERY legacy key (ok/reason/message/instances/conflicts) in the same
 // order and ADDS the candidate detail the path key needs (candidates[], identityConflict).
+// /N14: candidates[] + suggestion + resolution are now emitted on EVERY refusal (not only
+// on a multi-match or when remote endpoints exist): a refusal must say WHICH instances exist and
+// HOW to address one, otherwise "ambiguous_target" is a dead end instead of a predictable rule.
 function refusalBody(pick, insts, conflicts) {
   const reason = pick.conflict ? 'target_conflict' : (pick.mismatch ? 'target_mismatch' : (pick.ambiguous ? 'ambiguous_target' : 'no_ide_running'));
+  const cands = (pick.hits && pick.hits.length) ? pick.hits : (insts || []).map(candidateBrief);
   const body = {
     ok: false, reason: reason, message: pick.message,
     instances: (insts || []).map(function (i) { return { pid: i.pid, port: i.port, project: i.project }; }),
-    conflicts: conflicts
+    conflicts: conflicts,
+    candidates: pick.candidates || cands,
+    suggestion: pick.suggestion || ((insts || []).length ? suggestionFor(insts) : null),
+    resolution: pick.resolution || resolutionOf('refused', insts, { requested: null, explicit: false }),
+    targetResolutionRule: TARGET_RESOLUTION_RULE
   };
-  // candidates[] is emitted when it carries the identity information this change adds: a
-  // multi-match refusal (the same path on one endpoint, or one NAME over several paths) and
-  // ANY refusal once remote endpoints exist.  With remotes EMPTY and no multi-match, a refusal
-  // stays byte-identical to the pre-change hub (proven in re_work/t1103).
-  const showCandidates = REMOTE_ENDPOINTS.length > 0 || !!pick.conflict;
-  if (showCandidates) {
+  const showIdentity = REMOTE_ENDPOINTS.length > 0 || !!pick.conflict;
+  if (showIdentity) {
     if (pick.identityConflict !== undefined) body.identityConflict = !!pick.identityConflict;
     if (pick.distinctIdentities !== undefined) body.distinctIdentities = pick.distinctIdentities;
     if (pick.matchedCount !== undefined) body.matchedCount = pick.matchedCount;
-    body.candidates = (pick.hits && pick.hits.length) ? pick.hits : (insts || []).map(candidateBrief);
   }
   if (REMOTE_ENDPOINTS.length) { body.endpoints = endpointLabels(); body.targetKeyRule = TARGET_KEY_RULE; }
   body.failureKind = refusalFailureKind(insts);
@@ -1967,6 +2817,11 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
     pickNote.targetNote = 'the default ide_target "' + pick.staleTarget + '" points at no live instance (treated as unset, NOT rewritten); selected the only live instance ' + pick.port + '/' + (pick.project || '?') + ' -- clear it with ide_target{auto} if it is stale';
   }
   const isRemote = !!pick.remote;
+// /N11: the SAME verdict block ide_list reports (liveness + its basis, ownership,
+  // process kind, resolution) rides on the forwarded receipt too, so a noIde/wedged answer from a
+  // forwarded tool can never be read as contradicting ide_list - both name one fact source.
+  const hv = hubVerdictNote(pick, rawRequest);
+  if (hv) { for (const k of Object.keys(hv)) { if (pickNote[k] === undefined) pickNote[k] = hv[k]; } }
   if (isRemote) { pickNote.remote = true; pickNote.endpoint = pick.endpoint; pickNote.endpointUrl = pick.endpointUrl; }
   if (pick.matchedBy === 'project_path') {
     pickNote.targetKey = pick.targetKey;
@@ -1998,6 +2853,62 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
   return stampBody(result, ideStamp, snap.contractVersion, note);
 }
 
+// ---- ONE local resolution path ---------------------------------------------------
+// discovery -> directTarget escape -> the documented ladder.  Used by BOTH transports, so the
+// middle service and the direct path can never apply two different default-target rules (that
+// divergence is the "sometimes it works, sometimes ambiguous_target" of N14).
+async function resolveLocalPick(tgt, explicit, rawRequest) {
+  const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
+  const tRes = Date.now();
+  const popts = { remoteScope: false, explicit: explicit, requested: rawRequest };
+  let merged = null;
+  let pick = null;
+  let remoteOnly = null;
+  if (tgt.kind === 'endpoint') {                       // "local:<selector>"
+    pick = pickTarget(localD.instances, tgt.selector || null, popts);
+  } else if (tgt.kind === 'local') {                   // bare selector (path | pid | port | name)
+    pick = pickTarget(localD.instances, tgt.selector, popts);
+  } else if (localD.instances.length) {                // auto, LOCAL FIRST
+    pick = pickTarget(localD.instances, null, popts);
+  } else if (REMOTE_ENDPOINTS.length) {                // auto with ZERO local IDEs: LOCAL ONLY, never remote
+    // P1b (author ruling): an UNQUALIFIED call may only ever pick a LOCAL IDE.  The pre-P1b rule
+    // 6r ("else the ONLY live IDE overall") auto-targeted a lone REMOTE IDE - that silent machine
+    // jump is what this refuses.  The remote face is still PROBED here, but only so the refusal
+    // can name the endpoint-qualified keys the caller must use; nothing is routed anywhere.
+    merged = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
+    const remoteLive = merged.instances.filter(function (i) { return !!i.remote; });
+    if (remoteLive.length) remoteOnly = { remoteLive: remoteLive, merged: merged };
+    else pick = pickTarget(merged.instances, null, popts);
+  } else {
+    pick = pickTarget(localD.instances, null, popts);
+  }
+  // The direct-target escape hatch ("discovery is blind but the add-in is reachable") is NOT
+  // allowed to rescue a CONFLICT: a selector that matches several live IDEs on one endpoint
+  // must be reported, never silently resolved to the first registry hit (that is the exact
+  // silent pick the path key exists to prevent).
+  if (pick && !pick.ok && !pick.conflict) {
+    const want = explicit ? (tgt.selector || null) : (state.target || null);
+    const dt = want ? await directTarget(want) : null;
+    if (dt) {
+      dbg('resolveLocalPick: directTarget bypass used for ' + want + ' -> port ' + dt.port);
+      pick = Object.assign({}, dt, { resolution: resolutionOf('direct_target_escape', localD.instances, popts, { selectedBy: 'direct_target', matchedFrom: want }) });
+    }
+  }
+  return { localD: localD, merged: merged, pick: pick, remoteOnly: remoteOnly, elapsedMs: Date.now() - tRes };
+}
+// The hub's verdict about the resolved instance, attached to a forwarded receipt so a
+// noIde/wedged answer is never bare: WHICH instance, its liveness + basis, and how it was chosen.
+function hubVerdictNote(pick, rawRequest, step) {
+  if (!pick) return null;
+  const live = pick.liveness || (pick.probeStatus ? livenessOf(pick, bridgeIdentitySync()) : null);
+  return { hubInstance: { pid: pick.pid || null, port: pick.port || null, project: pick.project || null,
+                          projectPath: pick.projectPath || null, targetKey: pick.targetKey || null,
+                          processKind: pick.processKind || 'vb6_ide', ownership: pick.ownership || null },
+           hubLiveness: live ? { state: live.state, basis: live.basis, probeStatus: live.probeStatus, forwardRoute: live.forwardRoute, pipeState: live.pipeState } : null,
+           livenessRule: LIVENESS_RULE,
+           targetResolution: pick.resolution || null, targetRequested: rawRequest, targetResolutionRule: TARGET_RESOLUTION_RULE,
+           targetNote: step || null };
+}
 async function handleCall(params) {
   const name = params && params.name;
   const argsIn = (params && params.arguments) || {};
@@ -2046,12 +2957,85 @@ async function handleCall(params) {
   }
 
   // ---- thin shell (c): a LOCAL / unqualified call is handed to the bridge ------------------
-  // argsIn (NOT the _target-stripped args above) goes over verbatim: the bridge strips _target
-  // and resolves it.  An endpoint-qualified REMOTE target is deliberately NOT delegated - the
-  // remote path below is unchanged.
-  if (BRIDGE_MODE !== 'inproc' && !(tgt.kind === 'endpoint' && tgt.endpoint && tgt.endpoint.remote)) {
-    const stamped = await bridgeForwardCall(name, argsIn, snap);
-    if (stamped) return stamped;
+//, three EXPLICIT rules (reviewer-confirmed):
+  //   * EXPLICIT _target  -> handed down VERBATIM (hubTargetNotRewritten=true).  The hub never
+  //     rewrites a caller's selector; it only ATTACHES its own verdict/resolution as diagnostics,
+  //     and the middle service stays the resolver, exactly as before this change.
+  //   * OMITTED / auto    -> the HUB resolves it with the documented ladder and hands down a
+  //     canonical selector (pid preferred).  If the ladder is not decisive the hub REFUSES with
+  //     candidates[] + suggestion{} instead of letting a second rule guess.
+  //   * HUB BLIND (0 add-in instances visible) -> the caller's args go down verbatim with
+  //     targetResolution.step=blind_delegation, because delegation is the only route left.
+  // If the middle service REFUSES the target/selector, that refusal is surfaced with
+  // noSilentFallback=true: no other form is tried and no instance is picked by the hub itself.
+  const localScope = !(tgt.kind === 'endpoint' && tgt.endpoint && tgt.endpoint.remote);
+  const localRes = localScope ? await resolveLocalPick(tgt, explicit, rawRequest) : null;
+  if (BRIDGE_MODE !== 'inproc' && localScope) {
+    const hubBlind = !localRes || localRes.localD.instances.length === 0;
+    if (explicit) {
+      // (1) AN EXPLICIT _target IS NEVER REWRITTEN.  The hub only ATTACHES its own verdict and its
+      // own resolution attempt as ADDITIVE diagnostics; the caller's spelling goes down VERBATIM and
+      // the middle service stays the resolver (exactly the pre-change behaviour for an explicit
+      // selector).  The receipt says so: hubTargetNotRewritten=true.
+      const note = Object.assign({ hubTargetNotRewritten: true, targetRequested: rawRequest,
+                                   hubSelectorSent: String(argsIn._target), hubSelectorForm: 'verbatim_explicit' },
+        (localRes && localRes.pick && localRes.pick.ok) ? hubVerdictNote(localRes.pick, rawRequest,
+          'explicit _target "' + String(argsIn._target) + '" was handed to the middle service VERBATIM (the hub never rewrites an explicit target)') : {});
+      const stampedEx = await bridgeForwardCall(name, argsIn, snap, note);
+      if (stampedEx) {
+        const refusal = targetRefusalOf(stampedEx);
+        if (refusal) {
+          return stampBody(stampedEx, null, snap.contractVersion, {
+            targetRefusedByMiddleService: true, noSilentFallback: true,
+            targetRefusalReason: refusal.reason, targetRefusalMessage: refusal.message || null,
+            hubSelectorSent: String(argsIn._target), hubSelectorForm: 'verbatim_explicit',
+            note2: 'the middle service refused the target itself: the hub did NOT retry another selector form and did NOT pick an instance on its own (no silent fallback)'
+          });
+        }
+        return stampedEx;
+      }
+    } else if (localRes && localRes.pick && localRes.pick.ok) {
+      const sel = canonicalSelectorFor(localRes.pick);
+      const form = selectorFormOf(sel, localRes.pick);
+      const argsOut = Object.assign({}, argsIn, { _target: sel });
+      const note = Object.assign({}, hubVerdictNote(localRes.pick, rawRequest,
+        'the hub resolved _target (step=' + ((localRes.pick.resolution && localRes.pick.resolution.step) || '?')
+          + ') and handed the middle service the canonical selector "' + sel + '" (form=' + form + ')'),
+        { targetResolved: sel, targetResolvedBy: 'hub', hubSelectorSent: sel, hubSelectorForm: form,
+          hubTargetNotRewritten: false });
+      const stamped = await bridgeForwardCall(name, argsOut, snap, note);
+      if (stamped) {
+        // (3) NO SILENT FALLBACK: if the middle service does not accept the form the hub handed it,
+        // the call FAILS with a distinguishable reason, and the receipt records that nothing else
+        // was tried and no instance was picked on the hub's own authority.
+        const refusal = targetRefusalOf(stamped);
+        if (refusal) {
+          return stampBody(stamped, null, snap.contractVersion, {
+            targetRefusedByMiddleService: true, noSilentFallback: true,
+            targetRefusalReason: refusal.reason, targetRefusalMessage: refusal.message || null,
+            hubSelectorSent: sel, hubSelectorForm: form,
+            note2: 'the middle service refused the selector the hub resolved: NO other form was tried and NO instance was picked on the hub\'s own authority (no silent fallback)'
+          });
+        }
+        return stamped;
+      }
+    } else if (!hubBlind && localRes) {
+      const insts2 = (localRes.merged ? localRes.merged.instances : localRes.localD.instances);
+      const cf2 = (localRes.merged ? localRes.merged.conflicts : localRes.localD.conflicts);
+      if (localRes.remoteOnly) {
+        dbg('handleCall: REFUSED unqualified call - 0 local IDEs, ' + localRes.remoteOnly.remoteLive.length + ' live remote IDE(s); an endpoint-qualified key is required');
+        return stampBody({ content: [{ type: 'text', text: JSON.stringify(remoteRequiresEndpointBody(localRes.remoteOnly.remoteLive, localRes.remoteOnly.merged.conflicts), null, 2) }], isError: false }, null, snap.contractVersion);
+      }
+      dbg('handleCall: the hub REFUSED the target (reason=' + ((localRes.pick && (localRes.pick.conflict ? 'target_conflict' : (localRes.pick.mismatch ? 'target_mismatch' : (localRes.pick.ambiguous ? 'ambiguous_target' : 'no_ide_running')))) || 'no_ide_running') + '); NOT delegating to a second rule');
+      return stampBody({ content: [{ type: 'text', text: JSON.stringify(refusalBody(localRes.pick || { resolution: resolutionOf('no_candidate', insts2, { requested: rawRequest, explicit: explicit }) }, insts2, cf2), null, 2) }], isError: false }, null, snap.contractVersion);
+    } else {
+      const stamped = await bridgeForwardCall(name, argsIn, snap, {
+        targetRequested: rawRequest,
+        targetResolution: { rule: TARGET_RESOLUTION_RULE, step: 'blind_delegation',
+          basis: 'the hub\'s own discovery saw 0 add-in instances, so the target was resolved by the middle service (the only addresser left)' }
+      });
+      if (stamped) return stamped;
+    }
     dbg('bridge offline: falling back to the pre-change local path for tool=' + name);
   }
 
@@ -2079,46 +3063,18 @@ async function handleCall(params) {
     return forwardPicked(pickR, name, args, snap, explicit, rawRequest);
   }
 
-  // ---- local / unqualified -------------------------------------------------------------------
-  const localD = await resolveDiscovery(await discoverSoft(LIST_GRACE_MS));
-  const tRes = Date.now();
-  let merged = null;
-  let pick;
-  if (tgt.kind === 'endpoint') {                       // "local:<selector>"
-    pick = pickTarget(localD.instances, tgt.selector || null, { remoteScope: false, explicit: explicit });
-  } else if (tgt.kind === 'local') {                   // bare selector (path | pid | port | name)
-    pick = pickTarget(localD.instances, tgt.selector, { remoteScope: false, explicit: explicit });
-  } else if (localD.instances.length) {                // auto, LOCAL FIRST
-    pick = pickTarget(localD.instances, null, { remoteScope: false, explicit: false });
-  } else if (REMOTE_ENDPOINTS.length) {                // auto with ZERO local IDEs: LOCAL ONLY, never remote
-    // P1b (author ruling): an UNQUALIFIED call may only ever pick a LOCAL IDE.  The pre-P1b rule
-    // 6r ("else the ONLY live IDE overall") auto-targeted a lone REMOTE IDE - that silent machine
-    // jump is what this refuses.  The remote face is still PROBED here, but only so the refusal
-    // can name the endpoint-qualified keys the caller must use; nothing is routed anywhere.
-    merged = await withRemoteCandidates(localD, REMOTE_GRACE_MS);
-    const remoteLive = merged.instances.filter(function (i) { return !!i.remote; });
-    if (remoteLive.length) {
-      dbg('handleCall: REFUSED unqualified call - 0 local IDEs, ' + remoteLive.length + ' live remote IDE(s); an endpoint-qualified key is required');
-      return stampBody({ content: [{ type: 'text', text: JSON.stringify(remoteRequiresEndpointBody(remoteLive, merged.conflicts), null, 2) }], isError: false }, null, snap.contractVersion);
-    }
-    pick = pickTarget(merged.instances, null, { remoteScope: false, explicit: false });
-  } else {
-    pick = pickTarget(localD.instances, null, { remoteScope: false, explicit: false });
+  // ---- local / unqualified (the pre-change direct path) ---------------------------------------
+  // The pick was already made by resolveLocalPick() above, with the SAME ladder the bridge path
+  // used, so the two transports cannot disagree (checked:).
+  dbg('forward phases: resolveLocal=' + localRes.elapsedMs + 'ms instances=' + localRes.localD.instances.length + (localRes.merged ? ' merged=' + localRes.merged.instances.length : ''));
+  if (localRes.remoteOnly) {
+    dbg('handleCall: REFUSED unqualified call - 0 local IDEs, ' + localRes.remoteOnly.remoteLive.length + ' live remote IDE(s); an endpoint-qualified key is required');
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(remoteRequiresEndpointBody(localRes.remoteOnly.remoteLive, localRes.remoteOnly.merged.conflicts), null, 2) }], isError: false }, null, snap.contractVersion);
   }
-  const tPick = Date.now();
-  dbg('forward phases: discoverSoft=' + (tRes - tDisc) + 'ms resolveDiscovery=' + (tPick - tRes) + 'ms instances=' + localD.instances.length + (merged ? ' merged=' + merged.instances.length : ''));
-  // The direct-target escape hatch ("discovery is blind but the add-in is reachable") is NOT
-  // allowed to rescue a CONFLICT: a selector that matches several live IDEs on one endpoint
-  // must be reported, never silently resolved to the first registry hit (that is the exact
-  // silent pick the path key exists to prevent).
-  if (!pick.ok && !pick.conflict) {
-    const want = explicit ? (tgt.selector || null) : (state.target || null);
-    const dt = want ? await directTarget(want) : null;
-    if (dt) { dbg('handleCall: directTarget bypass used for ' + want + ' -> port ' + dt.port); pick = dt; }
-  }
+  const pick = localRes.pick;
   if (!pick.ok) {
-    const insts = (merged ? merged.instances : localD.instances);
-    const cf = (merged ? merged.conflicts : localD.conflicts);
+    const insts = (localRes.merged ? localRes.merged.instances : localRes.localD.instances);
+    const cf = (localRes.merged ? localRes.merged.conflicts : localRes.localD.conflicts);
     return stampBody({ content: [{ type: 'text', text: JSON.stringify(refusalBody(pick, insts, cf), null, 2) }], isError: false }, null, snap.contractVersion);
   }
   return forwardPicked(pick, name, args, snap, explicit, rawRequest);

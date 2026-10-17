@@ -21,18 +21,18 @@ Private m_mcp As McpServer
 Private m_form As ServerForm
 Private m_wsa As WinsockTransport
 
-' P0-3 (Planet Source Code 69284 / 54681): a pure-Winsock-API transport that
+' An earlier batch (Planet Source Code 69284 / 54681): a pure-Winsock-API transport that
 ' does not need MSWINSCK.OCX. Opt-in for now so the hardened OCX path stays the
 ' default:  VB6MCP_TRANSPORT=winsock  (env)  or  HKCU\Software\VB6MCP\Transport
 ' = "winsock" (registry). See 内部分析记录
 Private m_useWsa As Boolean
 Private m_menu As Object
 Private WithEvents m_menuEvents As VBIDE.CommandBarEvents
-' TASK-P1-079: the second Add-Ins entry - the settings dialog (NON-MODAL).
+' the second Add-Ins entry - the settings dialog (NON-MODAL).
 Private m_menuSettings As Object
 Private WithEvents m_settingsEvents As VBIDE.CommandBarEvents
 
-' P0-1: IDE change journal sources (signatures taken from the VB6EXT typelib dump,
+' An earlier batch: IDE change journal sources (signatures taken from the VB6EXT typelib dump,
 ' 内部类型库转储 -> _dispVBProjectsEvents / _dispVBComponentsEvents /
 ' _dispContainedVBControlsEvents).
 Private WithEvents m_prjEvents As VBIDE.VBProjectsEvents
@@ -47,7 +47,7 @@ Public Sub Start(ByVal vbe As Object)
     HookIdeEvents
     Dim basePort As Long
     basePort = ReadPortSetting()
-    ' TASK-P1-037: only a NAMED port (env/registry) is exclusive; otherwise the
+    ' only a NAMED port (env/registry) is exclusive; otherwise the
     ' transport probes 8766..8799 for a free one instead of sharing.
     Dim portExplicit As Boolean
     portExplicit = PortSettingExplicit()
@@ -61,7 +61,7 @@ Public Sub Start(ByVal vbe As Object)
         m_form.StartListening m_mcp, basePort, portExplicit
     End If
     AddMenuItem
-    ' TASK-P1-067: install the OPTIONAL code-pane mouse wheel. Default OFF: with
+    ' install the OPTIONAL code-pane mouse wheel. Default OFF: with
     ' VB6MCP_WHEEL (env) / HKCU\Software\VB6MCP\Wheel unset, nothing at all is
     ' subclassed. No keyboard hook and no global hook is ever installed.
     WinOps.WheelInit
@@ -69,7 +69,7 @@ Public Sub Start(ByVal vbe As Object)
 End Sub
 
 Public Sub Shutdown()
-    ' TASK-P1-067: clean uninstall - restore every code-pane window procedure we
+    ' clean uninstall - restore every code-pane window procedure we
     ' subclassed BEFORE the add-in goes away (a stale pointer would crash the IDE
     ' on exit). This is a no-op when the wheel was never enabled.
     On Error Resume Next
@@ -98,12 +98,12 @@ Private Function WantWinsockTransport() As Boolean
         WantWinsockTransport = True
         Exit Function
     End If
-    ' TASK-P1-079: advapi32 wrapper - WScript.Shell reads were unreliable in this process
+    ' advapi32 wrapper - WScript.Shell reads were unreliable in this process
     s = LCase$(Trim$(WinOps.McpSettingGet("Transport")))
     If s = "winsock" Then WantWinsockTransport = True
 End Function
 
-' TASK-P1-037 (contract v1.3.1 H2): is the port NAMED by the user (env or registry)?
+' (contract v1.3.1 H2): is the port NAMED by the user (env or registry)?
 ' A named port must never be replaced silently.
 Private Function PortSettingExplicit() As Boolean
     Dim env As String
@@ -114,7 +114,7 @@ Private Function PortSettingExplicit() As Boolean
             Exit Function
         End If
     End If
-    ' TASK-P1-079: advapi32 wrapper
+    ' advapi32 wrapper
     Dim v As String
     v = WinOps.McpSettingGet("Port")
     If Len(v) > 0 Then
@@ -132,7 +132,7 @@ Private Function ReadPortSetting() As Long
             Exit Function
         End If
     End If
-    ' TASK-P1-079: advapi32 wrapper
+    ' advapi32 wrapper
     Dim v As String
     v = WinOps.McpSettingGet("Port")
     If Len(v) > 0 Then
@@ -143,7 +143,7 @@ End Function
 Private Sub AddMenuItem()
     On Error Resume Next
     Dim addinsMenu As Object
-    ' Card TASK-P1-007 (i18n): Id-first (id=30038) with the caption kept as the
+    ' (i18n): Id-first (id=30038) with the caption kept as the
     ' fallback, so a VB6 in any language still finds the Add-Ins menu.
     Set addinsMenu = FindBarControlById(m_vbe, "Menu Bar|" & ChrW$(&H83DC) & ChrW$(&H5355) & ChrW$(&H6761), "Add-Ins|" & ChrW$(&H5916) & ChrW$(&H63A5) & ChrW$(&H7A0B) & ChrW$(&H5E8F), 30038, "")
     If addinsMenu Is Nothing Then Exit Sub
@@ -154,7 +154,7 @@ Private Sub AddMenuItem()
     End If
     m_menu.Visible = True
     Set m_menuEvents = m_vbe.Events.CommandBarEvents(m_menu)
-    ' TASK-P1-079: "VB6 MCP Settings..." - same id-first lookup, own click sink. The settings
+    ' "VB6 MCP Settings..." - same id-first lookup, own click sink. The settings
     ' form lives in THIS add-in (not in the user's project), so the entry works with no
     ' project open too.
     On Error Resume Next
@@ -174,7 +174,7 @@ Private Sub RemoveMenuItem()
         m_menu.Delete
         Set m_menu = Nothing
     End If
-    ' TASK-P1-079: the settings entry and its form go away with the add-in; the form is
+    ' the settings entry and its form go away with the add-in; the form is
     ' unloaded first so no orphan window survives the add-in (the IDE must not crash on exit).
     If Not SettingsForm Is Nothing Then
         If SettingsForm.Visible Then Unload SettingsForm
@@ -187,7 +187,7 @@ Private Sub RemoveMenuItem()
 End Sub
 
 ' ---------------------------------------------------------------------------
-' P0-1: IDE change journal. Only events that represent a real model change are
+' An earlier batch: IDE change journal. Only events that represent a real model change are
 ' recorded - Activated/Selected fire constantly and would be pure noise. Handlers
 ' never let an error escape and only read a Name; they run during run-mode
 ' transitions and project teardown.
@@ -219,16 +219,28 @@ Private Function EvName(o As Object) As String
     EvName = CStr(o.Name)
 End Function
 
+' the instance registry carries the PROJECT identity (and the loaded-build sha, which
+' is a load-time constant now). A project event is exactly when that identity can change, so
+' tell the watchdog instead of re-reading the VBE object model ~67 times per second.
+Private Sub MarkIdentityDirty()
+    On Error Resume Next
+    If m_form Is Nothing Then Exit Sub
+    m_form.MarkIdentityDirty
+End Sub
+
 Private Sub m_prjEvents_ItemAdded(ByVal VBProject As VBIDE.VBProject)
     Changes.Record "project_added", EvName(VBProject)
+    MarkIdentityDirty
 End Sub
 
 Private Sub m_prjEvents_ItemRemoved(ByVal VBProject As VBIDE.VBProject)
     Changes.Record "project_removed", EvName(VBProject)
+    MarkIdentityDirty
 End Sub
 
 Private Sub m_prjEvents_ItemRenamed(ByVal VBProject As VBIDE.VBProject, ByVal OldName As String)
     Changes.Record "project_renamed", OldName & " -> " & EvName(VBProject)
+    MarkIdentityDirty
 End Sub
 
 Private Sub m_cmpEvents_ItemAdded(ByVal VBComponent As VBIDE.VBComponent)
@@ -277,7 +289,7 @@ Private Sub m_menuEvents_Click(ByVal CommandBarControl As Object, handled As Boo
     MsgBox msg, vbInformation, "VB6 MCP"
 End Sub
 
-' TASK-P1-079: open the settings form NON-MODAL, so the MCP server keeps answering while the
+' open the settings form NON-MODAL, so the MCP server keeps answering while the
 ' form is up and the IDE is never left blocked (nothing here requires the IDE to be idle).
 Private Sub m_settingsEvents_Click(ByVal CommandBarControl As Object, handled As Boolean, CancelDefault As Boolean)
     On Error Resume Next

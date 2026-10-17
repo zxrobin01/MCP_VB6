@@ -250,7 +250,7 @@ End Function
 
 Private Function ParseStringValue(ByVal s As String, ByRef pos As Long) As String
     ' pos points at the opening quote
-    ' TASK-P1-049: the old loop accumulated "out = out & ..." once per character,
+    ' the old loop accumulated "out = out & ..." once per character,
     ' which is quadratic on a large JSON string (a replace_code request carries the
     ' whole new text). It now writes into ONE preallocated buffer, so the cost is
     ' O(n). The output is byte-identical: the decoded text is never longer than the
@@ -392,12 +392,12 @@ Private Function Num(ByVal v As Variant) As String
     End If
 End Function
 
-' TASK-P1-121 item 4: Public so WinProbe.Jq can share ONE JSON string quoter. This body
+' item 4: Public so WinProbe.Jq can share ONE JSON string quoter. This body
 ' escapes every control character (< 32) plus " and \\; 0x7F and everything >= 0x20 are
 ' passed through byte-for-byte, and the empty string still yields "".
 Public Function Quote(ByVal s As String) As String
-    ' TASK-P1-048: the per-character writer below is quadratic on a big string
-    ' (P4-047 measured ~12.4 s for 1 MB, exponent ~1.95). Keep it exactly as it
+    ' the per-character writer below is quadratic on a big string
+    ' (an earlier measurement: ~12.4 s for 1 MB, exponent ~1.95). Keep it exactly as it
     ' is for small strings, and route large ones through the batched O(n) path.
     If Len(s) > 512 Then
         Quote = QuoteBatch(s)
@@ -463,7 +463,7 @@ Public Function Quote(ByVal s As String) As String
     Quote = Left$(out, j)
 End Function
 
-' TASK-P1-048: O(n) batched escaping, used by Quote for strings above 512
+' O(n) batched escaping, used by Quote for strings above 512
 ' characters - the card's option (2), chosen BY MEASUREMENT: the reference
 ' implementation (the reference module's StringtoString, option (3): one
 ' piece per character + a single Join) was implemented and measured here at
@@ -496,7 +496,7 @@ Private Function QuoteBatch(ByVal s As String) As String
     QuoteBatch = qt & out & qt
 End Function
 
-' TASK-P1-048: the remaining control characters (0-7, 11, 14-31) become the
+' the remaining control characters (0-7, 11, 14-31) become the
 ' u-escape form with 4 hex digits, exactly as the legacy Case Else produced.
 ' Called after the backslash pass, so the single backslash it inserts is correct.
 Private Function EscapeOtherControl(ByVal s As String, ByVal bs As String) As String
@@ -515,7 +515,7 @@ Private Function EscapeOtherControl(ByVal s As String, ByVal bs As String) As St
     EscapeOtherControl = r
 End Function
 
-' TASK-P1-048: exactly the legacy pre-scan predicate (cc < 32, cc = 34, cc = 92)
+' exactly the legacy pre-scan predicate (cc < 32, cc = 34, cc = 92)
 ' but evaluated with native InStr scans instead of one AscW(Mid$(...)) per
 ' character. Returns True as soon as any character needs escaping.
 Private Function NeedsEscape(ByVal s As String) As Boolean
@@ -559,7 +559,7 @@ Private Function StringifyColl(ByVal c As Object) As String
     End If
     Dim parts() As String
     ReDim parts(0 To c.Count - 1)
-    ' TASK-P1-098: walk with the Collection's enumerator instead of c.Item(i) - VB6 index
+    ' walk with the Collection's enumerator instead of c.Item(i) - VB6 index
     ' access is a linear walk, so the old loop was O(n^2) on big collections (a failure
     ' receipt carrying 27k hits). Byte-identical output: same order, same elements.
     Dim i As Long, v As Variant

@@ -39,7 +39,7 @@ Public Sub Init(ByVal vbe As Object)
     Set m_tools = New CodeTools
     m_tools.Init vbe
     m_tools.SetServer Me
-    ' TASK-P1-067: hand the VBIDE holder to WinOps as a late-bound sink, so the
+    ' hand the VBIDE holder to WinOps as a late-bound sink, so the
     ' optional code-pane wheel can move a pane through the object model (WM_VSCROLL
     ' to the pane was measured to do nothing 5/5). No new type library is needed:
     ' WinOps.bas is a standard module and calls the sink late-bound.
@@ -92,7 +92,7 @@ Public Function ProjectName() As String
     ProjectName = m_tools.ProjectNameSafe()
 End Function
 
-' TASK-P1-037: the instance registry needs the project file and the DLL hash.
+' the instance registry needs the project file and the DLL hash.
 Public Function ProjectFileName() As String
     On Error Resume Next
     If m_tools Is Nothing Then Exit Function
@@ -105,7 +105,7 @@ Public Function ProductBuildSha256() As String
     ProductBuildSha256 = m_tools.BuildSha256()
 End Function
 
-' TASK-P1-079: the settings form shows the tool count; forward it from the tool table so it
+' the settings form shows the tool count; forward it from the tool table so it
 ' can never drift from tools/list.
 Public Function ToolCount() As Long
     On Error Resume Next
@@ -582,7 +582,7 @@ Private Function JsonRpcError(ByVal id As Variant, ByVal code As Long, ByVal mes
 End Function
 
 Private Function ToolErrorResult(ByVal msg As String) As Object
-    ' TASK-P1-062: this transport-level failure path used to answer a bare "Error: <text>",
+    ' this transport-level failure path used to answer a bare "Error: <text>",
     ' which the caller cannot branch on. It now carries the same structured envelope as the
     ' add-in Fail handler ({ok:false, reason, message[, vbErrorCode]}).
     Dim vbErr As Long

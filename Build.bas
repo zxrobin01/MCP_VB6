@@ -11,15 +11,48 @@ Public Type TBuildResult
     message As String
     key As String
     raw As String
-    ' Card TASK-P1-007 (i18n): product-first verdict fields
+    ' (i18n): product-first verdict fields
     artifactSize As Double
     okByKeyword As Boolean
     verdict As String
+    ' the line the compiler actually wrote (verbatim) and, when nothing could be
+    ' recognised, a STRUCTURED unparsed state plus a bounded excerpt of the raw log.  The
+    ' receipt must never claim "no error text" - it must say what it could not parse.
+    rawLine As String
+    unparsed As Boolean
+    logExcerpt As String
+    ' WHICH rule produced the value - err-marker | fail-marker-up | none
+    matchRule As String
+    ' the log reader's own facts, so "the file was non-empty but came back empty" can be
+    ' settled from the receipt instead of argued (ReadLogAny already reports the encoding).
+    logEncoding As String
+    logBytes As Double
+    ' (step B): the DECODED text the parser actually received, measured - never inferred.
+    '   rawLen    = number of CHARACTERS in r.raw.  Read together with logBytes it separates the
+    '               states a byte count alone cannot: logBytes>0 AND rawLen=0 proves the file was
+    '               read and yielded NOTHING (an unreadable/undecodable log), which is NOT the same
+    '               as a genuinely empty file (both = 0, encoding readable).
+    '   rawSha256 = sha256 of r.raw re-encoded as UTF-8, so two reads of the same characters agree
+    '               and a disagreement is provable without shipping the (possibly huge) text.
+    rawLen As Long
+    rawSha256 As String
 End Type
 
+Private Type TLogClassification
+    ' the ONE classification of a compiler log.  Every field is derived in exactly
+    ' one place (ClassifyLog) and every consumer reads only these fields.
+    markerCount As Long    ' Pass A: how many marker lines the log carries (the counter's n)
+    markerLine As String   ' Pass A: the FIRST marker line (what ParseBuild reports)
+    failAnchor As Boolean  ' the LAST non-empty line is the failure summary (structural anchor)
+    upLine As String       ' Pass B: the line captured above the anchor ("" = nothing captured)
+    matchRule As String    ' "none" | "err-marker" | "fail-marker-up"
+    rawLine As String      ' markerLine, else upLine - the line a receipt reports
+    excerpt As String      ' Pass C: the tail of the last <=10 non-empty lines, when nothing matched
+    errorCount As Long     ' THE count: markerCount, else 1 when the anchor holds, else 0
+End Type
 Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 
-' ---- Card TASK-P1-015: path identity ---------------------------------------
+' ---- path identity ---------------------------------------
 ' Two spellings can name ONE file: relative/absolute, / vs \, case, doubled
 ' separators -- and, the case text folding can NEVER see, a junction or symlink
 ' alias (measured: it is a junction pointing at the reference application). Only
@@ -60,7 +93,7 @@ fail:
 End Function
 
 Public Function ReadLogAnsi(ByVal logPath As String) As String
-    ' TASK-P1-126 (F2): the old body ALWAYS decoded as ANSI. A log that is really
+    ' (F2): the old body ALWAYS decoded as ANSI. A log that is really
     ' UTF-8 (or UTF-16) then came back as U+FFFD replacement characters, so the
     ' compiler message ("syntax error" / the localized equivalent) was unreadable.
     ' ReadLogAny reads it in ITS OWN encoding and reports which one was used.
@@ -69,7 +102,7 @@ Public Function ReadLogAnsi(ByVal logPath As String) As String
     ReadLogAnsi = s
 End Function
 
-' TASK-P1-126 (F2): detect the log's real encoding, decode with it, and return the
+' (F2): detect the log's real encoding, decode with it, and return the
 ' name of the encoding that was used so a receipt can PROVE how the text was read.
 ' DetectEncoding answers "utf-8" only when every byte sequence is valid UTF-8, and a
 ' GBK (system ANSI) log is not, so a Chinese ANSI log is never mistaken for UTF-8.
@@ -94,6 +127,31 @@ Public Sub ReadLogAny(ByVal logPath As String, ByRef out As String, ByRef encUse
     Err.Clear
 End Sub
 
+' the VERIFIED reader for the WRITE paths (add_code{file=}).  ReadLogAnsi /
+' ReadLogAny above stay byte-identical ON PURPOSE: they are the compiler-log reader and
+' 's firstError/matchRule evidence is built on them. This one is additive and
+' refuses (False + why) instead of ever handing a lossy decode to a code pane.
+Public Function ReadSourceText(ByVal path As String, ByRef out As String, ByRef encUsed As String, ByRef why As String) As Boolean
+    Dim b() As Byte, n As Long
+    out = "": encUsed = "": why = ""
+    ReadSourceText = False
+    On Error Resume Next
+    ReadAllBytesTo path, b
+    n = Encoding.ByteCount(b)
+    If Err.Number <> 0 Then
+        why = "input_file_unreadable": Err.Clear: Exit Function
+    End If
+    Err.Clear
+    If n <= 0 Then
+        ' an empty/unreadable file keeps its OLD meaning: nothing to append, no refusal
+        encUsed = "empty_or_unreadable"
+        ReadSourceText = True
+        Exit Function
+    End If
+    If Not Encoding.DecodeVerified(b, encUsed, out, why) Then Exit Function
+    ReadSourceText = True
+End Function
+
 Public Function HeaderOffset(ByVal diskLines As Long, ByVal ideLines As Long) As Long
     HeaderOffset = diskLines - ideLines
 End Function
@@ -113,9 +171,56 @@ End Function
 Private Function CUndef() As String
     CUndef = ChrW$(&H53D8) & ChrW$(&H91CF) & ChrW$(&H672A) & ChrW$(&H5B9A) & ChrW$(&H4E49)
 End Function
+' the failure SUMMARY line the compiler writes last ('<exe>' ...).
+Private Function CFail() As String
+    ' ROOT CAUSE (measured): the full stop here was written as ChrW(&HA1A3) - the GBK BYTE
+    ' value of the full-width period - but the decoded log text carries the UNICODE character
+    ' U+3002 (。).  The five-character marker could therefore never match, so Pass B never fired and
+    ' the receipt fell back to log-unparsed.  The other constants (CErr/COk/CFail2) use real Unicode
+    ' code points and were always fine; this one was the byte/character confusion.
+    CFail = ChrW$(&H7F16) & ChrW$(&H8BD1) & ChrW$(&H5931) & ChrW$(&H8D25) & ChrW$(&H3002)
+End Function
+' 生成失败 - the OTHER localized FAILURE SUMMARY line /make can write (the first one is 编译失败。).
+' this is a failure MARKER only, never a sentence to recognise an error by.
+Private Function CFail2() As String
+    ' 生成失败 - the OTHER localized failure summary /make writes
+    CFail2 = ChrW$(&H751F) & ChrW$(&H6210) & ChrW$(&H5931) & ChrW$(&H8D25)
+End Function
+' ---- ONE shared line recognizer ------------------------------------------
+' Both ParseBuild and CountBuildErrors call THIS, so the count and the first error can never
+' diverge.  Localized markers are now case-INsensitive and the English ones are the same set.
+Public Function IsCompileErrorLine(ByVal ln As String) As Boolean
+    ' MARKERS ONLY (structure, not sentences).  The project-level message '必须有启动窗体 或
+    ' Sub Main()' is deliberately NOT a marker here: it may only ever be the VERBATIM text that
+    ' Pass B captures, so this parser can never be tuned to one project's wording.
+    If InStr(1, ln, CErr(), vbTextCompare) > 0 Then IsCompileErrorLine = True
+    If InStr(1, ln, "compile error", vbTextCompare) > 0 Then IsCompileErrorLine = True
+End Function
+' The fail summary is a STRUCTURAL ANCHOR: /make always ENDS with it, so the caller asks this
+' predicate ONLY about the LAST non-empty line (never a whole-file scan for "failed", which would
+' mistake an error sentence containing that word for the summary).
+Public Function IsCompileFailLine(ByVal ln As String) As Boolean
+    If InStr(1, ln, CFail(), vbTextCompare) > 0 Then IsCompileFailLine = True
+    If InStr(1, ln, CFail2(), vbTextCompare) > 0 Then IsCompileFailLine = True
+    If InStr(1, ln, "failed", vbTextCompare) > 0 Then IsCompileFailLine = True
+    If InStr(1, ln, "build failed", vbTextCompare) > 0 Then IsCompileFailLine = True
+End Function
+' A banner / success / bare-path / bare-time line is never an error line even when it sits right
+' above the failure summary, so Pass B must not promote it to firstError.
+Private Function IsBannerLine(ByVal ln As String) As Boolean
+    Dim s As String
+    s = Trim$(ln)
+    If Len(s) = 0 Then IsBannerLine = True: Exit Function
+    If InStr(1, s, "Microsoft (R) Visual Basic", vbTextCompare) > 0 Then IsBannerLine = True: Exit Function
+    If InStr(1, s, "Copyright (C)", vbTextCompare) > 0 Then IsBannerLine = True: Exit Function
+    If InStr(1, s, CErr(), vbTextCompare) > 0 Then Exit Function
+    If IsCompileFailLine(s) Then IsBannerLine = True: Exit Function
+    If Len(s) <= 3 Then IsBannerLine = True: Exit Function
+    If Mid$(s, 2, 1) = ":" Then IsBannerLine = True: Exit Function
+End Function
 
 Public Function ErrorKey(ByVal msg As String) As String
-    ' Card TASK-P1-007 (i18n): the localized words are kept, but English keywords
+    ' (i18n): the localized words are kept, but English keywords
     ' are accepted too, so a VB6 in another language still classifies the error.
     If InStr(msg, CSyn()) > 0 Or InStr(1, msg, "syntax error", vbTextCompare) > 0 Then
         ErrorKey = "syntax"
@@ -129,48 +234,192 @@ Public Function ErrorKey(ByVal msg As String) As String
 End Function
 
 Public Function ParseBuild(ByVal logPath As String, ByVal headerOffset As Long) As TBuildResult
-    Dim r As TBuildResult, lines() As String, i As Long, ln As String, t As String
+    Dim r As TBuildResult
     r.ok = False
     r.exitCode = -999
     r.headerOffset = headerOffset
-    r.raw = ReadLogAnsi(logPath)
+    ' take the encoding the reader ACTUALLY used (ReadLogAnsi discarded it), and the
+    ' real byte size on disk - both are receipt facts, not inferences.
+    Dim encUsed As String
+    ReadLogAny logPath, r.raw, encUsed
+    r.logEncoding = encUsed
+    ' (step B): publish the reader's OWN output.  These two fields are the reason a
+    ' "the log is non-empty but came back empty" claim can be settled from the receipt alone:
+    ' logBytes is the SIZE ON DISK, rawLen is the number of characters the reader produced.
+    r.rawLen = Len(r.raw)
+    r.rawSha256 = Sha256.Sha256HexTextUtf8(r.raw)
+    On Error Resume Next
+    r.logBytes = FileLen(logPath)
+    On Error GoTo 0
+    Dim t As String
     t = r.raw
     r.okByKeyword = (InStr(t, COk()) > 0)
     If (Not r.okByKeyword) And Len(Trim$(t)) > 0 Then
         If InStr(1, t, "success", vbTextCompare) > 0 Then r.okByKeyword = True
     End If
     r.ok = r.okByKeyword
-    lines = Split(Replace(Replace(t, vbCrLf, vbLf), vbCr, vbLf), vbLf)
-    For i = 0 To UBound(lines)
-        MaybePump
-        ln = lines(i)
-        If InStr(ln, CErr()) > 0 Or InStr(1, ln, "compile error", vbTextCompare) > 0 Then
-            r.file = BetweenQuotes(ln)
-            r.reportedLine = LineAfter(ln)
-            r.message = MsgAfter(ln)
-            r.key = ErrorKey(r.message)
-            If headerOffset >= 0 And r.reportedLine > 0 Then r.diskLine = r.reportedLine + headerOffset + 1
-            Exit For
+    ' every recognition rule now runs in ONE place (ClassifyLog).  This function no
+    ' longer owns a second copy of the marker scan or of the fail-summary anchor - it only turns
+    ' the ONE classification into the receipt fields.
+    Dim c As TLogClassification
+    ClassifyLog t, c, True
+    r.matchRule = c.matchRule
+    If Len(c.rawLine) > 0 Then
+        r.rawLine = c.rawLine
+        If c.matchRule = "err-marker" Then
+            ' a marker line: the message is what FOLLOWS the marker, the line itself is the fallback
+            r.message = MsgAfter(c.rawLine)
+            If Len(Trim$(r.message)) = 0 Then r.message = Trim$(c.rawLine)
+            FileLineFrom c.rawLine, r.file, r.reportedLine
+        Else
+            ' a Pass B capture IS the message, verbatim - it is not a marker sentence
+            r.message = Trim$(c.rawLine)
+            FileLineFrom r.message, r.file, r.reportedLine
         End If
-    Next
+        r.key = ErrorKey(r.message)
+        If headerOffset >= 0 And r.reportedLine > 0 Then r.diskLine = r.reportedLine + headerOffset + 1
+    End If
+    ' Pass C: still nothing recognised -> record a STRUCTURED unparsed state and a
+    ' bounded excerpt of the raw log.  An empty message must never reach the caller, because the
+    ' caller used to turn that emptiness into a false statement ('no error text').
+    If Len(r.rawLine) = 0 And Len(r.message) = 0 And (Not r.ok) Then
+        r.unparsed = True
+        r.logExcerpt = c.excerpt
+    End If
     ParseBuild = r
 End Function
 
-' TASK-P1-125 (MCP-18): how many compile errors does a VB6 /out log carry?
+' =====================================================================
+' ONE log classifier - the ONLY place a compiler log is classified.
+'   ParseBuild and CountBuildErrors used to spell the SAME rules twice: split the log,
+'   scan it for a marker line (Pass A), and - when nothing matched - treat the LAST
+'   non-empty line as the structural failure summary and step up to the error text
+'   (Pass B).  Two copies of one rule can fork, and they already had: the Lead measured
+'   a log whose error is reachable ONLY through Pass B being counted as 0 errors while
+' firstError had a value. The fix removed the MEASURED fork; this
+'   makes the fork structurally impossible - a rule changed here moves the parsed receipt
+'   AND the count in the same edit, and no consumer owns a second marker table.
+'   The message pump is NOT a classification rule: ParseBuild runs inside the IDE and pumps
+'   between lines, CountBuildErrors never pumped.  It is passed in as a flag, so the pump
+'   stays with the caller and is not duplicated either.
+' =====================================================================
+Private Sub ClassifyLog(ByVal raw As String, ByRef c As TLogClassification, ByVal pump As Boolean)
+    Dim lines() As String, i As Long, last As Long, ln As String
+    Dim j As Long, steps As Long
+    c.markerCount = 0
+    c.markerLine = ""
+    c.failAnchor = False
+    c.upLine = ""
+    c.matchRule = "none"
+    c.rawLine = ""
+    c.excerpt = ""
+    c.errorCount = 0
+    lines = Split(Replace(Replace(raw, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    ' ---- ONE pass over the log: the marker rule (Pass A) and the anchor input --------
+    ' Split("") returns an array whose UBound is -1, so this loop simply does not run for a
+    ' 0-byte log; every walk below is bounded the same way (: VB6's And does NOT
+    ' short-circuit, so a bound that guards an index must stand on its own line).
+    last = -1
+    For i = 0 To UBound(lines)
+        ' the pump fires exactly where the old Pass A fired it: on every line up to and
+        ' including the first marker line (which is where ParseBuild used to Exit For).
+        If pump Then
+            If Len(c.markerLine) = 0 Then MaybePump
+        End If
+        ln = lines(i)
+        If Len(Trim$(ln)) > 0 Then last = i
+        If IsCompileErrorLine(ln) Then
+            c.markerCount = c.markerCount + 1
+            If Len(c.markerLine) = 0 Then c.markerLine = ln
+        End If
+    Next i
+    ' ---- Pass B: no marker line -> the failure summary is a STRUCTURAL ANCHOR -------
+    ' /make ENDS with its summary line, so the anchor is the LAST non-empty line - never
+    ' "the first line anywhere that contains failed".  From there we may step up at most 3
+    ' non-empty lines, skipping banners, to find the error text.
+    If Len(c.markerLine) = 0 Then
+        If last >= 0 Then
+            If IsCompileFailLine(lines(last)) Then
+                c.failAnchor = True
+                j = last - 1
+                steps = 0
+                Do While j >= 0 And steps < 3
+                    If Len(Trim$(lines(j))) > 0 Then
+                        steps = steps + 1
+                        If Not IsBannerLine(lines(j)) Then Exit Do
+                    End If
+                    j = j - 1
+                Loop
+                If j >= 0 Then
+                    If steps > 0 Then
+                        If Not IsBannerLine(lines(j)) Then
+                            c.upLine = lines(j)
+                            c.matchRule = "fail-marker-up"
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    ' ---- the ONE published verdict ---------------------------------------------------
+    If Len(c.markerLine) > 0 Then
+        c.rawLine = c.markerLine
+        c.matchRule = "err-marker"
+    ElseIf Len(c.upLine) > 0 Then
+        c.rawLine = c.upLine
+    End If
+    ' The count is DEFINED here, from the same facts that produced rawLine: marker lines
+    ' when there are any, else exactly ONE when the structural anchor holds (a log that
+    ' reaches Pass B carries one error - the line Pass B captures).
+    If c.markerCount > 0 Then
+        c.errorCount = c.markerCount
+    ElseIf c.failAnchor Then
+        c.errorCount = 1
+    End If
+    ' ---- Pass C: nothing recognised -> a bounded tail excerpt ------------------------
+    If Len(c.rawLine) = 0 Then
+        Dim ex As String, seen As Long
+        seen = 0
+        If UBound(lines) >= 0 Then
+            For i = UBound(lines) To 0 Step -1
+                If Len(Trim$(lines(i))) > 0 Then
+                    ex = lines(i) & vbCrLf & ex
+                    seen = seen + 1
+                    If seen >= 10 Then Exit For
+                End If
+            Next
+        End If
+        c.excerpt = ex
+    End If
+End Sub
+
+' the file/line STRUCTURE rule, in one place.  A quoted component name AND a line
+' number are what may become file/reportedLine; a quoted token inside an error sentence
+' (e.g. the argument of a localized undefined-variable message) must NOT become a file name,
+' and a project-level error must leave both ABSENT rather than filling reportedLine = 0 as if
+' it were a real line.  Both Pass A and Pass B used to spell this rule separately.
+Private Sub FileLineFrom(ByVal ln As String, ByRef outFile As String, ByRef outLine As Long)
+    If Len(BetweenQuotes(ln)) > 0 And LineAfter(ln) > 0 Then
+        outFile = BetweenQuotes(ln)
+        outLine = LineAfter(ln)
+    End If
+End Sub
+
+' how many compile errors does a VB6 /out log carry?
 ' One build stops at the FIRST error, but a caller still needs a count to judge
-' whether the log is a single failure or a cascade; the count is measured on the
-' same lines ParseBuild recognises, never assumed to be 1.
+' whether the log is a single failure or a cascade.: the count is now read
+' straight off the SAME classification ParseBuild uses, so the two can no longer fork
+' (the fork: a Chinese log whose error only Pass B could reach counted 0 while
+' firstError had a value).  No pump here - this function never pumped.
 Public Function CountBuildErrors(ByVal raw As String) As Long
     If Len(raw) = 0 Then Exit Function
-    Dim lines() As String, i As Long, n As Long
-    lines = Split(Replace(Replace(raw, vbCrLf, vbLf), vbCr, vbLf), vbLf)
-    For i = 0 To UBound(lines)
-        If InStr(lines(i), CErr()) > 0 Or InStr(1, lines(i), "compile error", vbTextCompare) > 0 Then n = n + 1
-    Next
-    CountBuildErrors = n
+    Dim c As TLogClassification
+    ClassifyLog raw, c, False
+    CountBuildErrors = c.errorCount
 End Function
 
-' TASK-P1-125 (MCP-18): the compiler's line numbers are CODE-PANE lines. When the
+
+' the compiler's line numbers are CODE-PANE lines. When the
 ' component is not open in the IDE there is no live header offset and diskLine came
 ' back 0 - which is exactly the user's case: they built a project the IDE did not
 ' hold and the log said "line 26955". The header is therefore counted from the file
@@ -263,9 +512,9 @@ Public Function CoordsJson(ByVal ideLine As Long, ByVal headerOffset As Long) As
 End Function
 
 ' ---------------------------------------------------------------------------
-' Card TASK-P1-007 (i18n): product-first build verdict.
+' (i18n): product-first build verdict.
 '
-' Success used to be decided by InStr(log, "缂栬瘧鎴愬姛") - a Chinese-only word. On a
+' Success used to be decided by InStr(log, "编译成功") - a Chinese-only word. On a
 ' VB6 in any other language every build looked failed. The compiled ARTIFACT is
 ' language-independent, so it decides: the output file must exist, be non-empty,
 ' and be no older than the build. The localized/English keyword is retained only
@@ -286,7 +535,7 @@ Public Function ArtifactPathOf(ByVal vbpPath As String) As String
         End If
     Loop
     ts.Close
-    ' Card TASK-P1-015 (found while building the junction fixture): TextStream.ReadLine
+    ' (found while building the junction fixture): TextStream.ReadLine
     ' leaves a stray CR behind when a hand-edited .vbp uses CR CR LF line ends. The
     ' artifact path then ended in CR, Dir$ could not see it, and a successful in-IDE
     ' Make was reported as artifact-missing/ok:false. Strip control characters first.
@@ -316,19 +565,19 @@ Public Function ArtifactBuilt(ByVal artifactPath As String, ByVal timeBefore As 
 End Function
 
 ' ---------------------------------------------------------------------------
-' Card TASK-P1-008: incremental build feedback.
+' incremental build feedback.
 ' Fingerprint = sha256(.vbp bytes) + sorted sha256 of every component file the
 ' .vbp references, plus /d defines. Disk based and language independent.
 ' ---------------------------------------------------------------------------
 Public Function FileSha256(ByVal path As String) As String
-    ' TASK-P1-126 (F1): delegate; the WHY-carrying form below is what lets a caller
+    ' (F1): delegate; the WHY-carrying form below is what lets a caller
     ' distinguish "no digest" from "the digest of an empty input".
     Dim why As String
     why = ""
     FileSha256 = FileSha256Why(path, why)
 End Function
 
-' TASK-P1-126 (F1): a sha256 that can NEVER silently be the digest of an EMPTY input.
+' (F1): a sha256 that can NEVER silently be the digest of an EMPTY input.
 ' Measured defect: an EXCLUSIVE-locked artifact was reported as
 ' sha256=E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855
 ' (the well-known digest of the empty string) while output.exists=true and size=16384,
@@ -525,7 +774,7 @@ Public Function BuildFingerprint(ByVal vbpPath As String, ByVal defines As Strin
         Next
     End If
     r("hash") = Sha256.Sha256HexTextUtf8(r("vbpHash") & "|" & defines & cat)
-    ' Card TASK-P1-015: the cache key must be the project IDENTITY, not its spelling.
+    ' the cache key must be the project IDENTITY, not its spelling.
     r("key") = CanonicalPath(vbpPath) & "|" & LCase$(defines)
     Set compsOut = comps
     Set BuildFingerprint = r

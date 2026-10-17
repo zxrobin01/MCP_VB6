@@ -28,14 +28,14 @@ Option Explicit
 
 Private Const MAX_CONNECTIONS As Integer = 16
 Private Const DEFAULT_PORT As Long = 8766
-' TASK-P1-037 (contract v1.3.1 H2): the dynamic range the hub scans (8766..8799).
+' (contract v1.3.1 H2): the dynamic range the hub scans (8766..8799).
 Private Const FIRST_PORT As Long = 8766
 Private Const MAX_PORT_TRIES As Long = 34
 Private Declare Function WsaGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 Private Const RECV_CHUNK As Long = 65536
 Private Const IDLE_TIMEOUT_SEC As Long = 30
 
-' TASK-49: in-flight request tracking, mirroring ServerForm. A socket whose request
+' in-flight request tracking, mirroring ServerForm. A socket whose request
 ' is being served (or whose response is not yet fully flushed - QueueSend is
 ' asynchronous and DoFlush runs on FD_WRITE) is never swept.
 Private Const IDLE_BUSY_CAP_SEC_DEF As Long = 300
@@ -54,18 +54,19 @@ Private m_started As Boolean
 Private m_quitArmed As Boolean
 Private m_restartArmed As Boolean
 
-Private m_conns As New Collection        ' CStr(sock) -> HttpConn
+Private m_conns As New Collection        ' CStr(sock) -> socket handle (Long); swept/closed as handles
+Private m_connObjs As New Collection     ' CStr(sock) -> HttpConn (the per-connection request accumulator)
 Private m_out As New Collection          ' CStr(sock) -> pending bytes (byte-per-char string)
 Private m_sendPos As New Collection      ' CStr(sock) -> next offset
 Private m_lastActive As New Collection   ' CStr(sock) -> Date
 Private m_closeAfterSend As New Collection ' CStr(sock) -> True
 Private m_sessions As New Collection     ' sessionId -> sock
-' TASK-P1-064: the identity actually published, so the watchdog can re-publish it when it changes.
+' the identity actually published, so the watchdog can re-publish it when it changes.
 Private m_instProject As String
 Private m_instProjectPath As String
 Private m_instSha As String
 Private m_instStartedAt As String
-' TASK-57 (ADR section 0 / 7): the named-pipe track. This class is the TCP
+' (ADR section 0 / 7): the named-pipe track. This class is the TCP
 ' track's pure-Winsock host, but the pipe is kernel32-only and its servicing pass
 ' rides this transport's own Win32 timer. PipeTransport itself never touches
 ' ws2_32 (WSACleanup is process-wide - spike trap 6 - and it killed the HTTP
@@ -73,7 +74,7 @@ Private m_instStartedAt As String
 Private m_pipe As PipeTransport
 Private m_mode As String
 Private m_portPublished As Boolean
-' TASK-57: true only in the pipe-only shape, where this host deliberately does
+' true only in the pipe-only shape, where this host deliberately does
 ' NOT call WSAStartup - so it must not call the matching WSACleanup either.
 Private m_pipeOnlyHost As Boolean
 
@@ -87,7 +88,7 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
     m_tries = 0
     m_listening = False
     m_idleBusyCapSec = IdleBusyCapFromEnv()
-    ' TASK-57 transport switch (ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
+    ' transport switch (ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
     ' pipe). This host is only selected for the TCP track, but an explicit env
     ' value wins over the registry, so the mode is resolved here as well: a
     ' pipe-only mode must never load ws2_32 at all.
@@ -133,7 +134,7 @@ Public Sub StopListening()
     WsaSetSink Nothing
     If m_listen <> 0 Then WsaClose m_listen
     m_listen = 0
-    ' TASK-P1-037: normal exit must deregister the instance file. TASK-57: the
+    ' normal exit must deregister the instance file.: the
     ' pipe-only track never publishes a port, so it is covered separately.
     If m_listening Or (Not m_pipe Is Nothing) Then DeleteInstanceFile WsaGetCurrentProcessId()
     If Not m_pipe Is Nothing Then
@@ -146,6 +147,7 @@ Public Sub StopListening()
         WsaClose CLng(m_conns.Item(i))
     Next
     Set m_conns = New Collection
+    Set m_connObjs = New Collection
     Set m_busy = New Collection
     Set m_busySince = New Collection
     Set m_out = New Collection
@@ -154,7 +156,7 @@ Public Sub StopListening()
     Set m_closeAfterSend = New Collection
     Set m_sessions = New Collection
     If m_started Then
-        ' TASK-57: only clear the port file when THIS instance published one, and
+        ' only clear the port file when THIS instance published one, and
         ' never run WSACleanup in pipe-only mode: that path never called
         ' WSAStartup, and WSACleanup is process-wide (spike trap 6 - it took down
         ' a co-resident add-in's HTTP listener).
@@ -233,7 +235,7 @@ Private Sub TryListen()
             m_portPublished = True
             RegisterInstance
             LogLine "winsock transport listening on http://127.0.0.1:" & CStr(m_port) & " (explicitPortOverride=" & CStr(m_explicitPort) & ")"
-            ' TASK-57: keep the watchdog fast enough to service the pipe track; the
+            ' keep the watchdog fast enough to service the pipe track; the
             ' TCP track alone keeps the historical 5000 ms cadence.
             If m_pipe Is Nothing Then
                 WsaSetTimer 5000
@@ -248,7 +250,7 @@ Private Sub TryListen()
     WsaSetTimer 350
 End Sub
 
-' TASK-P1-037: write %TEMP%\vb6mcp\instances\<pid>.json so the hub can resolve
+' write %TEMP%\vb6mcp\instances\<pid>.json so the hub can resolve
 ' ownership instead of scanning ports and guessing.
 Private Sub RegisterInstance()
     On Error Resume Next
@@ -265,7 +267,7 @@ Private Sub RegisterInstance()
     m_instSha = sha
     If Not m_pipe Is Nothing Then
         If m_pipe.Active() Then
-            ' TASK-57: ADR section 4.1 - the pipe identity triplet has to live in the
+            ' ADR section 4.1 - the pipe identity triplet has to live in the
             ' SAME registration entry or the hub has nothing to pair against. The
             ' legacy writer below stays byte-for-byte unchanged for the TCP track
             ' (ADR section 4.2 rule 1: missing transport/pipe means tcp).
@@ -275,13 +277,13 @@ Private Sub RegisterInstance()
         End If
     End If
     WriteInstanceFile WsaGetCurrentProcessId(), m_port, proj, ppath, sha, m_instStartedAt
-    ' TASK-48: a successful registration proves THIS process is alive - the right
+    ' a successful registration proves THIS process is alive - the right
     ' moment to drop the registrations left behind by instances that died without
     ' running their exit path (crash / Stop-Process -Force / taskkill).
     PruneDeadInstanceFiles WsaGetCurrentProcessId()
 End Sub
 
-' TASK-P1-064: the entry is published when the port comes up, which can precede VB6 opening
+' the entry is published when the port comes up, which can precede VB6 opening
 ' the command-line project; nothing re-published it afterwards, so project=""/projectPath=""
 ' stayed for the whole process lifetime. Re-publish only when the identity really changes.
 Private Sub RefreshInstanceIfChanged()
@@ -299,7 +301,7 @@ Private Sub RefreshInstanceIfChanged()
     End If
 End Sub
 
-' TASK-57: 0 means "this instance has no TCP leg" (pipe-only); the hub decides
+' 0 means "this instance has no TCP leg" (pipe-only); the hub decides
 ' from tcpEnabled, not from the port number.
 Private Function PipeRegistryPort() As Long
     If m_listening Then
@@ -310,7 +312,7 @@ Private Function PipeRegistryPort() As Long
 End Function
 
 Private Sub NextPort()
-    ' TASK-P1-037: an EXPLICIT port must never be silently replaced by another one -
+    ' an EXPLICIT port must never be silently replaced by another one -
     ' that is how two IDEs ended up sharing 8766 with undefined ownership.
     If m_explicitPort Then
         WsaKillTimer
@@ -330,12 +332,12 @@ End Sub
 
 Private Sub TimerTick()
     On Error Resume Next
-    ' TASK-P1-084: this transport has its own watchdog, and its WM_TIMER is dispatched
+    ' this transport has its own watchdog, and its WM_TIMER is dispatched
     ' by modal loops exactly like ServerForm's. The OCX transport already ticks WinOps
     ' from ServerForm.tmrWatch; do the same here so the armed Add Form confirm (and the
     ' optional wheel rescan) also work when VB6MCP_TRANSPORT=winsock is selected.
     WinOps.WheelTick
-    ' TASK-57: exactly one bounded pipe servicing pass per tick, on this same UI
+    ' exactly one bounded pipe servicing pass per tick, on this same UI
     ' thread. PipeTransport handles re-entrancy itself.
     If Not m_pipe Is Nothing Then m_pipe.Tick
     If m_restartArmed Then
@@ -350,7 +352,7 @@ Private Sub TimerTick()
         If Not m_mcp Is Nothing Then m_mcp.DoQuit
         Exit Sub
     End If
-    ' TASK-57: pipe-only mode never created a listener, so it must not fall into
+    ' pipe-only mode never created a listener, so it must not fall into
     ' the port-probing path (and it must still be pumped while idle).
     If m_mode = "pipe" Then
         ' WinOps.WheelTick already ran above; the pipe just needs its registration
@@ -390,12 +392,12 @@ End Sub
 Private Function GetConn(ByVal s As Long) As HttpConn
     On Error Resume Next
     Dim c As HttpConn
-    Set c = m_conns(CStr(s))
+    Set c = m_connObjs(CStr(s))
     On Error GoTo 0
     If c Is Nothing Then
         Set c = New HttpConn
         On Error Resume Next
-        m_conns.Add c, CStr(s)
+        m_connObjs.Add c, CStr(s)
         On Error GoTo 0
     End If
     Set GetConn = c
@@ -417,7 +419,7 @@ Private Sub DoRead(ByVal s As Long)
     Set conn = GetConn(s)
     conn.AppendBytes b
     If conn.Ready Then
-        ' TASK-49: in-flight from here until ServeRequest returns; BUSY is cleared on
+        ' in-flight from here until ServeRequest returns; BUSY is cleared on
         ' BOTH paths because VB6 has no finally.
         MarkBusy s
         Dim serveOk As Boolean
@@ -432,7 +434,7 @@ Private Sub DoRead(ByVal s As Long)
     End If
     Exit Sub
 Fail:
-    ' Card TASK-P1-010 root cause: this handler used to CloseConn with NO response,
+    ' Card root cause: this handler used to CloseConn with NO response,
     ' so an error raised while handling an already-received request was invisible to
     ' the caller (a bare "closed connection without response" while the add-in stayed
     ' alive) - the shape of both the native_breakpoint comment-line incident and the
@@ -445,28 +447,60 @@ End Sub
 
 Private Sub DoFlush(ByVal s As Long)
     On Error Resume Next
-    Dim pending As String
+    Dim rest As String
     Dim pos As Long
-    pending = OutGet(s, pos)
-    Do While Len(pending) > 0 And pos < Len(pending)
+    rest = OutGet(s, pos)
+    If Len(rest) = 0 Then
+        ' nothing queued: honour a pending close-after-send (read BEFORE ClearOut removes it).
+        Dim closeIdle As Boolean
+        closeIdle = IsCloseAfterSend(s)
+        ClearOut s
+        If closeIdle Then CloseConn s
+        Exit Sub
+    End If
+    If pos > 0 Then
+        ' defensive normalisation: the queue is stored as the UNSENT remainder only.
+        rest = Mid$(rest, pos + 1)
+        pos = 0
+    End If
+    ' The queue is drained by CHOPPING the sent prefix, so Mid$ never starts beyond 32769.
+    ' The old loop kept a cumulative pos and did Mid$(pending, pos + 1, 32768); on this VB6
+    ' a start past 64 KiB produced an unusable chunk (measured: send returned 0 with no
+    ' winsock error and the socket closed after exactly 2 or 3 32 KiB chunks).
+    Do While Len(rest) > 0
         Dim chunk As String
-        chunk = Mid$(pending, pos + 1, 32768)
-        Dim n As Long
+        chunk = Mid$(rest, 1, 32768)
+        If Len(chunk) = 0 Then Exit Do
         Dim bb() As Byte
         bb = StrToBytes(chunk)
+        Dim n As Long
         n = WsaSend(s, VarPtr(bb(0)), UBound(bb) - LBound(bb) + 1)
         If n <= 0 Then
-            If WsaLastError() = 10035 Then Exit Do   ' WSAEWOULDBLOCK
+            Dim werr As Long
+            werr = WsaLastError()
+            ' n = 0 with no winsock error is a NO-PROGRESS send (measured on this path):
+            ' it must be treated like WSAEWOULDBLOCK, never as a fatal error.
+            ' NO winsock error at all (measured: n < 0 with WSAGetLastError() = 0) is also a
+            ' DEFERRAL, not a fatal socket failure - same handling as WSAEWOULDBLOCK: keep
+            ' the remainder and let FD_WRITE retry; a truly dead socket reports a real error.
+            If werr = 10035 Or werr = 0 Then
+                LogLine "winsock flush defer n=" & CStr(n) & " werr=" & CStr(werr) & " on " & CStr(s) & " unsent=" & CStr(Len(rest))
+                Exit Do
+            End If
+            LogLine "winsock flush error n=" & CStr(n) & " werr=" & CStr(werr) & " on " & CStr(s) & " unsent=" & CStr(Len(rest)) & " chunk=" & CStr(Len(chunk)) & " vberr=" & CStr(Err.Number)
             CloseConn s
             Exit Sub
         End If
-        pos = pos + n
+        If n > Len(rest) Then n = Len(rest)
+        rest = Mid$(rest, n + 1)
     Loop
-    If pos >= Len(pending) Then
+    If Len(rest) = 0 Then
+        Dim closeNow As Boolean
+        closeNow = IsCloseAfterSend(s)
         ClearOut s
-        If IsCloseAfterSend(s) Then CloseConn s
+        If closeNow Then CloseConn s
     Else
-        OutSet s, pending, pos
+        OutSet s, rest, 0
     End If
 End Sub
 
@@ -503,11 +537,11 @@ Private Sub QueueSend(ByVal s As Long, ByVal text As String)
     Dim existing As String
     Dim pos As Long
     existing = OutGet(s, pos)
-    If Len(existing) > 0 And pos > 0 Then
-        existing = Mid$(existing, pos + 1)
-        pos = 0
+    If pos > 0 Then
+        ' defensive: the queue stores the UNSENT remainder only
+        If Len(existing) > 0 Then existing = Mid$(existing, pos + 1)
     End If
-    OutSet s, existing & text, pos
+    OutSet s, existing & text, 0
     DoFlush s
 End Sub
 
@@ -530,6 +564,7 @@ Private Sub CloseConn(ByVal s As Long)
     LogLine "winsock CloseConn " & CStr(s)
     WsaClose s
     m_conns.Remove CStr(s)
+    m_connObjs.Remove CStr(s)
     ClearOut s
     m_lastActive.Remove CStr(s)
     Dim k As Long
@@ -561,7 +596,7 @@ Private Function IsSseSock(ByVal s As Long) As Boolean
     Next
 End Function
 
-' TASK-49: BUSY bookkeeping (mirror of ServerForm; collection-keyed because a WSA
+' BUSY bookkeeping (mirror of ServerForm; collection-keyed because a WSA
 ' socket handle is not a 1..16 index).
 Private Sub MarkBusy(ByVal s As Long)
     On Error Resume Next
@@ -591,7 +626,7 @@ Private Function BusySince(ByVal s As Long) As Date
     If Err.Number <> 0 Then BusySince = Now
 End Function
 
-' TASK-49: is a response still waiting to be handed to the kernel? DoFlush runs on
+' is a response still waiting to be handed to the kernel? DoFlush runs on
 ' FD_WRITE, so a queued response is part of the in-flight window.
 Private Function HasPendingOut(ByVal s As Long) As Boolean
     On Error Resume Next
@@ -601,7 +636,7 @@ Private Function HasPendingOut(ByVal s As Long) As Boolean
     HasPendingOut = (Len(pending) > pos)
 End Function
 
-' TASK-49: run ONE request/response serve. Same contract as the ServerForm twin: it
+' run ONE request/response serve. Same contract as the ServerForm twin: it
 ' makes the BUSY clear unconditional and it reports only an error that ESCAPES
 ' HandleRequest. Err is never read after a normal return (a guarded Collection.Remove
 ' on a missing key leaves Err set by design - a phantom error would abort a queued reply).
@@ -635,7 +670,7 @@ Private Sub SweepIdle()
         Dim busyF As Boolean
         busyF = IsBusy(s) Or HasPendingOut(s)
         If busyF Then
-            ' TASK-49: never swept while in flight. The ONLY exception is the
+            ' never swept while in flight. The ONLY exception is the
             ' leaked-flag backstop, and it applies only to a flag actually SET.
             If IsBusy(s) Then
                 If DateDiff("s", BusySince(s), Now) > m_idleBusyCapSec Then
@@ -815,7 +850,7 @@ Private Function QueryParam(ByVal path As String, ByVal name As String) As Strin
 End Function
 
 
-' TASK-48: belt-and-braces deregistration. StopListening already deletes our own
+' belt-and-braces deregistration. StopListening already deletes our own
 ' <pid>.json on a clean exit; Class_Terminate covers a teardown that skips it.
 ' DeleteInstanceFile is idempotent and only ever touches OUR pid, so a double
 ' delete is harmless.

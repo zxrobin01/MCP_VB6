@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""vb6mcp_bridge.py - the VB6MCP middle service layer.
+r"""vb6mcp_bridge.py - the VB6MCP middle service layer.
 
 WHAT THIS IS (ADR docs/design/TRANSPORT_NP_DUAL.md sec 0.1, the 2026-10-15 three-layer ruling)
 
@@ -34,7 +34,7 @@ TRACKS (env VB6MCP_TRANSPORT)
   pipe_forced_but_absent error).  Reason: during the transition an old add-in registry entry has
   no pipe field at all, so a strict-by-default pipe track would refuse to serve a working machine.
 
-NAMED PIPE WIRE PROTOCOL (np/1) - fixed by the P1-065 spike, agreed with the VB side
+NAMED PIPE WIRE PROTOCOL (np/1) - fixed by the spike, agreed with the VB side
 
     pipe name   \\\\.\\pipe\\vb6mcp-<sid>-<pid>-<slug>-<nonce16hex>
     framing     [4-byte LITTLE-ENDIAN length][UTF-8 payload], one frame <= 8 MiB,
@@ -49,7 +49,7 @@ NAMED PIPE WIRE PROTOCOL (np/1) - fixed by the P1-065 spike, agreed with the VB 
     progress    optional {"vb6mcp":"progress","seq":n,"elapsedMs":n,"tool":"<maybe empty>"}
     heartbeat   optional {"vb6mcp":"ping"} / {"vb6mcp":"pong"}
 
-AUTHENTICATION (task-71; threat model = bridge/TOKEN_THREAT_MODEL.md)
+AUTHENTICATION (threat model = bridge/TOKEN_THREAT_MODEL.md)
 
     VB6MCP_TOKEN              the bearer credential (preferred: it never touches disk)
     VB6MCP_TOKEN_FILE         owner-only file holding it (used only when VB6MCP_TOKEN is unset)
@@ -65,10 +65,16 @@ AUTHENTICATION (task-71; threat model = bridge/TOKEN_THREAT_MODEL.md)
     auth.enabled=false and prints the shared-machine warning, and the startup line warns on
     BOTH stderr and the log - an unauthenticated face must never be invisible.
 
-    BINDING IS LOOPBACK-ONLY, UNCONDITIONALLY (threat model M-0): a non-loopback host is
-    refused with exit 6 and there is deliberately NO switch to override it.  A bearer token
-    authenticates an ENDPOINT, not a user's intent: a client that legitimately holds the token
-    is outside this control.
+    BINDING: the DEFAULT tier is loopback-only - a non-loopback host is refused with exit 6,
+    exactly as before.  REMOTE MODE (docs/design/REMOTE_ACCESS.md) is the explicit,
+    fail-closed exception: it needs --allow-remote + --tls-cert/--tls-key + a token source + a
+    writable --audit-log (missing any of them refuses to start with exit 7 and names them), a
+    non-loopback caller is READ-ONLY unless --remote-write, the source is re-checked in process
+    (403), tokens are compared in constant time with a previous token kept valid for rotation,
+    failures back off exponentially, every response is audited once (JSONL) and /health is
+    redacted for remote callers.  A bearer token authenticates an ENDPOINT, not a user's intent:
+    a client that legitimately holds the token is outside this control - which is exactly why
+    remote callers are read-only by default.
 
 BOUNDED WAITS (ADR sec 7.4) - this client can ALWAYS free itself
 
@@ -130,6 +136,10 @@ Exit codes: 0 ok | 2 usage | 3 refused/occupied port | 4 bind failure | 5 unread
 from __future__ import annotations
 
 import argparse
+import hashlib
+import ipaddress
+import ssl
+import base64
 import ctypes
 import hashlib
 import hmac
@@ -259,6 +269,14 @@ class Config(object):
         self.pipe_fallback = _env_bool("VB6MCP_PIPE_FALLBACK", True)
         self.pipe_replay = _env_bool("VB6MCP_PIPE_REPLAY", False)
         self.debug = _env_bool("VB6MCP_HUB_DEBUG", False)
+#: step 3 - the INBOUND ingress. "pipe" (the default) is byte-for-byte
+        #: the pre-existing path; "textbox" pushes the request into the add-in's hidden
+        #: IngressForm textbox with SendMessageTimeout (which returns in microseconds)
+        #: so the tool runs AFTER the write returned instead of inside it.  An
+        #: unrecognised value never silently enables a new path.
+        self.ingress = (_env_str("VB6MCP_INGRESS", "") or "pipe").strip().lower()
+        if self.ingress not in ("pipe", "textbox"):
+            self.ingress = "pipe"
         #: an APPEND-ONLY diagnostic log.  Without it a failed joint run leaves a 0-byte file
         #: and no way to tell "the IDE was invisible" from "the handshake was rejected".
         self.log_path = _env_str("VB6MCP_BRIDGE_LOG", "")
@@ -266,7 +284,7 @@ class Config(object):
         self.instances_dir = _env_str("VB6MCP_INSTANCES_DIR", "") or os.path.join(
             tempfile.gettempdir(), "vb6mcp", "instances")
         self.discovery_ttl_ms = _env_int("VB6MCP_DISCOVERY_TTL_MS", 2000)
-        # ---- authentication (task-71; threat model = bridge/TOKEN_THREAT_MODEL.md) -----------
+        # ---- authentication (threat model = bridge/TOKEN_THREAT_MODEL.md) -----------
         # M-5: environment first (never touches disk), then an owner-only file.  With neither,
         # the service still runs on loopback and REPORTS that it is unauthenticated - a weak
         # configuration must be visible, not silent.
@@ -545,7 +563,7 @@ def pid_alive(pid):
     """True when a process with this pid is alive.
 
     OpenProcess + GetExitCodeProcess, NOT kill(pid,0): a pid that was recycled by an
-    unrelated process must not read as 'our IDE' (TASK-P3-034), and this is only ever used
+    unrelated process must not read as 'our IDE' (an earlier fix), and this is only ever used
     together with the nonce pairing, which is what actually proves identity.
     """
     try:
@@ -662,7 +680,7 @@ def wait_named_pipe_bounded(name, budget_ms, tries=4):
 
     An error_ms-free ERROR_FILE_NOT_FOUND is not always 'the IDE is gone': the VB side writes a
     deny frame, waits for the client to read it (or 750 ms), closes the handle and rebuilds the
-    same pipe within ~250 ms (task-57 measurement).  Retrying costs nothing when the pipe is
+    same pipe within ~250 ms (measurement).  Retrying costs nothing when the pipe is
     genuinely gone because WaitNamedPipe returns immediately in that case.
     """
     deadline = time.monotonic() + budget_ms / 1000.0
@@ -925,6 +943,23 @@ class Instance(object):
         self.sessionId = entry.get("sessionId")
         self.instanceId = entry.get("instanceId")
         self.tcpEnabled = entry.get("tcpEnabled")
+        # fields the pass-through surfaces that the OLD whitelist dropped.  The
+        # self-registration record (hwnd/tid/epoch) and the wire-protocol stamp (pipeProto)
+        # are published by PipeTransport.PublishInstance and were invisible to this reader.
+        self.pipeProto = entry.get("pipeProto")
+        self.hwnd = _as_int(entry.get("hwnd"))
+        self.tid = _as_int(entry.get("tid"))
+        self.epoch = _as_int(entry.get("epoch"))
+        #: the raw registry object, so a caller can read a field that is not modelled here
+        #: without another parse - and so an unregistered field is never unreachable.
+        self.raw = entry
+#: step 3 - the OPTIONAL textbox doorbell identity. Absent on every
+        #: add-in that predates it and on every "pipe" deployment, so a missing field
+        #: means "not available", never an error.
+        self.ingressMode = entry.get("ingressMode")
+        self.ingressHwnd = entry.get("ingressHwnd")
+        self.ingressBoxHwnd = entry.get("ingressBoxHwnd")
+        self.ingressCaption = entry.get("ingressCaption")
         #: diagnostics: which encoding the registry file needed and which root it came from
         self.jsonEncoding = entry.get("jsonEncoding")
         self.registryRoot = entry.get("registryRoot")
@@ -976,14 +1011,67 @@ class Instance(object):
             "pidAlive": self.pidAlive,
             "registryFile": self.file,
             "registryRoot": self.registryRoot,
+            "pipeProto": self.pipeProto,
+            "hwnd": self.hwnd,
+            "tid": self.tid,
+            "epoch": self.epoch,
             "jsonEncoding": self.jsonEncoding,
         }
+
+
+# ---------------------------------------------------------------- registry fields ----
+# (second half): THE FIELD CONTRACT OF %TEMP%\vb6mcp\instances\*.json.
+#
+# Why this block exists: read_registry() used to build the entry as a HAND-WRITTEN
+# whitelist of 21 keys, so every field the WRITER published was silently swallowed until
+# somebody remembered to add it here. That is not hypothetical - the textbox
+# identity (ingressMode / ingressHwnd / ingressBoxHwnd / ingressCaption) was lost that
+# way, and the same dict still dropped pipeProto / hwnd / tid / epoch, which
+# PipeTransport.PublishInstance writes as the self-registration record "the bridge needs
+# to bind to the INGRESS window without guessing".  A reader that cannot see a field the
+# writer publishes is a disagreement nobody is told about.
+#
+# The rule is now: PASS EVERYTHING THROUGH, and name only what is deliberately dropped.
+#   * our own synthetic keys (file / jsonEncoding / registryRoot) are added on top;
+#   * REGISTRY_IGNORED_FIELDS is the EXPLICIT, reviewed drop list (empty by design);
+#   * REGISTRY_ACKNOWLEDGED_FIELDS is the set this middle service actually consumes;
+#   * anything else is returned by registry_unknown_fields() and LOGGED by discover(),
+#     so a new field is visible on the first run instead of in a later investigation.
+REGISTRY_SYNTHETIC_FIELDS = frozenset(("file", "jsonEncoding", "registryRoot",
+                                       "projectName", "path", "sha256"))
+REGISTRY_IGNORED_FIELDS = frozenset(())
+REGISTRY_ACKNOWLEDGED_FIELDS = frozenset((
+    # identity / liveness
+    "pid", "port", "transport", "pipe", "tcpEnabled", "sessionId", "instanceId",
+    "nonce", "startedAt", "startedByHub", "dllSha256", "version",
+    # project identity (the normalised names; the legacy aliases are SYNTHETIC above)
+    "project", "projectPath",
+    # pipe wire protocol + the self-registration record
+    "pipeProto", "hwnd", "tid", "epoch",
+# textbox doorbell identity
+    "ingressMode", "ingressHwnd", "ingressBoxHwnd", "ingressCaption",
+))
+
+
+def registry_unknown_fields(entry):
+    """Registry fields neither ours, nor deliberately ignored, nor ACKNOWLEDGED.
+
+    Empty is the healthy state.  Non-empty means a writer publishes a field this reader was
+    never told about: it still PASSES THROUGH (nothing is lost), but it is NAMED here and
+    logged by discover(), so "a new field must be explicitly registered" is enforced by a
+    report instead of by memory.
+    """
+    return sorted(k for k in entry
+                  if k not in REGISTRY_ACKNOWLEDGED_FIELDS
+                  and k not in REGISTRY_IGNORED_FIELDS
+                  and k not in REGISTRY_SYNTHETIC_FIELDS)
 
 
 def read_registry():
     """Tolerant read of %TEMP%\\vb6mcp\\instances\\*.json (sec 4.2.2: never drop an entry)."""
     d = CFG.instances_dir
     entries, stale, roots_seen, candidates = [], [], [], []
+    unknown_fields = []
     for root in registry_roots():
         try:
             names = sorted(os.listdir(root))
@@ -1005,25 +1093,38 @@ def read_registry():
         if not isinstance(j, dict):
             stale.append({"file": full, "reason": "not_an_object"})
             continue
-        entry = {
-            "file": full,
-            "pid": _as_int(j.get("pid")),
-            "port": _as_int(j.get("port")),
-            "project": j.get("project") or j.get("projectName"),
-            "projectPath": j.get("projectPath") or j.get("path"),
-            "startedAt": j.get("startedAt"),
-            "version": j.get("version"),
-            "dllSha256": j.get("dllSha256") or j.get("sha256"),
-            "startedByHub": bool(j.get("startedByHub")),
-            "transport": j.get("transport"),
-            "pipe": j.get("pipe"),
-            "nonce": j.get("nonce"),
-            "sessionId": _as_int(j.get("sessionId")),
-            "instanceId": j.get("instanceId"),
-            "tcpEnabled": j.get("tcpEnabled"),
-            "jsonEncoding": enc,
-            "registryRoot": root,
-        }
+        # PASS-THROUGH first - the file's own fields are the entry - and the
+        # normalisations are written ON TOP.  Only REGISTRY_IGNORED_FIELDS is dropped, and
+        # anything not ACKNOWLEDGED is reported below instead of vanishing.
+        entry = dict(j)
+        for _drop in REGISTRY_IGNORED_FIELDS:
+            entry.pop(_drop, None)
+        entry["file"] = full
+        entry["pid"] = _as_int(j.get("pid"))
+        entry["port"] = _as_int(j.get("port"))
+        entry["project"] = j.get("project") or j.get("projectName")
+        entry["projectPath"] = j.get("projectPath") or j.get("path")
+        entry["startedAt"] = j.get("startedAt")
+        entry["version"] = j.get("version")
+        entry["dllSha256"] = j.get("dllSha256") or j.get("sha256")
+        entry["startedByHub"] = bool(j.get("startedByHub"))
+        entry["transport"] = j.get("transport")
+        entry["pipe"] = j.get("pipe")
+        entry["nonce"] = j.get("nonce")
+        entry["sessionId"] = _as_int(j.get("sessionId"))
+        entry["instanceId"] = j.get("instanceId")
+        entry["tcpEnabled"] = j.get("tcpEnabled")
+# step 3 - the textbox doorbell identity. Now a pass-through like every
+        # other writer field; kept explicit so the normalisation stays readable.
+        entry["ingressMode"] = j.get("ingressMode")
+        entry["ingressHwnd"] = j.get("ingressHwnd")
+        entry["ingressBoxHwnd"] = j.get("ingressBoxHwnd")
+        entry["ingressCaption"] = j.get("ingressCaption")
+        entry["jsonEncoding"] = enc
+        entry["registryRoot"] = root
+        _unknown = registry_unknown_fields(entry)
+        if _unknown:
+            unknown_fields.append({"file": full, "fields": _unknown})
         inst = Instance(entry)
         if any(e.pid == inst.pid and e.key == inst.key for e in entries):
             continue                    # the same instance registered under two roots
@@ -1033,7 +1134,9 @@ def read_registry():
         elif inst.pipeState == "mismatch":
             stale.append({"file": full, "pid": inst.pid, "reason": "pipe_identity_mismatch"})
     return {"dir": d, "unreadable": False, "instances": entries, "stale": stale,
-            "roots": roots_seen}
+            "roots": roots_seen, "unknownFields": unknown_fields,
+            "ignoredFields": sorted(REGISTRY_IGNORED_FIELDS),
+            "acknowledgedFieldCount": len(REGISTRY_ACKNOWLEDGED_FIELDS)}
 
 
 def _loads_registry_bytes(raw):
@@ -1119,6 +1222,7 @@ def discover(force=False):
             "instances": raw["instances"],
             "stale": raw["stale"],
             "roots": raw.get("roots") or [],
+            "unknownFields": raw.get("unknownFields") or [],
             "live": [i for i in raw["instances"] if i.pidAlive and i.has_route],
             "at": now,
         }
@@ -1126,11 +1230,16 @@ def discover(force=False):
         _DISC_CACHE["data"] = data
         dbg("discover: entries=%d live=%d stale=%d" % (len(raw["instances"]), len(data["live"]),
                                                        len(raw["stale"])))
+        _unknown = raw.get("unknownFields") or []
         bridge_log("discover", configuredDir=raw.get("dir"), entries=len(raw["instances"]),
                    live=len(data["live"]),
                    roots=";".join("%s:%d" % (r["root"], r["entries"]) for r in (raw.get("roots") or [])),
                    staleReasons=",".join(sorted(set(s.get("reason", "?") for s in raw["stale"]))) or "-",
-                   encodings=",".join(sorted(set(str(i.jsonEncoding) for i in raw["instances"]))) or "-")
+                   encodings=",".join(sorted(set(str(i.jsonEncoding) for i in raw["instances"]))) or "-",
+                   # an unregistered registry field is NAMED, never swallowed.
+                   unknownRegistryFields=";".join(
+                       "%s:%s" % (os.path.basename(u["file"]), ",".join(u["fields"]))
+                       for u in _unknown) or "-")
         return data
 
 
@@ -1496,7 +1605,160 @@ def frame_wrap(payload_bytes):
     return len(payload_bytes).to_bytes(4, "little") + payload_bytes
 
 
-def pipe_roundtrip(inst, req_text, req_id, budget_ms):
+# ------------------------------------------------------------- textbox doorbell ---
+# (step 3): the INBOUND doorbell.
+#
+# WHAT PROBLEM THIS SOLVES: the pipe round trip writes the request and then WAITS for the
+# answer, so a 30 s tool holds the bridge for 30 s.  With the doorbell the bridge pushes
+# the request into the add-in's hidden textbox with SendMessageTimeout - measured to
+# return in microseconds - and the add-in executes it afterwards on its own watchdog
+# tick.  The reply needs no new channel: it still arrives on the pipe.
+#
+# MEASURED TRAPS THIS CODE ENCODES (step 1) - do not "simplify" them away:
+#   * SetWindowText on another process's child control fails SILENTLY;
+#   * PostMessage(WM_SETTEXT) never arrives (the text is not marshalled);
+#   * SendMessageTimeout returns NULL on timeout and ctypes with restype=c_void_p turns
+#     that into None, while `None != 0` is True - so a timeout once read as a successful
+#     delivery.  Every check below goes through _smto_ok();
+#   * a write TIMEOUT does not mean "not delivered", so the same payload is never
+#     written twice and never replayed on the pipe.
+
+WM_GETTEXTLENGTH = 0x000E
+WM_SETTEXT = 0x000C
+SMTO_ABORTIFHUNG = 0x0002
+INGRESS_MAX_B64 = 12288
+INGRESS_WRITE_TIMEOUT_MS = 2000
+INGRESS_PROBE_TIMEOUT_MS = 2000
+
+_user32 = None
+_ingress_seq_lock = threading.Lock()
+_ingress_seq = [0]
+_ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+def _next_ingress_seq():
+    with _ingress_seq_lock:
+        _ingress_seq[0] += 1
+        return _ingress_seq[0]
+
+
+def _u32():
+    global _user32
+    if _user32 is None:
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.SendMessageTimeoutW.restype = ctypes.c_void_p
+        u.SendMessageTimeoutW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+                                          ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                                          ctypes.POINTER(ctypes.c_size_t)]
+        u.IsWindow.restype = wintypes.BOOL
+        u.IsWindow.argtypes = [wintypes.HWND]
+        u.FindWindowW.restype = wintypes.HWND
+        u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        u.GetClassNameW.restype = ctypes.c_int
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.EnumChildWindows.restype = wintypes.BOOL
+        u.EnumChildWindows.argtypes = [wintypes.HWND, _ENUMPROC, wintypes.LPARAM]
+        _user32 = u
+    return _user32
+
+
+def _smto(hwnd, msg, wparam, lparam, timeout_ms):
+    """(return value, lpdwResult).  The return value is None on TIMEOUT."""
+    u = _u32()
+    res = ctypes.c_size_t(0)
+    r = u.SendMessageTimeoutW(wintypes.HWND(hwnd), msg, wparam, lparam,
+                              SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(res))
+    return r, res.value
+
+
+def _smto_ok(r):
+    """THE trap: NULL (None through c_void_p) is a FAILURE, not a success."""
+    return not (r is None or r == 0)
+
+
+def _is_textbox(hwnd):
+    u = _u32()
+    buf = ctypes.create_unicode_buffer(256)
+    if u.GetClassNameW(wintypes.HWND(hwnd), buf, 255) <= 0:
+        return False
+    return "textbox" in buf.value.lower()
+
+
+def _find_by_caption(caption):
+    if not caption:
+        return 0
+    u = _u32()
+    fw = u.FindWindowW(None, caption)
+    if not fw:
+        return 0
+    found = []
+
+    def _cb(h, _lp):
+        if _is_textbox(h):
+            found.append(int(h))
+            return False
+        return True
+
+    u.EnumChildWindows(wintypes.HWND(fw), _ENUMPROC(_cb), 0)
+    return found[0] if found else 0
+
+
+def _ingress_box(inst):
+    """(hwnd, how).  The handle published in the instance record first - it is exact and
+    needs no search - with the caption as the fallback for a recycled/stale handle."""
+    u = _u32()
+    hwnd = _as_int(inst.ingressBoxHwnd) or 0
+    if hwnd and u.IsWindow(wintypes.HWND(hwnd)) and _is_textbox(hwnd):
+        return hwnd, "recorded"
+    bycap = _find_by_caption(inst.ingressCaption)
+    if bycap:
+        return bycap, "caption"
+    return 0, "missing"
+
+
+def doorbell_write(inst, req_text, budget_ms=None):
+    """Push one request into the add-in's hidden textbox.
+
+    Returns (seq, reason, detail); reason == "" means DELIVERED.
+    "write_timeout" is the one reason the caller must NOT answer with a pipe fallback:
+    the payload may already be in the box.  Every other reason is a clean "not
+    available" and the caller may safely write the request on the pipe instead.
+    """
+    if CFG.ingress != "textbox":
+        return None, "switch_pipe", "VB6MCP_INGRESS=%s" % CFG.ingress
+    if str(inst.ingressMode or "").lower() != "textbox":
+        return None, "instance_not_textbox", "ingressMode=%r" % inst.ingressMode
+    mine = _session_id()
+    theirs = _as_int(inst.sessionId)
+    if theirs and mine and theirs != mine:
+        # Cross-session: a session-1 window is not drivable from session 0.
+        return None, "cross_session", "instance session=%s bridge session=%s" % (theirs, mine)
+    hwnd, how = _ingress_box(inst)
+    if not hwnd:
+        return None, "hwnd_missing", "box=%r caption=%r (%s)" % (
+            inst.ingressBoxHwnd, inst.ingressCaption, how)
+    r, boxlen = _smto(hwnd, WM_GETTEXTLENGTH, 0, None, INGRESS_PROBE_TIMEOUT_MS)
+    if not _smto_ok(r):
+        return None, "probe_timeout", "WM_GETTEXTLENGTH hwnd=%s" % hwnd
+    if boxlen != 0:
+        # ONE IN FLIGHT, ALWAYS: writing now would overwrite a request whose reply is
+        # still on its way, and nothing downstream could report that loss.
+        return None, "box_not_empty", "windowLength=%d hwnd=%s" % (boxlen, hwnd)
+    seq = _next_ingress_seq()
+    raw = "vb6mcp1|%d|%s|%s" % (seq, inst.nonce or "", req_text)
+    b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    if len(b64) > INGRESS_MAX_B64:
+        # Small payloads ride the window message; a big one goes back to the pipe.
+        return None, "payload_too_large", "b64Len=%d limit=%d" % (len(b64), INGRESS_MAX_B64)
+    buf = ctypes.create_unicode_buffer(b64)
+    r, _res = _smto(hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p),
+                    INGRESS_WRITE_TIMEOUT_MS)
+    if not _smto_ok(r):
+        return seq, "write_timeout", ("WM_SETTEXT hwnd=%s windowLengthAtWrite=%d "
+                                      "b64Len=%d seq=%d" % (hwnd, boxlen, len(b64), seq))
+    return seq, "", "hwnd=%s via=%s seq=%d b64Len=%d" % (hwnd, how, seq, len(b64))
+
+def pipe_roundtrip(inst, req_text, req_id, budget_ms, ingress_flags=None):
     """Send one JSON-RPC request over the pipe and return (raw_resp_text|None, saw_progress).
 
     Raises TransportError.  Every wait is deadline-bounded (sec 7.4).
@@ -1511,7 +1773,7 @@ def pipe_roundtrip(inst, req_text, req_id, budget_ms):
                 POOL.drop(inst)
                 flags = {"pipeIdentityMismatch": True} if exc.stage == "identity" else {}
                 # A server deny carries the ONLY diagnosis the add-in offers, so its raw
-                # reason/detail are lifted onto the receipt here as well (item 2 of task-64:
+# reason/detail are lifted onto the receipt here as well (item 2 of :
                 # a deny must never collapse into an anonymous failure).
                 try:
                     deny = json.loads((exc.partial or b"").decode("utf-8"))
@@ -1525,16 +1787,45 @@ def pipe_roundtrip(inst, req_text, req_id, budget_ms):
                 raise TransportError("pipe_connect_failed", str(exc), exc.code,
                                      exc.stage or "connect", wrote=False, flags=flags)
         client = sess.client
+        _mark("pool_and_handshake")
         payload = req_text.encode("utf-8")
         try:
             framed = frame_wrap(payload)
         except FrameError as exc:
             raise TransportError(exc.reason, str(exc), 0, "frame", wrote=False)
-        ok, _sent = client.write_all(framed, deadline)
-        if not ok:
-            POOL.drop(inst)
-            raise TransportError("pipe_write_failed", "request not fully written", 0, "write",
-                                 wrote=False)
+# step 3: the inbound doorbell. Switched OFF by default, so a "pipe"
+        # deployment takes exactly the pre-existing path below (byte for byte).
+        wrote_on_pipe = True
+        if CFG.ingress == "textbox":
+            _igseq, why, detail = doorbell_write(inst, req_text, budget_ms)
+            if why == "":
+                wrote_on_pipe = False
+                if ingress_flags is not None:
+                    ingress_flags["ingress"] = "textbox"
+                    ingress_flags["ingressSeq"] = _igseq
+                    ingress_flags["ingressDetail"] = detail
+                bridge_log("ingress", pid=inst.pid, result="delivered", seq=_igseq, detail=detail)
+            elif why == "write_timeout":
+                POOL.drop(inst)
+                raise TransportError("ingress_timeout",
+                                     "the textbox doorbell write timed out (%s); the payload "
+                                     "is NOT rewritten and NOT replayed on the pipe, because "
+                                     "a timeout does not mean it was not delivered" % detail,
+                                     0, "ingress", wrote=True,
+                                     flags={"ingressMode": "textbox", "ingressReason": why,
+                                            "ingressDetail": detail, "ingressNoReplay": True})
+            else:
+                if ingress_flags is not None:
+                    ingress_flags["ingressFallback"] = why
+                    ingress_flags["ingressDetail"] = detail
+                bridge_log("ingress", pid=inst.pid, result="fallback", reason=why, detail=detail)
+        if wrote_on_pipe:
+            ok, _sent = client.write_all(framed, deadline)
+            if not ok:
+                POOL.drop(inst)
+                raise TransportError("pipe_write_failed", "request not fully written", 0, "write",
+                                     wrote=False)
+        _mark("transport_write_done")
         if req_id is None:
             return None, False            # a notification gets NO response frame
         seen_progress = False
@@ -1594,6 +1885,7 @@ def pipe_roundtrip(inst, req_text, req_id, budget_ms):
                 continue
             if frame.get("id") == req_id:
                 sess.last_used = time.monotonic()
+                _mark("response_frame")
                 return client.last_payload.decode("utf-8"), seen_progress
             # an unexpected frame: additive frames are allowed, keep waiting inside the budget
             last_activity = time.monotonic()
@@ -1623,6 +1915,7 @@ def forward_raw(req_text, req_obj, selector):
     """Forward one JSON-RPC message.  Returns a dict:
        {text|None, transport, transportReason, flags{}, elapsedMs, ide{}, failure{}}"""
     inst, refusal = select_target(selector)
+    _mark("select_target")
     if inst is None:
         return {"text": None, "failure": refusal, "elapsedMs": 0}
     ide = {"pid": inst.pid, "project": inst.project, "port": inst.port}
@@ -1634,15 +1927,21 @@ def forward_raw(req_text, req_obj, selector):
         body.update(exc.flags)
         body["failureKind"] = "noIde" if exc.reason == "pipe_unavailable" else "wedged"
         return {"text": None, "failure": body, "elapsedMs": _ms(t0), "ide": ide}
+    _mark("track_chosen")
     req_id = req_obj.get("id") if isinstance(req_obj, dict) else None
     bridge_log("track", tool=_tool_of(req_obj), pid=inst.pid, port=inst.port,
                pipe=_pipe_leaf(inst.pipe), track=track, reason=reason,
                flags=",".join(sorted(flags)) or "-")
     if track == "pipe":
         try:
-            text, saw_progress = pipe_roundtrip(inst, req_text, req_id, CFG.forward_timeout_ms)
+            igf = {}
+            text, saw_progress = pipe_roundtrip(inst, req_text, req_id,
+                                               CFG.forward_timeout_ms, igf)
+            _mark("roundtrip_done")
+            flags = dict(flags)
+            flags.update(igf)
             return {"text": text, "transport": "pipe", "transportReason": reason,
-                    "flags": dict(flags), "elapsedMs": _ms(t0), "ide": ide,
+                    "flags": flags, "elapsedMs": _ms(t0), "ide": ide,
                     "sawProgress": saw_progress}
         except TransportError as exc:
             flags = dict(flags)
@@ -1867,6 +2166,54 @@ def _extract_target(req, default):
     return sel, req2
 
 
+# ------------------------------------------------------------- timing probe (147) ---
+# ONE-SHOT per-request stage timing.  OFF unless VB6MCP_TIMING=1, so a normal
+# deployment pays nothing, writes nothing and behaves byte-for-byte as before.  Remove
+# the whole block (or leave it switched off) once the attribution is recorded - a
+# permanently-on log would pollute the CPU measurements this project relies on.
+TIMING_ON = (os.environ.get("VB6MCP_TIMING") or "") == "1"
+TIMING_FILE = os.environ.get("VB6MCP_TIMING_FILE") or ""
+_TL = threading.local()
+_T_LOCK = threading.Lock()
+
+
+def _t0():
+    if not TIMING_ON:
+        return
+    _TL.t = {"t0": time.perf_counter(), "marks": []}
+
+
+def _mark(name):
+    if not TIMING_ON:
+        return
+    t = getattr(_TL, "t", None)
+    if t is None:
+        return
+    t["marks"].append((name, time.perf_counter()))
+
+
+def _timing_emit(extra=None):
+    if not TIMING_ON:
+        return
+    t = getattr(_TL, "t", None)
+    if not t:
+        return
+    base = t["t0"]
+    row = {"stages": []}
+    prev, prevname = base, "start"
+    for name, ts in t["marks"]:
+        row["stages"].append([prevname + ">" + name, round((ts - prev) * 1000.0, 3)])
+        prev, prevname = ts, name
+    row["totalMs"] = round((prev - base) * 1000.0, 3)
+    if extra:
+        row.update(extra)
+    if TIMING_FILE:
+        with _T_LOCK:
+            with open(TIMING_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+    _TL.t = None
+
+
 def handle_jsonrpc(req_text, selector=None):
     """Serve ONE JSON-RPC message.  Returns (response_text|None, is_error, meta).
 
@@ -1879,7 +2226,9 @@ def handle_jsonrpc(req_text, selector=None):
     try:
         req = json.loads(req_text)
     except Exception:
+        _mark("json_parse_failed")
         return _jsonrpc_error(None, -32700, "Parse error"), True, {"reason": "parse_error"}
+    _mark("json_parsed")
     if not isinstance(req, dict):
         return _jsonrpc_error(None, -32600, "Invalid Request"), True, {"reason": "not_object"}
     method = req.get("method")
@@ -1973,7 +2322,7 @@ def health_body():
         face = "live" if snapshot()["tools"] else "live(unsnapshotted)"
     auth = auth_state()
     if not auth["enabled"]:
-        # Lead ruling (task-71 item 3a): the weak configuration must be visible HERE too, not
+        # Lead ruling (item 3a): the weak configuration must be visible HERE too, not
         # only in the startup log.
         auth["guidance"] = ("multi-user machine: set VB6MCP_TOKEN (or VB6MCP_TOKEN_FILE) - on a "
                             "shared box ANY local user can reach this loopback port and drive "
@@ -2020,7 +2369,14 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         dbg("http", fmt % args)
 
-    def _send(self, status, ctype, body, extra=None, content_length=True):
+    def setup(self):
+# probe: t0 is the moment this connection's handler started, i.e.
+        # BEFORE the request line and headers are parsed by http.server.
+        http.server.BaseHTTPRequestHandler.setup(self)
+        _t0()
+        _mark("socket_setup")
+
+    def _send_raw(self, status, ctype, body, extra=None, content_length=True):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(status)
@@ -2076,7 +2432,7 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         return b"".join(chunks), None
 
     # -- verbs ----------------------------------------------------------------
-    # -- authentication (task-71 / TOKEN_THREAT_MODEL.md M-1..M-4) ---------------------------
+    # -- authentication (TOKEN_THREAT_MODEL.md M-1..M-4) ---------------------------
     def _url_tokens(self):
         """Query parameters that a caller must never put a credential in (M-3)."""
         if "?" not in self.path:
@@ -2090,6 +2446,40 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if k in ("token", "access_token", "api_key", "apikey", "auth", "authorization"):
                 bad.append(k)
         return bad
+
+    def _remote_gate(self):
+        """None when the request may proceed, else (status, reason, message, extra).
+
+        The LOOPBACK tier returns None immediately, so its behaviour stays byte-for-byte the
+        pre-existing one.  Remote mode adds: source allowlist (403), an auditable log (503) and
+        an auth lockout (429) - all BEFORE the token check, so a locked-out source learns
+        nothing about the credential.
+        """
+        if not _REMOTE["enabled"]:
+            return None
+        peer = self.client_address[0] if self.client_address else ""
+        if peer_is_loopback(peer):
+            return None
+        self._remote_peer = peer
+        if not source_allowed(peer):
+            return (403, "source_not_allowed",
+                    "this source (%s) is not inside --allow-remote %r" % (peer, _REMOTE["allowRaw"]), {})
+        if not _audit_writable():
+            return (503, "audit_unavailable",
+                    "remote requests require an append-only audit log and it is not writable", {})
+        remain = auth_lock_remaining(peer)
+        if remain > 0:
+            return (429, "auth_locked_out",
+                    "too many failed authentications from %s; retry in %ss" % (peer, remain),
+                    {"Retry-After": str(remain)})
+        return None
+
+    def _reject_gate(self, status, reason, message, extra):
+        body = json.dumps({"ok": False, "reason": reason, "message": message},
+                          ensure_ascii=False, indent=2)
+        self.close_connection = True
+        self._send(status, "application/json", body, dict(extra or {}))
+        return
 
     def _auth_problem(self):
         """None when the request may proceed, else (reason, message).  Never returns a secret."""
@@ -2115,8 +2505,14 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             return ("token_missing",
                     "this bridge requires a token; send Authorization: Bearer <token> "
                     "or X-VB6MCP-Token")
-        if not token_matches(provided, CFG.token):
+        if not token_ok(provided):
+            # count the failure; after AUTH_FAIL_THRESHOLD the source is locked out
+            # with a doubling wait (auth_locked_out), so an online brute force is not free.
+            count = auth_record_failure(self.client_address[0] if self.client_address else "")
+            bridge_log("auth_failure", source=self.client_address[0] if self.client_address else "",
+                       count=count)
             return ("token_mismatch", "the supplied token does not match")
+        auth_record_success(self.client_address[0] if self.client_address else "")
         return None
 
     def _reject_auth(self, reason, message):
@@ -2132,18 +2528,47 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         self._send(401, "application/json", body, {"WWW-Authenticate": 'Bearer realm="vb6mcp"'})
 
+    def _send(self, code, ctype, payload, headers=None):
+""": the ONE response exit. Every response (refusals included) is audited once."""
+        try:
+            if not getattr(self, "_audited", False):
+                self._audited = True
+                peer = self.client_address[0] if self.client_address else ""
+                if _REMOTE["enabled"] and not peer_is_loopback(peer) and _REMOTE["auditPath"]:
+                    audit_write("request",
+                                source=peer,
+                                method=getattr(self, "command", ""),
+                                path=(getattr(self, "path", "") or "").split("?", 1)[0],
+                                status=code,
+                                tool=getattr(self, "_audit_tool", None),
+                                result=getattr(self, "_audit_result", None),
+                                tokenId=("current" if getattr(self, "_audit_token", "") == "current"
+                                         else (getattr(self, "_audit_token", "") or None)))
+        except Exception:
+            pass
+        return self._send_raw(code, ctype, payload, headers)
+
     def do_OPTIONS(self):
         # CORS preflight carries no Authorization header by design, so it is never gated.
         self._send(204, "text/plain", b"")
 
     def do_GET(self):
+        gate = self._remote_gate()
+        if gate is not None:
+            self._reject_gate(*gate)
+            return
         problem = self._auth_problem()
         if problem is not None:
             self._reject_auth(*problem)
             return
         path = self.path.split("?", 1)[0]
         if path in ("/health", "/ping"):
-            self._send(200, "application/json", json.dumps(health_body(), ensure_ascii=False, indent=2))
+            hb = health_body()
+            peer = self.client_address[0] if self.client_address else ""
+            if not peer_is_loopback(peer):
+                # a remote caller never learns instance paths or pipe names.
+                hb = _redact_health(hb)
+            self._send(200, "application/json", json.dumps(hb, ensure_ascii=False, indent=2))
         elif path == "/":
             self._send(200, "text/plain", "%s %s is running on port %d (middle service layer).\n"
                        % (PRODUCT, VERSION, CFG.port))
@@ -2161,6 +2586,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send(404, "text/plain", "Not Found")
 
     def do_DELETE(self):
+        gate = self._remote_gate()
+        if gate is not None:
+            self._reject_gate(*gate)
+            return
         problem = self._auth_problem()
         if problem is not None:
             self._reject_auth(*problem)
@@ -2172,6 +2601,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send(404, "text/plain", "Not Found")
 
     def do_POST(self):
+        gate = self._remote_gate()
+        if gate is not None:
+            self._reject_gate(*gate)
+            return
         problem = self._auth_problem()
         if problem is not None:
             self._reject_auth(*problem)
@@ -2187,21 +2620,54 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         if path not in ("/rpc", "/mcp"):
             self._send(404, "text/plain", "Not Found")
             return
+        _mark("path_routed")
         body, err = self._read_body()
+        _mark("body_read")
         if err is not None:
             # the request body was NOT drained: never keep this connection alive
             self.close_connection = True
             self._send(err[0], err[1], err[2], {"Connection": "close"})
             return
         req_text = body.decode("utf-8-sig", "replace")
+        # a non-loopback caller is READ-ONLY unless the service was started with
+        # --remote-write.  Deny-FIRST: anything not on the read-only allowlist is refused.
+        _peer = self.client_address[0] if self.client_address else ""
+        if _REMOTE["enabled"] and not peer_is_loopback(_peer):
+            try:
+                _req = json.loads(req_text)
+                _tool = ((_req.get("params") or {}).get("name") if isinstance(_req, dict) else None)
+            except Exception:
+                _tool = None
+            self._audit_tool = _tool
+            if _req_is_tool_call(req_text):
+                _ok, _reason, _msg = remote_tool_allowed(_tool, True)
+                if not _ok:
+                    self._audit_result = _reason
+                    _rid = None
+                    try:
+                        _rid = json.loads(req_text).get("id")
+                    except Exception:
+                        _rid = None
+                    refusal = _jsonrpc_result(_rid, {"content": [{"type": "text", "text": json.dumps(
+                        {"ok": False, "reason": _reason, "message": _msg,
+                         "remoteMode": "read-only" if not _REMOTE["write"] else "read-write",
+                         "hint": "start the bridge with --remote-write if the network really must "
+                                 "drive write/execute tools"},
+                        ensure_ascii=False)}]})
+                    self._send(200, "application/json", refusal.encode("utf-8"))
+                    return
         target = self.headers.get("X-VB6MCP-Target") or CFG.target
         try:
             resp_text, _is_error, _meta = handle_jsonrpc(req_text, target)
         except Exception as exc:
             dbg("dispatch failed:", repr(exc))
             resp_text = _jsonrpc_error(None, -32603, "Internal error: %s" % exc)
+        _mark("dispatch_done")
         if resp_text is None:
+            _mark("send_begin")
             self._send(202, "application/json", b"")
+            _mark("send_done")
+            _timing_emit({"path": path, "reqLen": len(req_text), "respLen": 0})
             return
         accept = (self.headers.get("Accept") or "").lower()
         if "text/event-stream" in accept and "application/json" not in accept:
@@ -2211,7 +2677,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         extra = {}
         if '"method":"initialize"' in req_text.replace(" ", ""):
             extra["Mcp-Session-Id"] = str(uuid.uuid4())
+        _mark("send_begin")
         self._send(200, "application/json", resp_text.encode("utf-8"), extra)
+        _mark("send_done")
+        _timing_emit({"path": path, "reqLen": len(req_text), "respLen": len(resp_text)})
 
 
 class BridgeServer(http.server.ThreadingHTTPServer):
@@ -2244,17 +2713,302 @@ def run_stdio(selector):
 
 # ---------------------------------------------------------------- main ------------
 
+# =====================================================================================
+# REMOTE MODE (the specification is docs/design/REMOTE_ACCESS.md).
+#
+# The DEFAULT tier is unchanged: loopback only, no TLS requirement, and a non-loopback
+# host still exits with EXIT_LOOPBACK_REFUSED (6) unless remote mode is explicitly set up.
+# Remote mode is FAIL-CLOSED and needs ALL THREE of: --allow-remote <cidr[,cidr]>, a TLS
+# certificate+key, and a token source.  On top of that:
+#   * the source address is re-checked INSIDE the process (403 source_not_allowed),
+#   * a non-loopback caller is READ-ONLY by default (remote_read_only) unless --remote-write,
+#   * tokens are compared in constant time, a SECOND (previous) token stays valid for rotation,
+#   * auth failures back off exponentially per source (then auth_locked_out),
+#   * every response (refusals included) appends exactly ONE JSONL audit line, and an
+#     unwritable audit log refuses remote requests outright (audit_unavailable),
+#   * /health never shows instance paths or pipe names to a remote caller.
+# =====================================================================================
+EXIT_LOOPBACK_REFUSED = 6
+EXIT_REMOTE_MISCONFIGURED = 7
+
+#: Deny-first: a remote caller may only use tools on this READ-ONLY list.  A tool that is not
+#: listed (including anything new) is refused with remote_read_only, so a forgetful allowlist
+#: fails CLOSED instead of silently handing the write face to the network.
+REMOTE_READ_ONLY_TOOLS = {
+    "ide_state", "ide_list", "ide_target", "mcp_info", "audit_tail", "todo_status",
+    "current_position", "desktop_probe", "execution_state", "read_active_dialogs",
+    "list_windows", "list_addins", "list_component_parts", "list_files", "list_lessons",
+    "get_project_info", "get_component_list", "get_component_code", "get_component_properties",
+    "get_codepane", "get_selection", "get_device", "get_device_at", "get_device_properties",
+    "get_engine_status", "get_ic", "get_model_path", "get_param_value", "get_sim_mode",
+    "get_sim_time", "get_simulations", "get_status", "get_symbol_info", "get_display_mode",
+    "read_file", "read_source", "read_point", "read_monitor", "read_bytes",
+    "search_in_files", "search_point", "search_model_object", "search_procedures", "search_strings",
+    "find_in_component", "find_gui", "find_xrefs_to_name",
+    "check_component", "check_references", "check_public_api", "check_write_paths", "check_schema_baseline",
+    "validate_code", "verify", "verify_scope", "verify_reconstruction",
+    "export_public_api", "export_component", "export_evidence_bundle", "export_lessons",
+    "dependency_graph", "tree_list_nodes", "tree_node_info", "tree_find_node",
+    "units_of", "grep", "glob", "comment", "inline_comment", "list_bookmarks", "list_breakpoints",
+    "list_documents", "list_names", "list_procedures", "list_segments", "list_strings",
+    "list_architectures", "list_unknowns", "binary_overview", "binary_session",
+    "analysis_view", "inspect_analysis_view", "procedure_info", "procedure_assemblY",
+    "procedure_pseudo_code", "procedure_callers", "procedure_callees", "procedure_references",
+    "current_address", "current_document", "current_procedure", "address_name",
+    "read_function_instructions", "get_evidence_bundle", "get_navigation_context",
+}
+#: Even when the mode is --remote-write these stay refused from a remote peer (defence in depth).
+REMOTE_NEVER_TOOLS = {"quit_ide"}
+
+_REMOTE = {
+    "allow": (),            # tuple of ipaddress networks
+    "allowRaw": "",
+    "tlsCert": "", "tlsKey": "",
+    "write": False,
+    "tokenPrev": "",
+    "auditPath": "",
+    "enabled": False,
+}
+_AUTH_LOCK = threading.Lock()
+_AUTH_FAILS = {}            # source -> {"count": n, "until": epoch_seconds}
+AUTH_FAIL_THRESHOLD = 5     # then back off: 30 s, doubling, capped at 300 s
+AUTH_BACKOFF_BASE_S = 30
+AUTH_BACKOFF_MAX_S = 300
+
+
+def remote_configure(allow_remote, tls_cert, tls_key, remote_write, token_prev, audit_path):
+    """Set the remote-mode policy once, at startup.  Returns the list of MISSING prerequisites.
+
+    Nothing here enables anything by accident: an empty allow_remote keeps the loopback tier.
+    """
+    nets = []
+    raw = (allow_remote or "").strip()
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError as exc:
+                _REMOTE["allowError"] = "bad cidr %r: %s" % (part, exc)
+    _REMOTE["allow"] = tuple(nets)
+    _REMOTE["allowRaw"] = raw
+    _REMOTE["tlsCert"] = (tls_cert or "").strip()
+    _REMOTE["tlsKey"] = (tls_key or "").strip()
+    _REMOTE["write"] = bool(remote_write)
+    _REMOTE["tokenPrev"] = (token_prev or "").strip()
+    _REMOTE["auditPath"] = (audit_path or os.environ.get("VB6MCP_AUDIT_LOG", "") or "").strip()
+    _REMOTE["enabled"] = bool(raw)
+    return remote_missing()
+
+
+def remote_missing():
+    """Every prerequisite the CURRENT configuration lacks (empty list = remote is complete)."""
+    if not _REMOTE["enabled"]:
+        return []
+    missing = []
+    if _REMOTE.get("allowError"):
+        missing.append("--allow-remote (%s)" % _REMOTE["allowError"])
+    if not _REMOTE["allow"]:
+        missing.append("--allow-remote <cidr[,cidr]>")
+    if not _REMOTE["tlsCert"] or not _REMOTE["tlsKey"]:
+        missing.append("--tls-cert/--tls-key")
+    elif not (os.path.isfile(_REMOTE["tlsCert"]) and os.path.isfile(_REMOTE["tlsKey"])):
+        missing.append("--tls-cert/--tls-key (file not found)")
+    if not CFG.auth_enabled():
+        missing.append("token source (VB6MCP_TOKEN or VB6MCP_TOKEN_FILE)")
+    if not _REMOTE["auditPath"]:
+        missing.append("--audit-log/VB6MCP_AUDIT_LOG (remote requests MUST be auditable)")
+    elif not _audit_writable():
+        missing.append("--audit-log (path is not writable)")
+    return missing
+
+
+def remote_enabled():
+    return bool(_REMOTE["enabled"])
+
+
+def peer_is_loopback(peer):
+    return is_loopback_host(str(peer or ""))
+
+
+def source_allowed(peer):
+    """True when a REMOTE peer is inside --allow-remote.  Loopback is always allowed."""
+    if peer_is_loopback(peer):
+        return True
+    if not _REMOTE["enabled"]:
+        return False
+    try:
+        addr = ipaddress.ip_address(str(peer))
+    except ValueError:
+        return False
+    for net in _REMOTE["allow"]:
+        if addr in net:
+            return True
+    return False
+
+
+def remote_tool_allowed(tool, remote_peer):
+    """(allowed, reason, message) for one tool call from a (possibly remote) peer."""
+    if not remote_peer:
+        return True, "", ""
+    name = str(tool or "")
+    if name in REMOTE_NEVER_TOOLS:
+        return False, "remote_read_only", ("%s is never executable from a remote caller" % name)
+    if _REMOTE["write"]:
+        return True, "", ""
+    if name in REMOTE_READ_ONLY_TOOLS:
+        return True, "", ""
+    return False, "remote_read_only", (
+        "%r is not on the remote READ-ONLY allowlist: a non-loopback caller never gets the "
+        "write/execute face unless the service was started with --remote-write" % name)
+
+
+def token_ok(provided):
+    """Constant-time check against the CURRENT token and, during rotation, the PREVIOUS one."""
+    if token_matches(provided, CFG.token):
+        return True
+    prev = _REMOTE["tokenPrev"]
+    if prev and token_matches(provided, prev):
+        return True
+    return False
+
+
+def _audit_writable():
+    p = _REMOTE["auditPath"]
+    if not p:
+        return False
+    try:
+        d = os.path.dirname(os.path.abspath(p))
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write("")
+        return True
+    except OSError:
+        return False
+
+
+def audit_write(event, **fields):
+    """Append ONE JSONL line.  Never raises, never records a token value (M-4)."""
+    p = _REMOTE["auditPath"]
+    if not p:
+        return False
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event}
+    for k, v in fields.items():
+        if k.lower() in ("token", "authorization", "x-vb6mcp-token", "secret", "credential"):
+            rec[k] = "<redacted>"
+        else:
+            rec[k] = v
+    try:
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+        return True
+    except OSError:
+        return False
+
+
+def auth_lock_remaining(peer):
+    """Seconds a source is still locked out (0 = it may try now)."""
+    now = time.time()
+    with _AUTH_LOCK:
+        st = _AUTH_FAILS.get(str(peer or ""))
+        if not st:
+            return 0
+        if st["until"] <= now:
+            return 0
+        return int(st["until"] - now) + 1
+
+
+def auth_record_failure(peer):
+    """Record one auth failure; after AUTH_FAIL_THRESHOLD they are locked out with a doubled wait."""
+    now = time.time()
+    with _AUTH_LOCK:
+        st = _AUTH_FAILS.setdefault(str(peer or ""), {"count": 0, "until": 0, "wait": 0})
+        st["count"] += 1
+        if st["count"] >= AUTH_FAIL_THRESHOLD:
+            wait = st.get("wait") or AUTH_BACKOFF_BASE_S
+            st["until"] = now + wait
+            st["wait"] = min(int(wait) * 2, AUTH_BACKOFF_MAX_S)
+        return st["count"]
+
+
+def auth_record_success(peer):
+    with _AUTH_LOCK:
+        _AUTH_FAILS.pop(str(peer or ""), None)
+
+
+def _req_is_tool_call(req_text):
+    try:
+        j = json.loads(req_text)
+    except Exception:
+        return False
+    return isinstance(j, dict) and j.get("method") == "tools/call"
+
+
+def _jsonrpc_result(req_id, result):
+    return json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}, ensure_ascii=False)
+
+
+def _redact_health(body):
+    """Strip discovery detail (instance paths, pipe names, pids) for a non-loopback caller."""
+    try:
+        out = dict(body or {})
+        insts = out.get("instances") or []
+        out["instances"] = [{"project": (i or {}).get("project"), "port": (i or {}).get("port"),
+                             "transport": (i or {}).get("transport"), "redacted": True} for i in insts]
+        for k in ("pipe", "pipeName", "registryFile", "registryRoot", "registryDir", "projectPath",
+                  "pid", "instanceId", "dllSha256", "logPath", "dataDirs", "sourceDir"):
+            out.pop(k, None)
+        out["remoteRedacted"] = True
+        return out
+    except Exception:
+        return {"ok": True, "remoteRedacted": True}
+
+
+def _tls_fingerprint(cert_path):
+    """sha256 of the DER certificate - the value a client pins (never a secret)."""
+    try:
+        with open(cert_path, "rb") as fh:
+            pem = fh.read()
+        if b"-----BEGIN CERTIFICATE-----" in pem:
+            import base64 as _b64
+            body = pem.split(b"-----BEGIN CERTIFICATE-----", 1)[1].split(b"-----END CERTIFICATE-----", 1)[0]
+            der = _b64.b64decode(b"".join(body.split()))
+        else:
+            der = pem
+        return hashlib.sha256(der).hexdigest()
+    except Exception:
+        return ""
+
+
 def serve(port, host, selector):
     if not is_loopback_host(host):
-        # M-0, UNCONDITIONAL: no override switch exists on purpose.
-        sys.stderr.write(
-            "vb6mcp_bridge: REFUSED - %r is not a loopback address.\n"
-            "  This service exposes the whole tool face (110 tools, including WRITE tools that\n"
-            "  edit files and run code in the IDE).  Non-loopback binding is disabled outright\n"
-            "  (ADR sec 0.5 / TOKEN_THREAT_MODEL.md M-0) and there is deliberately NO switch to\n"
-            "  override it.  Use 127.0.0.1, ::1 or localhost.\n" % (host,))
-        bridge_log("bind_refused", host=host, reason="non_loopback_host")
-        return 6
+        # M-0 is now the DEFAULT tier, not the only one.  Without --allow-remote the
+        # old invariant holds EXACTLY (exit 6, no TLS requirement for loopback).  With it, remote
+        # mode must be COMPLETE (allow-remote + TLS cert/key + token source + an auditable log);
+        # any gap refuses to start and names every missing item - never a silent downgrade.
+        missing = remote_missing()
+        if not _REMOTE["enabled"]:
+            sys.stderr.write(
+                "vb6mcp_bridge: REFUSED - %r is not a loopback address.\n"
+                "  This service exposes the whole tool face (110 tools, including WRITE tools that\n"
+                "  edit files and run code in the IDE).  The DEFAULT tier is loopback-only\n"
+                "  (ADR sec 0.5 / TOKEN_THREAT_MODEL.md M-0); remote binding requires ALL of\n"
+                "  --allow-remote <cidr> + --tls-cert/--tls-key + a token source (see\n"
+                "  docs/design/REMOTE_ACCESS.md).  Missing: --allow-remote.\n" % (host,))
+            bridge_log("bind_refused", host=host, reason="non_loopback_host")
+            return EXIT_LOOPBACK_REFUSED
+        if missing:
+            sys.stderr.write(
+                "vb6mcp_bridge: REFUSED - remote mode is INCOMPLETE for %r.\n"
+                "  Missing: %s\n"
+                "  Remote mode is fail-closed: it needs --allow-remote, --tls-cert/--tls-key, a\n"
+                "  token source and an auditable --audit-log (docs/design/REMOTE_ACCESS.md).\n"
+                % (host, "; ".join(missing)))
+            bridge_log("bind_refused", host=host, reason="remote_misconfigured", missing=missing)
+            return EXIT_REMOTE_MISCONFIGURED
     if port == RESERVED_PORT:
         sys.stderr.write("vb6mcp_bridge: REFUSED - port %d is reserved by this repository.\n"
                          % RESERVED_PORT)
@@ -2267,9 +3021,33 @@ def serve(port, host, selector):
                          "port hopping)\n" % (host, port, exc))
         return 4
     CFG.port = port
-    sys.stderr.write("vb6mcp_bridge %s listening on http://%s:%d  (/rpc, /mcp, /health)\n"
-                     % (VERSION, host, port))
-    # ---- auth state, to stderr AND the log (Lead ruling task-71 item 3b) -------------------
+    scheme = "http"
+    if _REMOTE["enabled"] and _REMOTE["tlsCert"]:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(_REMOTE["tlsCert"], _REMOTE["tlsKey"])
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            scheme = "https"
+            fp = _tls_fingerprint(_REMOTE["tlsCert"])
+        except Exception as exc:
+            sys.stderr.write("vb6mcp_bridge: REFUSED - TLS could not be enabled: %r\n" % (exc,))
+            bridge_log("bind_refused", host=host, reason="tls_setup_failed", error=str(exc))
+            return EXIT_REMOTE_MISCONFIGURED
+    sys.stderr.write("vb6mcp_bridge %s listening on %s://%s:%d  (/rpc, /mcp, /health)\n"
+                     % (VERSION, scheme, host, port))
+    if _REMOTE["enabled"]:
+        # LOUD: an operator must never wonder whether the write face is exposed to the network.
+        _mode = "READ-WRITE (--remote-write)" if _REMOTE["write"] else "READ-ONLY"
+        sys.stderr.write("vb6mcp_bridge REMOTE MODE ENABLED: allow=%s tls=%s fingerprint=%s\n"
+                         "  remote callers: %s; audit=%s; token rotation=%s\n"
+                         % (_REMOTE["allowRaw"], _REMOTE["tlsCert"], fp or "(none)",
+                            _mode, _REMOTE["auditPath"],
+                            "previous token also valid" if _REMOTE["tokenPrev"] else "single token"))
+        bridge_log("remote_mode", allow=_REMOTE["allowRaw"], write=_REMOTE["write"],
+                   audit=_REMOTE["auditPath"], tlsFingerprint=fp,
+                   tokenRotation=bool(_REMOTE["tokenPrev"]))
+    # ---- auth state, to stderr AND the log (Lead ruling item 3b) -------------------
     _a = auth_state()
     _line = ("vb6mcp_bridge auth: enabled=%s required=%s source=%s tokenLen=%d"
              % (_a["enabled"], _a["required"], _a["source"], _a["tokenLen"]))
@@ -2327,12 +3105,27 @@ def main(argv=None):
     ap.add_argument("--smoke-seconds", type=int, default=60,
                     help="how long --smoke keeps serving (default 60)")
     ap.add_argument("--print-config", action="store_true")
+# ---- remote mode (docs/design/REMOTE_ACCESS.md)
+    ap.add_argument("--allow-remote", default=None,
+                    help="comma-separated CIDRs allowed to reach a NON-loopback bind; remote mode "
+                         "also needs --tls-cert/--tls-key, a token source and --audit-log")
+    ap.add_argument("--tls-cert", default=None, help="PEM certificate for the HTTPS face")
+    ap.add_argument("--tls-key", default=None, help="PEM private key for the HTTPS face")
+    ap.add_argument("--remote-write", action="store_true",
+                    help="allow a remote caller to use write/execute tools (default: read-only)")
+    ap.add_argument("--token-prev", default=None,
+                    help="previous token that stays valid during rotation (or VB6MCP_TOKEN_PREV)")
+    ap.add_argument("--audit-log", default=None,
+                    help="append-only JSONL audit log; REQUIRED for remote mode")
     ap.add_argument("--stub-addin", action="store_true",
                     help="DEV ONLY: run a stub np/1 pipe add-in in its own process "
                          "(used by --selftest; env VB6MCP_STUB_PIPE/NONCE/...)")
     args = ap.parse_args(argv)
 
     CFG.resolve_token()
+    remote_configure(args.allow_remote, args.tls_cert, args.tls_key, args.remote_write,
+                     args.token_prev or os.environ.get("VB6MCP_TOKEN_PREV", ""),
+                     args.audit_log or os.environ.get("VB6MCP_AUDIT_LOG", ""))
     if args.port is not None:
         CFG.port = args.port
     if args.host:
@@ -2355,7 +3148,14 @@ def main(argv=None):
             "registryRoots": registry_roots(),
             "authEnabled": CFG.auth_enabled(), "authSource": CFG.token_source,
             "tokenLen": len(CFG.token), "tokenNote": CFG.token_note or None,
-            "loopbackOnly": True,
+            "loopbackOnly": (not remote_enabled()),
+            "remoteMode": remote_enabled(),
+            "allowRemote": _REMOTE["allowRaw"] or None,
+            "remoteWrite": _REMOTE["write"],
+            "tlsCert": _REMOTE["tlsCert"] or None,
+            "auditLog": _REMOTE["auditPath"] or None,
+            "tokenRotation": bool(_REMOTE["tokenPrev"]),
+            "remoteMissing": remote_missing(),
         }, ensure_ascii=False, indent=2))
         return 0
     if args.stub_addin:
@@ -3396,7 +4196,7 @@ def run_selftest(with_battery=False):
                   s19.sessions))
 
         # ---- S20: welcome.project is NOT an identity input ------------------------------
-        # task-57 measured that welcome.project is the LIVE ActiveVBProject.Name at handshake
+# measured that welcome.project is the LIVE ActiveVBProject.Name at handshake
         # time: it may be "" (no project) and it may CHANGE after the add-in starts.  It is a
         # snapshot, never the authoritative project id - that is the registry project/projectPath.
         for idx, (welcome_project, reg_project) in enumerate([("WELCOME_OTHER", "RegName"),
@@ -3471,7 +4271,7 @@ def run_selftest(with_battery=False):
               and b'"nonce": "' not in hello_raw and hello_obj.get("nonce") == n21,
               "payload=%s" % hello_raw[:110].decode("utf-8", "replace"))
 
-        # ---- S27: the NEW writer (task-68) escapes non-ASCII -> the file is pure ASCII ------
+        # ---- S27: the NEW writer escapes non-ASCII -> the file is pure ASCII ------
         # Writer-side fix: Util.AsciiEscapeJson turns every >127 code unit into \uXXXX, so the
         # registry file is always pure ASCII.  The Lead requires the TOLERANT CHAIN TO STAY
         # (legacy GBK entries still exist on disk), so both forms must be readable in the SAME
@@ -3690,13 +4490,16 @@ def run_selftest(with_battery=False):
               and ("tokenLen=%d" % len(SECRET)) in logtext28,
               "logBytes=%d hasSecret=%s hasReject=%s" % (len(logtext28), SECRET in logtext28,
                                                          "auth_reject" in logtext28))
+        # The non-loopback examples are TEST-NET reservations (RFC 5737): 203.0.113.0/24 and
+        # 198.51.100.0/24.  They keep the "a non-loopback host is refused" semantics while making
+        # the shipped tree carry no real intranet address.
         check("V7a only literal loopback hosts are accepted (0.0.0.0 impossible)",
               all(is_loopback_host(h) for h in ("127.0.0.1", "127.9.9.9", "localhost", "::1"))
-              and not any(is_loopback_host(h) for h in ("0.0.0.0", "10.10.10.88", "192.168.1.5",
+              and not any(is_loopback_host(h) for h in ("0.0.0.0", "203.0.113.7", "198.51.100.7",
                                                         "example.com", "127.0.0.1.example.com")),
               "whitelist ok")
-        check("V7b serve() refuses a non-loopback host with exit 6 (no override switch)",
-              serve(8799, "0.0.0.0", "") == 6 and serve(8799, "10.10.10.88", "") == 6,
+        check("V7b DEFAULT tier: serve() refuses a non-loopback host with exit 6 (no --allow-remote)",
+              serve(8799, "0.0.0.0", "") == 6 and serve(8799, "203.0.113.7", "") == 6,
               "refused both")
         httpd28.shutdown()
         httpd28.server_close()

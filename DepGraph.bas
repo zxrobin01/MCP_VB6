@@ -8,7 +8,7 @@ Private m_nm() As String
 Private m_tx() As String
 Private m_cnt As Long
 
-' P0-5: procedure level graph state (component, procedure name, body text)
+' An earlier batch: procedure level graph state (component, procedure name, body text)
 Private m_pc() As String
 Private m_pn() As String
 Private m_pb() As String
@@ -20,7 +20,7 @@ Private m_sp As Long
 Private m_seen As Object
 Private m_cyc As String
 
-' TASK-42 (MCP-lead-19): the whole-graph build runs under ONE wall-clock budget.
+' the whole-graph build runs under ONE wall-clock budget.
 ' Default 8000 ms - well under the 60 s MCP client timeout; VB6MCP_BUDGET_MS (an
 ' environment variable) overrides it for one process. Every scan loop calls
 ' DepBudgetHit and, when it turns True, the builder STOPS and serialises what it
@@ -36,13 +36,17 @@ Private m_stage As String
 Private m_tokenized As Long
 Private m_edgeScan As Long
 
-' TASK-95: the cutoff must be DETERMINISTIC. The primary budget is a CHARACTER
+' the cutoff must be DETERMINISTIC. The primary budget is a CHARACTER
 ' quota (cross-machine stable); the wall clock is only a LAST RESORT and is
 ' reported separately (timingTruncated) so a partial answer can never be
 ' mistaken for a complete one. A complete run is reproducible (verified: three
 ' consecutive calls with a raised quota are byte-identical).
 Public Const DEP_CHAR_QUOTA_DEFAULT As Long = 900000
-' TASK-95 r2/r4: a single global quota let the FIRST phase (tokenize) eat the whole
+' Caller-supplied quota for ONE run (0 = use the environment/default). Lets a caller size
+' the budget to the project without setting a process-wide environment variable.
+Private m_quotaOverride As Long
+
+' r2/r4: a single global quota let the FIRST phase (tokenize) eat the whole
 ' default budget, so the default receipt had nodes but ZERO edges. Each phase now
 ' gets a deterministic RESERVED SHARE of the quota. The shares are CUMULATIVE
 ' ceilings as a percentage of the global quota; the phase order inside DepGraphJson
@@ -70,13 +74,13 @@ Private m_cyclesStageDone As Boolean
 Private m_procEdgeDone As Boolean
 Private m_procEdgeScan As Long
 Private m_procEdgesFound As Long
-' TASK-95 r4: per-stage COVERAGE counters. A *StageCompleted flag is true only when
+' r4: per-stage COVERAGE counters. A *StageCompleted flag is true only when
 ' that stage covered every item it was supposed to cover AND every stage it depends
 ' on was itself complete. A stage that was cut MUST report false - never true.
 Private m_purityScan As Long
 Private m_cyclesScan As Long
 Private m_cycleAbort As Boolean
-' TASK-95 r4: the project's TRUE component count. The collector can know more
+' r4: the project's TRUE component count. The collector can know more
 ' components than it managed to collect, so componentsTotal and every completion
 ' flag are measured against THIS, never against "what we happened to collect".
 Private m_totalComps As Long
@@ -103,17 +107,21 @@ Public Sub DepAdd(ByVal name As String, ByVal text As String)
 End Sub
 
 ' ---------------------------------------------------------------------------
-' TASK-42: the budget API. ToolDependencyGraph calls DepBudgetStart once per
+' the budget API. ToolDependencyGraph calls DepBudgetStart once per
 ' call; DepGraphJson auto-starts if a caller forgets, so a budget can never be
 ' silently absent (m_budgetMs = 0 would otherwise mean "expired at once").
 ' ---------------------------------------------------------------------------
 Public Sub DepBudgetStart(Optional ByVal ms As Long = 0)
     m_budgetMs = ms
-    ' TASK-95: the wall clock is only a last resort; the DETERMINISTIC cutoff is
+    ' the wall clock is only a last resort; the DETERMINISTIC cutoff is
     ' the character quota below (VB6MCP_CHAR_QUOTA overrides it for one process).
     If m_budgetMs <= 0 Then m_budgetMs = EnvLongOr("VB6MCP_BUDGET_MS", DEP_TIMING_DEFAULT_MS)
     If m_budgetMs <= 0 Then m_budgetMs = DEP_TIMING_DEFAULT_MS
-    m_charQuota = EnvLongOr("VB6MCP_CHAR_QUOTA", DEP_CHAR_QUOTA_DEFAULT)
+    If m_quotaOverride > 0 Then
+        m_charQuota = m_quotaOverride
+    Else
+        m_charQuota = EnvLongOr("VB6MCP_CHAR_QUOTA", DEP_CHAR_QUOTA_DEFAULT)
+    End If
     If m_charQuota <= 0 Then m_charQuota = DEP_CHAR_QUOTA_DEFAULT
     m_stageQuota = m_charQuota
     m_chars = 0
@@ -141,7 +149,7 @@ End Sub
 
 ' True once the budget is spent. Cheap (one increment + a mask), so it is called
 ' from inside every scan loop.
-' TASK-95: TWO cutoffs, two flags. The quota (characters) is deterministic, so
+' TWO cutoffs, two flags. The quota (characters) is deterministic, so
 ' the same input always stops at the same place; the clock is a last resort and
 ' sets m_timingTruncated so the receipt can say WHICH one fired.
 Public Sub DepAddChars(ByVal n As Long)
@@ -153,7 +161,7 @@ Public Sub DepAddChars(ByVal n As Long)
     End If
 End Sub
 
-' TASK-95 r2: per-phase reserved share; pct is a percentage of the global quota.
+' r2: per-phase reserved share; pct is a percentage of the global quota.
 Public Sub DepSetStageQuota(ByVal pct As Long)
     m_stageCut = False
     m_stageQuota = (m_charQuota \ 100) * pct
@@ -161,7 +169,7 @@ Public Sub DepSetStageQuota(ByVal pct As Long)
     If m_stageQuota > m_charQuota Then m_stageQuota = m_charQuota
 End Sub
 
-' TASK-95 r4: the caller tells us how many components the project really has (it knows
+' r4: the caller tells us how many components the project really has (it knows
 ' this even when the collection loop was itself cut).
 Public Sub DepSetComponentsTotal(ByVal n As Long)
     If n > m_totalComps Then m_totalComps = n
@@ -175,7 +183,7 @@ Private Function TotalComps() As Long
     End If
 End Function
 
-' TASK-95 r4: one place for the "is the answer complete?" question. partial is NOT a
+' r4: one place for the "is the answer complete?" question. partial is NOT a
 ' separate guess - it is exactly "some stage did not finish".
 Private Function AllStagesDone() As Boolean
     AllStagesDone = m_tokenizeDone And m_edgeStageDone And m_purityStageDone _
@@ -183,7 +191,7 @@ Private Function AllStagesDone() As Boolean
 End Function
 
 Public Function DepBudgetHit() As Boolean
-    ' TASK-95 r3: a TIMING hit is a global last resort, but a STAGE hit stops only
+    ' r3: a TIMING hit is a global last resort, but a STAGE hit stops only
     ' the CURRENT phase - the next phase runs with its own (larger) reserved share,
     ' so the edge phase can never be starved by the tokenize phase.
     If m_timingTruncated Then
@@ -227,6 +235,10 @@ Private Function BudgetSuffix() As String
         & "," & Qs("charsProcessed") & ":" & CStr(m_chars) _
         & "," & Qs("componentsScanned") & ":" & CStr(m_tokenized) _
         & "," & Qs("componentsTotal") & ":" & CStr(TotalComps()) _
+        & "," & Qs("componentsUnscanned") & ":" & CStr(TotalComps() - m_tokenized) _
+        & "," & Qs("edgeComponentsUnscanned") & ":" & CStr(TotalComps() - m_edgeScan) _
+        & "," & Qs("edgesComplete") & ":" & LCase$(CStr(m_edgeStageDone And Not m_timingTruncated And (m_edgeScan >= TotalComps()))) _
+        & "," & Qs("quotaSource") & ":" & Js(IIf(m_quotaOverride > 0, "caller (char_quota)", "environment/default")) _
         & "," & Qs("proceduresScanned") & ":" & CStr(m_procEdgeScan) _
         & "," & Qs("procEdgesFound") & ":" & CStr(m_procEdgesFound) _
         & "," & Qs("edgeStageCompleted") & ":" & LCase$(CStr(m_edgeStageDone)) _
@@ -251,7 +263,7 @@ Public Function DepGraphJson() As String
         DepGraphJson = "{" & Qs("nodes") & ":[]," & Qs("edges") & ":[]," & Qs("cycles") & ":[]," & Qs("purity") & ":[]," & Qs("procNodes") & ":[]," & Qs("procEdges") & ":[]," & Qs("procCount") & ":0" & BudgetSuffix() & "}"
         Exit Function
     End If
-    ' TASK-42 (MCP-lead-19): ONE token pass per module, plus ONE lowercased name
+    ' ONE token pass per module, plus ONE lowercased name
     ' table for the membership test. The component-edge phase used to call
     ' HasTok(tk(i), LCase$(m_nm(j))) for EVERY (i,j) pair - a Like over the WHOLE
     ' module token string, i.e. ~12,100 whole-text scans on 110 components. That is
@@ -266,7 +278,7 @@ Public Function DepGraphJson() As String
         MaybePump
         If DepBudgetHit() Then Exit For
         tk(i) = Toks(Sanitize(m_tx(i)))
-        ' TASK-95 r4: a cut INSIDE Toks/Sanitize leaves tk(i) PARTIAL, so component i
+        ' r4: a cut INSIDE Toks/Sanitize leaves tk(i) PARTIAL, so component i
         ' is NOT counted as scanned and is not used by the phases below. (The old
         ' "If m_exhausted Then Exit For" latch made every LATER phase abort after one
         ' iteration - that is why the procedure-edge stage reported 1 of 1400.)
@@ -327,7 +339,7 @@ Public Function DepGraphJson() As String
             End If
             tp = sp + 1
         Loop
-        ' TASK-95 r4: only a component whose WHOLE token stream was scanned counts.
+        ' r4: only a component whose WHOLE token stream was scanned counts.
         If Not edgeMid Then m_edgeScan = m_edgeScan + 1
     Next
     m_edgeStageDone = m_tokenizeDone And (m_edgeScan >= TotalComps())
@@ -354,7 +366,7 @@ Public Function DepGraphJson() As String
             End If
         Next
     Next
-    ' TASK-95 r4: the cycle phase shares the LAST slice of the quota on purpose - it
+    ' r4: the cycle phase shares the LAST slice of the quota on purpose - it
     ' spends no character quota, so a ceiling below what the earlier phases already
     ' spent would cut it on entry for no reason.
     DepSetStageQuota DEP_SHARE_LAST
@@ -381,7 +393,7 @@ Public Function DepGraphJson() As String
 End Function
 
 ' ---------------------------------------------------------------------------
-' P0-5: procedure level caller/callee.
+' An earlier batch: procedure level caller/callee.
 ' The component level part above only says "component A mentions component B".
 ' This resolves real call edges: each procedure body is tokenised (strings and
 ' comments removed by the same Sanitize) and matched against the set of
@@ -393,7 +405,7 @@ End Function
 ' ---------------------------------------------------------------------------
 
 Private Sub ExtractProcs(ByVal comp As String, ByVal text As String)
-    ' TASK-P1-052: the per-procedure text used to be accumulated with
+    ' the per-procedure text used to be accumulated with
     ' "acc = acc & lines(i) & vbLf" once per line - quadratic in the PROCEDURE size, so
     ' a single huge procedure paid it in full. The boundary is known, so the body is now
     ' ONE Join over the slice plus the trailing LF. Output is bit-identical.
@@ -430,7 +442,7 @@ Private Sub ExtractProcs(ByVal comp As String, ByVal text As String)
     If inProc Then AddProc comp, nm, JoinRangeDG(lines, pStart, UBound(lines)) & vbLf
 End Sub
 
-' TASK-P1-052: one Join over a slice of a line array - the linear replacement for the
+' one Join over a slice of a line array - the linear replacement for the
 ' per-line "acc = acc & lines(i) & vbLf" accumulation.
 Private Function JoinRangeDG(ByRef a() As String, ByVal lo As Long, ByVal hi As Long) As String
     Dim cnt As Long, i As Long
@@ -513,7 +525,7 @@ Private Function ProcNodesJson() As String
 End Function
 
 Private Function ProcEdgesJson() As String
-    ' TASK-95 r2: the procedure-edge phase gets the last slice, so a default run
+    ' r2: the procedure-edge phase gets the last slice, so a default run
     ' always reports edges (procEdgesFound > 0) instead of nodes only.
     DepSetStageQuota DEP_SHARE_LAST
     Dim dict As Object
@@ -521,7 +533,7 @@ Private Function ProcEdgesJson() As String
     ' NOTE: the token buffer must NOT be called "toks" - VB6 is case insensitive
     ' and a local named toks shadows the module function Toks, so Toks(...) is
     ' then parsed as an index into the String and the compiler reports the very
-    ' unhelpful "expected array" (ç¼ºå°‘æ•°ç»„).
+    ' unhelpful "expected array" (È±ÉÙÊý×é).
     Dim out As String, key As String, tkStr As String, body As String
     Dim parts() As String, owners() As String
     Dim lst As String
@@ -544,7 +556,7 @@ Private Function ProcEdgesJson() As String
         nl = InStr(body, vbLf)
         If nl > 0 Then body = Mid$(body, nl + 1)
         tkStr = Toks(Sanitize(body))
-        ' TASK-95 r4: a cut anywhere inside this body's tokenisation means the body was
+        ' r4: a cut anywhere inside this body's tokenisation means the body was
         ' NOT fully scanned - do not count it and stop the stage.
         If m_stageCut Or m_timingTruncated Then Exit For
         midCut = False
@@ -615,7 +627,7 @@ Private Function CyclesJson(ByRef adj() As Boolean) As String
         MaybePump
         If DepBudgetHit() Then Exit For
         If m_color(i) = 0 Then DfsV i, adj
-        ' TASK-95 r4: a DFS that aborted midway leaves the colouring incomplete, so the
+        ' r4: a DFS that aborted midway leaves the colouring incomplete, so the
         ' cycle set is NOT trustworthy - report the stage as incomplete.
         If m_cycleAbort Then Exit For
         m_cyclesScan = m_cyclesScan + 1
@@ -671,7 +683,7 @@ Private Sub AddCycle(ByVal startIdx As Long)
 End Sub
 
 Private Function Toks(ByVal s As String) As String
-    ' TASK-P1-058: was a per-character "buf = buf & ch" append - O(n^2) on a whole
+    ' was a per-character "buf = buf & ch" append - O(n^2) on a whole
     ' module (179 s for dependency_graph on a 27,000-line fixture). A pre-sized buffer
     ' plus Mid$ assignment is O(n); the output is byte-identical (same length, token
     ' characters kept, everything else a space).
@@ -681,7 +693,7 @@ Private Function Toks(ByVal s As String) As String
     buf = String$(n, " ")
     For i = 1 To n
         MaybePump
-        ' TASK-42: one huge module must not be able to overrun the budget on its own,
+        ' one huge module must not be able to overrun the budget on its own,
         ' so the character loop is a budget point (every 8192 characters).
         If (i And 8191) = 0 Then
             DepAddChars 8192
@@ -703,7 +715,7 @@ Private Function HasTok(ByVal toks As String, ByVal w As String) As Boolean
 End Function
 
 Private Function Sanitize(ByVal s As String) As String
-    ' TASK-P1-058: linear. The old body appended one character at a time to a growing
+    ' linear. The old body appended one character at a time to a growing
     ' BSTR (O(n^2) on a whole module). The output is NEVER longer than the input (a
     ' comment run collapses to its single space), so a pre-sized buffer + Mid$
     ' assignment reproduces the exact byte sequence, only in O(n).
@@ -756,3 +768,9 @@ Private Function Js(ByVal s As String) As String
     t = Replace(t, """", b & """")
     Js = """" & t & """"
 End Function
+
+' Caller-supplied quota for ONE run (see DepBudgetStart). It lives at the END of the
+' module because VB6 allows module-level DECLARATIONS only before the first procedure.
+Public Sub DepSetQuotaOverride(ByVal chars As Long)
+    m_quotaOverride = chars
+End Sub

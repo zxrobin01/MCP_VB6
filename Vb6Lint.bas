@@ -20,7 +20,7 @@ Private m_inProc() As Boolean
 Private m_procStart() As Long
 Private m_procEnd() As Long
 Private m_procName() As String
-' TASK-P1-121 item F-d/D1 (E116): the KIND of each procedure (sub/function/property).
+' item F-d/D1 (E116): the KIND of each procedure (sub/function/property).
 ' Filled in ComputeProcs from the SAME StripMods-based detection IsProcStart already
 ' uses, so the two can never disagree.
 Private m_procKind() As String
@@ -28,7 +28,7 @@ Private m_nproc As Long
 Private m_firstProcLine As Long
 Private m_diag() As TDiag
 Private m_nd As Long
-' TASK-P1-093 (F2): m_nd stays the FULL diagnostic count (DiagCount's meaning is
+' (F2): m_nd stays the FULL diagnostic count (DiagCount's meaning is
 ' unchanged). m_nerr/m_nwarn count every accepted diagnostic by severity so the
 ' summary no longer has to scan the array; m_nst is how many diagnostics were
 ' actually materialised and m_nstoreMax is the caller's cap (0 = store everything,
@@ -43,9 +43,9 @@ Private m_baseKeys As Object
 Private m_baseHits As Long
 Private m_regR0 As Long
 Private m_regR1 As Long
-' TASK-P1-121 item 8 (F-b): how many rule ids this engine can emit. The receipt used to
+' item 8 (F-b): how many rule ids this engine can emit. The receipt used to
 ' report only how many diagnostics FIRED, which a caller reads as coverage. Counted from
-' the source: E101..E115 (15) + W301 + W304 + W305 + E116 + E117 (F-d/TASK-P1-121) = 20.
+' the source: E101..E115 (15) + W301 + W304 + W305 + E116 + E117 (F-d) = 20.
 ' One constant, in the DECLARATIONS section (VB6 requires Const/Declare/Dim to precede
 ' every procedure); adding a rule moves exactly this number.
 Private Const RULE_COUNT As Long = 20
@@ -61,7 +61,7 @@ Public Sub Lint(ByVal text As String, ByVal compKind As String)
     RunRules compKind
 End Sub
 
-' TASK-P1-051: per-run state that must be cleared before the rules execute.
+' per-run state that must be cleared before the rules execute.
 Private Sub ResetRun()
     m_nd = 0
     m_nerr = 0
@@ -73,7 +73,7 @@ Private Sub ResetRun()
     ' m_nstoreMax is deliberately NOT reset here: it is a CALLER setting (SetStoreCap).
 End Sub
 
-' TASK-P1-051: state produced by the structural pre-scan (LoadLines/BuildLogical/
+' state produced by the structural pre-scan (LoadLines/BuildLogical/
 ' ComputeProcs), cleared before that pre-scan runs.
 Private Sub ResetScan()
     m_firstProcLine = -1
@@ -91,13 +91,13 @@ Private Sub RunRules(ByVal compKind As String)
     RuleAgent
     RuleSemantic
     RuleUndeclaredConst
-    ' TASK-P1-121 F-d (TASK-P4-111): the two NEW rules run last, so every existing rule's
+    ' F-d (an earlier lint batch): the two NEW rules run last, so every existing rule's
     ' diagnostic order and output is untouched.
     RuleExitKind
     RuleConstAssign
 End Sub
 
-' TASK-P1-051 region scope: is this physical (1-based) line inside the linted region?
+' region scope: is this physical (1-based) line inside the linted region?
 ' m_regR1 = 0 means "no region" (whole module).
 Private Function InReg(ByVal ln As Long) As Boolean
     If m_regR1 <= 0 Then
@@ -118,7 +118,7 @@ Private Function ProcOverlapsRegion(ByVal p As Long) As Boolean
     ProcOverlapsRegion = (s0 <= m_regR1 And s1 >= m_regR0)
 End Function
 
-' TASK-P1-051: lint ONLY the procedure that contains physLine, so a large module
+' lint ONLY the procedure that contains physLine, so a large module
 ' does not pay a whole-module pass for a small edit. The rule set, rule order and
 ' the physical/IDE line space are THE SAME as Lint's: every rule still runs (so
 ' global context - duplicate procedure names, the module-wide declared-name set,
@@ -181,7 +181,7 @@ Public Property Get DiagCount() As Long
     DiagCount = m_nd
 End Property
 
-' TASK-P1-093 (F2): DiagCount is the FULL count (unchanged semantics). DiagStored is
+' (F2): DiagCount is the FULL count (unchanged semantics). DiagStored is
 ' how many diagnostics are really in m_diag and is <= DiagCount whenever a store cap is
 ' in force, so every ARRAY reader must iterate DiagStored - never DiagCount. The two
 ' counters are the whole-summary sources: they count every diagnostic AddDiag accepted.
@@ -195,13 +195,13 @@ Public Property Get WarningCount() As Long
     WarningCount = m_nwarn
 End Property
 
-' TASK-P1-093 (F2): 0 = materialise every diagnostic (the historical behaviour);
+' (F2): 0 = materialise every diagnostic (the historical behaviour);
 ' n > 0 = materialise at most n. The FULL counters are unaffected either way.
 Public Sub SetStoreCap(ByVal n As Long)
     If n < 0 Then n = 0
     m_nstoreMax = n
 End Sub
-' TASK-P1-093 (F2): the four raw array readers are bounded by what is STORED, not by
+' (F2): the four raw array readers are bounded by what is STORED, not by
 ' DiagCount. A caller that iterates 0..DiagCount()-1 while a store cap is in force would
 ' otherwise read uninitialised slots; these guards turn that into "" / 0.
 Public Function RuleCount() As Long
@@ -227,11 +227,11 @@ End Function
 
 Private Sub AddDiag(ByVal rid As String, ByVal sev As String, ByVal ln As Long, ByVal msg As String)
     If m_silent Then Exit Sub
-    ' TASK-P1-051 region scope: a diagnostic outside the linted region is not reported.
+    ' region scope: a diagnostic outside the linted region is not reported.
     If m_regR1 > 0 Then
         If ln < m_regR0 Or ln > m_regR1 Then Exit Sub
     End If
-    ' TASK-P1-093: the dedup key is only needed when a baseline was installed. It used
+    ' the dedup key is only needed when a baseline was installed. It used
     ' to be built for EVERY diagnostic (one NormCtx = LCase + Trim + a Replace loop,
     ' 27,005 times on the module-level fixture) even though m_baseKeys was Nothing.
     If Not m_baseKeys Is Nothing Then
@@ -242,7 +242,7 @@ Private Sub AddDiag(ByVal rid As String, ByVal sev As String, ByVal ln As Long, 
             Exit Sub
         End If
     End If
-    ' TASK-P1-093 (F2): COUNT every diagnostic, MATERIALISE at most m_nstoreMax of them.
+    ' (F2): COUNT every diagnostic, MATERIALISE at most m_nstoreMax of them.
     ' The receipt cap (CodeTools.LintMaxDiag, default 300) is handed in by the caller via
     ' SetStoreCap, so a 27,005-diagnostic module no longer pays 27,005 UDT+BSTR writes for
     ' an array whose consumers keep at most 300 entries. m_nd keeps the FULL count, so
@@ -256,7 +256,7 @@ Private Sub AddDiag(ByVal rid As String, ByVal sev As String, ByVal ln As Long, 
     If m_nstoreMax > 0 Then
         If m_nst >= m_nstoreMax Then Exit Sub
     End If
-    ' TASK-P1-093: GEOMETRIC growth. Growing by a fixed +64 was QUADRATIC: the
+    ' GEOMETRIC growth. Growing by a fixed +64 was QUADRATIC: the
     ' module-level fixture emits 27,005 diagnostics, i.e. 422 ReDim Preserve calls
     ' copying an average of ~13,500 UDT-with-BSTR elements each (~5.7M copies).
     ' Only the CAPACITY changes: the diagnostics, their order, every counter and
@@ -283,11 +283,11 @@ Private Sub LoadLines(ByVal text As String)
     t = Replace(text, vbCrLf, vbLf)
     t = Replace(t, vbCr, vbLf)
     m_raw = Split(t, vbLf)
-    ' TASK-P1-063: an EMPTY pane (CountOfLines = 0 - e.g. the empty module a
+    ' an EMPTY pane (CountOfLines = 0 - e.g. the empty module a
     ' name-colliding import creates) is a LEGAL input. VB6's Split("") returns an
     ' EMPTY array (UBound = -1), so the "0 To m_n - 1" Redims below were
-    ' ReDim x(0 To -1) => VB error 9 (涓嬫爣瓒婄晫); that is the subscript error that
-    ' TASK-P1-062's empty-component guard then exposed on verify. Model the empty
+    ' ReDim x(0 To -1) => VB error 9 (下标越界); that is the subscript error that
+    ' 's empty-component guard then exposed on verify. Model the empty
     ' module as exactly ONE blank line so every downstream rule sees a valid array.
     If UBound(m_raw) < 0 Then
         ReDim m_raw(0 To 0)
@@ -305,7 +305,7 @@ Private Sub LoadLines(ByVal text As String)
 End Sub
 
 Public Function StripCode(ByVal s As String) As String
-    ' TASK-P1-051: same output as before, but O(n) per line. The old body appended
+    ' same output as before, but O(n) per line. The old body appended
     ' one character at a time (buf = buf & ch), which is O(n^2) on a BSTR; a
     ' 1.5 MB module paid that on every one of its ~27k lines. Here quoted runs are
     ' DROPPED by slicing around them, so the surviving text is built in a handful
@@ -417,7 +417,7 @@ Private Sub ComputeProcs()
     ReDim m_procKind(0 To m_nlog)
     m_nproc = 0
     Dim k As Long, isOpen As Boolean, st As Long, nm As String
-    ' TASK-P1-121 F-d/D1: the KIND has to be captured on the DECLARATION line. Reading it
+    ' F-d/D1: the KIND has to be captured on the DECLARATION line. Reading it
     ' when the procedure CLOSES would read "end sub" and yield "" - which then mismatched
     ' every Exit statement (the first F-d run reported G01..G04/G11 as E116 false
     ' positives for exactly this reason).
@@ -695,7 +695,7 @@ End Function
 ' ---------------- rules: stray statements outside procedures (E107) ----------------
 
 Private Sub RuleStray()
-    ' TASK-P1-051: E107 is emitted only for a line OUTSIDE every procedure
+    ' E107 is emitted only for a line OUTSIDE every procedure
     ' (Not m_inProc), and a region is exactly one procedure, so no in-region
     ' diagnostic can come from this rule.
     If m_regR1 > 0 Then Exit Sub
@@ -710,7 +710,7 @@ Private Sub RuleStray()
         If inBegin Then
             If L = "end" Then inBegin = False
         Else
-            ' TASK-P1-121 F-d/D3 (TASK-P4-110): the line still carries its modifiers
+            ' F-d/D3 (an earlier lint batch): the line still carries its modifiers
             ' ("public enum ...", "private enum ..."), so the un-stripped compare never
             ' matched and the whole Enum body was scanned as if it were module code -
             ' every member declaration was then reported as a stray statement (E107).
@@ -734,7 +734,7 @@ Private Function IsStrayStmt(ByVal L As String) As Boolean
     s = StripMods(L)
     first = Tok(s, 1)
     If IsDeclStartWord(first) Then Exit Function
-    ' TASK-P1-121 F-d/D4 (TASK-P4-111 D-192): Tok() splits on spaces, so "debug.print 1"
+    ' F-d/D4 (an earlier lint batch): Tok splits on spaces, so "debug.print 1"
     ' yields the first token "debug.print" and the old test first="debug" MISSED it -
     ' a plain Debug.Print outside a procedure was silently green. Any "debug.<member>"
     ' belongs to the same statement family.
@@ -781,7 +781,7 @@ Private Sub RuleDecls(ByVal compKind As String)
     For k = 0 To m_nlog - 1
         MaybePump
         L = m_lc(k)
-        ' TASK-P1-051: E110 requires Not m_inProc, i.e. a MODULE-LEVEL line, and a
+        ' E110 requires Not m_inProc, i.e. a MODULE-LEVEL line, and a
         ' region is exactly one procedure, so E110 can never be an in-region
         ' diagnostic. Skip its scan in region mode.
         If m_regR1 <= 0 Then
@@ -1033,7 +1033,7 @@ Private Function HasForeignKeyword(ByVal L As String) As Boolean
 End Function
 
 Private Function Tokenize(ByVal s As String) As String
-    ' TASK-P1-051: O(n) via a pre-sized buffer + Mid$ assignment (the old form
+    ' O(n) via a pre-sized buffer + Mid$ assignment (the old form
     ' appended one character at a time = O(n^2)). Output is byte-identical.
     Dim i As Long, n As Long, ch As String, t As String
     n = Len(s)
@@ -1050,7 +1050,7 @@ Private Function Tokenize(ByVal s As String) As String
 End Function
 
 Private Function RemoveHex(ByVal s As String) As String
-    ' TASK-P1-051: O(n) via a pre-sized buffer + Mid$ assignment (the old form
+    ' O(n) via a pre-sized buffer + Mid$ assignment (the old form
     ' appended one character at a time = O(n^2)). Output is byte-identical.
     Dim i As Long, n As Long, o As Long, ch As String, j As Long, t As String
     n = Len(s)
@@ -1236,20 +1236,20 @@ Private Sub CheckArrayByVal(ByVal L As String, ByVal ln As Long)
 End Sub
 
 Public Function HasErrors() As Boolean
-    ' TASK-P1-093 (F2): the counter, not an array scan. Identical answer (m_nerr counts
+    ' (F2): the counter, not an array scan. Identical answer (m_nerr counts
     ' every diagnostic AddDiag accepted) and it stays correct when storage is capped.
     HasErrors = (m_nerr > 0)
 End Function
 
 Public Function DiagnosticsJson() As String
-    ' TASK-P1-061: this used to accumulate "s = s & ..." once per diagnostic, which is
+    ' this used to accumulate "s = s & ..." once per diagnostic, which is
     ' O(n^2) on a BSTR - the SAME defect class as JsonLib.Quote / SliceLines /
     ' NormalizeCode / SetCompText / Toks / Sanitize. Measured on the 27,000-line fixture
     ' (1,079 diagnostics) it was 1,516-1,734 ms and was the SINGLE LARGEST segment of
     ' verify/verify_scope. The pieces are now collected into a String() and joined ONCE;
-    ' the output is byte-identical (see docs/evidence/TASK-P1-061).
+    ' the output is byte-identical (see docs/evidence).
     Dim i As Long, parts() As String
-    ' TASK-P1-093 (F2): serialise what is actually STORED. With no store cap (every caller
+    ' (F2): serialise what is actually STORED. With no store cap (every caller
     ' in this project that uses this function) that is all of them, so the output is
     ' byte-identical to before.
     If m_nst <= 0 Then
@@ -1275,7 +1275,7 @@ Private Function Jr(ByVal s As String) As String
     Jr = Chr$(34) & t & Chr$(34)
 End Function
 
-' TASK-P1-022: the owner of the procedure BODY that contains physical line ln
+' the owner of the procedure BODY that contains physical line ln
 ' (1-based), or "" when ln is module level or part of a procedure's declaration.
 ' m_procStart is the procedure's first logical line and m_procEnd its End line, so a
 ' body line is strictly after the start and at or before the end. This is exact,
@@ -1331,7 +1331,7 @@ Public Function BaselineHits() As Long
     BaselineHits = m_baseHits
 End Function
 
-' ===================== TASK-P1-121 F-d (TASK-P4-111) =====================
+' ===================== F-d (an earlier lint batch) =====================
 ' D1 (E116) + D2 (E117). Both are NEW diagnostics; no existing rule, message or
 ' description changed and RULE_COUNT moved by exactly two.
 ' ========================================================================
@@ -1450,7 +1450,7 @@ Private Function IsIdentName(ByVal s As String) As Boolean
 End Function
 
 ' Parameter names of a procedure declaration line ("sub f(a as long, b)").
-' TASK-P1-121 F-d: named CollectParamNames, NOT CollectParams - the module already has a
+' F-d: named CollectParamNames, NOT CollectParams - the module already has a
 ' CollectParams(L, ln, decl) for the E111 declaration audit and VB6 refuses two procedures
 ' with one name in the same module (build error: variable definition conflict).
 Private Sub CollectParamNames(ByVal s As String, ByVal into As Object)
@@ -1475,7 +1475,7 @@ Private Sub CollectParamNames(ByVal s As String, ByVal into As Object)
 End Sub
 
 ' ---------------- D2: E117 - assignment to a read-only constant ----------------
-' All FOUR narrowings that TASK-P4-109 measured are present, in this order:
+' All FOUR narrowings that an earlier lint batch measured are present, in this order:
 '   1. the Enum body is SKIPPED (a member line is a declaration, not an assignment),
 '      but the member NAMES are collected, so assigning to one is still caught;
 '   2. module-level AND procedure-level Const names are collected;
@@ -1580,10 +1580,10 @@ Private Sub RuleConstAssign()
 End Sub
 
 ' ===========================================================================
-' TASK-P1-126 (MCP-15 / MCP-04 / MCP-06)
+' (the counting review / the wording review / the structural-gate review)
 ' Two evidence-driven helpers.
 '   LintProcMap          - the caller-supplied STABLE identity of a diagnostic:
-'                          enclosing procedure + offset inside it (MCP-15).
+'                          enclosing procedure + offset inside it (the counting review).
 '   BlockPairingProblem  - the PRE-WRITE structural gate: a block carrying its
 '                          own procedure header AND an extra "End Function" was
 '                          accepted and written, and only the linter complained

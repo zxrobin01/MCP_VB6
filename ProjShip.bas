@@ -79,7 +79,10 @@ Public Function VbgAddJson(ByVal vbgPath As String, ByVal projectPath As String)
         Else
             newLine = "Project=" & projectPath
         End If
-        WriteTextFile vbgPath, TrimRight$(Join(lines, eol)) & eol & newLine & eol
+        If Not WriteTextFile(vbgPath, TrimRight$(Join(lines, eol)) & eol & newLine & eol) Then
+        VbgAddJson = ShipWriteRefusal("vbg_group", vbgPath, "write_not_visible", "the .vbg could not be read back after writing; nothing is claimed to have changed")
+        Exit Function
+    End If
         d("added") = True
     End If
     d("path") = vbgPath
@@ -110,7 +113,10 @@ Public Function VbgRemoveJson(ByVal vbgPath As String, ByVal projectPath As Stri
     Next
     If removed > 0 Then
         BackupFile vbgPath
-        WriteTextFile vbgPath, out & eol
+        If Not WriteTextFile(vbgPath, out & eol) Then
+        VbgRemoveJson = ShipWriteRefusal("vbg_group", vbgPath, "write_not_visible", "the .vbg could not be read back after writing; nothing is claimed to have changed")
+        Exit Function
+    End If
     End If
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
@@ -164,11 +170,58 @@ Public Function SnapshotCreateJson(ByVal vbpPath As String, ByVal dir As String)
     d("vbp") = vbpPath
     d("createdAt") = Format$(Now, "yyyy-mm-dd hh:nn:ss")
     d("fileCount") = files.Count
+    d("verified") = "every entry below exists on disk with the recorded sha256 (and, when srcSha256 is present, equals its source file)"
     Set d("files") = files
     Set d("references") = ReferencePaths(vbpPath)
     Dim s As String
     s = JsonStringify(d)
-    WriteTextFile fso.BuildPath(dir, "snapshot.json"), s
+    Dim manPath As String
+    manPath = fso.BuildPath(dir, "snapshot.json")
+    If Not WriteTextFile(manPath, s) Then
+        SnapshotCreateJson = ShipWriteRefusal("project_snapshot", manPath, "write_not_visible", "the snapshot manifest could not be read back after writing; nothing is claimed to be snapshotted")
+        Exit Function
+    End If
+    ' verify EVERY file the manifest records - exists + the recorded sha256.
+    Dim vf As Variant, vName As String, vPath As String, bad As String
+    Dim unver As String, nUnver As Long
+    bad = ""
+    unver = ""
+    nUnver = 0
+    For Each vf In files
+        vName = CStr(vf("name"))
+        vPath = fso.BuildPath(dir, vName)
+        If Not fso.FileExists(vPath) Then
+            bad = vName & " (recorded in the manifest but NOT on disk)"
+            Exit For
+        End If
+        If vf.Exists("sha256") Then
+            If Sha256HexFile(vPath) <> CStr(vf("sha256")) Then
+                bad = vName & " (on disk but its sha256 differs from the manifest)"
+                Exit For
+            End If
+            ' the copy must also equal the SOURCE it was made from
+            If vf.Exists("srcSha256") Then
+                If Sha256HexFile(vPath) <> CStr(vf("srcSha256")) Then
+                    bad = vName & " (the snapshot copy differs from its source file)"
+                    Exit For
+                End If
+            End If
+        Else
+            ' remaining: an entry with NO recorded sha256 is NAMED here - a silent
+            ' skip would let an unverifiable entry pass as a verified snapshot.
+            nUnver = nUnver + 1
+            If Len(unver) > 0 Then unver = unver & ","
+            unver = unver & vName
+        End If
+    Next
+    If Len(bad) > 0 Then
+        SnapshotCreateJson = ShipWriteRefusal("project_snapshot", dir, "snapshot_incomplete", "the snapshot is NOT usable: " & bad)
+        Exit Function
+    End If
+    If nUnver > 0 Then
+        SnapshotCreateJson = ShipWriteRefusal("project_snapshot", dir, "snapshot_unverified", CStr(nUnver) & " manifest entr(y/ies) carry no sha256 and were therefore NOT verified: " & unver)
+        Exit Function
+    End If
     SnapshotCreateJson = s
 End Function
 
@@ -185,6 +238,16 @@ Public Function SnapshotRestoreJson(ByVal dir As String, ByRef restoredCsv As St
     restored = 0
     skipped = 0
     restoredCsv = ""
+    ' remaining: copies that did NOT survive a read-back.
+    Dim failed As Long
+    Dim failedCsv As String
+    failed = 0
+    failedCsv = ""
+    ' remaining: snapshot files whose bytes no longer match the manifest.
+    Dim corrupt As Long
+    Dim corruptCsv As String
+    corrupt = 0
+    corruptCsv = ""
     Dim cur As Long, endPos As Long, chunk As String, src As String, nm As String
     cur = 1
     Do
@@ -199,17 +262,42 @@ Public Function SnapshotRestoreJson(ByVal dir As String, ByRef restoredCsv As St
             Dim from As String
             from = fso.BuildPath(dir, nm)
             If fso.FileExists(from) Then
+                ' remaining: restore ONLY from a file that still matches the manifest, so
+                ' a snapshot whose bytes were changed after it was taken cannot silently become
+                ' the project's source. The mismatch is NAMED in the receipt.
+                Dim mSha As String
+                mSha = JsonFieldOf(chunk, "sha256")
+                If Len(mSha) = 64 Then
+                    If Sha256HexFile(from) <> mSha Then
+                        corrupt = corrupt + 1
+                        If Len(corruptCsv) > 0 Then corruptCsv = corruptCsv & ","
+                        corruptCsv = corruptCsv & nm
+                        cur = endPos + 1
+                        GoTo NextChunk
+                    End If
+                End If
                 If fso.FileExists(src) Then fso.CopyFile src, src & ".bak", True
                 EnsureDir DirOf(src)
                 fso.CopyFile from, src, True
-                restored = restored + 1
-                If Len(restoredCsv) > 0 Then restoredCsv = restoredCsv & ","
-                restoredCsv = restoredCsv & nm
+                ' remaining: a file counts as RESTORED only when the bytes are
+                ' readable back at the destination; otherwise it is reported as FAILED.
+                Dim rstB() As Byte
+                ReadAllBytesTo src, rstB
+                If ByteCount(rstB) > 0 Then
+                    restored = restored + 1
+                    If Len(restoredCsv) > 0 Then restoredCsv = restoredCsv & ","
+                    restoredCsv = restoredCsv & nm
+                Else
+                    failed = failed + 1
+                    If Len(failedCsv) > 0 Then failedCsv = failedCsv & ","
+                    failedCsv = failedCsv & nm
+                End If
             Else
                 skipped = skipped + 1
             End If
         End If
         cur = endPos + 1
+NextChunk:
     Loop
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
@@ -217,6 +305,20 @@ Public Function SnapshotRestoreJson(ByVal dir As String, ByRef restoredCsv As St
     d("restored") = restored
     d("skipped") = skipped
     d("files") = restoredCsv
+    d("failed") = failed
+    d("failedFiles") = failedCsv
+    d("corrupt") = corrupt
+    d("corruptFiles") = corruptCsv
+    If corrupt > 0 Then
+        d("ok") = False
+        d("reason") = "snapshot_corrupt"
+        d("note") = "one or more snapshot files no longer match snapshot.json (they were changed or truncated after the snapshot was taken); those files were NOT restored and are named in corruptFiles."
+    End If
+    If failed > 0 Then
+        d("ok") = False
+        d("reason") = "restore_not_readable_back"
+        d("note") = "one or more files were copied back but are NOT readable at the destination: they are counted in failed/failedFiles, never in restored."
+    End If
     SnapshotRestoreJson = JsonStringify(d)
 End Function
 
@@ -272,7 +374,8 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
         made.Add fso.GetFileName(exePath)
         Dim man As String
         man = ProjMeta.ManifestText(level, True, "permonitorv2", False, fso.GetFileName(exePath))
-        WriteTextFile fso.BuildPath(outDir, fso.GetFileName(exePath) & ".manifest"), man
+        Dim wFail As String
+        If Not WriteTextFile(fso.BuildPath(outDir, fso.GetFileName(exePath) & ".manifest"), man) Then wFail = fso.GetFileName(exePath) & ".manifest"
         made.Add fso.GetFileName(exePath) & ".manifest"
     End If
     Dim deps As Object
@@ -280,7 +383,7 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
     Dim listed As Object
     Set listed = New Collection
     Dim regBat As String
-    ' TASK-P1-105: the header is composed AFTER the loop (it needs the dependency count), so
+    ' the header is composed AFTER the loop (it needs the dependency count), so
     ' the per-dependency lines go into their own buffer first.
     Dim regBody As String, regN As Long
     regBody = ""
@@ -303,9 +406,9 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
         listed.Add e
         If Not exists Then missing.Add dp
         If exists And (ext = "ocx" Or ext = "dll") Then
-            ' TASK-P1-105: NEVER a bare regsvr32. A bare name resolves through PATH and can hit a
-            ' stale SECOND installation of Windows (this host: SystemRoot=B:\Windows while
-            ' C:\Windows is a leftover) where EVERY 32-bit registration fails with 0xC0000139 -
+            ' NEVER a bare regsvr32. A bare name resolves through PATH and can hit a
+            ' stale SECOND installation of Windows (measured on a host whose SystemRoot is NOT on
+            ' the system drive, while a leftover Windows tree sits there) where EVERY 32-bit registration fails with 0xC0000139 -
             ' and /s prints nothing, so the failure is silent. So: the SysWOW64 copy of THIS
             ' installation, never a hardcoded C:\Windows. The exit code IS acted on here: the rc
             ' of a direct call is trustworthy (the stale-0 trap was a PowerShell $LASTEXITCODE
@@ -317,13 +420,13 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
         End If
     Next
     If Not exeOk Then missing.Add exePath
-    ' TASK-P1-105: hardened install.bat. Header + existence gate first, then one rc-checked
+    ' hardened install.bat. Header + existence gate first, then one rc-checked
     ' registration per dependency, then an explicit non-zero exit on any refusal.
     regBat = "@echo off" & vbCrLf
     regBat = regBat & "rem Generated by VB6MCP package_app" & vbCrLf
     regBat = regBat & "rem a 32-bit OCX/DLL must be registered with the SysWOW64 regsvr32 of" & vbCrLf
     regBat = regBat & "rem THIS Windows installation. A bare regsvr32 resolves through PATH and can hit a" & vbCrLf
-    regBat = regBat & "rem stale second installation (SystemRoot=B:\Windows, C:\Windows is a leftover) where" & vbCrLf
+    regBat = regBat & "rem stale second installation (SystemRoot not on the system drive, a leftover tree there) where" & vbCrLf
     regBat = regBat & "rem every 32-bit registration fails with 0xC0000139 - silently, because /s prints nothing." & vbCrLf
     regBat = regBat & "setlocal EnableExtensions" & vbCrLf
     regBat = regBat & "set ""REGSVR=%SystemRoot%\SysWOW64\regsvr32.exe""" & vbCrLf
@@ -342,14 +445,14 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
     regBat = regBat & ">&2 echo   Identify it by the 'rem dependency:' line above the last regsvr32 line, then re-run" & vbCrLf
     regBat = regBat & ">&2 echo   that command by hand and read its error; a 32-bit DLL must use ""%REGSVR%""." & vbCrLf
     regBat = regBat & "endlocal & exit /b 1" & vbCrLf
-    WriteTextFile fso.BuildPath(outDir, "install.bat"), regBat
+    If Not WriteTextFile(fso.BuildPath(outDir, "install.bat"), regBat) Then wFail = "install.bat"
     made.Add "install.bat"
     Dim depTxt As String
     depTxt = "Dependencies (from the .vbp Reference= lines)" & vbCrLf
     For Each v In listed
         depTxt = depTxt & v("name") & vbTab & v("path") & vbTab & VbFlag(CBool(v("exists")), "present", "MISSING") & vbCrLf
     Next
-    WriteTextFile fso.BuildPath(outDir, "dependencies.txt"), depTxt
+    If Not WriteTextFile(fso.BuildPath(outDir, "dependencies.txt"), depTxt) Then wFail = "dependencies.txt"
     made.Add "dependencies.txt"
     Dim readme As String
     readme = "VB6MCP delivery package" & vbCrLf
@@ -360,8 +463,33 @@ Public Function PackageJson(ByVal vbpPath As String, ByVal exePath As String, By
     readme = readme & "Run install.bat on the target machine to register the OCX/DLL dependencies." & vbCrLf
     readme = readme & "install.bat uses %SystemRoot%\SysWOW64\regsvr32.exe (never a bare regsvr32, never a hardcoded C:\Windows)" & vbCrLf
     readme = readme & "and exits NON-ZERO when a dependency cannot be registered or when that regsvr32 is missing." & vbCrLf
-    WriteTextFile fso.BuildPath(outDir, "README.txt"), readme
+    If Not WriteTextFile(fso.BuildPath(outDir, "README.txt"), readme) Then wFail = "README.txt"
     made.Add "README.txt"
+    ' a write that could not be read back is refused AT ITS OWN SITE, not merely covered
+    ' by the artifact sweep below (that would put the burden back on 'the caller remembers').
+    If Len(wFail) > 0 Then
+        PackageJson = ShipWriteRefusal("package_app", fso.BuildPath(outDir, wFail), "write_not_visible", "an artifact could not be read back after writing; nothing is claimed to have been packaged")
+        Exit Function
+    End If
+    ' every artifact this function CLAIMS to have made must be on disk and non-empty.
+    Dim va As Variant, aName As String, aPath As String, aBad As String
+    aBad = ""
+    For Each va In made
+        aName = CStr(va)
+        aPath = fso.BuildPath(outDir, aName)
+        If Not fso.FileExists(aPath) Then
+            aBad = aName & " (claimed but NOT on disk)"
+            Exit For
+        End If
+        If fso.GetFile(aPath).Size <= 0 Then
+            aBad = aName & " (exists but is EMPTY)"
+            Exit For
+        End If
+    Next
+    If Len(aBad) > 0 Then
+        PackageJson = ShipWriteRefusal("package_app", outDir, "package_incomplete", "the delivery folder is NOT complete: " & aBad)
+        Exit Function
+    End If
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
     d("outDir") = outDir
@@ -424,14 +552,41 @@ End Function
 Private Sub CopyInto(ByVal files As Object, ByVal seen As Object, ByVal fso As Object, ByVal src As String, ByVal dir As String)
     Dim nm As String
     nm = fso.GetFileName(src)
-    fso.CopyFile src, fso.BuildPath(dir, nm), True
-    seen(LCase$(nm)) = True
+    Dim dstP As String
+    dstP = fso.BuildPath(dir, nm)
+    ' remaining: a FAILED copy must become a named entry with an error, never a
+    ' raised run-time error - otherwise the structured snapshot_incomplete refusal is lost.
+    Dim cpErr As Long
+    cpErr = 0
+    On Error Resume Next
+    Err.Clear
+    fso.CopyFile src, dstP, True
+    cpErr = Err.Number
+    Err.Clear
+    On Error GoTo 0
+    ' remaining: the OLD code recorded the SOURCE's size/sha while claiming they
+    ' belonged to the packaged copy, and marked the file saved before proving it landed.
+    ' Read the DESTINATION back instead.
+    Dim ciB() As Byte
+    ReadAllBytesTo dstP, ciB
     Dim e As Object
     Set e = CreateObject("Scripting.Dictionary")
     e("name") = nm
     e("src") = src
-    e("bytes") = fso.GetFile(src).Size
-    e("sha256") = Sha256HexFile(src)
+    If cpErr <> 0 Then
+        e("error") = "copy_failed"
+        e("errorDetail") = CStr(cpErr)
+        e("errorTarget") = dstP
+    ElseIf ByteCount(ciB) <= 0 Then
+        e("error") = "copy_not_readable_back"
+        e("errorTarget") = dstP
+    Else
+        seen(LCase$(nm)) = True
+        e("bytes") = fso.GetFile(dstP).Size
+        e("sha256") = Sha256HexFile(dstP)
+        ' the SOURCE sha is recorded too, so create() can also prove the copy is faithful
+        e("srcSha256") = Sha256HexFile(src)
+    End If
     files.Add e
 End Sub
 
@@ -624,8 +779,39 @@ Public Function ReadTextFile(ByVal path As String) As String
     ReadTextFile = s
 End Function
 
-Public Sub WriteTextFile(ByVal path As String, ByVal s As String)
-    Dim b() As Byte
+' ---- read-back evidence for every write this module performs ------------------
+' Returns True ONLY when the bytes are readable back AND decode to exactly the intended text.
+' It used to be a Sub over the unchecked primitive (whose Open error is swallowed), so callers
+' could report a snapshot or a delivery package that was never written. VB6 allows a Function
+' to be called as a statement, so existing call sites keep compiling.
+Public Function WriteTextFile(ByVal path As String, ByVal s As String) As Boolean
+    Dim b() As Byte, back() As Byte, got As String
+    WriteTextFile = False
     EncodeText s, "ansi", b
-    WriteAllBytesTo path, b
-End Sub
+    If Not WriteAllBytesChecked(path, b) Then Exit Function
+    On Error Resume Next
+    ReadAllBytesTo path, back
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+    If ByteCount(back) = 0 Then Exit Function
+    DecodeBytes back, DetectEncoding(back), got
+    If got <> s Then Exit Function
+    WriteTextFile = True
+End Function
+
+' the refusal that replaces a success shape when the read-back failed.
+Private Function ShipWriteRefusal(ByVal toolName As String, ByVal target As String, ByVal reason As String, ByVal detail As String) As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("tool") = toolName
+    d("target") = target
+    d("reason") = reason
+    d("detail") = detail
+    d("verdictHint") = "an artifact-producing tool may only answer success when the artifact is readable back from disk"
+    ShipWriteRefusal = JsonStringify(d)
+End Function

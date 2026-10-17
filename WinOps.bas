@@ -2,18 +2,18 @@ Attribute VB_Name = "WinOps"
 Option Explicit
 
 ' =====================================================================
-' TASK-P1-069 (contract v1.5.0): message-only window primitives.
+' (contract v1.5.0): message-only window primitives.
 '   read_active_dialogs   - enumerate THIS process's active dialogs + buttons
 '   close_active_dialogs  - click a SAFE button of an active dialog
 '   send_window_message   - SendMessage/PostMessage to a hwnd of THIS process
-' TASK-P1-067 (opt-in, DEFAULT OFF): code-pane mouse wheel by SUBCLASSING the
+' (opt-in, DEFAULT OFF): code-pane mouse wheel by SUBCLASSING the
 '   code-pane window (class "VbaWindow"). NO keyboard hook, NO global hook,
 '   NO WH_MOUSE at all: the whole feature is SetWindowLong/CallWindowProc on
 '   windows of our own process.
 '
-' MEMORY DISCIPLINE (auditable by grep - see TASK-P1-069 acceptance (5)): the
+' MEMORY DISCIPLINE (auditable by grep - see acceptance (5)): the
 ' ONLY Win32 entry points in this module are the message/enumeration/geometry
-' family, the subclassing trio and (TASK-P1-079) the advapi32 REGISTRY family
+' family, the subclassing trio and the advapi32 REGISTRY family
 ' (RegOpenKeyExA/RegCreateKeyExA/RegSetValueExA/RegQueryValueExA/RegCloseKey). There is NO WriteProcessMemory, NO
 ' ReadProcessMemory, NO VirtualAlloc, NO CreateRemoteThread, NO SetWindowsHookEx
 ' and NO IAT patching anywhere here. "close a dialog" means "send a button
@@ -52,7 +52,7 @@ Private Declare Function WoGetWindowThreadProcessId Lib "user32" Alias "GetWindo
 Private Declare Function WoGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 Private Declare Function WoGetTickCount Lib "kernel32" Alias "GetTickCount" () As Long
 
-' ---- TASK-P1-157 (wheel #1): the fast attach timer --------------------------
+' ---- (wheel #1): the fast attach timer --------------------------
 ' A Win32 timer OWNED BY THIS MODULE. Measured on the live IDE: the watchdog that used
 ' to be the ONLY driver of WheelScan runs at tmrWatch.Interval = 5000 in steady state
 ' (measured 2 scans / 10 s), so a code pane opened after the last scan stayed
@@ -64,7 +64,7 @@ Private Declare Function WoSetTimer Lib "user32" Alias "SetTimer" (ByVal hWnd As
 Private Declare Function WoKillTimer Lib "user32" Alias "KillTimer" (ByVal hWnd As Long, ByVal nIDEvent As Long) As Long
 
 
-' ---- TASK-P1-079: registry access for the settings path --------------------
+' ---- registry access for the settings path --------------------
 ' WScript.Shell (COM) RegWrite FAILED inside this add-in process - measured with a diagnostic
 ' probe: RegPut returned False, the read-back right after the write was empty, and
 ' HKCU\Software\VB6MCP never appeared at all. The settings chain therefore talks to advapi32
@@ -84,14 +84,14 @@ Private Const WO_REG_SZ As Long = 1
 
 
 
-' ---- subclassing trio (TASK-P1-067 only) ----------------------------------
+' ---- subclassing trio (only) ----------------------------------
 Private Declare Function WoSetWindowLongW Lib "user32" Alias "SetWindowLongW" (ByVal h As Long, ByVal idx As Long, ByVal v As Long) As Long
 Private Declare Function WoGetWindowLongW Lib "user32" Alias "GetWindowLongW" (ByVal h As Long, ByVal idx As Long) As Long
 Private Declare Function WoCallWindowProcW Lib "user32" Alias "CallWindowProcW" (ByVal prev As Long, ByVal h As Long, ByVal msg As Long, ByVal wp As Long, ByVal lp As Long) As Long
 Private Declare Function WoDefWindowProcW Lib "user32" Alias "DefWindowProcW" (ByVal h As Long, ByVal msg As Long, ByVal wp As Long, ByVal lp As Long) As Long
 Private Declare Function WoGetCursorPos Lib "user32" Alias "GetCursorPos" (ByRef pt As WO_POINT) As Long
 Private Declare Function WoGetKeyState Lib "user32" Alias "GetKeyState" (ByVal vk As Long) As Integer
-' TASK-P1-088: used only to read the code pane's first visible line (see WheelPaneTop).
+' used only to read the code pane's first visible line (see WheelPaneTop).
 Private Declare Function WoFindWindowExW Lib "user32" Alias "FindWindowExW" (ByVal parent As Long, ByVal after As Long, ByVal cls As Long, ByVal title As Long) As Long
 
 ' ---- window messages ------------------------------------------------------
@@ -127,7 +127,7 @@ Private Const WHEEL_MAX As Long = 32
 Private m_woHwnd(0 To WO_MAX - 1) As Long
 Private m_woCount As Long
 
-' ---- TASK-P1-067 wheel state (module-level, so it MUST live here: VB6 puts
+' ---- wheel state (module-level, so it MUST live here: VB6 puts
 ' every module-level declaration before the first procedure) ----
 Private m_whHwnd(0 To WHEEL_MAX - 1) As Long
 Private m_whPrev(0 To WHEEL_MAX - 1) As Long
@@ -142,12 +142,12 @@ Private m_whHandled As Long
 Private m_whForwarded As Long
 Private m_whScans As Long
 Private m_whInProc As Boolean
-' TASK-P1-130: TRUE only after this add-in has ONCE positively identified a code pane from the
+' TRUE only after this add-in has ONCE positively identified a code pane from the
 ' VBE caption table. It ARMS the empty-table fallback in WheelConsider: at add-in start-up (no
 ' project, no code pane at all) the table is legitimately empty and hooking anything there would
 ' gain nothing while making a non-code window the first entry of the receipt's target fields.
 Private m_whEverVerified As Boolean
-' TASK-P1-088 observability: the last WM_MOUSEWHEEL we saw, what it carried, what we did
+' observability: the last WM_MOUSEWHEEL we saw, what it carried, what we did
 ' with it, and the pane's first visible line before/after our scroll messages. All of it
 ' is READ-ONLY state surfaced through WheelStateObj (mcp_info / ide_state).
 Private m_whLastWparam As Long
@@ -161,7 +161,7 @@ Private m_whLastTopAfter As Long
 Private m_whLastTitle As String
 Private m_whLastReason As String
 
-' ---- TASK-P1-067 final fix: move the pane through the VBIDE object model ----
+' ---- final fix: move the pane through the VBIDE object model
 ' WHY. Measured 2026-10-09 on the REAL code pane (hwnd=23464986, title
 ' "P1067 - modLong (Code)"): WM_VSCROLL + SB_LINEUP/SB_LINEDOWN/SB_PAGEUP/
 ' SB_PAGEDOWN 5/5 left CodePane.TopLine at 1 even though SendMessage returned
@@ -186,15 +186,15 @@ Private m_whSkipReason(0 To WHEEL_SKIP_MAX - 1) As String
 Private m_whSkipCount As Long
 ' The caption table built by the LAST WheelScan (read-only receipt data).
 Private m_whCaps As Object
-' TASK-P1-132 (D-130-01): where the caption table came from on the last scan
+' (the code-pane caption measurement): where the caption table came from on the last scan
 ' ("all" | "active_fallback" | "empty") and how many captions it held. Reported in
 ' ide_state.wheel so a missing hook has an explained cause, not just a symptom.
 Private m_whCapsSource As String
 Private m_whCapsCount As Long
-' TASK-P1-132 (D-130-01): which channel resolved the last caption -> CodePane lookup
+' (the code-pane caption measurement): which channel resolved the last caption -> CodePane lookup
 ' ("caption" | "component" | "active_name" | "none").
 Private m_whResolveVia As String
-' TASK-P1-132 (D-130-01): the REAL status/error of the last TopLine read/write, and the
+' (the code-pane caption measurement): the REAL status/error of the last TopLine read/write, and the
 ' pending scroll that the WndProc could not perform itself.
 Private m_whTopStatus As String
 Private m_whTopErr As String
@@ -205,15 +205,17 @@ Private m_whPendPages As Long
 Private m_whPendTries As Long
 Private m_whPendResult As String
 Private m_whLastPaneCaption As String
-' TASK-P1-157 (A/E): per-hook classification. TRUE = the caption table identified this
-' window as a code pane on some scan. hooked[] keeps its P1-067 meaning (code panes
+' (A/E): per-hook classification. TRUE = the caption table identified this
+' window as a code pane on some scan. hooked[] keeps its meaning (code panes
 ' only); EVERY subclassed window is listed in the new attached[].
 Private m_whIsPane(0 To WHEEL_MAX - 1) As Boolean
-' TASK-P1-157 (B/E): the fast attach timer plus the per-window decision list of the
+' (B/E): the fast attach timer plus the per-window decision list of the
 ' last attach pass (why each VbaWindow was or was not hooked).
 Private m_whFastId As Long
 Private m_whFastIn As Boolean
 Private m_whFastTicks As Long
+Private m_whFastSkipped As Long      ': fast ticks the gate suppressed
+Private m_whFastFg As Long           ': foreground hwnd of the last pass
 Private m_whFastLastAt As Long
 Private m_whAttachRuns As Long
 Private m_whDecHwnd(0 To WHEEL_SKIP_MAX - 1) As Long
@@ -221,11 +223,18 @@ Private m_whDecTitle(0 To WHEEL_SKIP_MAX - 1) As String
 Private m_whDecDecision(0 To WHEEL_SKIP_MAX - 1) As String
 Private m_whDecCount As Long
 Private Const WHEEL_FAST_MS As Long = 250
-' TASK-P1-157: WheelScan and the fast attach BOTH use the WoScan* scratch arrays, and
+' (measured 2026-10-17): WheelAttachPass is a FULL window-tree enumeration.
+' It used to run on every 250 ms fast-timer tick, i.e. 240x/min: 3.75 ms x 240 =
+' ~900 ms of CPU per 60 s while the IDE was idle - 55% of the add-in's idle cost.
+' It is a GAP-CLOSER (a new pane must be hooked before the 5 s watchdog scan sees it),
+' so it only needs to run when something may have changed. The gate is the FOREGROUND
+' window - the cheap proxy for 'the user moved into a pane' - with a safety net.
+Private Const WHEEL_FAST_SAFETY_MS As Long = 5000
+' WheelScan and the fast attach BOTH use the WoScan* scratch arrays, and
 ' WheelScan runs COM (which can pump). One flag keeps them from clobbering each other.
 Private m_woScanBusy As Boolean
 
-' ---- TASK-P1-084: armed, one-shot CONFIRM of a modal WE opened ---------------
+' ---- armed, one-shot CONFIRM of a modal WE opened ---------------
 ' Why this lives here and not in the caller: the IDE's own Add Form modal runs
 ' its OWN message loop. A tool call that opens that modal cannot click it - its
 ' DoEvents is trapped INSIDE the modal loop, so the code after DoEvents never
@@ -245,7 +254,7 @@ Private m_cfmArmedAt As Long
 Private m_cfmScan(0 To 31) As Long
 Private m_cfmScanN As Long
 
-' ---- TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the GENERIC MODAL GUARD ----
+' ---- an earlier fix (defects #10 / #11 / #4): the GENERIC MODAL GUARD ----
 ' State for the bounded, Cancel-first modal safety net. It lives HERE because VB6
 ' requires every module-level declaration before the first procedure.
 Private m_mgArmed As Boolean
@@ -279,7 +288,7 @@ Private m_mgAllowHostModal As Boolean
 ' These are the ONLY new Win32 entry points added for desktop_probe. They READ the
 ' window-station / desktop / foreground state of THIS process and close the
 ' input-desktop handle they open. No process memory is read or written, no thread
-' is created and nothing is injected - the TASK-P1-069 memory discipline still holds.
+' is created and nothing is injected - the memory discipline still holds.
 Private Declare Function WoGetProcessWindowStation Lib "user32" Alias "GetProcessWindowStation" () As Long
 Private Declare Function WoGetUserObjectInformationW Lib "user32" Alias "GetUserObjectInformationW" (ByVal hObj As Long, ByVal nIndex As Long, ByVal pvInfo As Long, ByVal nLength As Long, ByRef lpnLengthNeeded As Long) As Long
 Private Declare Function WoGetThreadDesktop Lib "user32" Alias "GetThreadDesktop" (ByVal dwThreadId As Long) As Long
@@ -330,7 +339,7 @@ Public Function RegSetString(ByVal subKey As String, ByVal valueName As String, 
     RegSetString = (rc = 0)
 End Function
 
-' TASK-P1-079: the settings path addresses HKCU\Software\VB6MCP only, so callers pass just the
+' the settings path addresses HKCU\Software\VB6MCP only, so callers pass just the
 ' leaf name; keeping the path here keeps backslashes out of the form's code.
 Public Function McpSettingGet(ByVal leaf As String) As String
     McpSettingGet = RegGetString("Software\VB6MCP", leaf)
@@ -425,7 +434,7 @@ Private Function HiWord(ByVal v As Long) As Long
 End Function
 
 ' =====================================================================
-' TASK-P1-069 (1): read_active_dialogs
+' (1): read_active_dialogs
 ' Enumerate the ACTIVE dialogs of THIS process (default class #32770) and
 ' report class / title / geometry / owner / whether the OWNER is DISABLED (the
 ' only reliable "this box is blocking its parent" signal - "a window exists" is
@@ -604,7 +613,7 @@ Public Function ReadActiveDialogsJson(ByVal cls As String, ByVal withChildren As
 End Function
 
 ' =====================================================================
-' TASK-P1-069 (2): close_active_dialogs
+' (2): close_active_dialogs
 ' Explicitly invoked ONLY (nothing in the product calls it automatically).
 ' Sends exactly one message - BM_CLICK - to a button whose text is on the SAFE
 ' whitelist and NOT on the danger denylist.
@@ -647,7 +656,7 @@ End Function
 ' Whitelist per the card: OK / Yes / Cancel and localized twins. "No" is
 ' deliberately absent (for a "save changes?" box it discards work). A deny
 ' token always wins, even when the caption also looks safe.
-' TASK-P1-125 (S point 3): cancelling cannot START the host-modal operation, so a
+' (S point 3): cancelling cannot START the host-modal operation, so a
 ' Cancel/Close/Ignore caption stays allowed on a box the host-modal guard would
 ' otherwise refuse to confirm. This is what lets make_project clean up a leaked
 ' Make box safely (Cancel, never OK).
@@ -683,14 +692,14 @@ Private Function WoButtonAllow(ByVal text As String, ByRef norm As String) As Bo
     WoButtonAllow = WoExactHit(good, norm)
 End Function
 
-' TASK-P1-092: "No" is NOT on the default whitelist (for a "save changes?" box it
+' "No" is NOT on the default whitelist (for a "save changes?" box it
 ' discards work) but it is never DESTRUCTIVE, so an EXPLICIT button="No" is the escape
 ' hatch the body guard suggests. Only the exact captions No / Chinese No qualify.
 Private Function WoButtonExplicitNo(ByVal norm As String) As Boolean
     WoButtonExplicitNo = WoExactHit("NO|" & ChrW$(&H5426), norm)
 End Function
 
-' TASK-P1-092: destructive-action patterns read from the dialog BODY (title +
+' destructive-action patterns read from the dialog BODY (title +
 ' every child control's text). Deliberately broader than the button denylist: a
 ' destructive confirmation usually puts the verb in the STATIC text, not on the
 ' button - the add-in removal box is "cannot load X ... remove it from the list"
@@ -724,7 +733,7 @@ Private Function WoBodyDangerous(ByVal body As String, ByRef hit As String) As B
     Loop
 End Function
 
-' TASK-P1-092: the dialog BODY as the guard sees it = title + every child
+' the dialog BODY as the guard sees it = title + every child
 ' control's text, joined by newlines.
 Private Function WoDialogBodyDangerous(ByVal d As Object, ByRef hit As String) As Boolean
     Dim s As String
@@ -743,7 +752,7 @@ Private Function WoDialogBodyDangerous(ByVal d As Object, ByRef hit As String) A
     WoDialogBodyDangerous = WoBodyDangerous(s, hit)
 End Function
 ' =====================================================================
-' TASK-P1-125 (MCP-01): the dialog-interlock classifier.
+' the dialog-interlock classifier.
 '
 ' Clicking a button whose dialog starts a LONG host-modal operation (VB6's own
 ' "Make Project" box, or a file chooser that leads into a compile) leaves the host
@@ -828,9 +837,40 @@ Private Function WoHostModalRiskOfDialog(ByVal d As Object, ByRef risk As String
     End If
 End Function
 
-' TASK-P1-125: public, read-only. The worst host-modal risk among the dialogs now
+' public, read-only. The worst host-modal risk among the dialogs now
 ' up, plus per-dialog detail as JSON. Returns the dialog count. Used by
 ' make_project before it decides whether to confirm the Make box.
+' cheap, read-only: is a VISIBLE top-level #32770 of THIS process up right now?
+' Used by Util.PumpGateBlocked; it never clicks, closes or messages anything.
+Public Function HasVisibleHostDialog(ByRef titleOut As String) As Boolean
+    On Error Resume Next
+    HasVisibleHostDialog = False
+    titleOut = ""
+    Dim n As Long, i As Long
+    WoScanTops
+    n = m_woCount
+    If n > WO_MAX Then n = WO_MAX
+    If n <= 0 Then Exit Function
+    Dim pid As Long
+    pid = WoGetCurrentProcessId()
+    For i = 0 To n - 1
+        Dim h As Long
+        h = m_woHwnd(i)
+        If h <> 0 Then
+            If WoPidOf(h) = pid Then
+                If WoCls(h) = "#32770" Then
+                    If WoIsWindowVisible(h) <> 0 Then
+                        titleOut = WoText(h)
+                        HasVisibleHostDialog = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next
+    Err.Clear
+End Function
+
 Public Function HostModalRiskProbe(ByVal cls As String, ByRef risk As String, _
                                    ByRef reason As String, ByRef riskClass As String, _
                                    ByRef detailsJson As String) As Long
@@ -878,7 +918,7 @@ Public Function HostModalRiskProbe(ByVal cls As String, ByRef risk As String, _
     detailsJson = JsonStringify(det)
 End Function
 
-' TASK-P1-125 (MCP-18): the visible text of every active dialog of this process,
+' the visible text of every active dialog of this process,
 ' flattened (title + every child caption). The in-IDE Make writes NO compiler log,
 ' so a VB6 compile-error box is the only place its text can be read from.
 Public Function DialogBodiesText(ByVal cls As String) As String
@@ -905,7 +945,7 @@ Public Function DialogBodiesText(ByVal cls As String) As String
     DialogBodiesText = s
 End Function
 
-' TASK-P1-125 (MCP-18): best-effort text of a VB6 compile-error box. The box body
+' best-effort text of a VB6 compile-error box. The box body
 ' carries the MESSAGE (measured: "Compile error: Sub or Function not defined",
 ' Chinese: Bianyi Cuowu ...) but not the file/line, so only the text is returned;
 ' the location comes from the compiler log on the route=cli path. Honest: returns
@@ -950,7 +990,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     root("explicitCall") = True
     root("allowHostModal") = allowHostModal
     root("policy") = "clicks ONLY buttons whose caption is on the safe whitelist (OK/Yes/Cancel/Close/Continue/Ignore + Chinese twins) and never on the danger denylist; the click is the BM_CLICK window message (a WM_COMMAND fallback is sent only if the button still exists). A second, independent guard: a dialog that would start a LONG host-modal operation (VB6's Make Project box) is reported as host_modal_risk=known and is NOT clicked unless allow_host_modal=true."
-    ' TASK-P1-125 (discipline 98): the same key set on EVERY path. Without these
+    ' (discipline 98): the same key set on EVERY path. Without these
     ' defaults a refusal-only key (hostModalGuard / refusedCount / bodyGuard) and the
     ' note vanished from the success path, so a caller could not rely on the shape.
     root("note") = ""
@@ -976,7 +1016,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
         Set d = before.Item(i)
         Dim dlgDangerous As Boolean, bodyHit As String
         dlgDangerous = WoDialogBodyDangerous(d, bodyHit)
-        ' ---- TASK-P1-125 (MCP-01): classify BEFORE anything is sent --------------
+        ' ---- classify BEFORE anything is sent --------------
         Dim dlgRisk As String, dlgRiskReason As String, dlgRiskClass As String
         WoHostModalRiskOfDialog d, dlgRisk, dlgRiskReason, dlgRiskClass
         Dim dlgRiskLvl As Long
@@ -1013,7 +1053,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                 normA = UCase$(Trim$(Replace(t, "&", "")))
                 Dim sk As Object
                 Set sk = CreateObject("Scripting.Dictionary")
-                ' TASK-P1-126 (MCP-14): skipped[] carries the SAME key set on every
+                ' skipped[] carries the SAME key set on every
                 ' refusal branch, so one shape can be read whichever reason fired.
                 sk("dialog") = d("hwnd")
                 sk("dialogTitle") = d("title")
@@ -1051,7 +1091,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                         refusedN = refusedN + 1
                         Exit For
                     ElseIf dlgRisk = "known" And Not allowHostModal And Not WoButtonCancelLike(normA) Then
-                        ' TASK-P1-125: this is the click that cost the user the whole
+                        ' this is the click that cost the user the whole
                         ' IDE. Refuse it and say exactly why, on dry_run too.
                         sk("reason") = "host_modal_risk_known"
                         sk("dialogTitle") = d("title")
@@ -1075,7 +1115,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                         ck("id") = b("id")
                         ck("normalized") = norm
                         ck("method") = "BM_CLICK"
-                        ' TASK-P1-126 (MCP-14): ONE key set on BOTH the dry_run and the
+                        ' ONE key set on BOTH the dry_run and the
                         ' real-click path. Before this the dry path emitted clicked/planned
                         ' while the real path emitted sendResult/commandFallback, so a
                         ' caller could not compare the two receipts key for key (discipline 98).
@@ -1138,7 +1178,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     Set root("skipped") = skipped
     root("dialogsAfter") = remaining.Count
     Set root("remaining") = remaining
-    ' ---- TASK-P1-125 (MCP-01): the host-modal verdict, on EVERY path ---------
+    ' ---- the host-modal verdict, on EVERY path ---------
     root("host_modal_risk") = worstRisk
     root("host_modal_risk_reason") = worstReason
     root("host_modal_risk_class") = worstClass
@@ -1166,7 +1206,7 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
 End Function
 
 ' =====================================================================
-' TASK-P1-084: the ARMED, ONE-SHOT confirm used by the IDE-native form route.
+' the ARMED, ONE-SHOT confirm used by the IDE-native form route.
 ' Arm -> (the caller executes the IDE's own "Add Form" menu command) -> the
 ' watchdog tick clicks that modal's confirm button -> the caller pumps until the
 ' click lands. Why the tick has to do it: the modal runs its OWN message loop, so
@@ -1174,7 +1214,7 @@ End Function
 ' the code that would click it; the watchdog's WM_TIMER is dispatched BY that
 ' loop, which is the only place the click can come from.
 ' SAFETY: windows of THIS process only, VISIBLE #32770 only, an ENABLED button
-' whose caption (accelerators stripped) is exactly Open/OK/Á°ÆÂÆö/ÊâìÂºÄ only, and a
+' whose caption (accelerators stripped) is exactly Open/OK/»∑∂®/¥Úø™ only, and a
 ' refusal to arm while a dialog of ours is already up (never click into a box this
 ' call did not open). No hook, no memory write: one BM_CLICK window message.
 ' =====================================================================
@@ -1227,7 +1267,7 @@ End Function
 
 ' The confirm button of dialog d, if it is one we are willing to press.
 ' The IDE's Add Form dialog is a file-style dialog: its confirm button is "&Open"
-' (localized "ÊâìÂºÄ"), which is deliberately NOT on close_active_dialogs' safe
+' (localized "¥Úø™"), which is deliberately NOT on close_active_dialogs' safe
 ' whitelist - that tool would skip it and leave the modal over the IDE.
 Private Function WoCfmButton(ByVal d As Long, ByRef outText As String) As Long
     On Error Resume Next
@@ -1246,12 +1286,12 @@ Private Function WoCfmButton(ByVal d As Long, ByRef outText As String) As Long
                     WoCfmButton = h
                     Exit Function
                 End If
-                If t = ChrW$(&H6253) & ChrW$(&H5F00) Then   ' "ÊâìÂºÄ"
+                If t = ChrW$(&H6253) & ChrW$(&H5F00) Then   ' "¥Úø™"
                     outText = WoText(h)
                     WoCfmButton = h
                     Exit Function
                 End If
-                If t = ChrW$(&H786E) & ChrW$(&H5B9A) Then   ' "Á°ÆÂÆö"
+                If t = ChrW$(&H786E) & ChrW$(&H5B9A) Then   ' "»∑∂®"
                     outText = WoText(h)
                     WoCfmButton = h
                     Exit Function
@@ -1313,7 +1353,7 @@ Public Sub WoConfirmTick()
     On Error Resume Next
     If Not m_cfmArmed Then Exit Sub
 
-    ' TASK-P2FIX4 (round 5): when the GENERIC MODAL GUARD is armed it OWNS the dialog
+    ' an earlier fix : when the GENERIC MODAL GUARD is armed it OWNS the dialog
     ' decision, because this one-shot confirm only ever presses a CONFIRM caption
     ' (Open / OK / the Chinese twins). On VB6's own Make Project box the enumeration
     ' order is Open(read-only,disabled), OK(id1), Cancel(id2)... so pressing "the first
@@ -1359,7 +1399,7 @@ End Sub
 
 
 ' =====================================================================
-' TASK-P2FIX4 (round 5, defects #10 / #11 / #4): the GENERIC MODAL GUARD
+' an earlier fix (defects #10 / #11 / #4): the GENERIC MODAL GUARD
 '
 ' WHY. Three unrelated tools were measured to leave a MODAL #32770 box up and
 ' then never return:
@@ -1371,7 +1411,7 @@ End Sub
 ' INSIDE the host's modal message loop, so no code after the failing call can ever
 ' dismiss the box. The only channel that still runs is a message that modal loop
 ' itself dispatches: the watchdog tick (ServerForm.tmrWatch -> WheelTick), which is
-' the same channel WoConfirmTick already proved works (TASK-P1-084).
+' the same channel WoConfirmTick already proved works.
 '
 ' WHAT. Arm the guard around ONE risky call. While armed, every pass enumerates the
 ' visible #32770 windows of THIS process that BLOCK their owner (ownerDisabled=true)
@@ -1443,7 +1483,7 @@ Public Sub WoModalGuardDisarm()
             If WoGetTickCount() >= m_mgDeadline Then m_mgTimedOut = True
         End If
     End If
-    ' TASK-P2FIX4: the LAST chance to OBSERVE the result of a click. BM_CLICK is sent
+    ' an earlier fix: the LAST chance to OBSERVE the result of a click. BM_CLICK is sent
     ' synchronously, but a MODAL dialog is torn down by the host's own modal loop when it
     ' regains control - i.e. AFTER the callback that sent the click has returned. On the
     ' first build of this card that made modalDismissed stay False and the receipt say
@@ -1451,7 +1491,9 @@ Public Sub WoModalGuardDisarm()
     ' DoEvents lets that teardown run, so "dismissed" can be a FACT here; when the box is
     ' genuinely still there it is reported as still there rather than guessed.
     If m_mgClicked Then
-        DoEvents
+        ' same gate - observing the dismissal must never dispatch a POSTED host
+        ' command. Without the pump the click is still sent; only the OBSERVATION is lost.
+        If CanPump() Then DoEvents
         If WoIsWindow(m_mgHwnd) = 0 Then m_mgDismissed = True
     End If
     m_mgArmed = False
@@ -1585,8 +1627,8 @@ Public Function WoModalGuardTick() As Boolean
     End If
     m_mgSeen = True
     m_mgSeenCount = n
-    ' TASK-P1-175 (#4 + #12): the deadline is -this many ms after the LAST SIGHTING-,
-    ' NOT -this many ms after the arm-. Measured on arm 32F7D24C (round 5): on the
+    ' (#4 + #12): the deadline is -this many ms after the LAST SIGHTING-,
+    ' NOT -this many ms after the arm-. Measured on arm 32F7D24C : on the
     ' make_project path the host Make Project box appears only AFTER the old 15 s window
     ' had already expired, so EVERY tick left through the deadline branch above and the box
     ' was never dismissed (the call then died on the gate backstop with no receipt).
@@ -1731,7 +1773,7 @@ Private Function btnsOf(ByVal d As Object) As Object
 End Function
 
 ' =====================================================================
-' TASK-P1-069 (1): send_window_message
+' (1): send_window_message
 ' "click / send a key / send a raw message" to a hwnd of THIS process.
 ' =====================================================================
 
@@ -1850,7 +1892,7 @@ Public Function SendWindowMessageJson(ByVal hwnd As Long, ByVal action As String
     root("title") = WoText(hwnd)
     Dim a As String
     a = LCase$(Trim$(action))
-    ' TASK-P1-076 (contract v1.6.0): HIGH-RISK message guard. WM_CLOSE / WM_QUIT /
+    ' (contract v1.6.0): HIGH-RISK message guard. WM_CLOSE / WM_QUIT /
     ' WM_SYSCOMMAND used to go out unguarded, so a message-only primitive could close a
     ' window - or ask the whole thread (the IDE) to quit - by accident. They now require
     ' an EXPLICIT confirm=true. Everything else is unchanged.
@@ -1990,13 +2032,13 @@ Public Function SendWindowMessageJson(ByVal hwnd As Long, ByVal action As String
 End Function
 
 ' =====================================================================
-' TASK-P1-067: optional code-pane wheel - OPT-IN, DEFAULT OFF.
+' optional code-pane wheel - OPT-IN, DEFAULT OFF.
 '
 ' WHY SUBCLASSING AND NOT A HOOK. A global keyboard hook is exactly what the
 ' user wants to get rid of (it is the suspected cause of the machine-wide input
 ' freeze), and a mouse hook is still a hook, so NONE is installed. Windows
 ' delivers WM_MOUSEWHEEL to the FOCUSED window and the VB6 code pane (window
-' class "VbaWindow", ÂÜÖÈÉ®Á™óÂè£Á±ªÊ∏ÖÂçï) ignores it; we chain our
+' class "VbaWindow", ƒ⁄≤ø¥∞ø⁄¿‡«Âµ•) ignores it; we chain our
 ' own window procedure in front of the pane's, for panes of our OWN process only.
 '
 ' UNINSTALL. Every hooked hwnd remembers its previous procedure. Uninstall
@@ -2060,7 +2102,7 @@ End Function
 ' True = the wheel was consumed (the caller must answer 0).
 Private Function WheelHandle(ByVal h As Long, ByVal wp As Long, ByVal lp As Long) As Boolean
     On Error Resume Next
-    ' TASK-P1-088: record EVERY observed WM_MOUSEWHEEL with its raw wParam/lParam, so the
+    ' record EVERY observed WM_MOUSEWHEEL with its raw wParam/lParam, so the
     ' receipt can say whether the message ever arrived at our WndProc (msgSeen) and what
     ' it carried (lastDelta = HiWord(wParam), lastWparam/lastLparam raw).
     m_whEvents = m_whEvents + 1
@@ -2132,7 +2174,7 @@ Private Function WheelHandle(ByVal h As Long, ByVal wp As Long, ByVal lp As Long
             m_whLastReason = "handled_lines"
         End If
     End If
-    ' TASK-P1-067 final fix: move the pane through the VBIDE object model.
+    ' final fix: move the pane through the VBIDE object model.
     ' WHY: WM_VSCROLL to the REAL code pane was measured to do NOTHING 5/5
     ' (SB_LINEDOWN x2 / SB_PAGEDOWN / SB_LINEUP x2 all left CodePane.TopLine at 1),
     ' while setting TopLine directly is observable and reversible 4/4. Only the
@@ -2153,7 +2195,7 @@ Private Function WheelHandle(ByVal h As Long, ByVal wp As Long, ByVal lp As Long
     m_whLastPaneCaption = m_whLastTitle
     m_whLastTopAfter = newTop
     If newTop < 0 Then
-        ' TASK-P1-132 (D-130-01): "the pane did not resolve" and "the pane resolved but the
+        ' (the code-pane caption measurement): "the pane did not resolve" and "the pane resolved but the
         ' IDE refused the read/write" are DIFFERENT failures and must never share a reason.
         m_whForwarded = m_whForwarded + 1
         If m_whTopStatus = "pane_not_writable_in_break" Then
@@ -2181,9 +2223,9 @@ Private Function WheelHandle(ByVal h As Long, ByVal wp As Long, ByVal lp As Long
     Err.Clear
 End Function
 
-' TASK-P1-088, LEGACY (no longer the behaviour oracle as of TASK-P1-067): first
+', LEGACY (no longer the behaviour oracle as of): first
 ' visible line of the pane's TEXT child. EM_GETFIRSTVISIBLELINE is the RichEdit
-' message (0xCE); TASK-P1-083 measured "RichEdit20A" as the code pane's text
+' message (0xCE); measured "RichEdit20A" as the code pane's text
 ' child class. 0 = the child was not found (the field then carries no information).
 ' This is a DIFFERENT quantity from get_codepane.topLine (VBIDE CodePane.TopLine,
 ' 1-based): compare MOVEMENT, not raw equality.
@@ -2202,7 +2244,7 @@ Private Function WheelPaneTop(ByVal pane As Long) As Long
     Err.Clear
 End Function
 
-' TASK-P1-088: which of the three candidate reasons the CURRENT wheel state points at.
+' which of the three candidate reasons the CURRENT wheel state points at.
 Private Function WheelReason() As String
     If Not m_whEnabled Then
         WheelReason = "switch_off"
@@ -2217,7 +2259,7 @@ Private Function WheelReason() As String
     End If
 End Function
 
-' TASK-P1-088: READ-ONLY wheel snapshot, embedded as the "wheel" object of mcp_info and
+' READ-ONLY wheel snapshot, embedded as the "wheel" object of mcp_info and
 ' ide_state (pure output - no new tool, no description change, so no re-freeze). It exists
 ' to tell three otherwise indistinguishable failure reasons apart:
 '   armed=False               -> (1) nothing was subclassed (switch off / no pane yet)
@@ -2231,15 +2273,15 @@ Public Function WheelStateObj() As Object
     d("installed") = m_whInstalled
     d("armed") = (m_whCount > 0)
     d("subclassCount") = m_whCount
-    ' TASK-P1-067: every hooked window IS a code pane now (WheelScan refuses any
+    ' every hooked window IS a code pane now (WheelScan refuses any
     ' VbaWindow whose title is not a live CodePane caption), so these fields can no
     ' longer point at the Immediate window - the misleading observability that sent
     ' an earlier measurement to the wrong window.
     d("targetHwnd") = 0
     d("targetTitle") = ""
     d("targetCaption") = ""
-    ' TASK-P1-157: the FIRST CODE PANE, not merely the first attached window (the fast
-    ' attach now subclasses the Immediate/Watch/Locals windows too, and P1-067 reads
+    ' the FIRST CODE PANE, not merely the first attached window (the fast
+    ' attach now subclasses the Immediate/Watch/Locals windows too, and reads
     ' target* as "which CODE PANE is armed" - a non-pane window must never appear here).
     Dim ti As Long
     For ti = 0 To m_whCount - 1
@@ -2288,14 +2330,14 @@ Public Function WheelStateObj() As Object
     d("lastPaneTitle") = m_whLastTitle
     d("lastTopLineBefore") = m_whLastTopBefore
     d("lastTopLineAfter") = m_whLastTopAfter
-    ' TASK-P1-132 (D-130-02): -1 must never look like "line 0" or like "did not move".
-    ' TASK-P1-132 (D-130-02): -1 must never look like "line 0" or like "did not move".
+    ' (the pane-scroll measurement): -1 must never look like "line 0" or like "did not move".
+    ' (the pane-scroll measurement): -1 must never look like "line 0" or like "did not move".
     d("lastTopLineBeforeKnown") = (m_whLastTopBefore > 0)
     d("lastTopLineBeforeNote") = ""
     If m_whLastTopBefore < 0 Then
         d("lastTopLineBeforeNote") = "UNAVAILABLE, not line 0. The exact cause is in lastTopStatus/lastTopError: pane_not_found = m_whLastTitle did not resolve to a CodePane; pane_not_writable_in_break = the pane WAS resolved but the IDE refused the TopLine read/write (measured 2026-10-13 in break mode; the real VB error is carried in lastTopError). Read paneTopLineNow (ActiveCodePane.TopLine, stamped by CodeTools) for the CURRENT line instead of comparing this field."
     End If
-    ' TASK-P1-132 (D-130-01): why the caption table was empty/partial on the last scan.
+    ' (the code-pane caption measurement): why the caption table was empty/partial on the last scan.
     d("captionsSource") = m_whCapsSource
     d("captionsCount") = m_whCapsCount
     d("lastResolveVia") = m_whResolveVia
@@ -2306,7 +2348,7 @@ Public Function WheelStateObj() As Object
     d("topLineSpace") = "lastTopLineBefore/After are VBIDE CodePane.TopLine (1-based) read back around the scroll; -1 means NO VALUE and the reason is in lastTopStatus/lastTopError: pane_not_found = the title resolved to no CodePane (forwarded untouched), pane_not_writable_in_break = the pane WAS resolved but the IDE refused the TopLine read/write (real VB error in lastTopError; the scroll is retried outside the window procedure by the timer - see pendingScroll/pendingScrollResult). The old EM_GETFIRSTVISIBLELINE channel is gone from these two fields because the code pane exposes no RichEdit20A child on this IDE (it read -1 and was never the behaviour oracle). paneTopLineNow is the ActiveCodePane.TopLine stamped by CodeTools."
     d("lastReason") = m_whLastReason
     d("reason") = WheelReason()
-    ' TASK-P1-157: hooked[] keeps its P1-067 meaning (the subclassed CODE PANES only).
+    ' hooked[] keeps its meaning (the subclassed CODE PANES only).
     ' attached[] is the new, complete list of every subclassed window with its role, and
     ' attachDecisions[] (option E) says why each VbaWindow seen in the last pass was or
     ' was not hooked - so a missing hook can never again look like a missing window.
@@ -2349,6 +2391,9 @@ Public Function WheelStateObj() As Object
     d("fastAttachIntervalMs") = WHEEL_FAST_MS
     d("fastAttachId") = m_whFastId
     d("fastAttachTicks") = m_whFastTicks
+    d("fastAttachSkipped") = m_whFastSkipped
+    d("fastAttachSafetyMs") = WHEEL_FAST_SAFETY_MS
+    d("fastAttachGate") = ": the fast pass runs only when the FOREGROUND hwnd changed, or after WHEEL_FAST_SAFETY_MS since the last pass; every other 250 ms tick increments fastAttachSkipped instead of enumerating the window tree."
     d("attachRuns") = m_whAttachRuns
     d("lastAttachMsAgo") = IIf(m_whFastLastAt = 0, -1, WoGetTickCount() - m_whFastLastAt)
     d("attachNote") = "hooked[] lists the subclassed CODE PANES. attached[] lists EVERY subclassed window (the Immediate/Watch/Locals windows are subclassed too now, and are forwarded untouched at message time). attachDecisions[] says why each VbaWindow of the last pass was or was not hooked. fastAttachTicks/attachRuns show the COM-free attach timer that closes the gap between a pane being created and the 5 s watchdog scan."
@@ -2369,7 +2414,7 @@ Private Function WheelHooked(ByVal h As Long) As Boolean
     Next
 End Function
 
-' TASK-P1-067: h may only be hooked when cap is a live CodePane caption (see
+' h may only be hooked when cap is a live CodePane caption (see
 ' WheelScan). The caption is stored next to the hwnd because it IS the key the
 ' scroll needs - and it is read here, in the scan, never inside the WndProc
 ' (enumeration/COM in a window procedure is a re-entrancy hazard).
@@ -2390,14 +2435,14 @@ Private Sub WheelHook(ByVal h As Long, ByVal cap As String, Optional ByVal isPan
     m_whHwnd(m_whCount) = h
     m_whPrev(m_whCount) = prev
     m_whTitle(m_whCount) = cap
-    ' TASK-P1-157: remember WHETHER the table classified this window as a code pane,
-    ' so hooked[] can keep the P1-067 meaning while attached[] shows everything.
+    ' remember WHETHER the table classified this window as a code pane,
+    ' so hooked[] can keep the meaning while attached[] shows everything.
     m_whIsPane(m_whCount) = isPane
     m_whCount = m_whCount + 1
     m_whInstalled = True
 End Sub
 
-' TASK-P1-067: is cap the caption of a code pane that is open RIGHT NOW?
+' is cap the caption of a code pane that is open RIGHT NOW?
 Private Function WheelCaptionMapped(ByVal cap As String, ByVal caps As Object) As Boolean
     On Error Resume Next
     If Len(cap) = 0 Then Exit Function
@@ -2414,11 +2459,11 @@ Private Function WheelCaptionMapped(ByVal cap As String, ByVal caps As Object) A
     Next
 End Function
 
-' TASK-P1-067: exactly one VbaWindow is a code pane; everything else with the
+' exactly one VbaWindow is a code pane; everything else with the
 ' SAME class (the Immediate / Watch / Locals windows) is skipped and recorded,
 ' so the receipt can never again show a non-code window as the target.
 '
-' TASK-P1-130 (measured 2026-10-13, pre-fix build D454878E): the VBE caption table can come
+' (measured 2026-10-13, pre-fix build D454878E): the VBE caption table can come
 ' back EMPTY while the project is running/broken - the debugger opens the code pane of the
 ' module it stopped in, and that pane's window need never have existed during design. In
 ' break mode the watchdog KEPT SCANNING (scans 2 -> 5) yet WheelPaneCaptions() yielded 0
@@ -2428,7 +2473,7 @@ End Function
 ' classify against, refusing to hook IS the defect. The scroll path re-resolves the caption
 ' at message time and FORWARDS anything that does not resolve to a CodePane, so hooking an
 ' unclassified VbaWindow cannot change that window's own behaviour. With a NON-empty table
-' the old strict rule is unchanged (P1-067 criterion 4 evidence still holds).
+' the old strict rule is unchanged (criterion 4 evidence still holds).
 Private Function WheelTableEmpty(ByVal caps As Object) As Boolean
     WheelTableEmpty = True
     If caps Is Nothing Then Exit Function
@@ -2449,14 +2494,14 @@ Private Sub WheelConsider(ByVal h As Long, ByVal caps As Object)
         WheelHook h, cap, True
         WheelDecide h, cap, "empty_table_fallback"
     ElseIf Len(cap) > 0 Then
-        ' TASK-P1-157 (A): the caption table NO LONGER GATES THE HOOK. Measured on the
+        ' (A): the caption table NO LONGER GATES THE HOOK. Measured on the
         ' live IDE: a code pane opened after the last scan is absent from the table until
         ' the next scan, and this scan is the only thing that hooks a window - so gating
         ' on the table meant a brand-new pane was never subclassed while the user scrolled
         ' (msgSeen did NOT move, so (i) "not attached", not (ii) "resolve failed").
         ' The window is subclassed regardless; the classification stays where it belongs
         ' - at message time - and WheelHandle still forwards anything that does not
-        ' resolve to a CodePane untouched, so P1-067 is preserved.
+        ' resolve to a CodePane untouched, so is preserved.
         WheelHook h, cap, False
         WheelDecide h, cap, "hooked_unclassified"
     Else
@@ -2475,7 +2520,7 @@ Private Sub WheelSkip(ByVal h As Long, ByVal cap As String, ByVal why As String)
 End Sub
 
 ' =====================================================================
-' TASK-P1-157 (wheel #1): the FAST, COM-FREE attach pass.
+' (wheel #1): the FAST, COM-FREE attach pass.
 '   Why it exists: the only driver of WheelScan is the watchdog
 '   (ServerForm.tmrWatch, Interval = 5000 in steady state - measured 2 scans / 10 s) plus
 '   the HTTP message pump. A code pane opened after the last scan was therefore NOT
@@ -2522,7 +2567,7 @@ End Sub
 
 ' Hook ONE window if it can carry the wheel. A window is refused only when we cannot even
 ' NAME it (empty caption) or when the hook table is full - NEVER because the caption
-' table did not list it (that was exactly the TASK-P1-157 defect).
+' table did not list it (that was exactly the defect).
 Private Sub WheelAttachOne(ByVal h As Long)
     On Error Resume Next
     Dim cap As String
@@ -2558,13 +2603,30 @@ Private Sub WheelMarkPane(ByVal h As Long)
     Next
 End Sub
 
-' TASK-P1-157 (B): the SetTimer callback. The OS calls it from the IDE's message loop,
+' (B): the SetTimer callback. The OS calls it from the IDE's message loop,
 ' so it must never raise and must never touch the VBIDE object model - which is why the
 ' fast attach is COM-free by construction.
 Public Sub WheelTimerProc(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
     On Error Resume Next
     m_whFastTicks = m_whFastTicks + 1
-    If m_whEnabled Then WheelAttachAll
+    If Not m_whEnabled Then
+        Err.Clear
+        Exit Sub
+    End If
+    ' gate the expensive pass (see WHEEL_FAST_SAFETY_MS).
+    Dim fastFg As Long, fastNow As Long
+    fastFg = WoGetForegroundWindow()
+    fastNow = WoGetTickCount()
+    If fastFg = m_whFastFg Then
+        ' wraparound-safe subtraction: never compute now + 5000 (Long overflow)
+        If (fastNow - m_whFastLastAt) < WHEEL_FAST_SAFETY_MS Then
+            m_whFastSkipped = m_whFastSkipped + 1
+            Err.Clear
+            Exit Sub
+        End If
+    End If
+    m_whFastFg = fastFg
+    WheelAttachAll
     Err.Clear
 End Sub
 
@@ -2603,7 +2665,7 @@ Public Sub WheelScan()
         End If
     Loop
     m_whScans = m_whScans + 1
-    ' TASK-P1-067: (re)build the code-pane caption table for THIS scan. It is the
+    ' (re)build the code-pane caption table for THIS scan. It is the
     ' ONLY thing that distinguishes a code pane from the Immediate / Watch / Locals
     ' windows, which carry the same window class "VbaWindow". Cost is one late-bound
     ' call per scan, not per message: nothing COM happens in the window procedure.
@@ -2611,17 +2673,17 @@ Public Sub WheelScan()
     m_whSkipCount = 0
     If Not m_whSink Is Nothing Then
         Set m_whCaps = m_whSink.WheelPaneCaptions()
-        ' TASK-P1-132 (D-130-01): publish WHY the table looks the way it does. In break
+        ' (the code-pane caption measurement): publish WHY the table looks the way it does. In break
         ' mode the VBE.CodePanes collection yields nothing and CodeTools falls back to the
         ' active pane; that is now visible instead of looking like "no panes exist".
         m_whCapsSource = m_whSink.WheelPaneCaptionsSource()
     End If
     m_whCapsCount = 0
     If Not m_whCaps Is Nothing Then m_whCapsCount = m_whCaps.Count
-    ' TASK-P1-157 (A): subclass EVERY VbaWindow first, table or no table. The decision is
+    ' (A): subclass EVERY VbaWindow first, table or no table. The decision is
     ' kept out of the hook: an unclassified window is forwarded untouched at message time.
     m_woScanBusy = True
-    ' TASK-P1-157: the decision list belongs to the SCAN (the pass that classifies), not to
+    ' the decision list belongs to the SCAN (the pass that classifies), not to
     ' the fast pass - a fast pass over an already-hooked set decides nothing and would wipe
     ' the list, which made the option-E diagnostic come back empty on the live IDE.
     m_whDecCount = 0
@@ -2653,14 +2715,14 @@ End Sub
 
 ' Throttled rescan; safe to call from the watchdog timer and the message pump.
 Public Sub WheelTick()
-    ' TASK-P1-084: the armed Add Form confirm has to be ticked even while the wheel
+    ' the armed Add Form confirm has to be ticked even while the wheel
     ' is OFF (the default), so it runs BEFORE the wheel's own early exit. This is the
     ' watchdog's path (ServerForm.tmrWatch) - and the watchdog's WM_TIMER is dispatched
     ' by the modal loop itself, which is precisely why the click can happen at all.
     WoConfirmTick
-    ' TASK-P1-132 (D-130-01): run a scroll the WndProc could not perform, from the TIMER
+    ' (the code-pane caption measurement): run a scroll the WndProc could not perform, from the TIMER
 
-    ' TASK-P2FIX4 (round 5): the GENERIC MODAL GUARD ticks here, right after the
+    ' an earlier fix : the GENERIC MODAL GUARD ticks here, right after the
     ' one-shot Add Form confirm and BEFORE the wheel's own early exit, for exactly the
     ' reason WoConfirmTick runs here: the host's modal loop dispatches this watchdog's
     ' WM_TIMER itself, so this is the only place a click can come from while a tool
@@ -2670,12 +2732,16 @@ Public Sub WheelTick()
     WheelPumpPending
     If Not m_whEnabled Then Exit Sub
     If m_whCount > 0 Then
-        If WoGetTickCount() - m_whLastScan < 1000 Then Exit Sub
+        ' 1000 -> 5000. WinOps.bas:57 has always documented the steady-state
+        ' cadence of this scan as tmrWatch.Interval = 5000; the 1 s value only existed
+        ' because the pipe transport drives the watchdog at 15 ms. The scan costs ~7 ms
+        ' (full tree + caption table), so at 1 Hz it was ~420 ms of CPU per 60 s.
+        If WoGetTickCount() - m_whLastScan < 5000 Then Exit Sub
     End If
     WheelScan
 End Sub
 
-' TASK-P1-132 (D-130-01): perform a pending pane scroll OUTSIDE the subclassed WndProc.
+' (the code-pane caption measurement): perform a pending pane scroll OUTSIDE the subclassed WndProc.
 Public Sub WheelPumpPending()
     On Error Resume Next
     If Not m_whPendOn Then Exit Sub
@@ -2699,7 +2765,7 @@ Public Sub WheelPumpPending()
     Err.Clear
 End Sub
 
-' TASK-P1-067: wire the VBIDE side in. WinOps.bas is a STANDARD module with no
+' wire the VBIDE side in. WinOps.bas is a STANDARD module with no
 ' VBIDE reference; CodeTools is the only holder of the VBE, so McpServer hands it
 ' over here and the two scroll helpers are called late-bound. Called once at
 ' start-up (ServerHost.Start -> McpServer.Init), before WheelInit.
@@ -2716,7 +2782,7 @@ Public Sub WheelInit()
     s = LCase$(Trim$(Environ$("VB6MCP_WHEEL")))
     m_whEnabled = (s = "1" Or s = "true" Or s = "on" Or s = "yes")
     If Not m_whEnabled Then
-        ' registry twin, same shape as VB6MCP_TRANSPORT / VB6MCP_PORT (TASK-P1-079: advapi32,
+        ' registry twin, same shape as VB6MCP_TRANSPORT / VB6MCP_PORT (: advapi32,
         ' because WScript.Shell RegRead/RegWrite is unreliable inside this add-in process)
         s = LCase$(Trim$(WinOps.RegGetString("Software\VB6MCP", "Wheel")))
         If s = "1" Or s = "true" Or s = "on" Or s = "yes" Then m_whEnabled = True
@@ -2724,7 +2790,7 @@ Public Sub WheelInit()
     m_whLines = 3
     s = Trim$(Environ$("VB6MCP_WHEEL_LINES"))
     If Len(s) = 0 Then
-        ' TASK-P1-079: registry twin, same precedence as the Wheel switch itself
+        ' registry twin, same precedence as the Wheel switch itself
         ' (env > HKCU\Software\VB6MCP\WheelLines > 3) - the settings form shows/writes
         ' exactly this chain, so the value it displays is the value that takes effect.
         s = Trim$(McpSettingGet("WheelLines"))
@@ -2748,7 +2814,7 @@ End Sub
 Public Function WheelShutdownJson() As String
     On Error Resume Next
     m_whEnabled = False
-    ' TASK-P1-157: kill OUR timer before anything else - a callback that arrives after the
+    ' kill OUR timer before anything else - a callback that arrives after the
     ' hook table is gone must find m_whEnabled = False (it is checked first).
     WheelStopFast
     Dim restored As Long, deferred As Long, i As Long, cur As Long
@@ -2779,9 +2845,9 @@ Public Function WheelShutdownJson() As String
     d("hadInstalled") = m_whInstalled
     m_whCount = 0
     m_whInstalled = False
-    ' TASK-P1-130: a later re-enable must re-earn the empty-table fallback
+    ' a later re-enable must re-earn the empty-table fallback
     m_whEverVerified = False
-    ' TASK-P1-067: drop the VBIDE sink too, so nothing can call back into the
+    ' drop the VBIDE sink too, so nothing can call back into the
     ' add-in after it has been unloaded.
     Set m_whSink = Nothing
     Set m_whCaps = Nothing
@@ -2794,7 +2860,7 @@ Public Function WheelShutdownJson() As String
     Err.Clear
 End Function
 
-' TASK-P1-164 (R18 focus safety): foreground read/write wrappers. They sit at the END of the
+' (R18 focus safety): foreground read/write wrappers. They sit at the END of the
 ' module on purpose - VB6 only allows declarations before the first procedure, and this module
 ' has declaration blocks further down.
 Public Function WoFrontHwnd() As Long

@@ -27,7 +27,7 @@ Public Function ApiExportJson(ByVal text As String) As String
     ApiExportJson = out
 End Function
 
-' TASK-42 (MCP-lead-20): the LIGHT variant. Same members[] as ApiExportJson, but
+' the LIGHT variant. Same members[] as ApiExportJson, but
 ' the TSV spec text is never built - which skips the SECOND CollectMembers pass
 ' that ApiExportJson pays for (ApiSpecText re-parses the whole text). ADDITIVE:
 ' ApiExportJson itself is untouched, so its bytes are unchanged.
@@ -73,7 +73,64 @@ Public Function ApiDiffSpecJson(ByVal specText As String, ByVal afterText As Str
     ApiDiffSpecJson = DiffCore(bk, bn, bs, bc, ak, an, ag, ac)
 End Function
 
-' TASK-42: COUNTS-ONLY diff - the same classification algorithm as DiffCore
+' The frozen spec is a LINE-ORIENTED TSV: one member per line, kind<TAB>name<TAB>sig.
+' A baseline that does not have that shape cannot be compared at all, and treating it
+' as an empty baseline would report EVERY current member as added (a false positive)
+' instead of a comparison. Returns "" when the text is usable; otherwise a one-line
+' problem description, with badLine = 1-based first offending line, badLineText = that
+' line as received, specLines = number of non-blank lines seen before the problem.
+' A spec that travelled through a JSON STRING field carries LITERAL \n / \t / \r instead of
+' the characters. Feeding that back as a baseline can never match, so it is DECODED here and
+' the caller reports baselineNormalized:true. Only applied when the text carries no real
+' newline/tab at all (a spec that already has real separators is left byte-for-byte alone).
+Public Function ApiSpecNormalizeEscapes(ByVal specText As String, ByRef didNormalize As Boolean) As String
+    ApiSpecNormalizeEscapes = specText
+    didNormalize = False
+    If Len(specText) = 0 Then Exit Function
+    If InStr(specText, vbLf) > 0 Then Exit Function
+    If InStr(specText, vbTab) > 0 Then Exit Function
+    Dim hasEsc As Boolean
+    hasEsc = False
+    If InStr(specText, Chr$(92) & "n") > 0 Then hasEsc = True
+    If InStr(specText, Chr$(92) & "t") > 0 Then hasEsc = True
+    If InStr(specText, Chr$(92) & "r") > 0 Then hasEsc = True
+    If Not hasEsc Then Exit Function
+    Dim s As String, mark As String
+    mark = ChrW$(&H1)
+    s = Replace(specText, Chr$(92) & Chr$(92), mark)
+    s = Replace(s, Chr$(92) & "r", vbCr)
+    s = Replace(s, Chr$(92) & "n", vbLf)
+    s = Replace(s, Chr$(92) & "t", vbTab)
+    s = Replace(s, mark, Chr$(92))
+    ApiSpecNormalizeEscapes = s
+    didNormalize = True
+End Function
+
+Public Function ApiSpecProblem(ByVal specText As String, ByRef badLine As Long, ByRef badLineText As String, ByRef specLines As Long) As String
+    ApiSpecProblem = ""
+    badLine = 0
+    badLineText = ""
+    specLines = 0
+    Dim lines() As String, i As Long, parts() As String, line As String
+    ' tolerate CRLF: split on LF and strip at most one trailing CR
+    lines = Split(specText, vbLf)
+    For i = LBound(lines) To UBound(lines)
+        line = lines(i)
+        If Right$(line, 1) = vbCr Then line = Left$(line, Len(line) - 1)
+        If Len(Trim$(line)) > 0 Then
+            specLines = specLines + 1
+            parts = Split(line, vbTab)
+            If UBound(parts) - LBound(parts) + 1 < 3 Then
+                badLine = i + 1
+                badLineText = line
+                ApiSpecProblem = "line " & CStr(i + 1) & " is not a spec record (expected kind<TAB>name<TAB>signature)"
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+' COUNTS-ONLY diff - the same classification algorithm as DiffCore
 ' (removed / changed / added), but it never builds the violations[] and added[]
 ' JSON lists, so it can be applied to EVERY component of a project inside a
 ' wall-clock budget. The counts are handed back through ByRef because the

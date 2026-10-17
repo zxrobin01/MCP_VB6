@@ -3,13 +3,13 @@ Option Explicit
 
 Private K(0 To 63) As Long
 Private H(0 To 7) As Long
-' TASK-P1-048: kernel-probe cache (declarations live here, at the top of the module).
+' kernel-probe cache (declarations live here, at the top of the module).
 Private mKernelProbed As Boolean
 Private mCngOk As Boolean
 Private mCapiOk As Boolean
 
 ' ---------------------------------------------------------------------------
-' TASK-P1-044 (user ruling: MUST DO): the SHA-256 kernel is now the SYSTEM API.
+' (user ruling: MUST DO): the SHA-256 kernel is now the SYSTEM API.
 ' The old pure-VB6 implementation (64-byte block loop + Double-simulated 32-bit
 ' arithmetic) took tens of seconds on a 973 KB module, and sha256Before/After are
 ' computed unconditionally on every edit, which is where the user-visible ~60 s
@@ -31,14 +31,14 @@ Private Declare Function CryptGetHashParam Lib "advapi32" (ByVal hHash As Long, 
 Private Declare Function CryptDestroyHash Lib "advapi32" (ByVal hHash As Long) As Long
 Private Declare Function CryptReleaseContext Lib "advapi32" (ByVal hProv As Long, ByVal dwFlags As Long) As Long
 
-' TASK-P1-048: kernel32 is used for the O(n) UTF-8 conversion (and for the raw
+' kernel32 is used for the O(n) UTF-8 conversion (and for the raw
 ' UTF-16 scan that keeps astral characters byte-identical - see Utf8Bytes below).
 Private Const CP_UTF8 As Long = 65001
 Private Declare Function WideCharToMultiByte Lib "kernel32" (ByVal CodePage As Long, ByVal dwFlags As Long, ByVal lpWideCharStr As Long, ByVal cchWideChar As Long, ByRef lpMultiByteStr As Any, ByVal cbMultiByte As Long, ByVal lpDefaultChar As Long, ByVal lpUsedDefaultChar As Long) As Long
 Private Declare Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" (ByRef Destination As Any, ByRef Source As Any, ByVal Length As Long)
 
-' TASK-P1-048: CNG/bcrypt is the kernel that actually runs. The CryptoAPI path
-' installed by TASK-P1-044 never worked on this machine: CryptAcquireContextA
+' CNG/bcrypt is the kernel that actually runs. The CryptoAPI path
+' installed by never worked on this machine: CryptAcquireContextA
 ' succeeds but CryptCreateHash(CALG_SHA_256) fails with NTE_BAD_ALGID
 ' (0x80090008), so every hash silently fell through to the pure-VB6 kernel below
 ' (~4.3 s per MB). Measured on this machine (CryptoProbe): acquire rc=1 ->
@@ -60,7 +60,7 @@ Public Function Sha256HexTextUtf8(ByVal s As String) As String
 End Function
 
 Public Function Sha256HexBytes(ByRef b() As Byte) As String
-    ' TASK-P1-044: try the system API first; on ANY failure fall through to the
+    ' try the system API first; on ANY failure fall through to the
     ' original pure-VB6 path below, which is byte-for-byte identical (same uppercase
     ' hex, same Utf8Bytes input convention for the text entry point).
     Dim apiOk As Boolean
@@ -110,25 +110,25 @@ Public Function Sha256HexBytes(ByRef b() As Byte) As String
     Sha256HexBytes = HashHex()
 End Function
 
-' TASK-P1-044: forced-fallback switch. VB6MCP_SHA_FALLBACK=1 makes every call use the
+' forced-fallback switch. VB6MCP_SHA_FALLBACK=1 makes every call use the
 ' pure-VB6 implementation, which is how the fallback path is proved identical.
-' TASK-P1-079: the settings form exposes this switch as HKCU\Software\VB6MCP\ShaFallback,
+' the settings form exposes this switch as HKCU\Software\VB6MCP\ShaFallback,
 ' so the fallback now has the same precedence chain the form displays:
 '   ENV VB6MCP_SHA_FALLBACK  >  HKCU\Software\VB6MCP\ShaFallback  >  default (off = CryptoAPI)
-' The environment still wins, which is what makes the P1-044 forced-fallback proof reproducible.
+' The environment still wins, which is what makes the forced-fallback proof reproducible.
 Private Function ShaForceFallback() As Boolean
     On Error Resume Next
     Dim s As String
     s = LCase$(Trim$(Environ$("VB6MCP_SHA_FALLBACK")))
     If Len(s) = 0 Then
-        ' TASK-P1-079: advapi32 wrapper (WScript.Shell was unreliable in this process)
+        ' advapi32 wrapper (WScript.Shell was unreliable in this process)
         s = LCase$(Trim$(WinOps.McpSettingGet("ShaFallback")))
     End If
     ShaForceFallback = (s = "1" Or s = "true" Or s = "on" Or s = "yes")
 End Function
 
-' TASK-P1-048: report the kernel that will ACTUALLY run, not the one we wish ran.
-' TASK-P1-044 returned a hard-coded "cryptoapi" while the CryptoAPI call was in fact
+' report the kernel that will ACTUALLY run, not the one we wish ran.
+' returned a hard-coded "cryptoapi" while the CryptoAPI call was in fact
 ' failing on every invocation and the pure-VB6 kernel was doing the work - the label
 ' hid a 4.3 s/MB cost. The probe result is cached in mKernelProbed.
 Public Function ShaKernelName() As String
@@ -169,7 +169,7 @@ Private Sub ShaProbeKernels()
     End If
 End Sub
 
-' TASK-P1-048: the kernel. Tries CNG/bcrypt first, then CryptoAPI, then gives up and
+' the kernel. Tries CNG/bcrypt first, then CryptoAPI, then gives up and
 ' lets the caller fall through to the pure-VB6 implementation below. The digest is
 ' UPPERCASE hex in every case (identical to HashHex), and the CNG and VB6 kernels are
 ' bit-identical on the same input (A/B: 7ACC26DF... for the same 1 MB fixture), which
@@ -414,9 +414,9 @@ Private Function HashHex() As String
     HashHex = s
 End Function
 
-' TASK-P1-048: O(n) UTF-8 conversion. The loop below used to run for EVERY
+' O(n) UTF-8 conversion. The loop below used to run for EVERY
 ' string: one AscW(Mid$(s,i,1)) plus a temporary Byte array of 3n per code unit.
-' P4-047 measured ~3.1 s of that for a 1 MB module, on top of a CryptoAPI kernel
+' An earlier measurement took ~3.1 s of that for a 1 MB module, on top of a CryptoAPI kernel
 ' that needs <10 ms. Now the system converter (kernel32 WideCharToMultiByte /
 ' CP_UTF8) does the common case in native code.
 '
@@ -466,7 +466,7 @@ Private Sub Utf8Bytes(ByVal s As String, ByRef o() As Byte)
     End If
 End Sub
 
-' TASK-P1-048: system UTF-8 conversion. Returns False - and the caller falls back
+' system UTF-8 conversion. Returns False - and the caller falls back
 ' to the legacy per-unit loop - on a string containing any surrogate code unit, on
 ' empty/degenerate input, or on any doubt. It never hands back a partial buffer:
 ' ok is set only after the full declared byte count was produced.
@@ -485,7 +485,7 @@ Fail:
     Utf8BytesSys = False
 End Function
 
-' TASK-P1-048: does the string contain any UTF-16 surrogate code unit
+' does the string contain any UTF-16 surrogate code unit
 ' (D800-DFFF)? Checked on the raw UTF-16 bytes: little-endian, so the HIGH byte of
 ' code unit i lives at the odd offset 2i+1, and D8..DF there is a surrogate. A
 ' Byte-array scan avoids one Mid$ allocation per character.

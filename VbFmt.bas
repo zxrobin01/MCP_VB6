@@ -68,12 +68,16 @@ Public Function FormatJson(ByVal path As String, ByVal indentUnit As String, ByV
     d("changedLines") = changed
     d("sha256Before") = Sha256HexFile(path)
     If apply And changed > 0 Then
-        ProjShip.WriteTextFile path, Join(out, eol)
+        ' remaining: use the returned Boolean - a write that cannot be read back
+        ' must not produce an 'applied' receipt.
+        If Not ProjShip.WriteTextFile(path, Join(out, eol)) Then
+            Err.Raise vbObjectError + 84, "VbFmt", "format_code could not write " & path & ": the rewritten bytes were not readable back from disk, so nothing is reported as formatted. Check the path/permissions and retry."
+        End If
         d("sha256After") = Sha256HexFile(path)
     Else
         d("sha256After") = Sha256HexFile(path)
     End If
-    ' TASK-P1-121 item 7 (G-4): state the backup policy instead of leaving it implicit.
+    ' item 7: state the backup policy instead of leaving it implicit.
     ' format_code writes NO .bak, on purpose - the frozen description says so - so this
     ' is an additive field and the description is deliberately NOT touched.
     d("backup") = False
@@ -100,9 +104,12 @@ Public Function RenameJson(ByVal vbpPath As String, ByVal oldName As String, ByV
     Dim attrWarn As Boolean
     attrWarn = False
     Dim v As Variant
-    ' TASK-P1-121 item 7 (G-4): the .bak files THIS call creates, named in the receipt.
+    ' item 7: the .bak files THIS call creates, named in the receipt.
     Dim baks As Object
     Set baks = New Collection
+    ' remaining: components whose write could not be read back.
+    Dim writeFail As Object
+    Set writeFail = New Collection
     For Each v In comps
         Dim f As String
         f = CStr(v)
@@ -121,18 +128,32 @@ Public Function RenameJson(ByVal vbpPath As String, ByVal oldName As String, ByV
                 e("file") = f
                 e("occurrences") = n
                 e("sha256Before") = before
+                ' remaining: BOTH writes are checked; a file whose rewrite is not
+                ' readable back is reported as a failure, never as a renamed file.
                 If dryRun Then
                     e("sha256After") = before
+                    items.Add e
+                    total = total + n
+                ElseIf Not ProjShip.WriteTextFile(f & ".bak", txt) Then
+                    e("error") = "backup_not_readable_back"
+                    e("errorTarget") = f & ".bak"
+                    e("sha256After") = before
+                    items.Add e
+                    writeFail.Add f
+                ElseIf Not ProjShip.WriteTextFile(f, after) Then
+                    e("error") = "rewrite_not_readable_back"
+                    e("errorTarget") = f
+                    e("sha256After") = Sha256HexFile(f)
+                    items.Add e
+                    writeFail.Add f
                 Else
-                    ProjShip.WriteTextFile f & ".bak", txt
-                    ProjShip.WriteTextFile f, after
                     e("backupFile") = f & ".bak"
                     baks.Add f & ".bak"
                     SeNoteBackup f & ".bak"
                     e("sha256After") = Sha256HexFile(f)
+                    items.Add e
+                    total = total + n
                 End If
-                items.Add e
-                total = total + n
             End If
         End If
     Next
@@ -145,9 +166,15 @@ Public Function RenameJson(ByVal vbpPath As String, ByVal oldName As String, ByV
     d("totalOccurrences") = total
     d("filesChanged") = items.Count
     Set d("files") = items
-    ' TASK-P1-121 item 7 (G-4): enumerate the backups instead of only mentioning them in
+    ' item 7: enumerate the backups instead of only mentioning them in
     ' prose; the same paths also reach the additive sideEffects block (item 6).
     Set d("backupsCreated") = baks
+    If writeFail.Count > 0 Then
+        d("ok") = False
+        d("reason") = "write_not_readable_back"
+        Set d("failedWriteTargets") = writeFail
+        d("note") = "one or more files were NOT renamed: the write could not be read back from disk (see files[].error / failedWriteTargets). The .bak for a failed file may exist; the target file was left as it was found."
+    End If
     If attrWarn Then
         d("warning") = "an Attribute line matches old_name (a module/class name): this tool skips Attribute lines by design - use rename_component for a component rename."
         d("routeHint") = "Component or module names must be renamed with rename_component (it also keeps the .vbp in sync)."
@@ -190,7 +217,7 @@ Private Function ReplaceIdent(ByVal txt As String, ByVal oldName As String, ByVa
                               ByVal skipAttributes As Boolean, ByRef n As Long, ByRef attrWarn As Boolean) As String
     Dim eol As String
     eol = LineEndingOf(txt)
-    ' TASK-P1-052: was "out = out & eol / & piece" per line (quadratic on a whole
+    ' was "out = out & eol / & piece" per line (quadratic on a whole
     ' module). Collect the pieces and Join ONCE. The old code inserted eol only when the
     ' accumulated output was ALREADY non-empty, so leading EMPTY pieces contribute no
     ' separator: find the first non-empty piece and Join from there - that reproduces the

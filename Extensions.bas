@@ -1,6 +1,6 @@
 Attribute VB_Name = "Extensions"
 Option Explicit
-' Extension library (æ‰©å±•åº“).
+' Extension library (À©Õ¹¿â).
 '
 ' An extension is a DECLARATIVE tool pack: <dll dir>\mcp_extensions\*.json
 '   { "name": "net-tools", "version": "1.0", "description": "...",
@@ -68,8 +68,8 @@ Public Function WriteText(ByVal path As String, ByVal text As String) As Boolean
     Dim bb() As Byte
     On Error GoTo Bad
     Encoding.EncodeText text, "utf-8", bb
-    Encoding.WriteAllBytesTo path, bb
-    WriteText = True
+    ' remaining: read the bytes back instead of assuming the write landed.
+    WriteText = Encoding.WriteAllBytesChecked(path, bb)
     Exit Function
 Bad:
     WriteText = False

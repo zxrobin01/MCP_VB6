@@ -1,4 +1,4 @@
-# Token authentication - threat model and mechanism decision (task-71)
+﻿# Token authentication - threat model and mechanism decision 
 
 Status: **threat model FIRST, by author ruling** (ADR sec 0.5 clause 3 and the Lead's card).
 This document decides WHO we defend against and WHAT they can reach; the mechanism at the end is
@@ -7,9 +7,11 @@ derived from that, not the other way round.  Written before any token code exist
 ## 0. Where this sits
 
 ADR `docs/design/TRANSPORT_NP_DUAL.md` sec 0.5 records the author's ruling (2026-10-15): token
-authentication comes later, and until it exists **no non-loopback exposure is allowed**, the
-remote per-machine shape may not be called deployable, and the mechanism must be preceded by a
-threat model.  The surfaces today:
+authentication comes later, and until it existed **no non-loopback exposure was allowed**, the
+remote per-machine shape could not be called deployable, and the mechanism had to be preceded by a
+threat model.  **Since 2026-10-17 that rule is REFINED, not dropped**: remote access
+now exists, but only as an EXPLICIT, fail-closed mode with its own hard prerequisites - section 10
+is the binding text, and the default tier is unchanged.  The surfaces today:
 
 - **Python bridge** (this file's component): ONE TCP port, 120-tool face **including write tools**
   (edit files, mutate the project, run code in the IDE), **no authentication**, loopback by default.
@@ -92,8 +94,8 @@ This one is entirely on us and is **in scope** (M-3, M-4).
 
 ## 5. Wire fields (pipe), to be pinned now and implemented server-side later
 
-Additive only; a server that does not read them must be unaffected (task-57's parser looks up
-`vb6mcp` and `nonce` only, so unknown keys are expected to be inert - **to be confirmed by task-57**, and the
+Additive only; a server that does not read them must be unaffected ('s parser looks up
+`vb6mcp` and `nonce` only, so unknown keys are expected to be inert - **to be confirmed by **, and the
 bridge will not depend on it: if a server answers `welcome` the token was not required).
 
 | frame | field | type | meaning |
@@ -149,3 +151,26 @@ version.
   read the registry can still attempt impersonation (the nonce is the only proof today).
 * T3 is untouched by design.
 
+
+## 10. Remote mode (2026-10-17) - the retired invariant and its replacement
+
+**RETIRED**: the old sentence "non-loopback binding is refused with exit 6 and there is deliberately
+NO switch to override it".  It was true while the bridge had no TLS and no remote read-only tier;
+keeping it now would either block the author-approved remote shape or turn a real capability into a
+false statement.  What replaces it:
+
+| gate | rule | refusal |
+|---|---|---|
+| default tier | loopback only; a non-loopback bind exits with **6** exactly as before | exit 6 |
+| remote prerequisites | `--allow-remote <cidr[,cidr]>` + `--tls-cert/--tls-key` + a token source + a WRITABLE `--audit-log`; ALL of them | exit **7**, naming every missing item |
+| source | the peer address is re-checked inside the process against the allowlist | `403 source_not_allowed` |
+| privilege | a non-loopback caller is **READ-ONLY**: only an explicit read-only allowlist runs, everything else (including any NEW tool) is refused | `remote_read_only` unless `--remote-write` (loud at startup) |
+| credential | constant-time compare, **two** valid tokens (current + previous) for rotation, per-source exponential backoff then lockout | `401 token_mismatch` / `429 auth_locked_out` |
+| transport | TLS on the HTTP face only (TLS >= 1.2); a self-signed certificate is acceptable only when the client PINS the sha256 of the DER certificate | startup refuses exit 7 if TLS cannot load |
+| audit | one append-only JSONL line per response (refusals included), never a token value; an unwritable log refuses remote requests | `503 audit_unavailable` |
+| discovery | a remote caller never sees instance paths, pipe names, pids or the registry dir | `/health` redacted (`remoteRedacted:true`) |
+
+**Why the gates are not optional**: a static bearer token is replayable, and this face executes code
+in the IDE - so TLS and source restriction are the floor, not the ceiling.  A deny-first tool allowlist
+makes a forgotten entry fail CLOSED instead of quietly shipping the write face to the network, and the
+audit log is what makes an incident attributable at all.

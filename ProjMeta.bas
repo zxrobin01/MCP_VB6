@@ -12,6 +12,50 @@ Option Explicit
 
 ' Reads every scalar key=value line of a .vbp (skipping components, references
 ' and [sections]) and returns {"path","exists","keys":{...},"lineEnding","sha256"}.
+' ---- independent read-back evidence for a write ---------------------------
+' True ONLY when the file exists AND decodes to EXACTLY the text that was to be written;
+' returns the file's own sha256 and byte count. The write side of this module used to report
+' the INTENDED size plus Sha256HexFile(), which on a failed write is the hash of an EMPTY
+' file - a success shape for a write that never happened.
+Private Function WrittenBackOk(ByVal path As String, ByVal expectedText As String, ByRef shaOut As String, ByRef bytesOut As Long) As Boolean
+    Dim b() As Byte, gotText As String
+    shaOut = ""
+    bytesOut = 0
+    WrittenBackOk = False
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then Exit Function
+    On Error Resume Next
+    ReadAllBytesTo path, b
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+    bytesOut = ByteCount(b)
+    If bytesOut = 0 Then Exit Function
+    DecodeBytes b, DetectEncoding(b), gotText
+    If gotText <> expectedText Then Exit Function
+    shaOut = Sha256HexFile(path)
+    WrittenBackOk = True
+End Function
+
+' the refusal that replaces a success shape when the read-back failed.
+Private Function WriteNotVisibleJson(ByVal toolName As String, ByVal target As String, ByVal shaOut As String, ByVal bytesOut As Long) As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("tool") = toolName
+    d("target") = target
+    d("reason") = "write_not_visible"
+    d("actualSha256") = shaOut
+    d("actualBytes") = bytesOut
+    d("detail") = "the write did NOT become visible on disk, or the bytes on disk are not the bytes that were to be written (target may be unwritable, the path invalid, or something else holds it). The success shape is deliberately NOT returned."
+    d("verdictHint") = "a write tool may only answer 'written' when the bytes are readable back from the target path"
+    WriteNotVisibleJson = JsonStringify(d)
+End Function
+
 Public Function MetaGetJson(ByVal vbpPath As String) As String
     Dim text As String
     text = ReadProjectText(vbpPath)
@@ -75,13 +119,23 @@ Public Function MetaSetJson(ByVal vbpPath As String, ByVal updates As Object, _
         End If
     Next
     BackupFile vbpPath
-    WriteProjectText vbpPath, Join(lines, eol)
+    Dim newText As String
+    newText = Join(lines, eol)
+    WriteProjectText vbpPath, newText
+    ' read the .vbp back and prove the edit landed, before claiming it did.
+    Dim vSha As String, vBytes As Long
+    If Not WrittenBackOk(vbpPath, newText, vSha, vBytes) Then
+        MetaSetJson = WriteNotVisibleJson("project_meta", vbpPath, vSha, vBytes)
+        Exit Function
+    End If
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
     d("path") = vbpPath
     d("changed") = changedCsv
     d("added") = addedCsv
-    d("sha256") = Sha256HexFile(vbpPath)
+    d("sha256") = vSha
+    d("bytesWritten") = vBytes
+    d("verifiedOnDisk") = True
     MetaSetJson = JsonStringify(d)
 End Function
 
@@ -133,15 +187,23 @@ Public Function ManifestWriteJson(ByVal exePath As String, ByVal level As String
     manPath = exePath & ".manifest"
     BackupFile manPath
     WriteProjectText manPath, s
+    ' same read-back assertion as MetaSetJson.
+    Dim mSha As String, mBytes As Long
+    If Not WrittenBackOk(manPath, s, mSha, mBytes) Then
+        ManifestWriteJson = WriteNotVisibleJson("app_manifest", manPath, mSha, mBytes)
+        Exit Function
+    End If
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
     d("path") = manPath
-    d("bytes") = Len(s)
+    d("bytes") = mBytes
+    d("bytesWritten") = mBytes
+    d("verifiedOnDisk") = True
     d("level") = LevelOf(level)
     d("dpiAware") = dpiAware
     d("dpiAwareness") = DpiAwarenessOf(dpiAwareness)
     d("uiAccess") = uiAccess
-    d("sha256") = Sha256HexFile(manPath)
+    d("sha256") = mSha
     d("note") = "External manifest: it must sit next to the exe with the same name plus .manifest. Redeploy the exe afterwards."
     ManifestWriteJson = JsonStringify(d)
 End Function
@@ -315,7 +377,9 @@ End Function
 Private Sub WriteProjectText(ByVal path As String, ByVal s As String)
     Dim b() As Byte
     EncodeText s, "ansi", b
-    WriteAllBytesTo path, b
+    ' the checked writer - the caller's WrittenBackOk() assertion then compares
+    ' the decoded TEXT, this compares the BYTES. Two independent read-backs.
+    WriteAllBytesChecked path, b
 End Sub
 
 Private Sub BackupFile(ByVal path As String)

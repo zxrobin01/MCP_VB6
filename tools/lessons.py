@@ -36,7 +36,7 @@ Semantics ported from Lessons.bas
 * ImportMdJson    : '## [id] scenario' headers + 坑:/trap: and 应:/do: lines;
                     ids already in the MERGED library are never overwritten
                     (they fall back to custom-N and count as a conflict).
-* Store safety (TASK-P1-038): a user.json that exists but is empty or does not
+* Store safety: a user.json that exists but is empty or does not
                     parse is NEVER silently replaced by an empty store -- the file
                     is left untouched, a timestamped .bak is kept and the call
                     fails with error="lesson_store_unreadable".

@@ -87,7 +87,7 @@ EXIT CODES
     2 usage error (including "the .vbp input set is not exhaustive")
     3 refused target (port 8766 is reserved and is NEVER contacted) or I/O failure
 
-PYTHON RUNTIME REQUIREMENT (task-78)
+PYTHON RUNTIME REQUIREMENT 
     This tool runs on BOTH Python 2.7 and Python 3.x - deliberately, because the build host
     (t16) only has a real 2.7 interpreter while this repository is developed on 3.x, and the
     same I must come out of either one (verified: identical SOURCE_HASH on 2.7.14 and 3.9.18).
@@ -186,25 +186,93 @@ def read_bytes(path):
         return f.read()
 
 
-def write_if_changed(path, data):
-    """Idempotent write: identical bytes => no rewrite, mtime untouched.
+def stat_bytes(path):
+    """(mtime, size) or (None, None) when the path does not exist."""
+    try:
+        st = os.stat(path)
+        return st.st_mtime, st.st_size
+    except OSError:
+        return None, None
 
-    Returns "created" | "unchanged" | "updated"."""
+
+def classify_write(path, data):
+    """What a write of these bytes to this path WOULD do - touching nothing.
+
+    Returns (state, old_sha256_or_None, new_sha256, mtime_before).  state is
+    "created" (path absent) | "rewritten" (different bytes) | "byte-identical"
+    (the file already carries exactly these bytes; a write would touch neither the
+    bytes nor the mtime)."""
+    new_sha = sha256_hex(data)
+    mt_before, _sz = stat_bytes(path)
+    if os.path.exists(path):
+        try:
+            old = read_bytes(path)
+        except OSError:
+            return "rewritten", None, new_sha, mt_before
+        if old == data:
+            return "byte-identical", sha256_hex(old), new_sha, mt_before
+        return "rewritten", sha256_hex(old), new_sha, mt_before
+    return "created", None, new_sha, mt_before
+
+
+def plan_write(path, data):
+    """The receipt a write WOULD produce, without performing it (--no-write)."""
+    state, old_sha, new_sha, mt = classify_write(path, data)
+    _mt, sz = stat_bytes(path)
+    return dict(path=path, state=state, old_sha256=old_sha, new_sha256=new_sha,
+                bytes=len(data), touched=False, planned=True, mtime_before=mt,
+                mtime_after=mt, size_before=sz, size_after=sz)
+
+
+def write_with_evidence(path, data):
+    """Write these bytes and return the EVIDENCE of what happened to the file.
+
+    {"path", "state", "old_sha256", "new_sha256", "bytes", "touched", "planned",
+     "mtime_before", "mtime_after", "size_before", "size_after"}
+
+    state: "created" | "rewritten" | "byte-identical" (see classify_write).
+
+    The old/new sha256 travel WITH the state on purpose: a reader must be able to
+CHECK the claim instead of trusting the word. Before the tool printed
+    "(unchanged)" for a manifest whose content had in fact been rewritten, and the
+    receipt carried no field that could have shown it."""
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.isdir(d):
         os.makedirs(d)
-    if os.path.exists(path):
-        try:
-            if read_bytes(path) == data:
-                return "unchanged"
-        except OSError:
-            pass
-        with open(path, "wb") as f:
-            f.write(data)
-        return "updated"
+    state, old_sha, new_sha, mt_before = classify_write(path, data)
+    _mt, sz_before = stat_bytes(path)
+    if state == "byte-identical":
+        return dict(path=path, state=state, old_sha256=old_sha, new_sha256=new_sha,
+                    bytes=len(data), touched=False, planned=False, mtime_before=mt_before,
+                    mtime_after=mt_before, size_before=sz_before, size_after=sz_before)
     with open(path, "wb") as f:
         f.write(data)
-    return "created"
+    mt_after, sz_after = stat_bytes(path)
+    return dict(path=path, state=state, old_sha256=old_sha, new_sha256=new_sha,
+                bytes=len(data), touched=True, planned=False, mtime_before=mt_before,
+                mtime_after=mt_after, size_before=sz_before, size_after=sz_after)
+
+
+def write_if_changed(path, data):
+    """Back-compat shim: the STATE of write_with_evidence."""
+    return write_with_evidence(path, data)["state"]
+
+
+def format_write_evidence(label, ev):
+    """One truthful line per artifact: WHERE, WHAT HAPPENED, and the shas that prove it.
+
+    The state is never inferred from "the call did not raise": it is the outcome of a
+    byte comparison.  "byte-identical" is only reported after the on-disk bytes were
+    compared with the payload, and it says the file was NOT touched."""
+    old = ev["old_sha256"] if ev.get("old_sha256") is not None else "none"
+    if ev.get("planned"):
+        state_text = "NOT WRITTEN (--no-write); would be: %s" % ev["state"]
+    elif ev["state"] == "byte-identical":
+        state_text = "byte-identical: file NOT touched, 0 bytes written"
+    else:
+        state_text = ev["state"]
+    return ("%s=%s (%s) old_sha256=%s new_sha256=%s"
+            % (label, ev["path"], state_text, old, ev["new_sha256"]))
 
 
 def is_excluded_rel(rel):
@@ -326,7 +394,7 @@ def canonical_rel(tree, vbp_rel):
     The manifest records a path STRING per input file and that string is hashed, so recording
     the caller's spelling made I depend on HOW the tool was invoked: --vbp MCP_VB6.vbp (CWD =
     tree root) and --vbp D:\...\MCP_VB6.vbp produced different I for byte-identical trees
-    (task-80, spec sec 10.8).  Every entry is therefore recorded tree-root-relative, with
+    (spec sec 10.8).  Every entry is therefore recorded tree-root-relative, with
     forward slashes, so the two invocations (and any CWD) agree.
 
     Only the path FORM is canonicalised - the tree's own location is never part of the entry,
@@ -836,11 +904,8 @@ def patch_vbp_comments(vbp_path, value):
                 break
         out.insert(insert_at, replacement + newline)
     new_raw = b"".join(out)
-    if new_raw == raw:
-        return "unchanged", new_raw
-    with open(vbp_path, "wb") as f:
-        f.write(new_raw)
-    return "updated", new_raw
+    ev = write_with_evidence(vbp_path, new_raw)
+    return ev["state"], new_raw
 
 
 def render_buildstamp(algo, stamp_hash, mode):
@@ -1008,15 +1073,22 @@ def manifest_dir_for(args):
     return args.manifest_dir or os.path.join(os.getcwd(), "dist")
 
 
-def record_manifest(mdir, tree, payload, stamp_hash):
+def manifest_targets(mdir, tree, stamp_hash):
+    """The two manifest paths a stamp owns: the generation file and the named file."""
     store = os.path.join(mdir, "srcstamp")
-    wrote = []
-    p1 = os.path.join(store, stamp_hash + ".srcmanifest.txt")
-    wrote.append((p1, write_if_changed(p1, payload)))
     base = os.path.basename(os.path.abspath(tree)) or "tree"
-    p2 = os.path.join(mdir, base + ".srcmanifest.txt")
-    wrote.append((p2, write_if_changed(p2, payload)))
-    return wrote
+    return [os.path.join(store, stamp_hash + ".srcmanifest.txt"),
+            os.path.join(mdir, base + ".srcmanifest.txt")]
+
+
+def record_manifest(mdir, tree, payload, stamp_hash):
+    """Write both manifests and return their write EVIDENCE (not just a state word).
+
+    This tool WROTE two files; the receipt now says which ones, whether each was
+    created / rewritten / already byte-identical, and each file's own old->new sha256,
+    so a caller can verify the claim instead of trusting it."""
+    return [write_with_evidence(p, payload)
+            for p in manifest_targets(mdir, tree, stamp_hash)]
 
 
 def find_baseline(args, stamp_hash):
@@ -1070,13 +1142,24 @@ def cmd_compute(args):
             eprint("  - " + p)
         return 2
     if args.manifest:
-        recorded = [(args.manifest, write_if_changed(args.manifest, payload))]
+        targets = [args.manifest]
     else:
-        recorded = record_manifest(manifest_dir_for(args), args.tree, payload, stamp)
+        targets = manifest_targets(manifest_dir_for(args), args.tree, stamp)
+    if args.no_write:
+        # READ-ONLY form.  compute WRITES by default, and a check tool that calls that
+# form silently modifies the working tree (: it minted a "generation"
+        # manifest that no build had ever produced).  --no-write reports what WOULD
+        # happen and writes nothing.
+        recorded = [plan_write(p, payload) for p in targets]
+        write_mode = "verified-only (nothing was written)"
+    else:
+        recorded = [write_with_evidence(p, payload) for p in targets]
+        write_mode = "wrote %d file(s)" % len([e for e in recorded if e["touched"]])
     out = dict(algo=ALGO, mode=args.mode, source_hash=stamp,
                files=len(entries), payload_bytes=len(payload),
                manifest_sha256_matches=(sha256_hex(payload) == stamp),
-               recorded=[dict(path=p, state=s) for p, s in recorded],
+               write_mode=write_mode,
+               recorded=recorded,
                tree=os.path.abspath(args.tree), vbp=args.vbp)
     if args.json:
         print(json.dumps(out, indent=1, sort_keys=True))
@@ -1085,8 +1168,9 @@ def cmd_compute(args):
         print("MODE=" + args.mode)
         print("SOURCE_HASH=" + stamp)
         print("FILES=%d" % len(entries))
-        for p, s in recorded:
-            print("MANIFEST=%s (%s)" % (p, s))
+        for e in recorded:
+            print(format_write_evidence("MANIFEST", e))
+        print("WRITE_MODE=" + write_mode)
     return 0
 
 
@@ -1102,10 +1186,9 @@ def cmd_emit(args):
                   buildstamp=None, vbp=None, manifest=None,
                   tree=os.path.abspath(args.tree))
     if args.out:
-        state = write_if_changed(args.out, data)
-        result["buildstamp"] = dict(path=args.out, state=state)
-        if state == "unchanged":
-            result["buildstamp"]["mtime_untouched"] = True
+        # the state is the OUTCOME of a byte comparison, reported together
+        # with the file's own old->new sha256 - never as a bare word.
+        result["buildstamp"] = write_with_evidence(args.out, data)
     vbp_value = comments_value(ALGO, stamp)
     # The .vbp Comments= line is the offline read point (spec section 5.2) and is
     # written BY THIS TOOL so that both write points provably come from one process and
@@ -1122,7 +1205,11 @@ def cmd_emit(args):
         state, _ = patch_vbp_comments(vbp_target, vbp_value)
         result["vbp"] = dict(path=vbp_target, state=state, value=vbp_value)
     recorded = record_manifest(manifest_dir_for(args), args.tree, payload, stamp)
-    result["manifest"] = [dict(path=p, state=s) for p, s in recorded]
+    result["manifest"] = recorded
+    n_written = len([e for e in recorded if e["touched"]])
+    if result["buildstamp"] and result["buildstamp"]["touched"]:
+        n_written += 1
+    result["write_mode"] = "wrote %d file(s)" % n_written
     if args.json:
         print(json.dumps(result, indent=1, sort_keys=True))
     else:
@@ -1131,8 +1218,7 @@ def cmd_emit(args):
         print("SOURCE_HASH=" + stamp)
         print("FILES=%d" % len(entries))
         if result["buildstamp"]:
-            print("BUILDSTAMP=%s (%s)" % (result["buildstamp"]["path"],
-                                          result["buildstamp"]["state"]))
+            print(format_write_evidence("BUILDSTAMP", result["buildstamp"]))
         if result["vbp"]:
             print("VBP=%s (%s) %s=%s" % (result["vbp"]["path"], result["vbp"]["state"],
                                          VBP_STAMP_KEY, vbp_value))
@@ -1140,7 +1226,8 @@ def cmd_emit(args):
             print("VBP_STAMP_LINE=%s=%s (NOT WRITTEN: --no-vbp-patch)"
                   % (VBP_STAMP_KEY, vbp_value))
         for m in result["manifest"]:
-            print("MANIFEST=%s (%s)" % (m["path"], m["state"]))
+            print(format_write_evidence("MANIFEST", m))
+        print("WRITE_MODE=" + result["write_mode"])
     return 0
 
 
@@ -1277,7 +1364,7 @@ def cmd_selftest(args):
         # The tmp tree must be addressed with the CANONICAL rel: passing args.vbp through
         # would let an ABSOLUTE --vbp escape the temp tree (os.path.join discards the earlier
         # component when the later one is absolute) and the "append the stamp key" step below
-        # would then write into the REAL project file.  Same family as task-80, so it is fixed
+# would then write into the REAL project file. Same family as, so it is fixed
         # here instead of only in the CLI path - and guarded.
         rel_vbp = canonical_rel(args.tree, args.vbp)[0]
         vbp_abs = os.path.join(tmp, rel_vbp.replace("/", os.sep))
@@ -1335,7 +1422,7 @@ def cmd_selftest(args):
             base_s, _b, _c, _d = compute_stamp(args.tree, args.vbp, "semantic")
             ok = say("5. semantic mode is stable across CRLF -> LF normalisation",
                      (not prs) and ss == base_s, "%s" % ((ss or "ERR")[:16],)) and ok
-        # ---- version independence (spec sec 11.3.2 - the point of task-76) -----------------
+# ---- version independence (spec sec 11.3.2 - the point of)
         def _rewrite(path, fn):
             raw = read_bytes(path)
             out = fn(raw)
@@ -1438,7 +1525,7 @@ def cmd_selftest(args):
                  and vbp_mask_version_values(b"MajorVer=1\r\n") == b"MajorVer=<version-independent>\r\n"
                  and vbp_mask_version_values(b"MajorVer=1\n") == b"MajorVer=<version-independent>\n",
                  "present=%s" % (",".join(seen_keys) or "none")) and ok
-        # 9: HOW the tool is invoked must not change I (task-80 / spec sec 10.8).  The .vbp is
+        # 9: HOW the tool is invoked must not change I (spec sec 10.8).  The .vbp is
         #    recorded tree-root-relative, so the caller's spelling and the tree's spelling are
         #    both irrelevant.  This is the regression guard for that trap.
         _tree_abs = os.path.abspath(args.tree)
@@ -1450,7 +1537,7 @@ def cmd_selftest(args):
                  (not pr9) and (not pr9b) and (not pr9c) and s_rel == s_abs == s_ta,
                  "%s / %s / %s" % ((s_rel or "ERR")[:16], (s_abs or "ERR")[:16],
                                    (s_ta or "ERR")[:16])) and ok
-        # ---- 10.x  the 12-class change matrix (task-81 -> task-84) ------------------------
+        # ---- 10.x  the 12-class change matrix (->) ------------------------
         # PROVES THE REVERSE DIRECTION: "source changed => I changes".  The forward direction
         # ("same source => same I") is cases 1-9 above.  Runs in its OWN temp copy so the
         # mutations of the earlier cases cannot pollute the baseline, and EVERY class is
@@ -1562,7 +1649,7 @@ def cmd_selftest(args):
                      (_f_s == M0S) and (_f_m == M0M) and _bytes_ok,
                      "%s / %s bytesIdentical=%s" % (_f_s[:16], _f_m[:16], _bytes_ok)) and ok
 
-            # ---- 11.x  CASE must stay significant (task-85 -> task-87) ------------------
+            # ---- 11.x  CASE must stay significant (->) ------------------
             # The stamp is a BYTE-level identity: a case-only change IS a source change, in
             # BOTH modes (semantic only absorbs line endings / BOM / trailing newline).  These
             # cases exist so a future "harmless" case fold cannot be introduced silently, and
@@ -1761,9 +1848,14 @@ def build_parser():
 
     c = sub.add_parser("compute", help="compute I and record the manifest")
     c.description = ("Compute the source stamp I for a tree and record the manifest "
-                     "(I == sha256 of the manifest file).")
+                     "(I == sha256 of the manifest file).  THIS WRITES FILES by "
+                     "default; a read-only check must pass --no-write.")
     common(c)
     c.add_argument("--manifest", default=None, help="write the manifest to this path")
+    c.add_argument("--no-write", action="store_true",
+                   help="compute I and REPORT what would be written (created / "
+                        "rewritten / byte-identical) but write NOTHING; the read-only "
+                        "form every check_* caller must use")
 
     e = sub.add_parser("emit", help="write BuildStamp.bas and the .vbp Comments= line")
     e.description = ("Write BuildStamp.bas (--out) and idempotently set the .vbp "

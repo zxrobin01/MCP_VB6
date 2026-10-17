@@ -223,6 +223,46 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
   prints the effective port / transport / `authEnabled`.
 - Log: the middle service's log path is `logPath` in `--print-config`; the add-in's own log stays `%TEMP%\vb6mcp.log`.
 
+### Which tools need no IDE, and which need a live IDE
+
+**The add-in face (110 tools): a live IDE is required.** Every one of them is implemented by the add-in that runs inside the `VB6.EXE` process (reading and editing code, static checks, building, breakpoints, forms, snapshots, ...), so with no executable instance there is nothing to run them. **Listing** them works without an IDE (the hub answers `tools/list` from the bundled snapshot, marked `faceSource=snapshot`), but **calling** one needs a live local instance, or an explicitly addressed remote endpoint that has one. The refusal codes for "no IDE" are in the next subsection.
+
+**The hub face (10 tools): they run outside the IDE process and need no add-in loaded**, but their dependencies differ:
+
+- **No IDE at all** (they read local state, or read/write local JSON storage):
+  - `ide_list` - reads this machine's instance registry + a port scan + the **probe status of every configured remote endpoint**; it still answers when there is no instance at all (and says why, including stale registry entries);
+  - `ide_target` - only changes the hub's own default target (local state; the IDE is not touched);
+  - `list_lessons` / `add_lesson` / `delete_lesson` / `export_lessons` / `import_lessons_md` - only read/write the JSON under `mcp_lessons/` (writes keep a `.bak`).
+- **Need one target instance to act on**: `ide_stop` (stops, by pid, an instance **this hub started**; a foreign instance is never touched) and `ide_restart` (recovers our own instance and proves it is ready). With no instance they answer a structured refusal instead of pretending: `ide_restart` answers `no_ide_running` when there is **no instance at all**.
+- **Need no existing IDE, but need the conditions to start one**: `ide_start` (an explicit `project` or `VB6MCP_AUTOSTART_PROJECT`, plus a resolvable `VB6.EXE`; otherwise `not_implemented` / `vb6_exe_not_found` / `project_not_found`).
+
+> The offline gates are the `tools/check_*` group; `tests/smoke_test.py` and `mcp_strict_audit` **must** have the IDE open with the add-in loaded - they are not offline self-checks.
+
+### The two "no IDE" refusal codes and their preconditions
+
+**`no_ide_running`**: this machine has **no live instance at all** - no registry entry whose process is still alive, and no instance that can be probed. It is **not** used for any of the following (each has a more precise shape):
+
+- the instance **is registered and its process is alive** but it did not answer the probe => the receipt names that pid and carries the verdict fields plus a recovery `nextStep`, instead of `no_ide_running`;
+- **only remote** endpoints have a live IDE and this call did not address one explicitly => `remote_requires_explicit_endpoint`;
+- the hub cannot see the fleet because the **middle service is unreachable** or was **rejected by authentication** => `bridge_unreachable` / `bridge_auth_failed` (not "the machine is idle");
+- several live instances cannot be narrowed to one => `ambiguous_target` (with `candidates[]` / `suggestion` / `resolution`).
+  Also: with no `_target` and **exactly one** live instance on this machine, that instance is selected automatically - no error.
+
+**`remote_requires_explicit_endpoint`**: these must hold **together** - (a) **no live instance on this machine**; (b) **at least one configured remote endpoint** has a live IDE; (c) this call carried **no endpoint-qualified target** (`_target` without an endpoint, and no `ide_target` default set). The call is then **never auto-routed to a remote** (and there is no local instance to fall back to) => the receipt is `ok:false` + `routed:false` + `qualifiedKeys[]` (verbatim `endpoint:projectPath` keys you can pass) + `hint`. Address it explicitly with `_target="<endpoint>:<path>"` (or first `ide_target{target:"<endpoint>:<path>"}`). **A bare pid / a bare project NAME only ever addresses this machine** and is never interpreted as a remote.
+
+### Project identity: any junction / alias spelling is the same project
+
+VB6 refuses to open the same `.vbp` twice, yet one project **can be spelled many ways**: a directory junction (an alias directory), the real directory that junction points at, `/` versus `\`, different case, an 8.3 short name. The hub normalizes **all of them to one identity** via the canonical real path - these spellings are **one candidate, not a conflict** (only **two live instances publishing the same identity** is a conflict).
+
+Normalization does not erase **which spelling you used**: `ide_list` reports, for every instance,
+
+- `projectPathReal` - the **canonical identity** (after realpath normalization);
+- `projectPathAsGiven` - the spelling the **registry/probe published** (`projectPathIsAlias` marks it as different from the canonical path);
+- `aliasAsGiven` / `aliasesAsGiven[]` / `aliasSource` / `aliasMatchedBy` - the spelling **the caller supplied** (`_target`, or the `ide_target` default), which candidate it resolved to and on what basis (canonical path equal / an alias directory that contains the project / the project name);
+- the top-level `aliasEcho` - one row per supplied spelling, how many candidates it matched, whether **all of them land on the same candidate** (`sameCandidate`), plus the rule text itself.
+
+**These are additive echoes, not selectors**: resolution still follows the canonical identity and the addressing rule (`targetKey = [endpoint:]projectPath`). **The same normalized path on one endpoint is a conflict; on two endpoints it is not.** The benefit cuts both ways: any spelling (junction, real path, separator style, case, 8.3 short name) lands on the same project, and "why did it resolve to that identity" can be read from `aliasEcho` instead of guessed.
+
 ## 3. Connecting an MCP client
 
 ### Connection and authentication (this generation)
@@ -343,10 +383,10 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `get_component_code` | Read component code from IDE memory, optionally one proc or symbol | `name`, `include_line_numbers`, `coords` |
+| `get_component_code` | Read component code from IDE memory, optionally one proc or symbol; a `proc` / `symbol` range also carries disk lines (`startLineDisk` / `endLineDisk`) | `name`, `include_line_numbers`, `coords` |
 | `read_source` | Read a source file from disk with encoding detection and sha256 | `path` |
 | `read_file` | Read any text file, UTF-8, UTF-16 or ANSI auto-detected | `path`, `max_lines` |
-| `find_in_component` | Find text in a component: whole word, case, pattern | `component`, `target`, `start_line` |
+| `find_in_component` | Find text in a component: whole word, case, pattern; answers `hits[]` / `count` / `nextStartLine`, and the end of a walk is `no_more_hits` (it **never wraps back**) | `component`, `target`, `start_line` |
 | `get_selection` | Read the IDE's selected component, active window and caret | - |
 | `get_codepane` | Read code-pane selection, top line and visible line count | `component` |
 | `set_codepane` | Set code-pane selection and scroll, optionally activating it | `component`, `selection`, `top_line`, `activate` |
@@ -357,10 +397,10 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
 | `replace_code` | Line-level edit: replace, insert, append, delete or set module | `name`, `operation`, `start_line` |
-| `add_code` | Append code to a component from a string or a file | `component`, `code`, `file` |
+| `add_code` | Append code to a component from a string or a file; the landing spot is **measured by reading back** (`insertedAt{ide,disk}` / `inDeclarationArea`) | `component`, `code`, `file` |
 | `create_event_proc` | Create an event-procedure stub such as Command1_Click | `component`, `object`, `event` |
-| `write_file` | Write a text file with optional encoding, directory creation and backup | `path`, `content`, `encoding` |
-| `write_source` | Write a VB source file with explicit encoding and byte-level sha256 | `path`, `text`, `encoding` |
+| `write_file` | Write a text file with optional encoding, directory creation and backup; the receipt carries `createdDirs[]` / `exists` / `size`, and a parent that cannot be created is `parent_dir_missing` | `path`, `content`, `encoding` |
+| `write_source` | Write a VB source file with explicit encoding and byte-level sha256; the receipt carries `createdDirs[]` / `exists` / `size`, and a parent that cannot be created is `parent_dir_missing` | `path`, `text`, `encoding` |
 | `edit_by_anchor` | Replace one uniquely matched line by content anchor, not line numbers | `name`, `anchor`, `new_text` |
 | `apply_edits` | Apply a batch of anchor edits atomically, all or nothing | `name`, `edits`, `expected_sha256` |
 | `preview_edit` | Preview anchor edits as a unified diff, writing nothing | `name`, `edits` |
@@ -372,9 +412,9 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
 | `validate_code` | Validate code before writing, with stable-key diagnostics | `code`, `name`, `kind` |
-| `check_component` | Lint the current in-IDE text of one component | `name` |
-| `verify` | Aggregate verdict: IDE equals disk plus lint counts | `name`, `disk_path`, `baseline` |
-| `verify_scope` | Check many components for IDE/disk equality and diagnostics | `components`, `path` |
+| `check_component` | Lint the current in-IDE text of one component; optional `baseline` compares the public API (an unparsable one is `baseline_unusable`) | `name`, `baseline` |
+| `verify` | Aggregate verdict: IDE equals disk plus lint counts; a difference made of **hidden Attribute lines only** is reported separately as `attributeOnlyDiff` / `attributeLineCount` | `name`, `disk_path`, `baseline` |
+| `verify_scope` | Check many components for IDE/disk equality and diagnostics; UNKNOWN is a separate bucket, **not a fail** (`pass + fail + unknown == checked`), and build evidence is judged at **project** level | `components`, `path` |
 | `format_code` | Re-indent by block structure, proving only leading whitespace changed | `path`, `indent`, `apply` |
 | `check_references` | List project references and flag ones whose file is missing | `include_resolved` |
 
@@ -385,7 +425,7 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `dependency_graph` | Component and procedure dependency graph: edges, cycles, purity; the main deadline is a **deterministic character quota** (`VB6MCP_CHAR_QUOTA`, default 900000) and the wall clock is only the last resort (`VB6MCP_BUDGET_MS`, default 30000). The receipt carries completeness fields such as `partial` / `*StageCompleted` / `budgetExhausted` / `timingTruncated` / `procEdgesFound` - **the default setting delivers a deterministic partial result** | - |
 | `purity_check` | Classify whether a component can enter an offline test host | `name` |
 | `export_public_api` | Freeze a component's public API into a comparable spec; omit `name` for a bounded whole-project export | `name`, `membersOnly` |
-| `check_public_api` | Compare against a frozen spec: removed, changed, added members; omit `name` for a bounded whole-project check | `baseline`, `name`, `membersOnly` |
+| `check_public_api` | Compare against a frozen spec: removed, changed, added members; **with `name` the comparison always runs** (`membersOnly` only changes output size), and an unparsable baseline is `baseline_unusable`; omit `name` for a bounded whole-project check | `baseline`, `name`, `membersOnly` |
 | `generate_stub` | Generate a compilable stub: declarations kept, bodies emptied | `name` |
 
 ### 7. Build & delivery artifacts
@@ -500,7 +540,7 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
 | `mcp_info` | Read the server version stamp, contract, tool count and build hash; `build.sourceHash` / `sourceAlgo` are the source input set's fingerprint and algorithm id | - |
-| `ide_state` | Read IDE mode plus in-flight, cancel and gate-release state | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
+| `ide_state` | Read IDE mode plus in-flight, cancel and gate-release state (`cancel_inflight` / `release_inflight` are **best effort**: neither can abort a call stuck in a host-modal loop) | `cancel_inflight`, `release_inflight`, `release_min_held_ms` |
 | `desktop_probe` | Measure the host's desktop and interactivity without stealing focus | - |
 | `ide_quiet_mode` | Toggle session quiet mode: no focus stealing, advisory appended | `on`, `ttl_ms` |
 | `todo_status` | Read-only snapshot of an optional in-repo task board | - |
@@ -509,18 +549,21 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `set_addin_state` | Load or unload an IDE add-in by ProgID | `prog_id`, `connect` |
 | `quit_ide` | Quit the IDE after responding, unsaved changes are lost | - |
 
-### 17. Hub face: IDE instance management & lesson store (10 tools, no IDE online required)
+### 17. Hub face: IDE instance management & lesson store (10 tools, they run outside the IDE process)
 
 These 10 tools come from the MCP hub (`bridge/vb6mcp_hub.mjs`) and run **outside the IDE
-process**: the client does not have to load the add-in first, and VB6 does not have to be
-running. The five lesson tools only touch a local JSON store, so they **work with no IDE online**.
+process**: the client does not have to load the add-in first. `ide_list`, `ide_target` and the five
+lesson tools **do not depend on any IDE** (the lesson store only reads/writes local JSON);
+`ide_stop` / `ide_restart` need **one target instance**, and `ide_start` needs **the conditions to
+start VB6**. The itemised list and the preconditions of the two refusal codes are in section 2,
+"Which tools need no IDE, and which need a live IDE".
 
 - **Lesson store** `mcp_lessons/`: `defaults.json` (shipped, do not edit) plus `user.json` (the user layer,
   which may override, disable or add entries by id). The merged result is published to clients through
   `initialize.instructions`, so an agent can read it before calling any tool; `add`/`delete`/`import` write
   `user.json` with a `.bak` backup.
 - **IDE instance management**: `ide_list` lists every VB6 IDE the hub can address: local instances (including the conflict where two instances
-  hold the same project), `ide_target` remembers the default target, and `ide_start` / `ide_stop` /
+  hold the same project), `ide_target` remembers the default target, and `ide_start` starts one; `ide_stop` /
   `ide_restart` only ever act on **instances this hub started**. It also lists every configured **remote endpoint** (allow-list only, never discovered; unreachable ones are still listed with their probe status) and echoes the one-set identity (endpoint / targetKey / pathVia), the canonical real path beside the registry spelling, and the caller's alias spelling that resolves to the same identity.
 
 | Tool | What it does | Key parameters |
@@ -528,8 +571,8 @@ running. The five lesson tools only touch a local JSON store, so they **work wit
 | `ide_list` | List **every** VB6 IDE the hub can address: local instances plus each **configured remote endpoint** (allow-list only, never discovered; unreachable ones still listed with their probe status). Reports pid/port/project, the one-set identity (endpoint / targetKey / pathVia), the canonical real path beside the registry spelling, and echoes the caller's alias that resolves to the same identity; includes stale entries and same-identity conflicts | - |
 | `ide_target` | Set or clear the default IDE target: pid, project or auto | `target` |
 | `ide_start` | Start a VB6 IDE instance for a .vbp project | `project` |
-| `ide_stop` | Stop an IDE instance that this hub started | `pid`, `force` |
-| `ide_restart` | Restart a wedged own IDE instance and prove readiness | `pid`, `project` |
+| `ide_stop` | Stop an IDE instance that this hub started (needs one target instance) | `pid`, `force` |
+| `ide_restart` | Restart a wedged own IDE instance and prove readiness (needs one target instance) | `pid`, `project` |
 | `list_lessons` | List lesson entries: scenario, trap, do (hub face, no IDE online) | `includeDisabled` |
 | `add_lesson` | Add or overwrite a user lesson, with backup (no IDE online) | `id`, `scenario`, `trap`, `do` |
 | `delete_lesson` | Remove a user lesson, or disable a shipped one (no IDE online) | `id` |
@@ -565,6 +608,17 @@ in the internal type-library dump).
 
 - VB6 is single-threaded STA: large searches briefly block the IDE UI (a 2000-file cap is
   enforced).
+- The add-in is **single-threaded**: while one call is in flight, **no second call is executed
+  (read-only ones included)** - it immediately receives a **busy refusal receipt**, and the
+  receipt field `readonly_serviceable` is **always `false`**. `cancel_inflight` /
+  `release_inflight` are **best effort**: a call stuck inside a **host-modal loop** (for example a
+  VB6 dialog of its own) **cannot be aborted**, and **the only reliable way out is to wait for it
+  to finish, or to terminate the VB6 process from outside**.
+- Timeout parameters are **not hard budgets**: `timeout_ms` on `build` / `make_project` (and on
+  `immediate_*`) does **not** interrupt a running call when it expires - it decides how long the
+  caller waits, or acts as a gate-age threshold. A value far below the real duration can still
+  return successfully (and `budgetMs` may then be `null`). To stop a running call, **terminate the
+  VB6 process from outside**.
 - In break mode `make_project` / `control_execution` may fail; the tools return the error text.
 - `make_project` acts on the active project and cannot silently redirect the output path (it
   follows the IDE's project settings).
@@ -774,6 +828,33 @@ After a successful compile, `make_project` and `build` set `IMAGE_FILE_LARGE_ADD
 - **Observability**: `lastResolveVia` (`caption` / `component` / `active_name` / `none` - which channel found the pane), `lastTopStatus`, `lastTopError`, `captionsSource` / `captionsCount`, plus the existing `lastTopLineBefore/After`, `handled` / `forwarded`, `msgSeen`, ... (all inside the `wheel{}` object of `ide_state` and `mcp_info`).
 - **Immediate / Watch / Locals windows cannot be mis-mapped**: they share the window class with a code pane, but the only fallback that maps a window onto the ACTIVE pane requires the window title to actually **contain** that pane's component name, so these three non-code windows are structurally unable to be treated as (or scroll) a code pane - they only show up in `skipped[]`.
 - `lastTopLineBefore/After` are VBIDE `CodePane.TopLine` (1-based); **`-1` means "no value", not line 0 and not "it did not move"** - the cause is in `lastTopStatus` / `lastTopError`. For the current line read `paneTopLineNow` (the active pane's `TopLine`).
+
+## The failure surface of receipts, and the two line spaces (v1.11.6 - v1.11.7)
+
+This generation closed several places where a failure used to be silent, under one rule: **what did not happen has to be said**.
+
+- **Undeclared argument names are refused**: `export_public_api` / `check_public_api` / `validate_code` / `check_component` check the parameter names first; an undeclared one answers `ok:false` + `reason:"unknown_argument"` + `unknownArguments[]` + `acceptedArguments[]` (`_target` is transport context and is always accepted). Doing this across the whole face removes the "this tool checks, that one does not" blind spot; `reason` also splits into `unknown_argument` / `component_not_found` / `target_has_no_project` / `ide_not_ready` (the old values stay in `reasonLegacy`).
+- **The comparison is never skipped**: `check_public_api` **always compares** whenever `name` is given, and `membersOnly` only changes the output size; a `baseline` that is not spec text answers `ok:false` + `reason:"baseline_unusable"` instead of "no differences". The component entrance and the whole-project entrance publish the same `comparedAgainstBaseline` / `baselineLines`; `check_component` accepts the optional `baseline` too.
+- **Writes are read back**: `write_file` / `write_source` receipts carry `createdDirs[]` / `createdDirsCount` / `exists` / `size`; a parent directory that cannot be created answers `reason:"parent_dir_missing"` (`missingPath` + `reasonLegacy:"parent_not_creatable"`) instead of a self-consistent "wrote N bytes" shape.
+- **Pagination has an end**: `find_in_component` answers `hits[]` / `count` / `nextStartLine`, and the end of a walk is `found:false` + `reason:"no_more_hits"` - it **never wraps back** (consecutive pages do not hand the earlier rows out again).
+- **Hidden Attribute lines are counted separately**: `verify` reports a pane/disk difference that consists **only of hidden Attribute lines** as `attributeOnlyDiff` / `attributeLineCount`, counted separately from a real source difference, and its comparison skips those lines. Note that a save through VBIDE `SaveAs` **materialises hidden Attribute lines on disk**.
+- **Two line spaces**: the range fields of `get_component_code{proc|symbol}` are **IDE lines**, with `startLineDisk` / `endLineDisk` added; the landing spot of `add_code` is **measured by reading back** and published as `insertedAt{ide,disk}` plus `inDeclarationArea` (the real declaration area: `insertedAt.ide` smaller than the first procedure header line; **an append at the end is `false`**).
+- **Every range shape carries its mode**: `requestedRange` carries `mode` in every shape - `range` (`replace_code` / `add_code` / guard refusals), `anchor` (`edit_by_anchor`), `anchor-batch` (`apply_edits`) - so one piece of caller code can parse all of them.
+- **The return envelope**: `result.content[0].text` is **one JSON string** (this is part of the contract).
+
+## `verify_scope` counting: UNKNOWN is not a fail, and build evidence is PROJECT-level
+
+- **UNKNOWN is its own bucket**: the three buckets are mutually exclusive - `pass` / `fail` / `unknown` - and the invariant **`pass + fail + unknown == checked`** always holds (the receipt carries `countsConsistent`); `failures[]` holds only **proven** IDE/disk mismatches. `unknown` means "**not enough evidence**", not "inconsistent".
+- **Build evidence is judged at PROJECT level**: `buildOk` / `buildSource` / `buildNote` come from the **project-level** build cache (both key and hash are project-level), and **a single component cannot "lack build evidence by itself"**. `unknown` is therefore a **project-level** conclusion, and `pass` is only reachable on a project with a **fresh build cache** - in a project that was never built, every component whose IDE and disk agree is `unknown`.
+- **Why this deserves its own section**: counting UNKNOWN as a fail makes one "not measured" look like one "inconsistent"; using project-level evidence at component level yields an impossible conclusion. Either misreading sends a caller off to fix a problem that does not exist.
+
+## Transport reliability: intermittent disconnects and the >64 KiB truncation are fixed
+
+- Two symptoms used to look like "the service is occasionally unstable": **intermittent `RemoteDisconnected`**, and **large responses truncated at 64/96 KiB**. They were not environmental noise but three **deterministic** defects stacked together:
+  1. **the per-connection object was never persisted** => a request arriving in more than one TCP segment lost its head and was only dropped by the 30 s idle sweep;
+  2. **close-after-send was decided after the queue had already been cleared** => a `Connection: close` response lingered until the idle sweep;
+  3. **the flush path grew a cumulative `Mid$` start past 64 KiB**, and `send()=-1` with `WSAGetLastError()=0` was treated as fatal => bodies were truncated.
+- All three are fixed. **The tool face and the parameter table did not change because of it** (add-in 110 + hub 10 = 120): this is a **behaviour fix**, so no call has to change after upgrading.
 
 ## License
 

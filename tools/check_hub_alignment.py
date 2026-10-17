@@ -4,6 +4,13 @@ Makes "someone forgot to
 regenerate the hub snapshot" fail loudly instead of drifting silently.
 
 Checks:
+  0. FACE FINGERPRINT: the snapshot carries the sha256 of the face it was
+     generated from.  If the live docs/tools_schema.json face no longer has that
+     fingerprint, the snapshot is STALE - the failure names the regeneration command and
+     says to re-run this check ("reload, then re-run").  This is what turns "somebody
+     forgot to regenerate the hub snapshot" from a field-level diff into a one-line verdict.
+     A snapshot WITHOUT a fingerprint is accepted (backward compatible) and only checks 1-3
+     run; regenerating writes one.
   1. bridge/hub_schema.generated.json tools == docs/tools_schema.json tools, EXACTLY and
      in order (name / description / inputSchema); the first difference is reported.
   2. hub-only tools (bridge/hub_tools.json) have NO name collision with the add-in face.
@@ -13,7 +20,7 @@ Usage:
   python tools/check_hub_alignment.py [--snapshot f] [--schema f] [--hub-tools f]
 Exit 0 = aligned, 1 = drift.
 """
-import json, os, sys
+import hashlib, json, os, sys
 
 
 def opt(name, default=None):
@@ -28,6 +35,12 @@ def tools_of(doc):
     if isinstance(doc, dict) and 'result' in doc:
         return doc['result']['tools']
     return doc['tools']
+
+
+def face_fingerprint(face):
+    """The SAME construction as tools/gen_hub_snapshot.py::face_fingerprint."""
+    canon = json.dumps(face, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canon.encode('utf-8')).hexdigest()
 
 
 def norm(t):
@@ -48,6 +61,15 @@ def main():
         hub = json.load(f)
     a, b = [norm(t) for t in snap['tools']], [norm(t) for t in tools_of(schema)]
     errs = []
+    want_fp = face_fingerprint(b)
+    got_fp = snap.get('faceFingerprint')
+    stale = bool(got_fp) and got_fp != want_fp
+    if stale:
+        errs.append(
+            'STALE hub snapshot: faceFingerprint=%s but the live face is %s '
+            '(the snapshot was generated from a DIFFERENT face). Reload the face: '
+            'run "python tools/gen_hub_snapshot.py", then RE-RUN this check.' % (
+                got_fp, want_fp))
     if len(a) != len(b):
         errs.append('toolCount: snapshot=%d schema=%d' % (len(a), len(b)))
     for i, (x, y) in enumerate(zip(a, b)):
@@ -73,7 +95,10 @@ def main():
             return os.path.relpath(p, root).replace('\\', '/')
         except ValueError:  # e.g. --snapshot on another drive (test fixtures)
             return p.replace('\\', '/')
-    print('SNAPSHOT=%s count=%d version=%s' % (rel(snapf), len(a), snap.get('contractVersion')))
+    print('SNAPSHOT=%s count=%d version=%s faceFingerprint=%s' % (
+        rel(snapf), len(a), snap.get('contractVersion'), got_fp or '(absent)'))
+    print('LIVE_FACE_FINGERPRINT=%s %s' % (
+        want_fp, 'STALE' if stale else ('n/a' if not got_fp else 'FRESH')))
     print('SCHEMA=%s count=%d' % (rel(schemaf), len(b)))
     print('HUB_ONLY=%s' % ','.join(hnames))
     if errs:

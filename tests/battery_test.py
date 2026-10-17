@@ -257,7 +257,7 @@ t("control_execution", {"mode": "end"}, expect='"executed":true', show=120)
 wait_state("design", 10, "wait_state design-fc")
 
 print("=" * 78)
-print("TASK-99 回归: 写前块结构守卫 / 歧义候选 / 多行锚点 / 过程回显")
+print(" 回归: 写前块结构守卫 / 歧义候选 / 多行锚点 / 过程回显")
 print("=" * 78)
 
 T99_FIX = ("Option Explicit\r\n\r\n"
@@ -295,7 +295,7 @@ def _t99_sha():
 
 t("add_component", {"type": "module", "name": "ModT99", "code": T99_FIX}, expect='"created"')
 
-# --- MCP-06: the pasted block's OWN pairing, with the offending line numbers ---------
+# --- the pasted block's OWN pairing, with the offending line numbers ---------
 t99("06 extra end refused", "replace_code",
     {"name": "ModT99", "operation": "append",
      "code": "Public Function T99Bad() As Long\r\n    T99Bad = 1\r\nEnd Function\r\nEnd Function"},
@@ -319,7 +319,7 @@ t99("06 fragment accepted (no false positive)", "replace_code",
      "code": "Public Sub T99Frag()\r\n    x = 2", "expected_sha256": _t99_sha()},
     lambda o: o.get("ok") is not False and "appliedRange" in o)
 
-# --- MCP-05: ambiguity returns candidates and never writes; block anchors work ------
+# --- ambiguity returns candidates and never writes; block anchors work ------
 t99("05 ambiguous anchor -> candidates", "edit_by_anchor",
     {"name": "ModT99", "anchor": "    a = 1", "new_text": "    a = 9"},
     lambda o: o.get("reason") == "anchor_not_unique" and len(o.get("hits") or []) == 2
@@ -334,7 +334,7 @@ t99("05/06 preview predicts the refusal", "preview_edit",
                                   "text": "Public Function T99Good() As Long\r\n    T99Good = 3"}]},
     lambda o: o.get("reason") == "predicted_procedure_imbalance" and o.get("tool") == "preview_edit")
 
-# --- MCP-07: a stale sha refuses the line-number edit; the receipt echoes the proc ---
+# --- a stale sha refuses the line-number edit; the receipt echoes the proc ---
 _stale = _t99_sha()
 call_tool("replace_code", {"name": "ModT99", "operation": "insert", "start_line": 1, "code": "' drift"})
 _l2 = _t99_pane()
@@ -351,7 +351,7 @@ t99("07 proc echo on replace", "replace_code",
               and (o.get("procBefore") or {}).get("startLine", 0) > 0)
 
 print("=" * 78)
-print("TASK-95 回归: dependency_graph 同输入三次必须给出同一份答案（确定性配额）")
+print(" 回归: dependency_graph 同输入三次必须给出同一份答案（确定性配额）")
 print("=" * 78)
 
 # A guaranteed CALL GRAPH for the fixture. Without it the fixture's procedures
@@ -364,7 +364,7 @@ t("add_component", {"type": "module", "name": "ModT95",
                             "Public Sub T95C()\r\n    T95A\r\nEnd Sub\r\n"},
   expect='"created"')
 
-# TASK-95 ENVELOPE MASK LIST -----------------------------------------------------
+# ENVELOPE MASK LIST
 # The ONLY fields a receipt may differ on between two calls with the SAME input.
 # Every entry names the field AND why it can never be part of the answer; every
 # other byte must be identical. Masking anything not listed here - or adding a

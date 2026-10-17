@@ -28,7 +28,7 @@ Private Declare Function Process32Next Lib "kernel32" (ByVal hSnapshot As Long, 
 Private Declare Function CloseHandle Lib "kernel32" (ByVal hObject As Long) As Long
 
 ' =====================================================================
-' Card TASK-P1-017 (contract v1.1.0 section 4): find_gui
+' (contract v1.1.0 section 4): find_gui
 ' Enumerate THIS process's top-level windows and all their children, filter by
 ' keyword / class / visibility, and report geometry plus the parent title chain.
 ' AddressOf callbacks are only legal in STANDARD modules, which is why this lives
@@ -60,7 +60,7 @@ Private Declare Function FgGetWindowThreadProcessId Lib "user32" Alias "GetWindo
 Private Declare Function FgGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
 ' =====================================================================
 
-' ---- contract v1.1.0 section 5 (TASK-P1-019): ui_text ----
+' ---- contract v1.1.0 section 5: ui_text ----
 ' Three channels, tried in order: UI Automation -> MSAA (IAccessible through
 ' AccessibleObjectFromWindow) -> WM_GETTEXT. A NEGATIVE result is a legitimate
 ' delivery: every channel reports its raw return code / error, so "no accessible
@@ -247,7 +247,7 @@ Public Function ExecutionStateJson(ByVal pid As Long) As String
 End Function
 
 Private Function Jq(ByVal v As String) As String
-    ' TASK-P1-121 item 4 (P4-095): delegate to the shared JSON string quoter.
+    ' item 4 (an earlier batch): delegate to the shared JSON string quoter.
     ' The old two-Replace body escaped ONLY the backslash and the double quote, so a
     ' window title/text containing LF, CR, TAB or 0x01 produced INVALID JSON and the
     ' whole find_gui answer became unparseable. JsonLib.Quote escapes control characters
@@ -257,7 +257,7 @@ Private Function Jq(ByVal v As String) As String
     Jq = JsonLib.Quote(v)
 End Function
 
-' ---- Card TASK-P1-017 (contract v1.1.0 section 4): find_gui procedures ----
+' ---- (contract v1.1.0 section 4): find_gui procedures ----
 
 Private Function FgCollect(ByVal h As Long, ByVal lp As Long) As Long
     If m_fgCount < FG_MAX Then
@@ -267,13 +267,13 @@ Private Function FgCollect(ByVal h As Long, ByVal lp As Long) As Long
     FgCollect = 1
 End Function
 
-' TASK-P1-120 (D-1118-01): snapshot the desktop's top-level windows into a LOCAL array and
+' (the window-enumeration finding): snapshot the desktop's top-level windows into a LOCAL array and
 ' return the count.  Both callers below used to read the top-level hwnds straight out of m_fgHwnd
 ' while FgCollect was overwriting that SAME module array from index 0 (m_fgCount had just been
 ' reset), so the child pass walked a progressively corrupted window sequence: which windows were
 ' enumerated depended on the desktop Z-order at that instant, the same hwnd could be collected
 ' many times, and the process's own children were often never reached at all (measured
-' TASK-P1-118: 132 items / 93 unique hwnds in one condition, and 26 items covering 0 of the 31
+' 132 items / 93 unique hwnds in one condition, and 26 items covering 0 of the 31
 ' windows vba6_probe{wnd_probe} could see in another).  Snapshotting first removes the aliasing.
 Private Function FgSnapshotTops(ByRef topsArr() As Long) As Long
     Dim n As Long, i As Long
@@ -342,7 +342,7 @@ Public Function FindGuiJson(ByVal keyword As String, ByVal cls As String, ByVal 
     Dim topsArr() As Long
     Dim all() As Long
     ReDim all(0 To FG_MAX * 3 - 1)
-    ' TASK-P1-120 (D-1118-01): snapshot the tops BEFORE the child pass reuses m_fgHwnd as
+    ' (the window-enumeration finding): snapshot the tops BEFORE the child pass reuses m_fgHwnd as
     ' FgCollect's destination - see FgSnapshotTops for the measured failure mechanism.
     tops = FgSnapshotTops(topsArr)
     total = 0
@@ -370,7 +370,7 @@ Public Function FindGuiJson(ByVal keyword As String, ByVal cls As String, ByVal 
         Dim h As Long, wpid As Long
         h = all(i)
         wpid = 0
-        ' TASK-P1-120 (D-1118-01 (1)): emit each hwnd AT MOST ONCE.  With the aliasing gone the two
+        ' (the window-enumeration finding (1)): emit each hwnd AT MOST ONCE.  With the aliasing gone the two
         ' passes are already disjoint, but the receipt must be unique by construction rather than by
         ' luck (the aliased version returned 132 items for 93 distinct hwnds: +39 duplicates).
         dup = False
@@ -411,7 +411,7 @@ Public Function FindGuiJson(ByVal keyword As String, ByVal cls As String, ByVal 
 End Function
 
 
-' ---- contract v1.1.0 section 5 (TASK-P1-019): ui_text procedures ----
+' ---- contract v1.1.0 section 5: ui_text procedures ----
 
 ' First window of THIS process whose class matches (top-level first, then any
 ' descendant). Returns 0 when nothing matches.
@@ -423,7 +423,7 @@ Private Function UiFindByClass(ByVal cls As String) As Long
     If Len(want) = 0 Then Exit Function
     Dim i As Long, tops As Long
     Dim topsArr() As Long
-    ' TASK-P1-120 (D-1118-01): identical aliasing pattern to FindGuiJson - fixed the same way.
+    ' (the window-enumeration finding): identical aliasing pattern to FindGuiJson - fixed the same way.
     tops = FgSnapshotTops(topsArr)
     For i = 0 To tops - 1
         If LCase$(FgClassOf(topsArr(i))) = want Then

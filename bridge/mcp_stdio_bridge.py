@@ -6,7 +6,7 @@ MCP clients speak JSON-RPC over stdio; the VB6MCP add-in exposes the same
 JSON-RPC over HTTP on 127.0.0.1. This bridge proxies between the two using
 only the Python standard library.
 
-LEGACY / ROLLBACK ONLY (TASK-72).  This is the PRE-bridge stdio entry point: it talks to
+LEGACY / ROLLBACK ONLY.  This is the PRE-bridge stdio entry point: it talks to
 the add-in's own HTTP port directly (default 8766) and has NO token support.  The current
 entry point is the Node MCP shell
 

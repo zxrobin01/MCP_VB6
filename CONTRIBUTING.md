@@ -87,6 +87,10 @@ the same commit and say so in the description; `check_schema_baseline.py` will f
 
 * **Source encoding:** VB6 `.bas`/`.cls`/`.frm` files are stored as ANSI (GBK on a Chinese
   Windows). Do not convert them to UTF-8 — VB6 will garble non-ASCII string literals.
+  Keep string literals 7-bit ASCII (build user-visible non-ASCII with `ChrW$(&H....)`), and
+  never add a BOM. Rationale, convention and the machine guard are in
+  [docs/SOURCE_ENCODING.md](docs/SOURCE_ENCODING.md); enforce with
+  `python tools/check_source_encoding.py` (self test: `tools/check_source_encoding_selftest.py`).
 * **Never ship a NUL byte** in a source or text file. Some of our tooling refuses it.
 * **VB6 source lines have a hard limit of 1023 characters.** A longer line is a compile error
   (measured: 1023 characters compiles, 1028 fails). Split a long single-quoted string with

@@ -1,5 +1,5 @@
 Type=OleDll
-Reference=*\G{00020430-0000-0000-C000-000000000046}#2.0#0#B:\Windows\SysWOW64\stdole2.tlb#OLE Automation
+Reference=*\G{00020430-0000-0000-C000-000000000046}#2.0#0#$(WinDir)\SysWOW64\stdole2.tlb#OLE Automation
 Reference=*\G{AC0714F2-3D04-11D1-AE7D-00A0C90F26F4}#1.0#0#B:\Program Files (x86)\Common Files\designer\MSADDNDR.DLL#Microsoft Add-In Designer
 Reference=*\G{EF404E00-EDA6-101A-8DAF-00DD010F7EBB}#5.3#0#C:\Program Files (x86)\Microsoft Visual Studio\VB98\VB6EXT.OLB#Microsoft Visual Basic 6.0 Extensibility
 Object={248DD890-BB45-11CF-9ABC-0080C7E7B78D}#1.0#0; MSWINSCK.OCX
@@ -17,6 +17,7 @@ Module=StubGen; StubGen.bas
 Module=Fixture; Fixture.bas
 Module=JsonLib; JsonLib.bas
 Module=Utf8; Utf8.bas
+Module=Ingress; Ingress.bas
 Module=Util; Util.bas
 Module=Vb6Lint; Vb6Lint.bas
 Module=Sha256; Sha256.bas
@@ -41,6 +42,7 @@ Module=ProjMeta; ProjMeta.bas
 Module=ProjShip; ProjShip.bas
 Module=VbFmt; VbFmt.bas
 Form=SettingsForm.frm
+Form=IngressForm.frm
 Startup="(None)"
 HelpFile=""
 Title="MCP_VB6"
@@ -48,12 +50,14 @@ ExeName32="VB6MCP.dll"
 Command32=""
 Name="VB6MCP"
 HelpContextID="0"
-CompatibleMode="0"
+CompatibleMode="2"
+CompatibleEXE32="dist\compat\VB6MCP_ref.dll"
 MajorVer=1
 MinorVer=0
 RevisionVer=0
 AutoIncrementVer=0
 ServerSupportFiles=0
+VersionComments=algo=vb6src/2;src=0c3bd0f6aff56e8635581628d60d0c176f813ad702aa410233864185e0e3aeea
 VersionCompanyName="VB6MCP"
 CompilationType=0
 OptimizationType=0
@@ -71,6 +75,5 @@ Retained=0
 ThreadPerObject=0
 MaxNumberOfThreads=1
 
-VersionComments=algo=vb6src/2;src=19f4d5be9f956f3fb5000b9dc70a9b3f4eea7786c31ce5144f0838bf47d18470
 [MS Transaction Server]
 AutoRefresh=1

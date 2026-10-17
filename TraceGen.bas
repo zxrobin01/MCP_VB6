@@ -2,7 +2,7 @@ Attribute VB_Name = "TraceGen"
 Option Explicit
 
 ' ===========================================================================
-' TASK-P1-129: modMcpTrace is now MATERIALIZED BY THE ADD-IN.
+' modMcpTrace is now MATERIALIZED BY THE ADD-IN.
 ' The guard inject_trace emits is 'If McpTraceOn() Then ... End If' and it has
 ' to resolve at COMPILE time, so the target project must contain modMcpTrace.
 ' Instead of shipping a file the user has to import by hand, the module source
@@ -43,8 +43,8 @@ Public Function GenerateTraceModule(ByVal templatePath As String, ByVal outPath 
         GenerateTraceModule = False
         Exit Function
     End If
-    WriteAllBytesTo outPath, b
-    GenerateTraceModule = True
+    ' remaining: the generated module must be readable back before success.
+    GenerateTraceModule = WriteAllBytesChecked(outPath, b)
     Exit Function
 fail:
     GenerateTraceModule = False
@@ -69,7 +69,7 @@ Public Function InjectTrace(ByVal text As String, ByVal procName As String, ByVa
     body = BuildCall(id, exprsCsv)
     Dim ins As Long, ind As String
     ins = BodyInsertIndex(lines, di, ind)
-    ' TASK-P1-028: the guard is a RUNTIME check on purpose. "#If MCP_TRACE Then" is a
+    ' the guard is a RUNTIME check on purpose. "#If MCP_TRACE Then" is a
     ' COMPILE-TIME condition: the VBIDE object model does not expose CondComp, our
     ' project_meta tool edits the .vbp TEXT, so an already-LOADED project keeps its old
     ' in-memory CondComp and the guarded block is compiled out - the trace silently
@@ -86,7 +86,7 @@ Public Function RemoveTrace(ByVal text As String, ByVal id As String, ByRef newT
 End Function
 
 ' =====================================================================
-' TASK-P1-032: lexical symbol visibility at the injection point.
+' lexical symbol visibility at the injection point.
 ' A MODAL compile-error dialog is much worse than a rejection (it blocks
 ' end/remove_trace too), so inject_trace must never emit code that cannot
 ' compile. Everything here is decided from the TEXT - VB6 is never asked to
@@ -184,7 +184,7 @@ Public Function VisibleSymbolsAt(ByVal text As String, ByVal procName As String,
     insIndex = BodyInsertIndex(lines, di, ind)
     If insIndex < di Then insIndex = di
     afterIdeLine = insIndex + 1
-    ' TASK-P1-049: was "names = names & ..." ONCE PER MODULE LINE (quadratic on
+    ' was "names = names & ..." ONCE PER MODULE LINE (quadratic on
     ' the module being traced). Collect the fragments and Join ONCE; the old code
     ' put a "," BEFORE every fragment, which is exactly Join(frags, ",") - empty
     ' fragments (DeclNamesOnLine can return "") are preserved, so ",," still
@@ -449,7 +449,7 @@ End Sub
 Private Function InsertMarkedBlock(ByRef lines() As String, ByVal di As Long, ByVal prefix As String, ByVal id As String, ByVal gOpen As String, ByVal gClose As String, ByVal body As String, ByVal indent As String) As String
     Dim blk(0 To 4) As String, out() As String
     Dim i As Long, j As Long, n As Long
-    ' P0-4: indentation now comes from the target line instead of a hardcoded 4
+    ' An earlier batch: indentation now comes from the target line instead of a hardcoded 4
     ' spaces, and the markers/guards are indented with it (RemoveBlockByMarkers
     ' compares Trim$() so that is still safe).
     blk(0) = indent & "' " & prefix & id & " begin"
@@ -626,7 +626,7 @@ Public Function ClearBreakpoint(ByVal text As String, ByVal id As String, ByRef 
 End Function
 
 ' ---------------------------------------------------------------------------
-' P0-4: injection pre-checks, adapted from the algorithms in EventTracer v223
+' An earlier batch: injection pre-checks, adapted from the algorithms in EventTracer v223
 ' (Planet Source Code 33472, frmAddIn.frm) which is the same kind of tool:
 '   AdjustForLineContinuation / IsFirstLineOfProcedure / InsertionPointFor / FindIndent.
 '
@@ -703,7 +703,7 @@ Private Function AsLf(ByVal text As String) As String
 End Function
 
 
-' ---------------- TASK-P1-129: generated modMcpTrace ----------------
+' ---------------- generated modMcpTrace ----------------
 
 Public Function TraceModuleMarker() As String
     TraceModuleMarker = TG_MARKER
@@ -725,7 +725,7 @@ Public Function TraceModuleSource(ByVal lang As String) As String
     End If
 End Function
 
-' TASK-P1-129 (final ruling): the comment language is chosen UI-FIRST.
+' (final ruling): the comment language is chosen UI-FIRST.
 '   1) the IDE's own UI language (menu captions, else the title mode marker) wins;
 '   2) if the UI cannot be read, the running VB6.EXE's version resource decides
 '      (PRIMARYLANGID 0x04 = LANG_CHINESE -> zh, anything else -> en);

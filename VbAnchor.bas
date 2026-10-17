@@ -26,7 +26,7 @@ Private Function FindUnique(ByRef lines() As String, ByVal oldLine As String, By
     Next
 End Function
 
-' TASK-P1-020 alpha (edit_by_anchor rejection): expose EVERY hit line so a
+' alpha (edit_by_anchor rejection): expose EVERY hit line so a
 ' rejection can list the candidates instead of only saying "not unique (N)".
 ' hits() is 1-based module line numbers; cnt is the number of hits.
 Public Function FindHits(ByVal text As String, ByVal oldLine As String, ByRef hits() As Long, ByRef cnt As Long)
@@ -34,7 +34,7 @@ Public Function FindHits(ByVal text As String, ByVal oldLine As String, ByRef hi
     Dim i As Long
     lines = Split(AsLf(text), vbLf)
     cnt = 0
-    ' TASK-P1-063: an EMPTY pane (CountOfLines = 0) is a LEGAL input and simply has
+    ' an EMPTY pane (CountOfLines = 0) is a LEGAL input and simply has
     ' NO hits, but hits() must still come back as a VALID array - VB6's Split("")
     ' returns an EMPTY array (UBound = -1), so "ReDim hits(0 To -1)" raised VB error
     ' 9. This is the root that made edit_by_anchor / apply_edits answer error 9
@@ -54,7 +54,7 @@ Public Function FindHits(ByVal text As String, ByVal oldLine As String, ByRef hi
 End Function
 
 ' ===========================================================================
-' TASK-P1-094: one O(N) pass per BATCH instead of one O(N) pass per OP.
+' one O(N) pass per BATCH instead of one O(N) pass per OP.
 '
 ' The anchor batch path used to call FindHits/FindHitsEx once per op, and each of those
 ' did "Split(AsLf(text), vbLf)" plus a NormLine (LCase + Trim + Replace) on EVERY line.
@@ -71,7 +71,7 @@ Public Sub BuildNormIndex(ByVal text As String, ByRef raw() As String, ByRef nor
                           ByRef first As Object, ByRef cnts As Object)
     Dim i As Long, n As Long, k As String
     raw = Split(AsLf(text), vbLf)
-    ' TASK-P1-063: an EMPTY pane is legal; Split("") is an empty array, so model it as
+    ' an EMPTY pane is legal; Split("") is an empty array, so model it as
     ' exactly one blank line (same convention as LoadLines / FindHits).
     If UBound(raw) < 0 Then
         ReDim raw(0 To 0)
@@ -94,7 +94,7 @@ Public Sub BuildNormIndex(ByVal text As String, ByRef raw() As String, ByRef nor
     Next
 End Sub
 
-' TASK-P1-094: hits for ONE anchor against an index built by BuildNormIndex.
+' hits for ONE anchor against an index built by BuildNormIndex.
 ' cnt = 0 -> hits(0) is a valid (unused) element, exactly like FindHits' empty case.
 Public Sub FindHitsIndexed(ByRef norm() As String, ByRef first As Object, ByRef cnts As Object, _
                            ByVal oldLine As String, ByRef hits() As Long, ByRef cnt As Long)
@@ -209,7 +209,7 @@ Public Function AnchorDeleteLine(ByVal text As String, ByVal oldLine As String, 
     errMsg = ""
 End Function
 
-' TASK-P1-024 gamma-5/6 (B+C batch): match-aware and scope-aware hit collection.
+' gamma-5/6 (B+C batch): match-aware and scope-aware hit collection.
 ' matchMode: "normalized" (default: ignores indentation and case, the A batch rule)
 '          | "exact" (raw line, binary compare).
 ' scopeStart/scopeEnd are 1-based IDE lines; 0 means unbounded on that side.
@@ -221,7 +221,7 @@ Public Function FindHitsEx(ByVal text As String, ByVal oldLine As String, ByVal 
     Dim i As Long, ln As Long
     lines = Split(AsLf(text), vbLf)
     cnt = 0
-    ' TASK-P1-063: same empty-pane root as FindHits (see there): Split("") has
+    ' same empty-pane root as FindHits (see there): Split("") has
     ' UBound = -1, so "ReDim hits(0 To -1)" was VB error 9.
     If UBound(lines) < 0 Then
         ReDim hits(0 To 0)
@@ -250,7 +250,7 @@ Public Function LineMatches(ByVal line As String, ByVal want As String, ByVal ma
 End Function
 
 ' ===========================================================================
-' TASK-P1-126 (MCP-07): MULTI-LINE (block) anchors.
+' MULTI-LINE (block) anchors.
 ' The A batch matched exactly ONE normalized line against the pane, so a caller who
 ' pasted a two-or-three-line block as the anchor always got anchor_not_found even
 ' though the block was present verbatim in the code pane. FindBlockHitsEx answers
@@ -286,7 +286,7 @@ Public Function FindBlockHitsEx(ByVal text As String, ByVal anchorText As String
     For i = 0 To UBound(lines) - m + 1
         MaybePump
         ln = i + 1
-        ' TASK-P1-099: bounds FIRST, elements SECOND (VB6 And does not short-circuit).
+        ' bounds FIRST, elements SECOND (VB6 And does not short-circuit).
         If scopeStart > 0 Then
             If ln < scopeStart Then GoTo NextLine
         End If

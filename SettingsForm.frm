@@ -103,7 +103,7 @@ Attribute VB_PredeclaredId = True
 Attribute VB_Exposed = False
 Option Explicit
 
-' TASK-P1-079: VB6 MCP settings form (shown NON-MODAL from the Add-Ins menu so the MCP
+' VB6 MCP settings form (shown NON-MODAL from the Add-Ins menu so the MCP
 ' server keeps answering while it is open). Item precedence: ENV > HKCU\Software\VB6MCP >
 ' built-in default. The form writes HKCU only - it never changes the environment of the VB6
 ' process (that environment belongs to whoever launched VB6).
@@ -118,7 +118,7 @@ Private Function Truthy(ByVal s As String) As Boolean
 End Function
 
 Private Function RegGet(ByVal leaf As String) As String
-    ' TASK-P1-079: advapi32 wrapper (WScript.Shell RegRead/RegWrite FAILED inside
+    ' advapi32 wrapper (WScript.Shell RegRead/RegWrite FAILED inside
     ' this add-in process - measured with a diagnostic probe)
     RegGet = Trim$(WinOps.McpSettingGet(leaf))
 End Function

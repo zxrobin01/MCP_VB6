@@ -1,16 +1,16 @@
 Attribute VB_Name = "Verify"
 Option Explicit
 
-' TASK-P1-061: millisecond clock for the per-segment timing this module now reports.
+' millisecond clock for the per-segment timing this module now reports.
 Private Declare Function GetTickCount Lib "kernel32" () As Long
 
 Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As String, ByVal diskPath As String, ByVal headerOffset As Long, ByVal baselineLines As String, ByVal buildLogPath As String, Optional ByVal compName As String = "", Optional ByVal buildState As Long = -1, Optional ByVal buildSource As String = "", Optional ByVal buildNote As String = "", Optional ByVal extraJson As String = "", Optional ByRef tmLint As Long = 0, Optional ByRef tmDiag As Long = 0, Optional ByRef tmDisk As Long = 0) As String
-    ' TASK-P1-061: report where the time of a verify actually goes. The caller
+    ' report where the time of a verify actually goes. The caller
     ' (CodeTools.ToolVerify) splices these into the receipt; 0 means "not measured".
     Dim tA As Long
     Dim errN As Long, warnN As Long, i As Long
     SetBaseline baselineLines
-    ' TASK-P1-093 (F2): verify''s receipt carries the FULL diagnostics array (DiagnosticsJson
+    ' (F2): verify''s receipt carries the FULL diagnostics array (DiagnosticsJson
     ' below), so ask the lint engine for UNLIMITED storage - DiagStored = DiagCount and the
     ' array is byte-identical to before. The two counts now come from the engine''s own
     ' counters rather than a 27,005-iteration scan of the array.
@@ -24,12 +24,12 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     tA = GetTickCount()
     lintJson = DiagnosticsJson()
     tmDiag = GetTickCount() - tA
-    ' TASK-P1-035: the comparison now returns both line counts and the offset it
+    ' the comparison now returns both line counts and the offset it
     ' actually used, and the receipt states the coordinate space explicitly instead
     ' of a bare NOT-SYNCED.
     Dim detail As String, verdict As String
     Dim ideLines As Long, diskLines As Long, usedOffset As Long
-    ' TASK-P1-121 item 10 (F-c): the formatting-only diff count/first line, reported as a
+    ' item 10 (F-c): the formatting-only diff count/first line, reported as a
     ' structured field so a caller never has to parse the prose in ideDiskDetail.
     Dim fmtCount As Long, fmtFirst As String
     fmtCount = 0
@@ -55,7 +55,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     Dim overall As String
     overall = "PASS"
     If verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL" Then overall = "FAIL"
-    ' TASK-P1-121 item 10 (F-c): MISMATCH-FORMATTING is deliberately NOT added to the FAIL
+    ' item 10 (F-c): MISMATCH-FORMATTING is deliberately NOT added to the FAIL
     ' list above (a formatting-only difference is UNPROVEN, not proven bad) and it is NOT
     ' allowed to inherit PASS either: with a fresh build artifact the ladder below would
     ' otherwise hand out overall=PASS for an ide:=disk= that is demonstrably not equal.
@@ -64,7 +64,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     End If
     If errN > 0 Then overall = "FAIL"
     If buildOk = 0 Then overall = "FAIL"
-    ' Card TASK-P1-011: PASS now requires POSITIVE build evidence. The build state
+    ' PASS now requires POSITIVE build evidence. The build state
     ' used to be left at -1 (unknown) because verify passed buildLogPath="", and
     ' "unknown" still produced overall:PASS - so a module with a hard syntax error
     ' answered PASS / lintErrors:0. lintErrors counts this project's OWN rules, not
@@ -83,7 +83,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("overall") & ":" & Js(overall) & ","
     sb = sb & Jq("ideDisk") & ":" & Js(verdict) & ","
     sb = sb & Jq("ideDiskDetail") & ":" & Js(detail) & ","
-    ' TASK-P1-035: the caller must not have to guess. ideEqualsDisk is the boolean
+    ' the caller must not have to guess. ideEqualsDisk is the boolean
     ' answer; lineSpace/lineNumbersAre say which coordinate space the comparison and
     ' the counts live in; ideLineCount/diskLineCount are the normalised counts.
     sb = sb & Jq("ideEqualsDisk") & ":" & eqFlag & ","
@@ -92,7 +92,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("ideLineCount") & ":" & CStr(ideLines) & ","
     sb = sb & Jq("diskLineCount") & ":" & CStr(diskLines) & ","
     sb = sb & Jq("diskBodyOffsetUsed") & ":" & CStr(usedOffset) & ","
-    ' TASK-P1-121 item 10 (F-c): additive; ideEqualsDisk stays false for this verdict
+    ' item 10 (F-c): additive; ideEqualsDisk stays false for this verdict
     ' because the two texts are NOT equal - only their paren-less Call spelling differs.
     sb = sb & Jq("formattingDiffs") & ":{" & Jq("count") & ":" & CStr(fmtCount) & "," & Jq("first") & ":" & Js(fmtFirst) & "," & Jq("kind") & ":" & Js("paren-less Call <name>() empty argument parentheses") & "},"
     sb = sb & Jq("lintErrors") & ":" & CStr(errN) & ","
@@ -103,7 +103,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("lintNote") & ":" & Js("lintErrors counts this project's own lint rules, NOT the VB6 compiler: a module with a hard syntax error can still report 0 lint errors") & ","
     If Len(buildNote) > 0 Then sb = sb & Jq("buildNote") & ":" & Js(buildNote) & ","
     sb = sb & Jq("diagnostics") & ":" & lintJson
-    ' TASK-P1-020 alpha: coords / ideSha256 / artifact fields arrive as raw JSON from
+    ' alpha: coords / ideSha256 / artifact fields arrive as raw JSON from
     ' CodeTools so this module does not re-implement the coordinate or artifact logic.
     If Len(extraJson) > 0 Then sb = sb & "," & extraJson
     sb = sb & "}"

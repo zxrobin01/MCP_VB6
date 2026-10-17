@@ -27,7 +27,7 @@ Public Const SOCK_STREAM As Long = 1
 Public Const IPPROTO_TCP As Long = 6
 Public Const SOL_SOCKET As Long = &HFFFF
 Public Const SO_REUSEADDR As Long = 4
-' TASK-P1-037 (contract v1.3.1 H2): the EXCLUSIVE option is ~SO_REUSEADDR = -5.
+' (contract v1.3.1 H2): the EXCLUSIVE option is ~SO_REUSEADDR = -5.
 ' With REUSEADDR two IDE processes can both bind 8766 and ownership is undefined.
 Public Const SO_EXCLUSIVEADDRUSE As Long = -5
 Public Const HWND_MESSAGE As Long = -3
@@ -139,7 +139,7 @@ Public Function WsaListenSocket(ByVal port As Long, ByRef outErr As Long) As Lon
         WsaListenSocket = WSA_INVALID
         Exit Function
     End If
-    ' TASK-P1-037: SO_EXCLUSIVEADDRUSE, NOT SO_REUSEADDR. With REUSEADDR a second
+    ' SO_EXCLUSIVEADDRUSE, NOT SO_REUSEADDR. With REUSEADDR a second
     ' IDE could also bind 8766 and the port ownership was UNDEFINED (the hub had to
     ' guess). With EXCLUSIVEADDRUSE the second bind fails with WSAEADDRINUSE (10048).
     one = 1

@@ -27,9 +27,9 @@ End Function
 Public Function SaveBaselineText(ByVal path As String, ByVal text As String) As Boolean
     Dim b() As Byte
     On Error GoTo fail
+    ' remaining: report success only when the bytes are READABLE BACK.
     EncodeText text, "ansi", b
-    WriteAllBytesTo path, b
-    SaveBaselineText = True
+    SaveBaselineText = WriteAllBytesChecked(path, b)
     Exit Function
 fail:
     SaveBaselineText = False

@@ -2,7 +2,7 @@ Attribute VB_Name = "Changes"
 Option Explicit
 
 ' ---------------------------------------------------------------------------
-' Project change journal (P0-1, from the Planet Source Code report's P0-1 item).
+' Project change journal (from the Planet Source Code report's first-priority item).
 ' Fed by the three VBIDE event sinks hooked in ServerHost.cls:
 '     VBProjectsEvents / VBComponentsEvents / VBControlsEvents
 ' Rationale: the IDE model has no change feed, and polling get_project_info is

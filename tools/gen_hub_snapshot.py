@@ -15,7 +15,7 @@ Usage:
                                    [--contract docs/CONTRACTS.md]
                                    [--out bridge/hub_schema.generated.json]
 """
-import json, os, re, sys
+import hashlib, json, os, re, sys
 
 
 def opt(name, default=None):
@@ -24,6 +24,19 @@ def opt(name, default=None):
         if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
             return sys.argv[i + 1]
     return default
+
+
+def face_fingerprint(face):
+    """The FACE fingerprint: sha256 over the canonical (name/description/inputSchema) list.
+
+the snapshot is a CACHE of the add-in face, and a cache without a key is a
+    cache that cannot be invalidated.  The key is written into the snapshot and recomputed by
+    check_hub_alignment.py from the live docs/tools_schema.json, so a face change that was not
+    followed by a regeneration is reported as STALE instead of only as a field diff - and the
+    runtime face cache (bridge/hub_face_cache.json) can be keyed on the same value.
+    """
+    canon = json.dumps(face, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canon.encode('utf-8')).hexdigest()
 
 
 def _vkey(s):
@@ -125,6 +138,7 @@ def main():
 
     snap = {
         'generatedFrom': rel(schema),
+        'faceFingerprint': face_fingerprint(face),
         'contractVersion': cv,
         'contractDeclaredToolCount': declared,
         'versionToolCountMismatch': bool(mismatch),
@@ -140,8 +154,8 @@ def main():
     if mismatch:
         print('WARNING versionToolCountMismatch: contract %s declares %s tools, snapshot has %d '
               '(snapshot NOT silently reconciled)' % (cv, declared, len(face)))
-    print('HUB_SNAPSHOT=%s TOOLS=%d VERSION=%s DECLARED=%s MISMATCH=%s' % (
-        rel(out), len(face), cv, declared, bool(mismatch)))
+    print('HUB_SNAPSHOT=%s TOOLS=%d VERSION=%s DECLARED=%s MISMATCH=%s FACEFP=%s' % (
+        rel(out), len(face), cv, declared, bool(mismatch), snap['faceFingerprint']))
     return 0
 
 

@@ -11,12 +11,31 @@ Option Explicit
 ' ---------------------------------------------------------------------------
 Public Const VB6MCP_PRODUCT As String = "vb6-mcp"
 
-' TASK-P1-037: this module needs the pid for the instance registry; declare it with
+' this module needs the pid for the instance registry; declare it with
 ' a module-unique name (CodeTools declares GetCurrentProcessId privately too).
 Private Declare Function UtilProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
+' the window thread of this process (the UI thread that owns the form and will own
+' the ingress window).  The bridge needs it in the self-registration record.
+Public Declare Function UtilThreadId Lib "kernel32" Alias "GetCurrentThreadId" () As Long
+' registration accounting state (module-level declarations MUST stay in the
+' declaration region - VB6 refuses a Dim/Private after any procedure).
+Private m_regState As String              ' "" | "pending" | "registered" | "failed"
+Private m_regAttempts As Long
+Private m_regLastError As String
+Private m_regLastSuccessAt As String
+Private m_regLastAttemptAt As String
+Private m_regElapsedMs As Long
+Private m_regHwnd As Long
+Private m_regTid As Long
+Private m_regEpoch As Long
+Private m_regPipe As String
+Private m_regNonce As String
+Private m_regDllSha As String
+Private m_regSession As Long
+
 Private Declare Function PumpTickCount Lib "kernel32" Alias "GetTickCount" () As Long
 
-' TASK-48: process-liveness probes for the instance-registry sweep (see
+' process-liveness probes for the instance-registry sweep (see
 ' PruneDeadInstanceFiles at the bottom of this module).
 '
 ' WHY Toolhelp32 IS THE PRIMARY: OpenProcess + GetLastError was MEASURED broken in
@@ -52,26 +71,26 @@ Private Declare Function UtilCloseHandle Lib "kernel32" Alias "CloseHandle" (ByV
 Private Declare Function UtilGetExitCodeProcess Lib "kernel32" Alias "GetExitCodeProcess" (ByVal hProcess As Long, ByRef lpExitCode As Long) As Long
 Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 
-' TASK-P1-042: THE contract banner - a single source of truth. The first line of
+' THE contract banner - a single source of truth. The first line of
 ' initialize.instructions and mcp_info.contract BOTH read this one constant, so bumping
 ' the contract is a ONE-LINE change here. NEVER hardcode a contract version anywhere
 ' else in the product: a stale self-report is the exact defect this card fixed (the
 ' banner still claimed v1.3.0 after the contract text had reached v1.4.0, and because
 ' the hub forwards the LIVE banner, users saw the old version).
-' TASK-P1-089: the P1-087 snapshot parameter is an inputSchema change, so the contract
+' the snapshot parameter is an inputSchema change, so the contract
 ' version moves with it. It is ADDITIVE (optional parameter, default off), but a tool-face
 ' change still has to be named by a version - the rule above is "bump it HERE, in one line".
-' TASK-67 (Lead batch ruling 2026-10-15): mcp_info.build{} gains two ADDITIVE keys,
+' (Lead batch ruling 2026-10-15): mcp_info.build{} gains two ADDITIVE keys,
 ' sourceHash/sourceAlgo (the SOURCE STAMP of docs/SOURCE_STAMP.md). No tool name,
 ' description or inputSchema changes, and no existing receipt key changes - the bump
 ' exists because a NEW receipt field is a contract-visible addition, exactly as v1.11.1
 ' was for its ADDED receipt fields.
-' TASK-95 (v1.11.3): dependency_graph gained ADDITIVE coverage fields (partial /
+' (v1.11.3): dependency_graph gained ADDITIVE coverage fields (partial /
 ' charQuota / charsProcessed / componentsScanned / componentsTotal / procEdgesFound /
 ' edgeStageCompleted / purityStageCompleted / cyclesStageCompleted / timingTruncated /
 ' completeHint) and its cutoff became DETERMINISTIC (a character quota) so the same
 ' input returns the same receipt. No existing key changed.
-' TASK-99 (v1.11.4, MCP-Âè∞Ë¥¶Êâπ): the write-class and build tools gain behaviour and
+' (v1.11.4, MCP-Ã®’À≈˙): the write-class and build tools gain behaviour and
 ' receipts: a PRE-WRITE structural pairing gate on every block-writing tool plus a
 ' result-level guard (extra_procedure_end / missing_procedure_end /
 ' predicted_procedure_imbalance, with block/pane line numbers), candidate hits[] for an
@@ -80,8 +99,69 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 ' make_project buildState + wait_for_build, and the linter!=compiler clarification in
 ' validate_code/check_component. No tool added or removed; inputSchema gains ONE optional
 ' parameter (make_project.wait_for_build), so the frozen face must be re-frozen.
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.4"
-' TASK-P1-066: message-pump period and state. The DECLARATIONS live here (VB6 only accepts
+' /170/171 (v1.11.5): a REAL semantics change, so the contract version is bumped at
+' patch level and the change is broadcast before the face is re-frozen:
+'   * (plan B) RETRACTS the promise that a read-only call is served while another call is
+'     in flight (readonly_serviceable is now always false; cancel/release are BEST EFFORT);
+' * newTotalLines is the CALLER's splitlines line count on all four write paths, and
+'     a new trailingBlankLine field explains the difference from the IDE's own count;
+' * the hub's ide_stop/ide_restart share one ownership resolver, so the same pid can no
+'     longer get two verdicts, and every refusal carries alsoForeignPort/ownershipBasis.
+' v1.11.6 (P0 honesty batch): a REAL semantics change, broadcast before the face is re-frozen:
+'   * check_public_api ALWAYS compares when a component name is given (membersOnly is output
+'     size only) and refuses a baseline it cannot parse with reason=baseline_unusable instead
+'     of reporting no differences; export_public_api/check_public_api/validate_code/
+'     check_component refuse undeclared argument names with reason=unknown_argument +
+'     acceptedArguments.
+'   * check_component gains the OPTIONAL baseline parameter (declared and honoured; an unusable
+'     baseline is refused with baseline_unusable). This is the one inputSchema addition.
+'   * write_file/write_source publish createdDirs[]/createdDirsCount/exists/size, and a parent
+'     that cannot be created is refused as parent_dir_missing (missingPath, reasonLegacy=
+'     parent_not_creatable) instead of a generic failure.
+'   * find_in_component publishes hits[]/count/nextStartLine and answers found:false +
+'     reason=no_more_hits at the end of a pagination walk (it never wraps back to line 1).
+'   * make_project{diagnose} isolated copies now carry the binary-compatibility reference
+'     (CompatibleEXE32/CompatibleEXE) and a PropertyPage .pgx, and report
+'     compatibilityReferenceCopied; a missing reference is named in missingFiles.
+' v1.11.7 (write-receipt + diagnosis batch): behaviour-lit changes, broadcast before re-freeze:
+'   * unknown-argument gate for the WHOLE tool face (declared property set is the contract; _target excepted);
+'     reasons split into unknown_argument / component_not_found / target_has_no_project / ide_not_ready
+'     (legacy no_project / ide_model_not_ready are kept in reasonLegacy);
+'   * add_code publishes insertedAt{ide,disk} + inDeclarationArea; every write-class receipt keeps
+'     ok + sha256Before/sha256After + lineDelta + the measured landing;
+'   * verify annotates an ATTRIBUTE-ONLY pane/disk difference (attributeOnlyDiff/attributeLineCount);
+'   * get_component_code{proc|symbol} states the range line space (IDE) and adds startLineDisk/endLineDisk;
+'   * schema gains the declared-only parameters that were honoured but undeclared (preview_edit.match,
+'     set_codepane.view, vba6_probe.step/frame_index).
+' v1.11.8 (internal-identifier cleanup, rebuild window): tool descriptions and receipts no longer
+'   carry internal task identifiers; the DELIVERED behaviour is unchanged (wording only, plus the
+'   generated artifacts re-derived from the cleaned descriptions).
+' v1.11.9 (naming/shape + count semantics batch), broadcast before the face is re-frozen:
+'   * add_code.inDeclarationArea now means the DECLARATION AREA (insertedAt.ide < the first
+'     procedure header line) instead of "outside an unclosed procedure body", so an END
+'     append on a module that already has procedures reports false;
+'   * requestedRange has ONE shape per mode: mode="range" {operation,start_line,end_line} on
+'     replace_code / add_code / guard refusals, mode="anchor" / "anchor-batch" on
+'     edit_by_anchor and apply_edits;
+'   * verify_scope: UNKNOWN is NOT a fail (it is counted once in `unknown` and listed in
+'     unknowns[] only), so pass + fail + unknown == checked always holds (countsConsistent).
+' v1.11.11 (changelog catch-up + one description-hygiene pass; tool count unchanged 110):
+'   * BEHAVIOUR FIX, restated honestly: the v1.11.10 batch fixed three winsock transport defects
+'     (the per-connection object was never persisted, so a request split across TCP segments lost
+'     its head; close-after-send was tested after the queue had already been cleared; the flush
+'     path grew a cumulative Mid$ start past 64 KiB and treated send()=-1 with
+'     WSAGetLastError()=0 as fatal). Together they closed the intermittent RemoteDisconnected
+'     and the >64 KiB truncation - a behaviour fix, NOT a wording change.
+'   * TEXT-ONLY edits in the same batch: 3 tool descriptions (edit_by_anchor / apply_edits /
+'     preview_edit: internal-id prefixes removed), 1 tool description (verify_scope: build evidence
+'     is PROJECT-level), 2 parameter descriptions (replace_code.expected_sha256 /
+'     make_project.wait_for_build), 1 runtime receipt string (make_project.buildStateNote lost its
+'     internal-id prefix; fields and semantics unchanged).
+'   * v1.11.11: 10 vba6_probe PARAMETER descriptions no longer carry internal experiment ids or
+'     reverse-engineering round numbers (same meaning, no parameter added/removed/retyped), and the
+'     remaining internal experiment ids and round numbers are gone from the shipped comments.
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.11"
+' message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
 Public Const PUMP_EVERY_ITER As Long = 1000
@@ -95,8 +175,18 @@ Private m_pumpDepth As Long
 Private m_pumpCount As Long
 Private m_pumpMs As Long
 Private m_pumpMaxMs As Long
+' the ONE gate for the whole pump class. A host modal box that is UP means a
+' DoEvents here can dispatch a POSTED host command and enter the host's modal loop -
+' measured in: the add-in then never returns, no watchdog tick is delivered
+' inside that loop, and the single pipe instance stays held for ever. So: no DoEvents
+' while a visible #32770 of this process is up. The cached probe keeps it cheap.
+Private Const PUMP_GATE_CACHE_MS As Long = 100
+Private m_gateAt As Long
+Private m_gateBlocked As Boolean
+Private m_gateSkips As Long
+Private m_gateTitle As String
 
-' TASK-P1-121 item 6 (G-1/G-5): the side-effects AUDIT BLOCK is accumulated per top-level
+' item 6: the side-effects AUDIT BLOCK is accumulated per top-level
 ' call in CodeTools.cls, but VbFmt.bas (format_code / rename_symbol) writes .bak files as
 ' well and is a different module. This ONE collection is therefore shared: CodeTools
 ' resets it once per call and reads it when it builds the additive `sideEffects` block;
@@ -145,7 +235,7 @@ Public Sub WritePortFile(ByVal port As Long)
 End Sub
 
 ' ---------------------------------------------------------------------------
-' TASK-P1-037 (contract v1.3.1 H2): instance registration
+' (contract v1.3.1 H2): instance registration
 ' %TEMP%\vb6mcp\instances\<pid>.json  {pid,port,project,projectPath,dllSha256,
 ' startedAt,startedByHub}. Written on listen success, deleted on normal exit.
 ' Stale entries are the READER@s business (pid alive + port listening); a writer
@@ -156,12 +246,85 @@ Public Function Vb6mcpDir() As String
     Vb6mcpDir = TempDir() & "\vb6mcp"
 End Function
 
+' ===================== registration accounting =====================
+' The registration RETRY loop lives in ServerForm (it owns the publisher); the STATE lives
+' here so a read-only receipt (mcp_info.registration) can report it without reaching into
+' the form.  Before this card every publish error was swallowed by On Error Resume Next, so
+' a registration that never landed was indistinguishable from a successful one (the same
+' silent-failure family as). Nothing here blocks: the loop is driven from the
+' existing watchdog tick and never waits for a bridge.
+
+Public Function RegState() As String
+    If Len(m_regState) = 0 Then RegState = "pending" Else RegState = m_regState
+End Function
+
+Public Function RegAttempts() As Long
+    RegAttempts = m_regAttempts
+End Function
+
+Public Function RegLastError() As String
+    RegLastError = m_regLastError
+End Function
+
+Public Sub RegNoteAttempt(ByVal attempts As Long, ByVal errText As String)
+    m_regAttempts = attempts
+    m_regLastError = errText
+    m_regLastAttemptAt = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    If m_regState <> "registered" Then m_regState = "pending"
+End Sub
+
+Public Sub RegNoteRecord(ByVal hwnd As Long, ByVal tid As Long, ByVal epoch As Long, _
+                         ByVal pipeName As String, ByVal nonce As String, ByVal dllSha As String, ByVal sessionId As Long)
+    m_regHwnd = hwnd
+    m_regTid = tid
+    m_regEpoch = epoch
+    m_regPipe = pipeName
+    m_regNonce = nonce
+    m_regDllSha = dllSha
+    m_regSession = sessionId
+End Sub
+
+Public Sub RegNoteSuccess(ByVal elapsedMs As Long)
+    m_regState = "registered"
+    m_regLastError = ""
+    m_regLastSuccessAt = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    m_regElapsedMs = elapsedMs
+End Sub
+
+Public Sub RegNoteFailed(ByVal elapsedMs As Long)
+    m_regState = "failed"
+    m_regElapsedMs = elapsedMs
+End Sub
+
+' the full self-registration record, so one retry does BOTH jobs (retry and
+' HWND reporting) instead of building the report twice.
+Public Function RegistrationInfo() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("state") = RegState()
+    d("attempts") = m_regAttempts
+    d("lastError") = m_regLastError
+    d("lastSuccessAt") = m_regLastSuccessAt
+    d("lastAttemptAt") = m_regLastAttemptAt
+    d("elapsedMs") = m_regElapsedMs
+    d("pid") = UtilProcessId()
+    d("tid") = m_regTid
+    d("hwnd") = m_regHwnd
+    d("epoch") = m_regEpoch
+    d("sessionId") = m_regSession
+    d("dllSha256") = m_regDllSha
+    d("pipeName") = m_regPipe
+    d("sessionNonce") = m_regNonce
+    d("backoffMs") = "500/1000/2000/4000, cap 15000"
+    Set RegistrationInfo = d
+End Function
+
 Public Function InstancesDir() As String
     InstancesDir = Vb6mcpDir() & "\instances"
 End Function
 
-' TASK-68: the instance registration MUST stay pure ASCII. This writer uses FSO
-' CreateTextFile (ANSI / system ACP), so a project name such as Â∑•Á®ã1 was written as
+' the instance registration MUST stay pure ASCII. This writer uses FSO
+' CreateTextFile (ANSI / system ACP), so a project name such as π§≥Ã1 was written as
 ' GBK bytes; a strict UTF-8 reader (the Python bridge) then failed to decode the whole
 ' entry and dropped it. Escaping every non-ASCII UTF-16 code unit as \uXXXX makes the
 ' file ASCII-only, so the ANSI writer, a strict UTF-8 reader and JSON.parse all decode
@@ -225,7 +388,7 @@ Public Sub WriteInstanceFile(ByVal pid As Long, ByVal port As Long, ByVal projec
     d("project") = project
     d("projectPath") = projectPath
     d("dllSha256") = dllSha
-    ' TASK-P1-064: the entry may be RE-published when the identity changes; startedAt must
+    ' the entry may be RE-published when the identity changes; startedAt must
     ' keep meaning "when this instance started", so the caller passes the first value back in.
     If Len(startedAt) = 0 Then
         d("startedAt") = Format$(Now, "yyyy-mm-dd hh:nn:ss")
@@ -235,7 +398,7 @@ Public Sub WriteInstanceFile(ByVal pid As Long, ByVal port As Long, ByVal projec
     d("startedByHub") = (Environ$("VB6MCP_STARTED_BY_HUB") = "1")
     Dim ts As Object
     Set ts = fso.CreateTextFile(InstancesDir() & "\" & CStr(pid) & ".json", True)
-    ' TASK-68: ASCII-only output so every reader (ANSI / strict UTF-8 / JSON.parse) agrees.
+    ' ASCII-only output so every reader (ANSI / strict UTF-8 / JSON.parse) agrees.
     ts.WriteLine AsciiEscapeJson(JsonStringify(d))
     ts.Close
 End Sub
@@ -251,7 +414,7 @@ Public Sub DeleteInstanceFile(ByVal pid As Long)
 End Sub
 
 ' ---------------------------------------------------------------------------
-' TASK-48: prune DEAD instance registrations.
+' prune DEAD instance registrations.
 '
 ' StopListening already deletes our own <pid>.json on a CLEAN exit, but when the
 ' IDE crashes or is killed (Stop-Process -Force / taskkill) that code never runs
@@ -555,7 +718,15 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
     For bi = 1 To nb
         Set b = bars.Item(bi)
         If Not b Is Nothing Then
-            If (Not filterBar) Or MatchCand(b.Name, barCands) Then
+            Dim barOk As Boolean
+            barOk = MatchCand(b.Name, barCands)
+            ' bar= names a BAR *or a menu-path segment*. The id path already
+            ' honoured an ancestor on the path; the caption path did not, so a caller who
+            ' copied the 'path' the list published ('≤Àµ•Ãı>Œƒº˛(&F)>...') could not use
+            ' its middle segment. Matching power only GROWS here.
+            Dim gateBar As Boolean
+            gateBar = (filterBar And Len(barCands) > 0)
+            If (Not filterBar) Or barOk Then
                 Dim nc As Long
                 nc = b.Controls.Count
                 Dim ci As Long
@@ -567,6 +738,8 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
                             Set FindBarControlPass = c
                             Exit Function
                         End If
+                        Dim underOk As Boolean
+                        underOk = barOk Or MatchCand(c.Caption, barCands)
                         ' one level of popup sub-menus (buttons have no
                         ' child controls: touching .Controls on them
                         ' raises 438 - guarded access)
@@ -581,9 +754,11 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
                             For si = 1 To ns
                                 Set subc = subCol.Item(si)
                                 If Not subc Is Nothing Then
-                                    If MatchCand(subc.Caption, ctrlCands) Then
-                                        Set FindBarControlPass = subc
-                                        Exit Function
+                                    If (Not gateBar) Or underOk Or MatchCand(subc.Caption, barCands) Then
+                                        If MatchCand(subc.Caption, ctrlCands) Then
+                                            Set FindBarControlPass = subc
+                                            Exit Function
+                                        End If
                                     End If
                                 End If
                             Next
@@ -595,13 +770,45 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
     Next
 End Function
 
-Public Function MatchCand(ByVal caption As String, ByVal cands As String) As Boolean
-    Dim base As String
-    base = caption
-    base = Replace(base, "&", "")
+' THE normaliser. Both the caption and every candidate go through this, so
+' 'what the list prints' and 'what execute accepts' cannot drift apart again.
+'   * the accelerator group '(&X)' is decoration: everything from the first '(' is dropped;
+'   * a trailing ellipsis ('...' or U+2026) is decoration too, NOT identity:
+'     'µ˜”√∂—’ª...' names exactly the command 'µ˜”√∂—’ª(&K)...' does;
+'   * everything is trimmed.
+' Public so the list side can group controls by the SAME key the matcher uses
+' (a second copy of this normalisation is exactly how 'listed' and 'executable' drift apart).
+Public Function CandBase(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, "&", "")
     Dim p As Long
-    p = InStr(base, "(")
-    If p > 0 Then base = Trim$(Left$(base, p - 1))
+    p = InStr(t, "(")
+    If p > 0 Then t = Left$(t, p - 1)
+    t = Trim$(t)
+    Do While Len(t) >= 3
+        If Right$(t, 3) <> "..." Then Exit Do
+        t = Trim$(Left$(t, Len(t) - 3))
+    Loop
+    Do While Len(t) >= 1
+        If Right$(t, 1) <> ChrW$(&H2026) Then Exit Do
+        t = Trim$(Left$(t, Len(t) - 1))
+    Loop
+    CandBase = t
+End Function
+
+Public Function MatchCand(ByVal caption As String, ByVal cands As String) As Boolean
+    ' ====================================================================
+    ' (C4) MEASURED DEFECT: the CAPTION was normalised (accelerator
+    ' "&" removed, everything from the first "(" dropped) but the CANDIDATE
+    ' was not. command_bars{action=list} prints the RAW caption, e.g.
+    '     …˙≥…π§≥Ã1.exe(&K)...   or   µ˜”√∂—’ª(&K)...
+    ' so passing back the very string the list published could never match -
+    ' '¡–µ√≥ˆ¿¥' but '¥Ú≤ª÷–' (menu_control_not_found). Both sides now go
+    ' through the SAME normalisation, so the listed caption matches verbatim
+    ' and every shorter form that used to work keeps working.
+    ' ====================================================================
+    Dim base As String
+    base = CandBase(caption)
     If Len(base) = 0 Then Exit Function
     Dim pos As Long
     Dim sep As Long
@@ -612,7 +819,12 @@ Public Function MatchCand(ByVal caption As String, ByVal cands As String) As Boo
         If sep = 0 Then sep = Len(cands) + 1
         cand = Trim$(Mid$(cands, pos, sep - pos))
         If Len(cand) > 0 Then
-            cand = Replace(cand, "&", "")
+            ' BOTH sides go through the ONE normaliser - the accelerator group
+            ' AND a trailing ellipsis. Measured residual: 'µ˜”√∂—’ª...' (accelerator removed,
+            ' ellipsis kept) was still unmatchable, because the ellipsis was only ever
+            ' dropped as a side effect of cutting at '(' - which a caller who strips the
+            ' accelerator does not trigger.
+            cand = CandBase(cand)
             If StrComp(base, cand, vbTextCompare) = 0 Then
                 MatchCand = True
                 Exit Function
@@ -629,16 +841,16 @@ Public Function MatchCand(ByVal caption As String, ByVal cands As String) As Boo
 End Function
 
 ' ---------------------------------------------------------------------------
-' Card TASK-P1-007 (i18n): Id-first command lookup.
+' (i18n): Id-first command lookup.
 '
 ' Until now a menu item could only be identified by its LOCALIZED caption, so a
 ' VB6 IDE in any language other than English/Chinese lost every menu command.
-' The CommandBars model also exposes a language-independent Id - but TASK-P1-006
+' The CommandBars model also exposes a language-independent Id - but
 ' measured that VB6 Ids are NOT unique: id=746 alone covers 986 nodes (including
 ' both "Make" and "Start With Full Compile"), and Start/Continue share id=186.
 ' A bare Id query would therefore hit the wrong control.
 '
-' Rule enforced here (per S's ruling on REQ-20260921-016): the Id is NEVER used
+' Rule enforced here (per the Id-usage ruling): the Id is NEVER used
 ' on its own. It is AND-ed with the shortcut text when one is known, and
 ' otherwise with the caption candidates. If no Id-verified candidate is found we
 ' fall back to the original localized-caption lookup, so the pre-existing
@@ -741,7 +953,7 @@ Private Function CtrlMatches(ByVal c As Object, ByVal wantId As Long, _
 End Function
 
 ' ---------------------------------------------------------------------------
-' TASK-P1-069: Id-ONLY command lookup, used by command_bars when the caller
+' Id-ONLY command lookup, used by command_bars when the caller
 ' addresses an item as "#746" / "id:746" / "746".
 '
 ' The existing FindBarControlById is Id-AND-(shortcut or caption), because a
@@ -753,30 +965,33 @@ End Function
 ' ---------------------------------------------------------------------------
 Public Function FindBarControlByIdOnly(ByVal vbe As Object, ByVal barCands As String, _
         ByVal capCands As String, ByVal wantId As Long, _
-        ByRef matchCount As Long, ByRef candsOut As String) As Object
+        ByRef matchCount As Long, ByRef candsOut As String, _
+        Optional ByRef disabledCount As Long) As Object
     On Error Resume Next
     matchCount = 0
     candsOut = ""
+    disabledCount = 0
     Dim v As Object
     If Len(barCands) > 0 Then
         ' pass 1: the caller's bar argument must match the BAR NAME or a node on
-        ' the control's menu PATH (e.g. bar="Â∑•Á®ã" for Â∑•Á®ã>ÈÉ®‰ª∂).
-        Set v = FindByIdOnlyPass(vbe, barCands, capCands, wantId, matchCount, candsOut)
+        ' the control's menu PATH (e.g. bar="π§≥Ã" for π§≥Ã>≤øº˛).
+        Set v = FindByIdOnlyPass(vbe, barCands, capCands, wantId, matchCount, candsOut, disabledCount)
         If Not v Is Nothing Then
             Set FindBarControlByIdOnly = v
             Exit Function
         End If
         If matchCount > 0 Then Exit Function   ' ambiguous inside that scope: do not widen
         ' pass 2: the bar name is localized, so retry with no bar scope
-        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut)
+        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount)
     Else
-        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut)
+        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount)
     End If
     If Not v Is Nothing Then Set FindBarControlByIdOnly = v
 End Function
 
 Private Function FindByIdOnlyPass(ByVal vbe As Object, ByVal barCands As String, ByVal capCands As String, _
-        ByVal wantId As Long, ByRef matchCount As Long, ByRef candsOut As String) As Object
+        ByVal wantId As Long, ByRef matchCount As Long, ByRef candsOut As String, _
+        ByRef disabledCount As Long) As Object
     On Error Resume Next
     Dim bars As Object
     Set bars = vbe.CommandBars
@@ -789,7 +1004,7 @@ Private Function FindByIdOnlyPass(ByVal vbe As Object, ByVal barCands As String,
         If Not b Is Nothing Then
             under = True
             If Len(barCands) > 0 Then under = MatchCand(b.Name, barCands)
-            FindByIdOnlyIn b.Controls, b.Name, 0, wantId, barCands, capCands, under, hit, matchCount, candsOut
+            FindByIdOnlyIn b.Controls, b.Name, 0, wantId, barCands, capCands, under, hit, matchCount, candsOut, disabledCount
         End If
     Next
     If matchCount = 1 Then Set FindByIdOnlyPass = hit
@@ -797,12 +1012,13 @@ End Function
 
 ' Qualify = Id matches AND enabled AND (the caller's bar argument matched the bar
 ' name or an ancestor on the menu PATH) AND (when the caller also gave a caption,
-' the caption matches). The caption conjunct is REQUIRED: TASK-P1-069 measured
+' the caption matches). The caption conjunct is REQUIRED: measured
 ' that id=746 has 525 ENABLED matches across the menus and still 6 inside the
-' Â∑•Á®ã submenu alone, so an id on its own cannot name a control.
+' π§≥Ã submenu alone, so an id on its own cannot name a control.
 Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal depth As Long, _
         ByVal wantId As Long, ByVal barCands As String, ByVal capCands As String, ByVal under As Boolean, _
-        ByRef hit As Object, ByRef matchCount As Long, ByRef candsOut As String)
+        ByRef hit As Object, ByRef matchCount As Long, ByRef candsOut As String, _
+        Optional ByRef disabledCount As Long)
     On Error Resume Next
     If col Is Nothing Then Exit Sub
     If depth > 2 Then Exit Sub
@@ -831,12 +1047,19 @@ Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal d
                     If Len(candsOut) > 0 Then candsOut = candsOut & "; "
                     candsOut = candsOut & barName & ">" & cap
                 End If
+            Else
+                ' the control may EXIST and simply be DISABLED. Counting it separately
+                ' lets command_bars answer 'disabled' instead of the false 'not found'.
+                Dim qualOff As Boolean
+                qualOff = (gid = wantId) And Not en And selfOk
+                If qualOff And Len(capCands) > 0 Then qualOff = MatchCand(cap, capCands)
+                If qualOff Then disabledCount = disabledCount + 1
             End If
             Set subCol = Nothing
             Err.Clear
             Set subCol = c.Controls
             If Not subCol Is Nothing Then
-                FindByIdOnlyIn subCol, barName, depth + 1, wantId, barCands, capCands, selfOk, hit, matchCount, candsOut
+                FindByIdOnlyIn subCol, barName, depth + 1, wantId, barCands, capCands, selfOk, hit, matchCount, candsOut, disabledCount
             End If
         End If
     Next
@@ -846,14 +1069,14 @@ End Sub
 ' (kernel32 GetTickCount is declared in the declarations section above - VB6
 '  only accepts Declare statements before the first procedure.)
 ' ===========================================================================
-' TASK-P1-066: THE unified message-pump point.
+' THE unified message-pump point.
 '
 ' WHY. VB6 hosts this add-in on the IDE's single UI thread (STA). While a tool
 ' call computes, the IDE message queue is not serviced, so the IDE UI - and
 ' every other MCP request - is frozen until the call returns. Measured BEFORE
 ' this fix on a 3 x 26,999-line fixture: a 3.2 s verify_scope made a concurrent
 ' ide_state wait 2.9 s and return at the very instant the long call ended
-' (ÂÜÖÈÉ®ËØÅÊçÆ). Long loops therefore hand the
+' (ƒ⁄≤ø÷§æ›). Long loops therefore hand the
 ' queue back periodically.
 '
 ' WHAT. Exactly ONE helper. Rule enforced by grep: no module may call DoEvents
@@ -906,8 +1129,21 @@ Public Sub PumpNow()
     Dim t0 As Long
     t0 = PumpTickCount()
     m_pumpLastAt = t0
-    DoEvents
-    ' TASK-P1-067: throttle-rescan the optional code-pane wheel. It returns
+    ' ==== THE ONE GATE ====
+    ' A host modal box that is UP turns DoEvents into the wedge path: the pump dispatches
+    ' whatever the host has POSTED (measured VB6's File>Make command arriving that
+    ' way), the host opens its modal box, this single-threaded add-in is suspended inside
+    ' that modal loop and NEVER returns - and inside it NO watchdog tick is delivered, so
+    ' neither the one-shot confirm nor the generic modal guard can rescue it.
+    ' The TICK IS STILL RUN: WinOps.WheelTick below keeps driving the guard (it presses
+    ' synchronously, it does not need a message pump), so withholding DoEvents costs
+    ' OBSERVATION of the dismissal, never the ability to act.
+    If PumpGateBlocked() Then
+        m_gateSkips = m_gateSkips + 1
+    Else
+        DoEvents
+    End If
+    ' throttle-rescan the optional code-pane wheel. It returns
     ' immediately while the wheel is OFF (the default), so the pump cost is
     ' unchanged by default and no hook is ever installed.
     WinOps.WheelTick
@@ -930,7 +1166,37 @@ Public Function PumpMsMax() As Long
     PumpMsMax = m_pumpMaxMs
 End Function
 
-Public Function PumpStatsJson() As String
+' THE gate. True = a visible top-level #32770 of THIS process is up, so a pump
+' would be unsafe. Cached for PUMP_GATE_CACHE_MS because the pump runs roughly every
+' PUMP_EVERY_MS during long loops and a window walk is not free.
+Public Function PumpGateBlocked() As Boolean
+    Dim now As Long
+    now = PumpTickCount()
+    If m_gateAt <> 0 Then
+        If (now - m_gateAt) < PUMP_GATE_CACHE_MS Then
+            PumpGateBlocked = m_gateBlocked
+            Exit Function
+        End If
+    End If
+    m_gateAt = now
+    m_gateTitle = ""
+    m_gateBlocked = WinOps.HasVisibleHostDialog(m_gateTitle)
+    PumpGateBlocked = m_gateBlocked
+End Function
+
+' The same verdict, phrased for the DIRECT DoEvents call sites (there are six outside this
+' module): they must ask before pumping. Rule: no module calls DoEvents unguarded.
+Public Function CanPump() As Boolean
+    CanPump = Not PumpGateBlocked()
+End Function
+
+Public Function PumpGateSkipped() As Long
+    PumpGateSkipped = m_gateSkips
+End Function
+
+' ONE source of truth for the pump/gate numbers. The object is what a receipt should
+' carry (a nested BLOCK, so a caller does not have to parse a JSON string inside JSON).
+Public Function PumpStatsObj() As Object
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
     d("calls") = m_pumpCount
@@ -938,7 +1204,16 @@ Public Function PumpStatsJson() As String
     d("maxPumpMs") = m_pumpMaxMs
     d("iterPeriod") = PUMP_EVERY_ITER
     d("msPeriod") = PUMP_EVERY_MS
-    PumpStatsJson = JsonStringify(d)
+    ' the gate is part of the measurement, not a hidden policy.
+    d("gateSkips") = m_gateSkips
+    d("gateBlockedNow") = m_gateBlocked
+    d("gateTitle") = m_gateTitle
+    d("gateNote") = "gateSkips counts the pumps WITHHELD because a visible #32770 of this process was up: with a host modal box up, DoEvents would dispatch the host's POSTED command and enter its modal loop, from which this single-threaded add-in never returns (measured). The tick still runs, so the guard can still act; only the DoEvents is withheld."
+    Set PumpStatsObj = d
+End Function
+
+Public Function PumpStatsJson() As String
+    PumpStatsJson = JsonStringify(PumpStatsObj())
 End Function
 
 ' Read-and-reset, for a measurement run.
@@ -946,12 +1221,13 @@ Public Function PumpStatsConsume() As String
     Dim s As String
     s = PumpStatsJson()
     m_pumpCount = 0
+    m_gateSkips = 0
     m_pumpMs = 0
     m_pumpMaxMs = 0
     PumpStatsConsume = s
 End Function
 
-' TASK-P1-121 item 6: record a .bak this call created (VbFmt.bas calls it). The collection
+' item 6: record a .bak this call created (VbFmt.bas calls it). The collection
 ' itself is declared in the declarations section above; CodeTools resets it per call.
 Public Sub SeNoteBackup(ByVal path As String)
     On Error Resume Next
@@ -962,7 +1238,7 @@ Public Sub SeNoteBackup(ByVal path As String)
 End Sub
 
 ' ===========================================================================
-' TASK-42 (consumer ledger MCP-lead-19 / -20): SHARED WALL-CLOCK BUDGET.
+' (consumer ledger -20): SHARED WALL-CLOCK BUDGET.
 '
 ' WHY. dependency_graph and export_public_api/check_public_api scan the whole
 ' project on the IDE's single UI thread. On a real 110-component project the

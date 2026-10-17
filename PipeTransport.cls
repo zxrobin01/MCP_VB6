@@ -14,12 +14,12 @@ Attribute VB_Exposed = False
 Option Explicit
 
 ' ===========================================================================
-' TASK-57 (ADR docs/design/TRANSPORT_NP_DUAL.md section 0 / 7): the named-pipe
+' (ADR docs/design/TRANSPORT_NP_DUAL.md section 0 / 7): the named-pipe
 ' server end of the add-in. One instance per VB6 process, serviced from the
 ' SAME UI/EDT thread and the SAME message pump the TCP transports already use
 ' (ServerForm.tmrWatch / WinsockTransport's Win32 timer call Pipe.Tick).
 '
-' HARD RULES THIS FILE OBEYS (each one is a measured failure in the P1-065
+' HARD RULES THIS FILE OBEYS (each one is a measured failure in the
 ' spike report, docs/evidence/np_spike/REPORT.md):
 '   1. NO WSAStartup / WSACleanup anywhere in this file, and no ws2_32 declare.
 '      WSACleanup is PROCESS-WIDE: in the spike it killed the HTTP listener of
@@ -198,10 +198,16 @@ Private m_curTool As String
 Private m_serveStart As Long
 Private m_progSeq As Long
 Private m_lastProgAt As Long
-' TASK-57 diagnostic (Lead-authorized narrow round): count every nested re-entry so
+' diagnostic (Lead-authorized narrow round): count every nested re-entry so
 ' "was the pipe ever ticked while a tool call was running?" is a FACT in the log,
 ' not a guess.
 Private m_nestedTicks As Long
+' the REAL reason the last instance publish failed.  PublishInstance runs under
+' On Error Resume Next (it always has), so without this the retry loop could report only the
+' symptom ("the instance file is missing") and never the cause.  Measured with the injection
+' test: the cause was a path whose parent was a FILE, so "cannot write" and "cannot write
+' BECAUSE the path is not a directory" differ exactly here.
+Private m_lastPublishErr As String
 Private m_progFrames As Long
 Private m_nestedLogged As Long
 Private m_useAcl As Boolean
@@ -217,14 +223,14 @@ Private m_progressOn As Boolean
 
 ' --- public entry points ---------------------------------------------------
 
-' TASK-57 transport switch. ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
+' transport switch. ADR section 0.2 rule 3: pipe | tcp | auto, DEFAULT
 ' pipe. "winsock" is the pre-existing value for the pure-Winsock TCP track and
 ' is kept working (it maps onto tcp).
 Public Function ResolveMode() As String
     Dim s As String
     s = LCase$(Trim$(Environ$("VB6MCP_TRANSPORT")))
     If Len(s) = 0 Then
-        ' TASK-P1-079 wrapper: WScript.Shell registry reads were unreliable here.
+        ' wrapper: WScript.Shell registry reads were unreliable here.
         s = LCase$(Trim$(WinOps.McpSettingGet("Transport")))
     End If
     ResolveMode = NormalizeMode(s)
@@ -388,7 +394,19 @@ End Function
 ' HERE rather than through Util.WriteInstanceFile because the pipe identity
 ' triple (pipe/sessionId/nonce/instanceId) has to be added to the same file and
 ' the legacy writer must stay byte-for-byte unchanged for the TCP track.
-Public Sub PublishInstance(ByVal port As Long, ByVal tcpEnabled As Boolean, ByVal project As String, ByVal projectPath As String, ByVal dllSha As String, ByVal startedAt As String)
+' ServerForm owns the retry loop but NOT the transport log; this hook lets the
+' loop write registration_retry / registration_failed / registration_ok into the same log
+' the transport already uses, so the accounting is READABLE (a counter nobody can read is
+' not accounting).
+Public Function LastPublishError() As String
+    LastPublishError = m_lastPublishErr
+End Function
+
+Public Sub LogRegistration(ByVal msg As String)
+    NpLog msg
+End Sub
+
+Public Sub PublishInstance(ByVal port As Long, ByVal tcpEnabled As Boolean, ByVal project As String, ByVal projectPath As String, ByVal dllSha As String, ByVal startedAt As String, Optional ByVal hwnd As Long = 0, Optional ByVal tid As Long = 0, Optional ByVal epoch As Long = 0, Optional ByVal ingressOn As Boolean = False, Optional ByVal ingressHwnd As Long = 0, Optional ByVal ingressBoxHwnd As Long = 0, Optional ByVal ingressCaption As String = "")
     On Error Resume Next
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
@@ -415,9 +433,35 @@ Public Sub PublishInstance(ByVal port As Long, ByVal tcpEnabled As Boolean, ByVa
         d("startedAt") = startedAt
     End If
     d("startedByHub") = (Environ$("VB6MCP_STARTED_BY_HUB") = "1")
+    ' the self-registration record the bridge needs to bind to the INGRESS window
+    ' (textbox) without guessing: the window handle, its thread, and a monotonic
+    ' epoch that makes a stale record distinguishable from a fresh one.  Written by the same
+    ' attempt that publishes pid/pipe/nonce, so retry and HWND reporting are one pass.
+    d("hwnd") = hwnd
+    d("tid") = tid
+    d("epoch") = epoch
+    ' (step 2): the OPTIONAL textbox-ingress identity. Written ONLY when the
+    ' ingress switch is on, so the default (pipe) instance file keeps exactly the keys
+    ' it has today - the fallback path must not visibly drift just because a new field
+    ' exists.  These are Additions on the textbox track, not a widening of the default.
+    If ingressOn Then
+        d("ingressMode") = "textbox"
+        d("ingressHwnd") = ingressHwnd
+        d("ingressBoxHwnd") = ingressBoxHwnd
+        d("ingressCaption") = ingressCaption
+    End If
     Dim ts As Object
+    m_lastPublishErr = ""
+    Err.Clear
     Set ts = fso.CreateTextFile(Util.InstancesDir() & "\" & CStr(m_pid) & ".json", True)
-    ' TASK-68: same ASCII-only rule as Util.WriteInstanceFile (pipe is the DEFAULT track,
+    ' name the cause (0x46 permission, 0x4B/0x4C path shapes) instead of letting the
+    ' caller infer it from a missing file.
+    If Err.Number <> 0 Then
+        m_lastPublishErr = "CreateTextFile 0x" & Hex$(Err.Number) & " " & Err.Description
+        Err.Clear
+        Exit Sub
+    End If
+    ' same ASCII-only rule as Util.WriteInstanceFile (pipe is the DEFAULT track,
     ' so without this the GBK defect would survive on the default path).
     ts.WriteLine Util.AsciiEscapeJson(JsonStringify(d))
     ts.Close
@@ -530,10 +574,48 @@ Private Sub OnConnected()
     m_outSent = 0
     m_closeAfterFlush = False
     Set m_outQ = New Collection
+    ' (step 3): a new authenticated connection means a new doorbell seq space.
+    Ingress.SessionReset
     NpLog "transport=pipe event=connect conns=" & CStr(m_conns) & " (handshake deadline " & CStr(m_helloMs) & " ms)"
 End Sub
 
 ' --- state 2: connected ---------------------------------------------------
+
+' =====================================================================
+' (step 3): the TEXTBOX DOORBELL service path.
+'
+' The request does NOT arrive on the pipe: it is queued by the IngressForm Change
+' handler and handed in HERE from the watchdog tick. The reply is written by the
+' ordinary QueueOut path onto the ALREADY AUTHENTICATED connection the bridge is
+' holding open, so the wire protocol is unchanged - the request simply arrives
+' out of band.
+' =====================================================================
+Public Function IngressReady() As Boolean
+    IngressReady = False
+    If m_hPipe = 0 Then Exit Function
+    If Not m_authed Then Exit Function
+    ' Never re-enter a tool call: a nested tick (DoEvents inside a long tool) must
+    ' not start a second request on the same connection.
+    If m_serving Then Exit Function
+    If m_state <> 2 And m_state <> 3 Then Exit Function
+    ' A partially received pipe frame means the client is talking on the pipe too;
+    ' serving out of band at that moment would interleave two requests.
+    If m_accLen <> 0 Then Exit Function
+    IngressReady = True
+End Function
+
+Public Sub IngressServe(ByVal reqText As String)
+    If Not IngressReady() Then Exit Sub
+    ServeRpc reqText
+End Sub
+
+' The per-process pairing credential (16 hex chars) the payload of the textbox
+' doorbell must carry. It is the SAME value the pipe handshake uses, so there is
+' one identity and one compare - the caption's 12-char locator only FINDS the
+' window, it never authorises anything.
+Public Function NonceValue() As String
+    NonceValue = m_nonce
+End Function
 
 Private Function ServiceConnected() As Boolean
     ServiceConnected = False
@@ -864,7 +946,7 @@ Private Sub FlushProgressNow()
 End Sub
 
 Private Sub MaybeProgress()
-    ' TASK-57 diagnostic: every guard is reported as a machine-readable reason. The
+    ' diagnostic: every guard is reported as a machine-readable reason. The
     ' nested_tick line is rate limited (first 10, then every 100th) so a storm cannot
     ' flood the log while the decisive first occurrences stay visible.
     Dim why As String

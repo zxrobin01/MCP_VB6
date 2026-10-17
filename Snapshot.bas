@@ -5,7 +5,7 @@ Public Function Sha256OfText(ByVal text As String) As String
     Sha256OfText = Sha256HexTextUtf8(text)
 End Function
 
-' TASK-P1-035: the old version compared LINE COUNTS computed by dropping exactly ONE
+' the old version compared LINE COUNTS computed by dropping exactly ONE
 ' trailing empty line per side. VB6 writes the file with an extra trailing blank line
 ' (measured: disk split_lines=12, pane split_lines=10 for identical content), so a
 ' freshly saved component answered NOT-SYNCED - a misleading receipt (the very failure
@@ -60,7 +60,7 @@ Public Function VerifyTextVsDisk(ByVal ideText As String, ByVal diskPath As Stri
         detail = detail & " ; identical content (encoding " & enc & ")"
         Exit Function
     End If
-    ' TASK-P1-121 item 10 (F-c): the SECOND, WHOLE-TEXT judgment, taken after BOTH lookups
+    ' item 10 (F-c): the SECOND, WHOLE-TEXT judgment, taken after BOTH lookups
     ' failed and BEFORE MISMATCH. VB6 itself drops the empty argument parentheses of a
     ' paren-less `Call X()` when it saves, so a component that had just been saved
     ' answered MISMATCH - a false red (the caller then "fixed" nothing). We answer
@@ -69,13 +69,13 @@ Public Function VerifyTextVsDisk(ByVal ideText As String, ByVal diskPath As Stri
     ' applied to BOTH sides. No case folding, no whitespace folding, no keyword folding.
     ' ANTI-MASKING: the equality demanded is of the ENTIRE text, so any other byte
     ' difference anywhere in the module keeps the old MISMATCH / NOT-SYNCED answer.
-    ' TASK-P1-121 item 10, correction found by the live matrix: the whole-text equality is
+    ' item 10, correction found by the live matrix: the whole-text equality is
     ' of the WHOLE PANE against the WHOLE DISK BODY - i.e. the disk file minus the head the
     ' caller's offset resolved. Comparing against the RAW FILE text would make the verdict
     ' unreachable for every .bas/.cls that carries an Attribute head (ideN can never equal
     ' diskN there), which contradicts the item's own acceptance case. The anti-masking
     ' property is unchanged: the equality demanded is still of the ENTIRE body text.
-    ' TASK-P1-121 item 10, second correction from the live matrix. The caller's
+    ' item 10, second correction from the live matrix. The caller's
     ' headerOffset is 0 whenever it could not be RESOLVED, and it cannot be resolved for
     ' this very case (the block lookup fails precisely because of the Call-parens
     ' difference), so keying the check on `off` made the verdict unreachable.
@@ -109,7 +109,7 @@ Public Function VerifyTextVsDisk(ByVal ideText As String, ByVal diskPath As Stri
     End If
 End Function
 
-' TASK-P1-121 item 10: N() - the ONLY normalisation the new verdict may use. It touches a
+' item 10: N - the ONLY normalisation the new verdict may use. It touches a
 ' line if and only if the line is a paren-less `Call <name>()`: the empty argument
 ' parentheses are dropped and nothing else moves (leading indentation is preserved, so an
 ' indentation difference still breaks the whole-text equality and stays a MISMATCH).
@@ -188,19 +188,34 @@ End Function
 Private Function BlockMatches(ByRef dl() As String, ByVal off As Long, ByRef il() As String, ByVal ideN As Long, ByRef bad As Long, ByRef firstDiff As String) As Boolean
     bad = 0
     firstDiff = ""
-    Dim diskN As Long, i As Long
+    Dim diskN As Long, i As Long, di As Long
     diskN = ArrCount(dl)
     If ideN = 0 Then
         BlockMatches = (diskN = off)
         Exit Function
     End If
-    If off < 0 Or ideN > diskN - off Then Exit Function
+    If off < 0 Then Exit Function
+    If off >= diskN Then Exit Function
+    ' A hidden inline Attribute line exists ONLY in the FILE: a code pane never shows it.
+    ' The pane block therefore has to be aligned against the disk body with those lines
+    ' SKIPPED, otherwise a correctly saved component reads as MISMATCH. They stay visible
+    ' to the caller through the pane->disk map (hiddenInlineAttributeLines).
+    di = off
     For i = 0 To ideN - 1
         MaybePump
-        If dl(off + i) <> il(i) Then
+        Do While di < diskN
+            If Left$(Trim$(dl(di)), 10) = "Attribute " Then
+                di = di + 1
+            Else
+                Exit Do
+            End If
+        Loop
+        If di >= diskN Then Exit Function
+        If dl(di) <> il(i) Then
             bad = bad + 1
-            If Len(firstDiff) = 0 Then firstDiff = "first diff at ide line " & CStr(i + 1) & " (disk line " & CStr(off + i + 1) & "): ide=[" & il(i) & "] disk=[" & dl(off + i) & "]"
+            If Len(firstDiff) = 0 Then firstDiff = "first diff at ide line " & CStr(i + 1) & " (disk line " & CStr(di + 1) & "): ide=[" & il(i) & "] disk=[" & dl(di) & "]"
         End If
+        di = di + 1
     Next
     BlockMatches = (bad = 0)
 End Function
@@ -233,7 +248,7 @@ Private Function LocateBlock(ByRef dl() As String, ByRef il() As String, ByVal i
     Next
 End Function
 
-' TASK-P1-121 item 10: join the disk lines from i0 onwards with LF (the common text form
+' item 10: join the disk lines from i0 onwards with LF (the common text form
 ' NormCallParens and the comparison use). VB6 cannot return an array from a function, so
 ' this is the join helper this module did not yet have.
 Private Function JoinFrom(ByRef a() As String, ByVal i0 As Long) As String
