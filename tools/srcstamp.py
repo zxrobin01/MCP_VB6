@@ -389,7 +389,7 @@ def normalize_semantic(raw, ext):
 # input set + indicator
 # --------------------------------------------------------------------------------------
 def canonical_rel(tree, vbp_rel):
-    """(manifest_rel, abspath) - the .vbp path as it must appear IN THE MANIFEST.
+    r"""(manifest_rel, abspath) - the .vbp path as it must appear IN THE MANIFEST.
 
     The manifest records a path STRING per input file and that string is hashed, so recording
     the caller's spelling made I depend on HOW the tool was invoked: --vbp MCP_VB6.vbp (CWD =

@@ -124,11 +124,11 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 ### v1.11.11 发布后修复：bridge 源在 v1.11.8–v1.11.11 之间不可启动（已修 + 已加闸门）
 
-`bridge/vb6mcp_bridge.py` 自 `1cf4bec`（v1.11.8 的内部号清理）起是**不可导入**的：`_send` 的 docstring 行被拽到列 0（`IndentationError: expected an indented block after function definition`），文件另有 UTF-8 BOM（BOM 更早就在，不是启动阻断者）。**症状只有一条：中继服务起不来**——VB 工程照常编译、闸门 7/7 全绿、导出审计 `AUDIT_OK`（bridge 源不在公开导出树），所以 v1.11.8→v1.11.11 四个提交都没发现。项目侧启动失败后自行修复并重启，本仓库采纳其修复（docstring 归位 + 去 BOM）。
+`bridge/vb6mcp_bridge.py` 自 `1cf4bec`（v1.11.8 的内部号清理）起是**不可导入**的：`_send` 的 docstring 行被拽到列 0（`IndentationError: expected an indented block after function definition`），文件另有 UTF-8 BOM（BOM 更早就在，不是启动阻断者）。**症状只有一条：中继服务起不来**——VB 工程照常编译、闸门全绿（当时为 7 道）、导出审计 `AUDIT_OK`（bridge 源不在公开导出树），所以 v1.11.8→v1.11.11 四个提交都没发现。项目侧启动失败后自行修复并重启，本仓库采纳其修复（docstring 归位 + 去 BOM）。
 
 **为什么漏了**：闸门里没有任何一步编译 `.py`/`.mjs`；既有「source encoding」门只覆盖 VB 构建组件。
 
-**已堵**（`tools/check_source_encoding.py` 扩展，闸门集仍 7/7，语义并入既有编码门）：① 编译每个 `bridge/*.py` 与 `tools/*.py`；② 对每个 `bridge/*.mjs` 跑 `node --check`；③ `.py`/`.mjs` 上的 UTF-8 BOM 判 **ERROR**（markdown 上的 BOM 判 WARN）。负向臂实测：插入缩进破坏 ⇒ `VERDICT=FAIL rc=1`（报 `文件:行`）；插入 BOM ⇒ `VERDICT=FAIL rc=1`。
+**已堵**（`tools/check_source_encoding.py` 扩展；并新增**第 8 道门禁** `tools/check_source_encoding_selftest.py`，闸门集为 **8/8**）：① 编译每个 `bridge/*.py` 与 `tools/*.py`；② 对每个 `bridge/*.mjs` 跑 `node --check`；③ `.py`/`.mjs` 上的 UTF-8 BOM 判 **ERROR**（markdown 上的 BOM 判 WARN）；④ 第 8 道 = 编码守卫的**负样本自证**：BOM / UTF-8 组件 / GBK 字面量在 `--strict` 下必须判 **FAIL**，合规树必须 **PASS**（10 cases，随 `tools/run_gates.py` 一起跑）。负向臂实测：插入缩进破坏 ⇒ `VERDICT=FAIL rc=1`（报 `文件:行`）；插入 BOM ⇒ `VERDICT=FAIL rc=1`。
 
 ## v1.2.0 工具加固（从真实工程实战反推）
 

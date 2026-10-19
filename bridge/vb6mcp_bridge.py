@@ -1288,7 +1288,7 @@ def select_target(selector):
 
 
 def _pipe_leaf(name):
-    """The pipe name without the \\.\pipe\ prefix, for compact diagnostic lines."""
+    """The pipe name without the \\.\\pipe\\ prefix, for compact diagnostic lines."""
     s = "" if name is None else str(name)
     idx = s.rfind("\\")
     return s[idx + 1:] if idx >= 0 else s
