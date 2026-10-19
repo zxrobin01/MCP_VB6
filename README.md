@@ -235,6 +235,20 @@ VB6 不允许同一个 `.vbp` 被打开两次，而同一个工程**可以有很
 
 **这些是加法回显，不是选择器**：解析目标仍按规范身份与寻址规则（`targetKey = [endpoint:]projectPath`）。**同一个规范路径在同一个端点上出现两次才算冲突，出现在两个端点上则不算**。收益是双向的：任何拼写（junction、真实路径、分隔符差异、大小写、8.3 短名）都落到同一个工程；而「它为什么认成了另一个身份」可以直接从 `aliasEcho` 读出依据，不必猜。
 
+### 常驻中间服务：安装、升级、健康与卸载
+
+中间服务（`bridge/vb6mcp_bridge.py`）是**常驻层**，不是按需进程：它**占住一个 TCP 端口**、等待并管理所有 add-in 的命名管道、转发 hub 的调用。**即使本机没有任何 VB6 IDE 在运行，它也必须活着**；IDE 后起时会被**自动接管**（add-in 注册管道后立即可转发，无需重启服务）。hub 侧按需拉起（lazy-ensure）只是**兜底**，常驻服务才是主路径；两者并存不冲突（同一端口只能有一个监听者，服务持有这个单实例）。
+
+- **安装（需管理员）**：`powershell -File tools\install_middle_service.ps1 -Action install`。它写一个启动器（环境变量 + 日志重定向）、注册**开机自启**的计划任务（`AtStartup`、`SYSTEM` 账户、失败按 `RestartCount/RestartInterval` 自动重启），启动后**轮询 `/health`** 直到 200。**先看计划**：加 `-DryRun` 只打印将执行的命令与所需权限、不做任何改动。脚本**从不自行提权**；非管理员运行会返回结构化 `needs_elevation`。
+- **默认值**：`-Port 8797`、`-ExePath dist\vb6mcp_bridge.exe`（**缺失时自动回退**到 `python bridge\vb6mcp_bridge.py`）、`-TokenFile` 默认**当前用户目录**下的 `.vb6mcp\token.txt`；另有 `-TaskName`、`-AuditLog`、`-UseService`（检测到 nssm 时改走 Windows 服务）。
+- **升级**：先停任务 → 替换产物（`dist\vb6mcp_bridge.exe` 或源码）→ 再跑一次 `-Action install`（幂等覆盖注册）→ `-Action status` 应报 `verdict:UP`。
+- **卸载（需管理员）**：`-Action uninstall`：停止并移除任务/服务、停止本服务的进程；**保留 token 文件与日志/审计**（脚本不会删它们）。
+- **健康检查（无需管理员）**：`-Action status` 输出任务/服务、进程、端口是否 `LISTENING`、`/health` **原文**（存在 token 文件时自动带 `Authorization: Bearer`），并给出 `verdict`：`up` / `up-health-unverified` / `degraded` / `down`。**语义**：`/health` 的 **HTTP 200 表示中间服务本身在跑**；body 里的 `ok` 表示**当前是否有活 add-in** —— 没有 IDE 时 `ok:false` 属正常（服务在等），**不是**服务故障。`-Action smoke` 用**临时端口**启一份新进程跑 `--smoke`（不需要管理员、不碰线上端口），输出结构化结果。
+- **日志与审计**：服务日志由启动器写到 `%ProgramData%\vb6mcp\logs\middle-service.log`；远端模式（`--allow-remote` + TLS + token）要求 `--audit-log`，安装器默认指向 `%ProgramData%\vb6mcp\logs\remote-audit.jsonl`（JSONL，仅记录外网来源的请求）。两者在卸载时**保留**。
+- **token 轮换**：token 来源优先 `VB6MCP_TOKEN`（不落盘），否则 `VB6MCP_TOKEN_FILE`。轮换时把旧 token 传给 `--token-prev`（或 `VB6MCP_TOKEN_PREV`）⇒ 新旧在一个窗口内同时有效，客户端切换完成后去掉旧值。安装器只**引用** token 文件，不创建也不删除。
+- **端口必须一致**：`VB6MCP_BRIDGE_URL` 必须与安装器的 `-Port` 指向**同一个**服务端口（安装器默认 **8797**；`bridge` 源码自身默认是 `8767`，用安装器时以 `-Port` 为准）。改端口要**同时**改安装器与客户端配置，否则 hub 连不上。
+- **故障排查**：`status` 报 `listener.listening:false` ⇒ 任务没起或进程已退（看日志与任务上次结果 `lastTaskResult`）；`health.httpStatus:401` ⇒ 服务在跑但 token 不匹配（核对 `-TokenFile` 与客户端 token）；hub 报 `127.0.0.1:null/rpc`、`RemoteDisconnected` 或所有插件工具静默失败 ⇒ **没有服务在监听该端口**（本轮曾因此让 110 个插件工具全部静默）；`verdict:degraded` ⇒ 任务存在但端口未监听，重启任务并复看日志。
+
 ## 三、接入 MCP 客户端
 
 ### 连接与鉴权（新一代）

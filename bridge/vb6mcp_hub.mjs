@@ -21,6 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SNAP = path.join(HERE, 'hub_schema.generated.json');
@@ -70,6 +71,268 @@ let bridgeHealthCache = { at: 0, data: null, promise: null };
 // Before this, a 401 was logged and then the face reported 'no instance discovered at all' - the
 // caller could not tell an authorization failure from an empty machine.
 let bridgeLastFailure = null;   // {kind:'auth'|'unreachable', reason, status, detail, at}
+
+// ---- middle-service lifecycle (lazy ensure; the hub KNOWS the dependency, so it OWNS it) ------
+// A pipe-only IDE is addressable ONLY through the middle service, but the hub used to assume that
+// service was already running.  One restart (DSH, the machine, a crash) therefore left the whole
+// tool face silent and the only clue was a null-port URL.  This block is the ONE place that makes
+// the middle service EXIST, adopting a healthy one before ever spawning anything.
+// Rollback: VB6MCP_BRIDGE=inproc does NO probe, NO spawn and adds NO receipt field, so the
+// pre-change path stays byte-for-byte what it was.
+const MIDDLE_MANAGED = !(process.env.VB6MCP_BRIDGE_MANAGED === '0');
+const MIDDLE_SPAWN_WAIT_MS = parseInt(process.env.VB6MCP_BRIDGE_SPAWN_WAIT_MS || '8000', 10);
+const MIDDLE_PROBE_INTERVAL_MS = 250;
+const BRIDGE_PY = process.env.VB6MCP_BRIDGE_PY || path.join(HERE, 'vb6mcp_bridge.py');
+const MIDDLE_PRODUCT = 'vb6mcp-bridge';
+let middleServiceState = { reachable: false, url: BRIDGE_URL, pid: null, startedAt: null,
+                           managedByHub: false, managedByThisHub: false,
+                           reason: BRIDGE_MODE === 'inproc' ? 'inproc_mode' : 'not_checked',
+                           lockFile: null, spawnAttemptedAt: null, portTakenByOther: false, foreignPid: null };
+let middleServiceEnsure = null;   // single-flight: two concurrent calls never race a spawn
+let middleSpawnedPid = null;     // the ONLY pid this hub process may ever signal (task-108 (4))
+// ---- P1 (task-110): PROVABLE code identity ------------------------------------------------
+// A DSH restart can leave an OLDER hub alive (measured: pid 12172 from 17:21 served a file that
+// was rewritten at 19:27), so "which code answered" must come from a receipt, never a pid guess.
+const HUB_SELF_PATH = fileURLToPath(import.meta.url);
+const HUB_STARTED_AT = new Date().toISOString();
+let HUB_CODE_REV = 'unknown', HUB_FILE_MTIME = null;
+try {
+  HUB_FILE_MTIME = fs.statSync(HUB_SELF_PATH).mtime.toISOString();
+  HUB_CODE_REV = crypto.createHash('sha256').update(fs.readFileSync(HUB_SELF_PATH)).digest('hex').slice(0, 16);
+} catch (e) { /* a diagnostic field must never break startup */ }
+// null in inproc mode: that rollback receipt stays byte-for-byte unchanged.
+function hubCodeStamps() {
+  if (BRIDGE_MODE === 'inproc') return null;
+  return { hubCodeRev: HUB_CODE_REV, hubStartedAt: HUB_STARTED_AT, fileMtime: HUB_FILE_MTIME };
+}
+// ---- P2 (task-110): "a forward just worked" is liveness evidence ---------------------------
+const FORWARD_EVIDENCE_TTL_MS = parseInt(process.env.VB6MCP_FORWARD_EVIDENCE_TTL_MS || '120000', 10);
+const lastForwardOk = new Map();   // pid -> Date.now() of the last SUCCESSFUL forward
+function noteForwardSuccess(pick) {
+  if (BRIDGE_MODE === 'inproc') return;   // inproc receipts must stay byte-identical
+  if (pick && pick.pid) lastForwardOk.set(Number(pick.pid), Date.now());
+}
+function forwardAnsweredOk(stamped) {
+  if (!stamped || !stamped.result) return false;
+  if (stamped.result.isError === true) return false;
+  const obj = firstBodyObject(stamped.result);
+  return !(obj && obj.ok === false);
+}
+// ---- P3 (task-110): lastEnsure persistence + a READ-ONLY report probe ----------------------
+function middleStatePath() {
+  return path.join(os.tmpdir(), 'vb6mcp', 'middle.' + (bridgePortHint() || 'default') + '.state.json');
+}
+function readMiddleState() { try { return JSON.parse(fs.readFileSync(middleStatePath(), 'utf8')); } catch (e) { return null; } }
+function writeMiddleState(extra) {
+  try {
+    const d = path.dirname(middleStatePath());
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+    const rec = Object.assign({}, readMiddleState() || {}, { at: new Date().toISOString(), bridgeUrl: BRIDGE_URL, bridgeMode: BRIDGE_MODE }, extra || {});
+    fs.writeFileSync(middleStatePath(), JSON.stringify(rec, null, 2));
+    return rec;
+  } catch (e) { return null; }
+}
+let middleLastEnsure = readMiddleState();   // survives hub restarts (DSH restarts the hub often)
+// ide_list calls this: /health only - NEVER a spawn, NEVER a lock write.
+async function middleServiceReportProbe() {
+  if (BRIDGE_MODE === 'inproc') return null;
+  const p = await middleProbeOnce();
+  if (p.ok && isOurMiddle(p.body)) {
+    let pid = null;
+    try { const lp = listeningPortsCached(); const hp = bridgePortHint(); pid = (hp && lp[hp] && lp[hp][0]) || null; } catch (e) { pid = null; }
+    middleServiceState.reachable = true;
+    if (pid) middleServiceState.pid = Number(pid);
+    if (!middleServiceState.managedByThisHub) middleServiceState.reason = 'healthy_by_health_probe';
+    middleServiceState.portTakenByOther = false;
+    bridgeHealthCache = { at: Date.now(), data: p.body, promise: null };
+    bridgeLastFailure = null;
+  } else if (p.status === 401) {
+    middleServiceState.reachable = false;
+    middleServiceState.reason = 'bridge_auth_failed';
+  } else if (middleServiceState.reachable) {
+    middleServiceState.reachable = false;
+    middleServiceState.reason = 'health_probe_failed_at_ide_list';
+  }
+  return middleServiceReceipt();
+}
+// null in inproc mode: every caller then OMITS the key, which is what keeps that mode identical.
+function middleServiceReceipt() {
+  if (BRIDGE_MODE === 'inproc') return null;
+  const st = middleServiceState;
+  return { reachable: !!st.reachable, url: BRIDGE_URL, pid: st.pid || null, startedAt: st.startedAt || null,
+           managedByHub: !!st.managedByHub, managedByThisHub: !!st.managedByThisHub,
+           reason: st.reason || null, lockFile: st.lockFile || null,
+           spawnAttemptedAt: st.spawnAttemptedAt || null,
+           portTakenByOther: !!st.portTakenByOther, foreignPid: st.foreignPid || null,
+           lastEnsure: middleLastEnsure ? { at: middleLastEnsure.at || null, reachable: !!middleLastEnsure.reachable,
+             pid: middleLastEnsure.pid || null, reason: middleLastEnsure.reason || null,
+             by: middleLastEnsure.bridgeMode || null } : null };
+}
+function middleLockPath() {
+  return path.join(os.tmpdir(), 'vb6mcp', 'middle.' + (bridgePortHint() || 'default') + '.lock');
+}
+function readMiddleLock() {
+  try { return JSON.parse(fs.readFileSync(middleLockPath(), 'utf8')); } catch (e) { return null; }
+}
+function writeMiddleLock(obj) {
+  try {
+    const d = path.dirname(middleLockPath());
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(middleLockPath(), JSON.stringify(obj, null, 2));
+    return true;
+  } catch (e) { return false; }
+}
+function clearMiddleLock() { try { fs.unlinkSync(middleLockPath()); } catch (e) { } }
+// ONE raw probe (bypasses the 5 s positive cache: an ensure decision must be FRESH).
+async function middleProbeOnce() {
+  try {
+    const res = await fetch(BRIDGE_URL + '/health', { signal: AbortSignal.timeout(1200), headers: bridgeAuthHeaders() });
+    if (!res.ok) {
+      const body = await res.text().catch(function () { return ''; });
+      return { ok: false, status: res.status, auth: authFailureEnvelope(res.status, body), detail: body.slice(0, 200) };
+    }
+    const j = await res.json();
+    return { ok: true, status: res.status, body: j };
+  } catch (e) { return { ok: false, status: 0, detail: String((e && e.message) || e) }; }
+}
+function isOurMiddle(j) { return !!(j && typeof j === 'object' && String(j.server || j.product || '') === MIDDLE_PRODUCT); }
+function adoptMiddle(j) {
+  const port = bridgePortHint();
+  let pid = null;
+  try { const lp = listeningPortsCached(); pid = (port && lp[port] && lp[port][0]) || null; } catch (e) { pid = null; }
+  const lock = readMiddleLock();
+  const lockPid = lock && lock.pid ? Number(lock.pid) : null;
+  // P3: an ADOPTED service gets an ADVISORY record only (by:"adopt", pid:null so a real spawner is
+  // never blocked by it).  It grants NO ownership/kill rights: managedByHub stays false and
+  // managedByThisHub comes solely from middleSpawnedPid.
+  if (!lock || lock.by !== 'hub') {
+    writeMiddleLock({ by: 'adopt', pid: null, servicePid: pid ? Number(pid) : null, port: bridgePortHint(),
+                      firstSeenAt: (lock && lock.firstSeenAt) || new Date().toISOString(), bridgeUrl: BRIDGE_URL });
+  }
+  middleServiceState = { reachable: true, url: BRIDGE_URL, pid: pid ? Number(pid) : lockPid, startedAt: (lock && lock.startedAt) || null,
+    managedByHub: !!(lock && lock.by === 'hub'),
+    // managedByThisHub means THIS process spawned it - never "the lock names the pid", which is how
+    // a second hub would have claimed ownership of a service another hub started.
+    managedByThisHub: !!(middleSpawnedPid && pid && Number(pid) === Number(middleSpawnedPid)),
+    reason: 'healthy', lockFile: middleLockPath(), spawnAttemptedAt: middleServiceState.spawnAttemptedAt || null,
+    portTakenByOther: false, foreignPid: null };
+  // refresh the cached health so the very NEXT forward sees the adopted service immediately
+  bridgeHealthCache = { at: Date.now(), data: j, promise: null };
+  bridgeLastFailure = null;
+  return middleServiceReceipt();
+}
+function markPortTaken(detail, foreignPid) {
+  middleServiceState = { reachable: false, url: BRIDGE_URL, pid: null, startedAt: null, managedByHub: false, managedByThisHub: false,
+    reason: 'port_taken_by_other', lockFile: middleLockPath(), spawnAttemptedAt: middleServiceState.spawnAttemptedAt || null,
+    portTakenByOther: true, foreignPid: foreignPid || null };
+  dbg('middle service: port ' + bridgePortHint() + ' is occupied by something that is NOT ' + MIDDLE_PRODUCT + ' -> fail-closed (no spawn, no forward)');
+  return middleServiceReceipt();
+}
+function markAuthFailure(detail) {
+  middleServiceState = { reachable: false, url: BRIDGE_URL, pid: null, startedAt: null, managedByHub: false, managedByThisHub: false,
+    reason: 'bridge_auth_failed', lockFile: middleLockPath(), spawnAttemptedAt: middleServiceState.spawnAttemptedAt || null,
+    portTakenByOther: false, foreignPid: null };
+  dbg('middle service: /health answered 401 -> credential mismatch, NOT spawning a second service');
+  return middleServiceReceipt();
+}
+async function waitForMiddle(ms) {
+  const deadline = Date.now() + Math.max(0, ms || 0);
+  let last = null;
+  for (;;) {
+    last = await middleProbeOnce();
+    if (last.ok && isOurMiddle(last.body)) return last;
+    if (last.status === 401) return last;
+    if (Date.now() >= deadline) return last;
+    await new Promise(function (r) { setTimeout(r, MIDDLE_PROBE_INTERVAL_MS); });
+  }
+}
+function spawnMiddleService() {
+  const port = bridgePortHint();
+  if (!port) return { ok: false, reason: 'bridge_url_has_no_port' };
+  const args = [BRIDGE_PY, '--port', String(port)];
+  // The credential is inherited through the environment (VB6MCP_TOKEN_FILE / VB6MCP_TOKEN); it is
+  // never copied onto a command line.  detached + unref: the service OUTLIVES this hub process.
+  let child = null;
+  try {
+    child = spawn(PYTHON_BIN, args, { detached: true, stdio: 'ignore', windowsHide: true,
+      env: Object.assign({}, process.env, { VB6MCP_BRIDGE_PORT: String(port) }) });
+    child.unref();
+  } catch (e) { return { ok: false, reason: 'spawn_failed: ' + String((e && e.message) || e) }; }
+  const lock = { pid: child.pid || null, port: port, startedAt: new Date().toISOString(), by: 'hub', hubPid: process.pid, py: PYTHON_BIN, script: BRIDGE_PY };
+  writeMiddleLock(lock);
+  middleSpawnedPid = child.pid || null;
+  dbg('middle service: spawned pid=' + child.pid + ' port=' + port + ' (detached; lock=' + middleLockPath() + ')');
+  return { ok: true, pid: child.pid || null, lock: lock };
+}
+// Lazy ensure: adopt a healthy service; otherwise spawn ONE detached copy.  Never takes over a
+// foreign listener (fail-closed), never spawns while another hub holds a live lock.
+async function ensureMiddleService() {
+  if (BRIDGE_MODE === 'inproc') return middleServiceReceipt();   // null: nothing runs, nothing is added
+  // A service adopted/verified inside the health TTL is reused without another HTTP round trip.
+  if (middleServiceState.reachable && bridgeHealthCache.data && (Date.now() - bridgeHealthCache.at) < BRIDGE_HEALTH_TTL_MS) return middleServiceReceipt();
+  if (middleServiceEnsure) return middleServiceEnsure;
+  middleServiceEnsure = (async function () {
+    // (1) a healthy instance is ADOPTED, never restarted
+    const first = await middleProbeOnce();
+    if (first.ok && isOurMiddle(first.body)) return adoptMiddle(first.body);
+    if (first.ok) return markPortTaken(first);
+    if (first.status === 401) return markAuthFailure(first);
+    // (2) is the port already occupied by something else?  A foreign listener must NEVER be
+    //     forwarded to (history: a python listener was once read as a live IDE with 110 tools).
+    const port = bridgePortHint();
+    const listening = port ? await tcpListening(port, 300) : false;
+    if (listening) {
+      const second = await middleProbeOnce();
+      if (second.ok && isOurMiddle(second.body)) return adoptMiddle(second.body);
+      if (second.status === 401) return markAuthFailure(second);
+      let foreignPid = null;
+      try { const lp = listeningPortsCached(); foreignPid = (lp[port] && lp[port][0]) || null; } catch (e) { foreignPid = null; }
+      return markPortTaken(second, foreignPid);
+    }
+    // (3) single-instance safety: a LIVE lock means another hub/operator owns the startup
+    if (!MIDDLE_MANAGED) { middleServiceState.reason = 'management_disabled(VB6MCP_BRIDGE_MANAGED=0)'; return middleServiceReceipt(); }
+    const lock = readMiddleLock();
+    if (lock && lock.pid && pidAlive(lock.pid)) {
+      dbg('middle service: lock held by live pid ' + lock.pid + ' -> waiting/adopting instead of spawning');
+      const waited = await waitForMiddle(Math.min(MIDDLE_SPAWN_WAIT_MS, 5000));
+      if (waited.ok && isOurMiddle(waited.body)) return adoptMiddle(waited.body);
+      if (waited.status === 401) return markAuthFailure(waited);
+      middleServiceState = { reachable: false, url: BRIDGE_URL, pid: Number(lock.pid), startedAt: lock.startedAt || null,
+        managedByHub: true, managedByThisHub: false, reason: 'lock_held_but_service_not_answering',
+        lockFile: middleLockPath(), spawnAttemptedAt: middleServiceState.spawnAttemptedAt || null,
+        portTakenByOther: false, foreignPid: null };
+      return middleServiceReceipt();
+    }
+    if (lock && lock.pid && !pidAlive(lock.pid)) { dbg('middle service: clearing stale lock pid=' + lock.pid); clearMiddleLock(); }
+    // (4) spawn exactly ONE detached copy and wait for its /health
+    const sp = spawnMiddleService();
+    if (!sp.ok) { middleServiceState.reason = sp.reason; return middleServiceReceipt(); }
+    middleServiceState.spawnAttemptedAt = new Date().toISOString();
+    const after = await waitForMiddle(MIDDLE_SPAWN_WAIT_MS);
+    if (after.ok && isOurMiddle(after.body)) {
+      adoptMiddle(after.body);
+      middleServiceState.managedByHub = true;
+      middleServiceState.managedByThisHub = true;
+      middleServiceState.pid = sp.pid || middleServiceState.pid;
+      const lk = readMiddleLock();
+      middleServiceState.startedAt = (lk && lk.startedAt) || new Date().toISOString();
+      dbg('middle service: ensured pid=' + middleServiceState.pid + ' port=' + bridgePortHint() + ' managedByHub=true');
+      return middleServiceReceipt();
+    }
+    middleServiceState.reason = after.status === 401 ? 'bridge_auth_failed' : 'spawned_but_not_answering';
+    if (after.ok && !isOurMiddle(after.body)) middleServiceState.reason = 'port_taken_by_other';
+    middleServiceState.portTakenByOther = (middleServiceState.reason === 'port_taken_by_other');
+    return middleServiceReceipt();
+  })().then(function (ms) {
+    if (ms) {
+      // P3: persist the OUTCOME, so a restarted hub can report the last ensure BEFORE any probe.
+      middleLastEnsure = writeMiddleState({ reachable: !!ms.reachable, pid: ms.pid || null, reason: ms.reason || null,
+        managedByHub: !!ms.managedByHub, managedByThisHub: !!ms.managedByThisHub, portTakenByOther: !!ms.portTakenByOther });
+    }
+    return ms;
+  }).finally(function () { middleServiceEnsure = null; });
+  return middleServiceEnsure;
+}
 // Startup breadcrumb, deferred like the endpoint one below: dbg()/DEBUG are declared further
 // down, so calling this at module-evaluation time would be a temporal-dead-zone error.
 setTimeout(function () {
@@ -116,6 +379,14 @@ bridgeLastFailure = null; //: a healthy bridge clears the recorded failure
 // One JSON-RPC POST to the bridge - the SAME wire shape rpcAt() uses against an add-in, so the
 // bridge is just another endpoint as far as this file is concerned.
 async function bridgeRpc(method, params, timeoutMs) {
+  // task-108 (3): a FOREIGN listener on the configured port is fail-closed for EVERY caller.  A
+  // history bug read a python listener as a live IDE with 110 tools; no path may POST /rpc to a
+  // service that did not identify itself as vb6mcp-bridge.
+  if (BRIDGE_MODE !== 'inproc' && middleServiceState.portTakenByOther) {
+    const err = new Error('middle service port is occupied by a foreign listener (port_taken_by_other): refusing to POST /rpc to it');
+    err.code = 'middle_service_port_taken';
+    throw err;
+  }
   const body = { jsonrpc: '2.0', id: (Date.now() % 100000) + 1, method: method };
   if (params !== undefined) body.params = params;
   const res = await fetch(BRIDGE_URL + '/rpc', {
@@ -147,7 +418,21 @@ function mergeHubFace(faceTools) {
 // the bridge's job (addressing moved to the Python layer).  stampBody() below only fills keys
 // that are undefined, so the bridge's transport / transportReason / *Fallback / pipeBusy marks
 // SURVIVE into the receipt and are never overwritten.
-async function bridgeForwardCall(name, argsIn, snap, note) {
+async function bridgeForwardCall(name, argsIn, snap, note, pick) {
+  // task-108: the hub OWNS the dependency.  Ensure the middle service exists before the first
+  // forward.  A FOREIGN listener on the configured port is fail-closed here - it is never read
+  // as an IDE and never forwarded to (that is the historical fake-IDE incident).
+  const msr = (BRIDGE_MODE === 'inproc') ? null : await ensureMiddleService();
+  const hcStamps = hubCodeStamps();
+  if (msr && msr.portTakenByOther) {
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify({
+      ok: false, reason: 'port_taken_by_other', failureKind: 'toolError', failureKindRule: FAILURE_KIND_RULE,
+      middleService: msr, hubCode: hcStamps,
+      message: 'the configured middle-service port is occupied by something that is NOT the vb6mcp middle service. Refusing to forward: a foreign listener is never read as an IDE or as the middle service.',
+      hint: 'stop the foreign process on that port, or point VB6MCP_BRIDGE_URL at the real middle service, then retry. Nothing was forwarded.',
+      nothingForwarded: true }, null, 2) }], isError: true }, null, snap.contractVersion);
+  }
+  const midNote = Object.assign({}, msr ? { middleService: msr } : {}, hcStamps ? { hubCode: hcStamps } : {});
   const h = await bridgeHealth();
   if (!h) return null;
   const t0 = Date.now();
@@ -163,19 +448,25 @@ async function bridgeForwardCall(name, argsIn, snap, note) {
     dbg('bridge forward FAILED tool=' + name + ' ms=' + ms + (isAuth ? ' auth=' + e.reason : '') + ' err=' + String((e && e.message) || e));
     let authBlock = {};
     if (isAuth) authBlock = { authRequired: true, authReason: e.reason, authStatus: e.status, authHint: e.authHint, hubAuth: bridgeAuthState() };
-    return stampBody({ content: [{ type: 'text', text: JSON.stringify(Object.assign({
+    const fwBody = Object.assign({
       ok: false, reason: isAuth ? 'bridge_auth_failed' : (isTimeout ? 'forward_timeout' : 'forward_failed'),
       message: String((e && e.message) || e), elapsedMs: ms, budgetMs: bridgeCallTimeoutMs(),
       transport: 'bridge', transportReason: isAuth ? 'bridge_auth_failed' : 'bridge_unreachable',
+      bridgeUrl: BRIDGE_URL, bridgeMode: BRIDGE_MODE, bridgeLastFailure: bridgeLastFailure || null,
+      middleService: msr, hubCode: hcStamps,
       failureKind: isAuth ? 'toolError' : (isTimeout ? 'wedged' : 'noIde'), failureKindRule: FAILURE_KIND_RULE
-    }, authBlock), null, 2) }], isError: true }, null, snap.contractVersion);
+    }, authBlock);
+    const fwGuard = nullPortUrlGuard(fwBody, 'bridge_forward_failed(' + String(name) + ')');
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(fwGuard || fwBody, null, 2) }], isError: true }, null, snap.contractVersion);
   }
   dbg('bridge forward ok tool=' + name + ' ms=' + (Date.now() - t0));
   const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
 // /N11: the hub's OWN liveness/resolution verdict rides along (ADDITIVE - stampBody only
   // fills keys the body does not already carry).  So a forwarded call that comes back
   // noIde/wedged can be read next to ide_list's verdict for the SAME instance, with the basis.
-  return stampBody(result, null, snap.contractVersion, note);
+  // P2: this route just ANSWERED a real call - liveness evidence for ide_list.
+  noteForwardSuccess(pick);
+  return stampBody(result, null, snap.contractVersion, Object.assign({}, midNote, note || {}));
 }
 // Latency budget: the DSH client must get initialize/tools/list in <1s.
 const DISCOVERY_TTL_MS = 15000;     // cached (re-validated) discovery is reused for this long
@@ -498,6 +789,102 @@ function forwardRouteOf(i) {
   return BRIDGE_MODE === 'inproc'
     ? 'none (inproc: a pipe-only instance is unreachable by design)'
     : (BRIDGE_URL + ' -> named pipe (the middle service is the only addresser)');
+}
+// A local instance is DIRECTLY addressable only when it publishes a REAL TCP port.  port 0 / null
+// means the add-in registered a PIPE-ONLY instance (transport:pipe, tcpEnabled:false): the middle
+// service is then the ONLY addresser, because the pipe itself is not a URL.  Building a URL from
+// such a port produces "http://127.0.0.1:null/rpc" - a URL parse failure that HID the real cause
+// (the middle service was not running) and surfaced as noIde.  This is the ONE place that decides
+// what a pick can be reached over.
+function directEndpointOf(inst) {
+  if (!inst) return { kind: 'none', base: null, port: null };
+  const port = Number(inst.port);
+  if (inst.remote) return { kind: 'remote', base: inst.endpointUrl || null, port: (Number.isFinite(port) && port > 0) ? port : null };
+  if (Number.isFinite(port) && port > 0) return { kind: 'addin', base: 'http://127.0.0.1:' + port, port: port };
+  return { kind: 'pipeOnly', base: null, port: null };
+}
+// FAIL-CLOSED self-check: an outward payload must NEVER carry a null/undefined port URL.  A
+// pipe-only IDE has no TCP endpoint, so such a URL can only be a bug - and it must not reach a
+// caller even if some future code path builds one.  Returns a replacement body when it would.
+const NULL_PORT_URL_RE = /(?:https?:\/\/[^\s"'<>]*?|127\.0\.0\.1):(?:null|undefined)(?![A-Za-z0-9_-])/;
+function nullPortUrlGuard(body, where) {
+  let text = '';
+  try { text = JSON.stringify(body); } catch (e) { text = String(body); }
+  if (!NULL_PORT_URL_RE.test(text)) return null;
+  return { ok: false, reason: 'internal_null_port_url', failureKind: 'toolError',
+           failureKindRule: FAILURE_KIND_RULE, where: String(where || 'unknown'),
+           bridgeUrl: BRIDGE_URL, bridgeMode: BRIDGE_MODE,
+           message: 'FAIL-CLOSED self-check: refused to emit an outward payload that contains a null/undefined port URL. A pipe-only IDE has NO TCP endpoint; the middle service (VB6MCP_BRIDGE_URL) is its only addresser.',
+           hint: 'this means the hub tried to build a direct add-in URL for an instance that has no port. Nothing was forwarded; start the middle service (or expose a real add-in TCP port) and retry.' };
+}
+// The registration facts the pipe-only refusal must NAME (file, port, transport, tcpEnabled, pipe).
+function registrySnapshotFor(pid) {
+  try {
+    const want = Number(pid);
+    const r = readRegistry();
+    const hit = (r.entries || []).filter(function (e) { return Number(e.pid) === want; })[0] || null;
+    if (!hit) return null;
+    // readRegistry() normalises a pipe registration's port 0 to null; report the RAW registration
+    // values too, so the receipt can say "port:0 / tcpEnabled:false" instead of just "no port".
+    let rawPort = hit.port, rawTcp = hit.tcpEnabled;
+    try {
+      const raw = JSON.parse(fs.readFileSync(hit.file, 'utf8'));
+      if (raw && raw.port !== undefined) rawPort = raw.port;
+      if (raw && raw.tcpEnabled !== undefined) rawTcp = raw.tcpEnabled;
+    } catch (e) { }
+    return { file: hit.file ? path.basename(hit.file) : null, dir: r.dir, pid: hit.pid,
+             port: rawPort, portNormalized: hit.port, transport: hit.transport, tcpEnabled: rawTcp,
+             pipe: hit.pipe, project: hit.project, projectPath: hit.projectPath, startedByHub: hit.startedByHub };
+  } catch (e) { return null; }
+}
+// A picked instance with NO TCP port can only be served by the middle service.  When that service
+// is not answering, the call FAILS HERE - structured.  The reason names the real cause, and the
+// receipt carries the registration plus the SAME liveness evidence ide_list already reports
+// (probeRoute / forwardRoute / probe reason), so a caller never sees a bare "noIde" again.
+function pipeOnlyRefusal(pick, name, snap, note) {
+  const reg = registrySnapshotFor(pick && pick.pid);
+  let lv = null;
+  try { lv = (pick && pick.liveness) || livenessOf(pick, bridgeIdentitySync() || {}); } catch (e) { lv = null; }
+  const regPort = reg ? reg.port : ((pick && pick.port === undefined) ? null : pick.port);
+  const regTransport = (reg && reg.transport) || (pick && pick.transport) || null;
+  const regTcp = reg ? reg.tcpEnabled : ((pick && pick.tcpEnabled === undefined) ? null : pick.tcpEnabled);
+  const body = {
+    ok: false, tool: name,
+    reason: 'middle_service_unreachable',
+    reasonLegacy: 'forward_failed',
+    failureKind: 'pipeOnlyNeedsMiddleService',
+    failureKindRule: FAILURE_KIND_RULE,
+    pipeOnly: true,
+    pid: (pick && pick.pid) || null,
+    port: (pick && pick.port === undefined) ? null : pick.port,
+    project: (pick && pick.project) || null,
+    projectPath: (pick && pick.projectPath) || (reg && reg.projectPath) || null,
+    pipe: (reg && reg.pipe) || (pick && pick.pipe) || null,
+    bridgeUrl: BRIDGE_URL,
+    bridgeMode: BRIDGE_MODE,
+    bridgePort: bridgePortHint(),
+    bridgeLastFailure: bridgeLastFailure || null,
+    bridgeHealthAttemptedAt: bridgeHealthCache.at || null,
+    middleService: middleServiceReceipt(),
+    hubCode: hubCodeStamps(),
+    registry: reg,
+    registryReason: (lv && lv.probeStatus === 'failed') ? 'registry_port_not_mcp_probe_failed' : 'pipe_only_registration',
+    probeRoute: (lv && lv.probeRoute) || (pick && pick.probeRoute) || null,
+    forwardRoute: (lv && lv.forwardRoute) || forwardRouteOf(pick),
+    probeStatus: (lv && lv.probeStatus) || (pick && pick.probeStatus) || null,
+    probeReason: (lv && lv.probeReason) || (pick && pick.probeReason) || null,
+    liveness: lv ? { state: lv.state, basis: lv.basis, probeStatus: lv.probeStatus, probeReason: lv.probeReason,
+                     probeRoute: lv.probeRoute, forwardRoute: lv.forwardRoute, pipeState: lv.pipeState,
+                     pipeAvailable: lv.pipeAvailable } : null,
+    message: 'this IDE is registered PIPE-ONLY (registration port ' + JSON.stringify(regPort) + ', transport ' + JSON.stringify(regTransport) + ', tcpEnabled ' + JSON.stringify(regTcp) + '): the hub cannot reach it over TCP, and the middle service (bridge/vb6mcp_bridge.py) at ' + BRIDGE_URL + ' is the ONLY addresser for it - and it is NOT answering. A direct URL would have to name a null port, which is not a real endpoint, so NO forward was attempted.',
+    hint: 'start the middle service and point VB6MCP_BRIDGE_URL at its port, then retry. Nothing was forwarded. If this add-in is TCP-capable, expose a real port (tcpEnabled) and it becomes directly addressable.',
+    nothingForwarded: true
+  };
+  const guarded = nullPortUrlGuard(body, 'pipe_only_refusal(' + String(name) + ')');
+  const finalBody = guarded || body;
+  const ide = { pid: (pick && pick.pid) || null, project: (pick && pick.project) || null, port: null };
+  return stampBody({ content: [{ type: 'text', text: JSON.stringify(finalBody, null, 2) }], isError: true },
+                   ide, snap.contractVersion, note);
 }
 function livenessOf(i, ctx) {
   const byPid = (ctx && ctx.byPid) || {};
@@ -959,14 +1346,33 @@ function instanceRpc(port, transport, method, params, proto, timeoutMs, rpcPath)
 //   call is also the LIVE DLL IDENTITY: mcp_info.build.sha256 is hashed from the loaded DLL at
 //   call time, so a receipt can assert which binary answered.
 const PROBE_INFO_TIMEOUT_MS = parseInt(process.env.VB6MCP_PROBE_INFO_TIMEOUT_MS || '1500', 10);
+// P2: a pipe-only probe is served by the MIDDLE SERVICE (which must resolve a default target and
+// then cross the named pipe), so the direct-addin 1.5 s cap is too tight; it made ide_list read
+// failed while an explicit-target forward succeeded (N11).  Callers can override.
+const PIPE_PROBE_TIMEOUT_MS = parseInt(process.env.VB6MCP_PIPE_PROBE_TIMEOUT_MS || '4500', 10);
 async function probe(port, knownProject, pids, transport) {
   pids = pids || [];
   if (!pids.length) return null;
+  if (!port && BRIDGE_MODE !== 'inproc') {
+    // task-108: a pipe-only probe goes THROUGH the middle service, so the service must be safely
+    // ours BEFORE any /rpc is attempted.  A foreign listener is never probed as an IDE.
+    const ms = await ensureMiddleService();
+    if (ms && ms.portTakenByOther) {
+      return { livenessFailed: true, probeReason: 'middle_service_port_taken_by_other',
+               probeEvidenceAt: Date.now(), probeRoute: BRIDGE_URL + ' -> pipe',
+               probeBasis: 'the configured middle-service port is occupied by a foreign listener; refusing to probe it as an IDE (no /rpc was sent)' };
+    }
+  }
   const route = port ? ('http://127.0.0.1:' + port + ' /rpc')
                      : (BRIDGE_MODE === 'inproc' ? 'none' : BRIDGE_URL + ' -> pipe');
+  // P2: send the SAME selector a forward would use, and give a pipe-only probe pipe time.
+  const pipeOnlyProbe = !port;
+  const probeArgs = (pipeOnlyProbe && pids.length) ? { _target: String(pids[0]) } : {};
+  const infoTimeout = pipeOnlyProbe ? PIPE_PROBE_TIMEOUT_MS : PROBE_INFO_TIMEOUT_MS;
+  const probeDetail = 'infoTimeoutMs=' + infoTimeout + (pipeOnlyProbe ? ' target=' + probeArgs._target + ' (pipe-only)' : ' (direct add-in)');
   let info = null, infoReason = null;
   try {
-    const mi = await instanceRpc(port, transport, 'tools/call', { name: 'mcp_info', arguments: {} }, null, PROBE_INFO_TIMEOUT_MS);
+    const mi = await instanceRpc(port, transport, 'tools/call', { name: 'mcp_info', arguments: probeArgs }, null, infoTimeout);
     const txt = firstText(mi);
     if (txt) {
       try { info = JSON.parse(txt); } catch (e) { infoReason = 'unparsable_mcp_info'; }
@@ -984,7 +1390,7 @@ async function probe(port, knownProject, pids, transport) {
   // (not null) carries the exact reason down to the receipt instead of a generic one.
   if (!info) return { livenessFailed: true, probeReason: infoReason || 'addin_did_not_answer',
                       probeEvidenceAt: Date.now(), probeRoute: route,
-                      probeBasis: 'the ADD-IN did not answer mcp_info over ' + route + ' (' + (infoReason || 'unknown') + ')' };
+                      probeBasis: 'the ADD-IN did not answer mcp_info over ' + route + ' (' + (infoReason || 'unknown') + '); ' + probeDetail };
   let tools = [];
   try {
     const tl = await instanceRpc(port, transport, 'tools/list', {}, null, 8000);
@@ -1013,7 +1419,7 @@ async function probe(port, knownProject, pids, transport) {
            liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools, instructions: instructions,
            // ---- the ONE liveness evidence -------------------------------------
            probeEvidenceAt: Date.now(),
-           probeBasis: 'addin_answered_mcp_info via ' + route,
+           probeBasis: 'addin_answered_mcp_info via ' + route + '; ' + probeDetail,
            probeRoute: route,
            addinProduct: (info && info.product) || null,
            addinContract: (info && info.contract) || null,
@@ -1870,8 +2276,23 @@ async function faceState(d, spellings, ctx) {
   (d.instances || []).forEach(function (i) {
     const live = livenessOf(i, ctx);
     const own = ownershipOf(i);
+    // P2: a SUCCESSFUL forwarded tools/call is liveness evidence too.  A pipe-only snapshot probe
+    // can time out while the very same route answers a real call; without this merge ide_list
+    // contradicted a working forward (N11).  probeStatusRaw stays the raw probe verdict.
+    const fwdAt = lastForwardOk.get(Number(i.pid));
+    if (fwdAt && (Date.now() - fwdAt) < FORWARD_EVIDENCE_TTL_MS && live.state !== 'responding') {
+      live.state = 'responding';
+      live.basis = String(live.basis || '') + ' + a forwarded tools/call SUCCEEDED at ' + new Date(fwdAt).toISOString();
+      live.lastForwardOkAt = new Date(fwdAt).toISOString();
+      live.evidenceByForward = true;
+    }
     i.liveness = { state: live.state, basis: live.basis, evidenceAt: live.evidenceAt, evidenceAgeMs: live.evidenceAgeMs,
                    probeRoute: live.probeRoute, forwardRoute: live.forwardRoute, pipeState: live.pipeState, pipeAvailable: live.pipeAvailable, cached: live.cached };
+    // The forward-evidence keys exist ONLY outside inproc, which must stay byte-for-byte unchanged.
+    if (BRIDGE_MODE !== 'inproc' && live.evidenceByForward) {
+      i.liveness.lastForwardOkAt = live.lastForwardOkAt || null;
+      i.liveness.evidenceByForward = true;
+    }
     i.probeStatus = live.probeStatus;
     i.probeStatusRaw = live.probeStatusRaw;
     if (live.probeReason) i.probeReason = live.probeReason;
@@ -1954,7 +2375,8 @@ async function faceState(d, spellings, ctx) {
       liveToolCount: (i.pending || i.probeStatus !== 'ok') ? null : ((i.liveTools && i.liveTools.length) || null),
       probeReason: i.probeReason || null,
       // ---- the ONE liveness verdict + the evidence it came from ------------------
-      addinAnswered: i.probeStatus === 'ok',
+      addinAnswered: i.probeStatus === 'ok' || !!(i.liveness && i.liveness.evidenceByForward),
+      ...(BRIDGE_MODE === 'inproc' ? {} : { lastForwardOkAt: (i.liveness && i.liveness.lastForwardOkAt) || null }),
       liveness: i.liveness || null,
       probeEvidenceAt: i.probeEvidenceAt || null,
       probeBasis: i.probeBasis || null,
@@ -2006,6 +2428,9 @@ async function faceState(d, spellings, ctx) {
     // MEASURED 2026-10-17 on this host: after ide_list the same registration file is byte-identical
     // (size/mtime/sha256 unchanged) and no .pruned/.bak residue appears. A registration is removed
     // ONLY by ide_restart, after a CONFIRMED stop of that same target (registryCleared=true).
+    // task-108: WHO addresses the pipe-only IDEs, and whether a hub started/kept it.  Omitted
+    // entirely in inproc mode, so that rollback receipt stays byte-for-byte unchanged.
+    ...(function () { const m = middleServiceReceipt(); return m ? { middleService: m } : {}; })(),
     registryWrites: 0,
     registryPolicy: 'ide_list is READ-ONLY: it never writes, prunes or deletes a registration (%TEMP%\\vb6mcp\\instances\\<pid>.json). Cleanup happens only in ide_restart after a confirmed stop of its own target.',
 // ---- /N11: WHICH source the authoritative IDE view came from
@@ -2107,6 +2532,9 @@ function resolveVb6Exe() {
 }
 
 async function hubState(opts) {
+  // P3: a READ-ONLY /health probe (never spawns, never writes the lock) so a hub that has just
+  // restarted can still report the middle service before the first forward.
+  if (BRIDGE_MODE !== 'inproc') { try { await middleServiceReportProbe(); } catch (e) { } }
   // ide_list is the ONE read that shows the whole set (local + configured remote endpoints).
   // tools/list + initialize deliberately stay on the LOCAL path so a slow remote can never
   // push the MCP handshake towards its 1s budget.
@@ -2168,6 +2596,9 @@ async function hubState(opts) {
       }
     }
   }
+  // P1: the receipt can PROVE which code answered (sha16 of the running file + start time).
+  const hcStamps = hubCodeStamps();
+  if (hcStamps) st.hubCode = hcStamps;
   return st;
 }
 
@@ -2810,6 +3241,10 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
     }, null, 2) }], isError: true }, null, snap.contractVersion);
   }
   const pickNote = {};
+  const midRec = middleServiceReceipt();
+  if (midRec) pickNote.middleService = midRec;   // task-108: every forwarded receipt names its addresser
+  const hcPick = hubCodeStamps();               // P1: same code-proof on the direct path
+  if (hcPick) pickNote.hubCode = hcPick;
   if (pick.selectedBy) pickNote.selectedBy = pick.selectedBy;
   if (pick.staleTarget) {
     pickNote.staleTarget = pick.staleTarget;
@@ -2830,7 +3265,27 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
   const ideStamp = { pid: pick.pid, project: pick.project, port: pick.port };
   if (isRemote) { ideStamp.endpoint = pick.endpoint; ideStamp.remote = true; }
   const timeoutMs = isRemote ? REMOTE_FORWARD_TIMEOUT_MS : FORWARD_TIMEOUT_MS;
-  const base = isRemote ? pick.endpointUrl : ('http://127.0.0.1:' + pick.port);
+  // ONE decision about what this pick can be reached over.  A pipe-only pick has NO direct
+  // endpoint: it is the middle service's job (or nothing), and a URL built from its port would
+  // be "...:null/rpc" - the parse failure that hid the real cause.  Refuse structurally instead.
+  const fe = directEndpointOf(pick);
+  if (fe.kind === 'pipeOnly') {
+    dbg('forward REFUSED: pipe-only instance pid=' + pick.pid + ' port=' + pick.port + ' -> the middle service is required at ' + BRIDGE_URL);
+    return pipeOnlyRefusal(pick, name, snap, pickNote);
+  }
+  if (!fe.base) {
+    const nb = { ok: false, tool: name, reason: 'no_forward_route',
+      failureKind: isRemote ? 'noIde' : 'pipeOnlyNeedsMiddleService', failureKindRule: FAILURE_KIND_RULE,
+      remote: !!isRemote, endpoint: isRemote ? pick.endpoint : null, endpointUrl: isRemote ? (pick.endpointUrl || null) : null,
+      pid: pick.pid || null, port: (pick.port === undefined) ? null : pick.port,
+      forwardRoute: forwardRouteOf(pick), probeRoute: pick.probeRoute || null,
+      bridgeUrl: isRemote ? null : BRIDGE_URL, bridgeMode: BRIDGE_MODE,
+      message: isRemote ? 'the remote endpoint has no URL, so nothing was forwarded' : 'the selected instance has no usable forward route, so nothing was forwarded',
+      nothingForwarded: true };
+    const nbg = nullPortUrlGuard(nb, 'no_forward_route(' + String(name) + ')');
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(nbg || nb, null, 2) }], isError: true }, ideStamp, snap.contractVersion, pickNote);
+  }
+  const base = fe.base;
   const tFwd = Date.now();
   let resp;
   try { resp = await rpcAt(base, 'tools/call', { name: name, arguments: args }, null, timeoutMs); }
@@ -2838,10 +3293,15 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
     const ms = Date.now() - tFwd;
     const isTimeout = !!(e && (e.name === 'TimeoutError' || /abort/i.test(String(e && e.message))));
     const errBody = { ok: false, reason: isTimeout ? 'forward_timeout' : 'forward_failed', message: String(e && e.message || e), elapsedMs: ms, budgetMs: timeoutMs,
-                      failureKind: transportFailureKind(e), failureKindRule: FAILURE_KIND_RULE };
+                      failureKind: transportFailureKind(e), failureKindRule: FAILURE_KIND_RULE,
+                      forwardRoute: forwardRouteOf(pick), probeRoute: pick.probeRoute || null,
+                      port: fe.port, bridgeUrl: isRemote ? null : BRIDGE_URL, bridgeMode: BRIDGE_MODE,
+                      registry: isRemote ? null : registrySnapshotFor(pick.pid),
+                      liveness: pick.liveness || null };
     if (isRemote) { errBody.endpoint = pick.endpoint; errBody.endpointUrl = pick.endpointUrl; errBody.remote = true; }
     else if (isTimeout) { errBody.hint = 'raise VB6MCP_FORWARD_TIMEOUT_MS for legitimately long calls'; }
-    return stampBody({ content: [{ type: 'text', text: JSON.stringify(errBody) }], isError: true }, ideStamp, snap.contractVersion, pickNote);
+    const guardedErr = nullPortUrlGuard(errBody, 'forward_failed(' + String(name) + ')');
+    return stampBody({ content: [{ type: 'text', text: JSON.stringify(guardedErr || errBody, null, 2) }], isError: true }, ideStamp, snap.contractVersion, pickNote);
   }
   dbg('forward phases: rpc=' + (Date.now() - tFwd) + 'ms tool=' + name + ' ' + (isRemote ? 'endpoint=' + pick.endpoint : 'port=' + pick.port));
   const result = (resp && resp.result) || { content: [{ type: 'text', text: JSON.stringify(resp) }] };
@@ -2981,7 +3441,8 @@ async function handleCall(params) {
                                    hubSelectorSent: String(argsIn._target), hubSelectorForm: 'verbatim_explicit' },
         (localRes && localRes.pick && localRes.pick.ok) ? hubVerdictNote(localRes.pick, rawRequest,
           'explicit _target "' + String(argsIn._target) + '" was handed to the middle service VERBATIM (the hub never rewrites an explicit target)') : {});
-      const stampedEx = await bridgeForwardCall(name, argsIn, snap, note);
+      const stampedEx = await bridgeForwardCall(name, argsIn, snap, note, localRes && localRes.pick);
+  if (forwardAnsweredOk(stampedEx)) noteForwardSuccess(localRes && localRes.pick);
       if (stampedEx) {
         const refusal = targetRefusalOf(stampedEx);
         if (refusal) {
@@ -3003,7 +3464,8 @@ async function handleCall(params) {
           + ') and handed the middle service the canonical selector "' + sel + '" (form=' + form + ')'),
         { targetResolved: sel, targetResolvedBy: 'hub', hubSelectorSent: sel, hubSelectorForm: form,
           hubTargetNotRewritten: false });
-      const stamped = await bridgeForwardCall(name, argsOut, snap, note);
+      const stamped = await bridgeForwardCall(name, argsOut, snap, note, localRes && localRes.pick);
+  if (forwardAnsweredOk(stamped)) noteForwardSuccess(localRes && localRes.pick);
       if (stamped) {
         // (3) NO SILENT FALLBACK: if the middle service does not accept the form the hub handed it,
         // the call FAILS with a distinguishable reason, and the receipt records that nothing else
@@ -3080,7 +3542,24 @@ async function handleCall(params) {
   return forwardPicked(pick, name, args, snap, explicit, rawRequest);
 }
 
-function send(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+function send(obj) {
+  // FAIL-CLOSED last line of defence (task-107): no JSON-RPC payload may carry a null/undefined
+  // port URL.  The per-receipt guards make this unreachable in normal operation; if some future
+  // path still builds one, the caller gets a structured replacement instead of a URL parse error.
+  let out = JSON.stringify(obj);
+  if (NULL_PORT_URL_RE.test(out)) {
+    const id = (obj && obj.id !== undefined) ? obj.id : null;
+    dbg('SEND GUARD: replaced a payload containing a null/undefined port URL (id=' + String(id) + ')');
+    out = JSON.stringify({ jsonrpc: '2.0', id: id, result: { content: [{ type: 'text', text: JSON.stringify({
+      ok: false, reason: 'internal_null_port_url', failureKind: 'toolError', failureKindRule: FAILURE_KIND_RULE,
+      where: 'jsonrpc_send', bridgeUrl: BRIDGE_URL, bridgeMode: BRIDGE_MODE,
+      middleService: middleServiceReceipt(),
+      message: 'FAIL-CLOSED self-check: refused to emit an outward payload that contains a null/undefined port URL.',
+      hint: 'a pipe-only IDE has no TCP endpoint; the middle service (VB6MCP_BRIDGE_URL) is its only addresser. Nothing was forwarded.'
+    }, null, 2) }], isError: true } });
+  }
+  process.stdout.write(out + '\n');
+}
 
 async function handle(line) {
   let req;
@@ -3180,6 +3659,18 @@ function flushResidual(reason) {
     return;
   }
   dispatch(rem);
+}
+// task-108 (author addendum): the middle service must be RESIDENT even when NO VB IDE exists at
+// all, so the lazy ensure is ALSO kicked at HUB STARTUP (background - it must never delay
+// initialize/tools/list, hence the timer and the ignored promise).  A later IDE needs no restart
+// of the service: the bridge caches "no instance" for VB6MCP_DISCOVERY_TTL_MS (2 s) and a failed
+// pipe probe for 2 s, so the next call after the add-in registers is already served.
+if (BRIDGE_MODE !== 'inproc') {
+  setTimeout(function () {
+    ensureMiddleService().then(function (ms) {
+      if (ms) dbg('middle ensure at startup: reachable=' + ms.reachable + ' reason=' + ms.reason + ' pid=' + ms.pid + ' managedByThisHub=' + ms.managedByThisHub);
+    }).catch(function (e) { dbg('middle ensure at startup failed: ' + String((e && e.message) || e)); });
+  }, 50);
 }
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', function (chunk) {
