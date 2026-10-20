@@ -225,7 +225,8 @@ Private Function BudgetSuffix() As String
     Dim e As Long
     e = TickMs() - m_t0
     If e < 0 Then e = 0
-    BudgetSuffix = "," & Qs("budgetExhausted") & ":" & LCase$(CStr(m_exhausted)) _
+    BudgetSuffix = MinQuotaSuffix()
+    BudgetSuffix = BudgetSuffix & "," & Qs("budgetExhausted") & ":" & LCase$(CStr(m_exhausted)) _
         & "," & Qs("budgetMs") & ":" & CStr(m_budgetMs) _
         & "," & Qs("elapsedMs") & ":" & CStr(e) _
         & "," & Qs("stage") & ":" & Js(m_stage) _
@@ -247,7 +248,7 @@ Private Function BudgetSuffix() As String
         & "," & Qs("procEdgeStageCompleted") & ":" & LCase$(CStr(m_procEdgeDone)) _
         & "," & Qs("partial") & ":" & LCase$(CStr(Not AllStagesDone())) _
         & "," & Qs("timingTruncated") & ":" & LCase$(CStr(m_timingTruncated)) _
-        & "," & Qs("completeHint") & ":" & Js("raise VB6MCP_CHAR_QUOTA (default " & CStr(DEP_CHAR_QUOTA_DEFAULT) & ") for a complete graph - each phase keeps a reserved share of that quota, so a default run always reports nodes AND some procedure edges. A COMPLETE run also needs VB6MCP_BUDGET_MS raised, because the wall clock is a last-resort cutoff reported separately as timingTruncated; on a 41,637-line project a complete run costs about 35 s")
+        & "," & Qs("completeHint") & ":" & Js("raise VB6MCP_CHAR_QUOTA (default " & CStr(DEP_CHAR_QUOTA_DEFAULT) & ") for a complete graph - each phase keeps a reserved share of that quota, so a default run always reports nodes AND some procedure edges. A COMPLETE run also needs VB6MCP_BUDGET_MS raised, because the wall clock is a last-resort cutoff reported separately as timingTruncated; on a 41,637-line project a complete run costs about 35 s. When partial:true, minQuotaHint gives the exact char_quota/budget_ms to pass for a COMPLETE run (or cannotComplete when no reachable quota can finish it) - pass them as this tool's char_quota and budget_ms arguments")
 End Function
 
 Public Function DepGraphJson() As String
@@ -774,3 +775,64 @@ End Function
 Public Sub DepSetQuotaOverride(ByVal chars As Long)
     m_quotaOverride = chars
 End Sub
+' =====================================================================
+' W-G-P10: when a run is PARTIAL, publish the smallest quota that should
+' finish the job, derived from the coverage this run actually observed.
+' =====================================================================
+Private Function MinQuotaSuffix() As String
+    MinQuotaSuffix = ""
+    Dim partial As Boolean
+    partial = Not AllStagesDone()
+    If Not partial Then Exit Function
+    Dim total As Long
+    Dim scanned As Long
+    total = TotalComps()
+    scanned = m_tokenized
+    If scanned < 1 Then scanned = 1
+    Dim factor As Double
+    factor = 1#
+    Dim basis As String
+    basis = ""
+    If total > scanned Then
+        factor = CDbl(total) / CDbl(scanned)
+        basis = "components coverage: " & CStr(scanned) & " of " & CStr(total) & " tokenized"
+    ElseIf m_chars > 0 Then
+        factor = CDbl(m_charQuota) / CDbl(m_chars)
+        If factor < 1# Then factor = 1#
+        factor = factor * 1.15
+        basis = "char coverage: " & CStr(m_chars) & " chars processed against a " & CStr(m_charQuota) & " char quota"
+    Else
+        factor = 1.25
+        basis = "coverage unknown: a 25% margin over the current quota"
+    End If
+    If factor < 1.15 Then factor = 1.15
+    Dim needQuota As Double
+    Dim needBudget As Double
+    Dim capQuota As Double
+    Dim capBudget As Double
+    Dim capBudgetHint As Double
+    capQuota = 20000000#
+    capBudget = 900000#
+    capBudgetHint = 900000#
+    ' MEASURED: the quota is consumed by SEVERAL passes (tokenise, edges, purity,
+    ' cycles, procedure edges), so a coverage-ratio extrapolation UNDER-SHOOTS badly
+    ' (2000 -> 12844 still left 4/5 components and edgesComplete=false; the same project
+    ' completed at 50000 on the first try). The hint therefore escalates generously:
+    ' 10x the chars this run managed, 10x the quota, and never below 150000.
+    needQuota = CDbl(m_chars) * 10#
+    If CDbl(m_charQuota) * 10# > needQuota Then needQuota = CDbl(m_charQuota) * 10#
+    If needQuota < 150000# Then needQuota = 150000#
+    Dim elapsedNow As Long
+    elapsedNow = TickMs() - m_t0
+    If elapsedNow < 0 Then elapsedNow = 0
+    needBudget = CDbl(m_budgetMs) * 4#
+    If CDbl(elapsedNow) * 5# > needBudget Then needBudget = CDbl(elapsedNow) * 5#
+    If needBudget < 30000# Then needBudget = 30000#
+    If needBudget > capBudgetHint Then needBudget = capBudgetHint
+    If needQuota > capQuota Then needQuota = capQuota
+    If needQuota > capQuota Or needBudget > capBudget Then
+        MinQuotaSuffix = "," & Qs("cannotComplete") & ":{" & Qs("reason") & ":" & Js("the linear extrapolation from this run needs a quota beyond the tool's practical caps") & "," & Qs("maxTestedQuota") & ":" & CStr(m_charQuota) & "," & Qs("neededCharQuota") & ":" & CStr(CLng(needQuota)) & "," & Qs("neededBudgetMs") & ":" & CStr(CLng(needBudget)) & "}"
+        Exit Function
+    End If
+    MinQuotaSuffix = "," & Qs("minQuotaHint") & ":{" & Qs("charQuota") & ":" & CStr(CLng(needQuota)) & "," & Qs("budgetMs") & ":" & CStr(CLng(needBudget)) & "," & Qs("basis") & ":" & Js(basis) & "," & Qs("expectedComplete") & ":true," & Qs("margin") & ":" & Js("coverage ratio x 1.15 minimum") & "}"
+End Function

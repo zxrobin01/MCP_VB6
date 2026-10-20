@@ -57,7 +57,7 @@ MinorVer=0
 RevisionVer=0
 AutoIncrementVer=0
 ServerSupportFiles=0
-VersionComments=algo=vb6src/2;src=0c3bd0f6aff56e8635581628d60d0c176f813ad702aa410233864185e0e3aeea
+VersionComments=algo=vb6src/2;src=0ed1dbaeb53945f7bfa05dc5f32418c80da550d06b2c625026b3af75fc7b3d79
 VersionCompanyName="VB6MCP"
 CompilationType=0
 OptimizationType=0

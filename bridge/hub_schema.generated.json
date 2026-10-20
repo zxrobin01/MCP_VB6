@@ -1,10 +1,10 @@
 {
   "generatedFrom": "docs/tools_schema.json",
-  "faceFingerprint": "4560f6e8517e9817aaa24082f108f3593167173aad151b1529cc466da034b29a",
-  "contractVersion": "v1.11.11",
-  "contractDeclaredToolCount": 110,
+  "faceFingerprint": "89263aa689eb7f39ade863cbe94c0f1ad4f1bd1e04ac40cdb2e3c1553acd2fe7",
+  "contractVersion": "v1.12.0",
+  "contractDeclaredToolCount": 120,
   "versionToolCountMismatch": false,
-  "toolCount": 110,
+  "toolCount": 120,
   "instructions": "PRODUCT vb6-mcp <semver>  CONTRACT v1.11.4  TOOLS 110  BUILT <sha256 前 8 位>\nBREAKING (read before calling):\n- v1.11.0 the 5 lessons tools (list_lessons / add_lesson / delete_lesson / export_lessons / import_lessons_md) MOVED from the add-in face to the hub face: names/descriptions/inputSchema are unchanged and they now also work with NO IDE online; the add-in face is 110 tools, the hub face 5 -> 10, DSH-facing total stays 120\n- v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind=\"api_unavailable\" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)\n- v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)\n- v1.6.0 send_window_message: WM_CLOSE/WM_QUIT/WM_SYSCOMMAND need confirm=true; the parameter is message (not msg) and raw numbers are accepted\n- v1.6.0 add_component(type=form): the form is built by the IDE itself; the receipt adds createdVia (ide_dialog|synthesized) and the call takes ~3.5-4.9 s\n- v1.6.0 +2 tools: replace_in_files (dry_run defaults to true; only the OPEN project) and undo_edit (pane-only, explicit)\n- v1.7.0 snapshot param (ADDITIVE, non-breaking): replace_code / apply_edits / edit_by_anchor accept snapshot=true (on/yes/1) to guarantee exactly ONE pre-edit pane snapshot that undo_edit can restore; default off (set / apply_edits / edit_by_anchor already snapshot by default)\n- get_component_code: coords default disk -> ide (pass coords=\"disk\" for the old text/numbering); response is a JSON envelope, text in result.text\n- replace_code: out-of-range/continuation now REJECTED (range_beyond_end / inside_continuation); deletedLines=0 is no longer a success signal\n- write-class tools: validate=off|warn|strict; edit-side failures carry ok:false + reason\n- write_file now truncates; build/make_project/verify: judge by artifactChanged/verdict (compiled-no-artifact-change = NOT built)\nROUTING (use the tool; never hand-edit VB project files):\n- .vbp version + build metadata (MajorVer / MinorVer / RevisionVer / AutoIncrementVer / CompanyName / FileDescription / ProductName / Title / ExeName32 / CondComp) -> project_meta (text edit, keeps a .bak; close the project first)\n- project / IDE options (description / help file / startup object / startup project / output path / read-only) -> set_project_options\n- UAC level + DPI awareness -> app_manifest (writes <exe>.manifest; do not hand-write one)\n- components: add / remove / import / rename / reload / export -> add_component / remove_component / import_component / rename_component / reload_component / export_component\n- COM references -> add_reference / remove_reference / check_references\n- forms and controls: list / add / remove / design-time properties -> form_designer / add_control / remove_control / set_control_property / list_component_parts\n- lint before writing / static checks / formatting -> validate_code / check_component / format_code / verify / verify_scope\n- component text edits (surgical or bulk) -> edit_by_anchor / apply_edits / replace_code / replace_in_files; preview_edit first; snapshot=true or undo_edit to roll back\n- project-wide checkpoint / rollback -> project_snapshot (whole project: .vbp + component files)\n- build verdict -> build (offline /make) or make_project (in-IDE): judge by artifactChanged + verdict; compiled:true alone is NOT built\n- ENCODING: VB project files (.vbp / .frm / .cls / .bas / .ctl / .pag / .dsr / .res / .inc) must stay system ANSI (GBK) WITHOUT a BOM - never hand-edit or re-encode them (a UTF-8 BOM makes VB6 refuse the project: \"invalid keyword\"); the tools above already write ANSI for those extensions.\n- v1.11.4 current (110 tools): the bullets above are historical - call mcp_info once after initialize for the authoritative breaking[] / migrations[] / changelog[]\nCAPABILITY INDEX (question -> tool; read this before improvising):\n- impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)\n- who references a symbol -> rename_symbol  (dry_run=true by default; skips strings and comments)\n- public API broken? -> check_public_api / export_public_api ; missing files or OCX parts -> check_references / list_component_parts\n- runtime window tree / control text / modal dialog -> find_gui / ui_text / read_active_dialogs\n- click a button or send keys to a window of THIS VB6 process -> send_window_message\n- offline single-module test -> test_host ; stub a procedure or trace calls -> fault_inject / inject_trace\n- NOT available: screenshots; driving a standalone built EXE (message tools are in-process only)\nFILE ENCODING: .vbp/.frm/.cls/.bas/.ctl are ANSI WITHOUT BOM (write_file / write_source already do this); never write them as UTF-8-with-BOM, or VB6 reads a mangled first keyword and the project stops loading; use project_meta for .vbp version metadata (keeps a .bak).",
   "breaking": [
     "- v1.11.0 the 5 lessons tools (list_lessons / add_lesson / delete_lesson / export_lessons / import_lessons_md) MOVED from the add-in face to the hub face: names/descriptions/inputSchema are unchanged and they now also work with NO IDE online; the add-in face is 110 tools, the hub face 5 -> 10, DSH-facing total stays 120",
@@ -44,7 +44,7 @@
   "tools": [
     {
       "name": "ide_state",
-      "description": "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to ASK the in-flight call to stop, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000). BOTH ARE BEST EFFORT: while a call holds the message-pump point no second call is executed - the request may not even be delivered - so the reliable exits are WAIT or terminate the VB6 process from outside.",
+      "description": "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to ASK the in-flight call to stop, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000). BOTH ARE BEST EFFORT: while a call holds the message-pump point no second call is executed - the request may not even be delivered - so the reliable exits are WAIT or terminate the VB6 process from outside. It also reports stateSource (ebMode | commandBars | ebMode+commandBars), commandBarsSuspended and notRunning, and clears a detected post-run suspended CommandBars window with ONE activate_component (autoRecover in the receipt) so a following attach call cannot mistake design for run. Waits are resolved EbMode-FIRST: EbMode=2 is break; while the CommandBars model is suspended EbMode=1 is run and EbMode=0 is design (nothing is running), never run.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -64,21 +64,26 @@
             "type": "integer",
             "description": "The age threshold for release_inflight, in ms (default 60000). The gate is NOT touched while the in-flight call is younger than this, so a healthy long call keeps the single-flight guarantee."
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "current_position",
       "description": "Where the engine is currently stopped, read from the IDE itself: in break mode {available:true, project, module, proc, line, text, ebMode} with line 1-based inside the module and text the raw source line; in design/run mode {available:false, reason:not_in_break} without raising. The raw selection it read is echoed as selectedLine so the claim can be cross-checked.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
       "name": "list_breakpoints",
       "description": "List the breakpoints this tool injects into source (marker lines ' @mcp-break <id> begin / Debug.Assert False / end') as {component, line, kind, enabled}. The VBIDE object model has no breakpoint API, so IDE-native breakpoints cannot be enumerated and are reported as native:null instead of being guessed.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -99,7 +104,8 @@
             "type": "integer",
             "description": "How many child-window levels to include (default 3)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -120,14 +126,17 @@
             "type": "boolean",
             "description": "true = only visible windows, false = only hidden ones; omitted = no visibility filter"
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "get_project_info",
       "description": "Get detailed information about the open VB6 project(s): name, paths, type, IDE mode (design/run/break), options (description, help file, startup object, start project), components and references.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -172,7 +181,8 @@
             "type": "boolean",
             "description": "Set true to apply read_only_mode"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -215,7 +225,8 @@
             "type": "string",
             "description": "Optional .vbp template path (VBProjects.AddFromTemplate)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -228,14 +239,17 @@
             "type": "string",
             "description": "Project name (default: active project)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "get_component_list",
       "description": "List all components (modules/forms/classes) of a project with procedures, kinds, line ranges, dirty state and designer info.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -324,6 +338,86 @@
         "required": [
           "name",
           "operation"
+        ]
+      }
+    },
+    {
+      "name": "move_procedure",
+      "description": "Move a WHOLE procedure block between components in ONE transaction: take the block from the SOURCE pane, insert it into the TARGET (after insert_anchor, or appended), then delete it from the SOURCE. Any failure rolls BOTH panes back (rolledBack:true, restoreVerified proves the read-back). .vbp is never touched. Receipt: moved{from,to,proc,lineCount,insertAfterLine}, sourceSha256Before/After, targetSha256Before/After, rolledBack, restoreVerified, snapshots[], encoding/roundtrip_ok/bom, vbpTouched:false.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "from_component": {
+            "type": "string",
+            "description": "Source component name"
+          },
+          "proc": {
+            "type": "string",
+            "description": "Procedure name to move (exact, case-insensitive)"
+          },
+          "to_component": {
+            "type": "string",
+            "description": "Target component name"
+          },
+          "insert_anchor": {
+            "type": "string",
+            "description": "Optional exact line in the target after which the block is inserted; omit to APPEND at the end of the target"
+          }
+        },
+        "required": [
+          "from_component",
+          "proc",
+          "to_component"
+        ]
+      }
+    },
+    {
+      "name": "delete_procedures",
+      "description": "Delete SEVERAL procedures in ONE transaction: a pre-edit _undo pane snapshot is written for every touched component (undo_edit can restore it); if any deletion fails every touched pane is restored. Receipt: deleted[]{component,proc,fromLine,toLine,lineCount}, snapshotId, rolledBack, restoreVerified, shas[].",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "procedures": {
+            "type": "array",
+            "description": "Procedure list: either [{component,proc}, ...] or plain proc names (then component names the single component)"
+          },
+          "component": {
+            "type": "string",
+            "description": "Component used for plain proc-name entries"
+          }
+        },
+        "required": [
+          "procedures"
+        ]
+      }
+    },
+    {
+      "name": "edit_by_byte_anchor",
+      "description": "Replace bytes in a file using GBK/ANSI RAW-BYTE anchors (base64 in, base64 out) - the only byte-exact edit path for mixed Chinese/ASCII sources. Refuses an anchor that would split a double-byte GBK character (lead 0x81..0xFE / trail 0x40..0xFE) with reason=anchor_splits_gbk_char; reports encoding_mismatch when the bytes are valid text but the file is not in that encoding. A round-trip self-check (decode->encode) runs BEFORE writing and a failure refuses the write (roundtrip_ok:false). Receipt: encoding, bom{...}, gbkBoundarySafe, anchorByteOffset, matches, sha256Before/After, bytesBefore/After, roundtrip_ok.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or project-relative file path"
+          },
+          "old_bytes_b64": {
+            "type": "string",
+            "description": "Base64 of the exact ORIGINAL bytes to replace (GBK/ANSI bytes as stored on disk)"
+          },
+          "new_bytes_b64": {
+            "type": "string",
+            "description": "Base64 of the replacement bytes (may be empty to delete, or contain an INSERTION)"
+          },
+          "all_matches": {
+            "type": "boolean",
+            "description": "default false = the anchor must occur exactly once; true = replace every occurrence"
+          }
+        },
+        "required": [
+          "path",
+          "old_bytes_b64",
+          "new_bytes_b64"
         ]
       }
     },
@@ -577,7 +671,8 @@
             "type": "string",
             "description": "Optional component whose code pane to query (default: active code pane)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -606,14 +701,17 @@
             "type": "boolean",
             "description": "Bring the code pane to the front (Show)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "get_selection",
       "description": "What is currently selected in the IDE: selected component, active project, active window and cursor position.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -663,7 +761,8 @@
             "type": "integer",
             "description": "Maximum number of entries (default: 500)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -726,6 +825,10 @@
               "warn",
               "strict"
             ]
+          },
+          "confirm_truncate": {
+            "type": "boolean",
+            "description": "default false. Guard against ACCIDENTAL data loss: when the target ALREADY EXISTS and is NON-EMPTY and content is empty/blank, the write is REFUSED with reason=empty_content_would_truncate. Pass true to intentionally empty a NON-VB file. VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are ALWAYS refused, even with confirm_truncate:true - an empty VB source cannot compile; delete the file explicitly if that is really intended."
           }
         },
         "required": [
@@ -780,7 +883,8 @@
             "type": "string",
             "description": "Optional .vbp path: an unsaved project is saved there and unsaved components are saved next to it (bas/cls/frm/res by type)."
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -800,6 +904,10 @@
           "out_path": {
             "type": "string",
             "description": "route=cli: compiler log path (default %TEMP%\\vb6mcp_build.log)"
+          },
+          "project": {
+            "type": "string",
+            "description": "Optional ABSOLUTE path of ANY .vbp to compile (route=cli only). When set, that project is compiled even if a DIFFERENT project is open in the IDE; a CLI build registers a CLSID snapshot around the /make and restores/ reports it. route=ide refuses this parameter (the IDE route compiles whatever the IDE holds)."
           },
           "timeout_ms": {
             "type": "integer",
@@ -821,12 +929,13 @@
             "type": "boolean",
             "description": "default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure."
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "control_execution",
-      "description": "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken.",
+      "description": "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken. An end/stop that finds NOTHING running (EbMode=0 and design) returns ok:true + state_not_changed:true + alreadyNotRunning:true instead of ok:false: in the post-run suspended CommandBars window the End item is disabled precisely because the program has already ended.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -932,7 +1041,8 @@
             "type": "integer",
             "description": "Minor version (default: 0)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1048,7 +1158,9 @@
       "name": "list_windows",
       "description": "List all IDE windows with caption, kind, visibility, state, position and size.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1176,7 +1288,9 @@
       "name": "list_component_parts",
       "description": "Read-only: list the ActiveX control parts this project has registered (its .vbp Object= lines) as {guid, version, path, resolvedPath, exists}. Intrinsic VB.* controls are compiled in, need no declaration and are therefore NOT listed; unknown ProgIDs are not resolved to a part, so no progIds are reported.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1282,7 +1396,9 @@
       "name": "list_addins",
       "description": "List all registered add-ins with their connection state.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1352,7 +1468,8 @@
             "type": "integer",
             "description": "Maximum number of dialogs to return (default: all)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1377,7 +1494,8 @@
             "type": "boolean",
             "description": "Default false. A dialog whose own button starts a long VB6-modal operation (VB6's Make Project box, detected from its title or from its Save &in: / Save as &type: / File &name: controls) is reported as host_modal_risk=known and is NOT clicked, because the click leaves the host inside a modal loop that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy (busyTool=close_active_dialogs) until the IDE is restarted. Set true to click it anyway."
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1432,7 +1550,9 @@
       "name": "quit_ide",
       "description": "Quit the VB6 IDE (VBE.Quit) with an HONEST receipt. A process cannot observe its own exit (once it exits, no receipt can be written), so exited is ALWAYS false here and the exit is confirmed by an observer OUTSIDE this process. If anything BLOCKS the quit - unsaved project/component changes, or a modal box that owns the IDE (ownerDisabled=true) - NOTHING is requested: ok:false + requested:false + blockedBy + evidence{dialogs[],unsavedProjects[],unsavedComponents[]} + howToClear, and the IDE is left running and unchanged. Otherwise the quit IS requested: ok:true + requested:true + pendingExit:true + waitedMs (the measured pre-check) + howToConfirm. quitting:true is kept only as a legacy alias of requested, never as a claim of exit. The quit runs about 150 ms AFTER this response is sent, so confirm the exit outside: poll ide_state / ide_list / the instance registry until THIS pid is gone.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1529,7 +1649,8 @@
             "type": "boolean",
             "description": "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted."
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1680,6 +1801,10 @@
               "warn",
               "strict"
             ]
+          },
+          "confirm_truncate": {
+            "type": "boolean",
+            "description": "default false. An EXISTING NON-EMPTY target plus empty/blank text is REFUSED with reason=empty_content_would_truncate; VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are ALWAYS refused even with confirm_truncate:true (an empty VB source cannot compile)."
           }
         },
         "required": [
@@ -1710,6 +1835,198 @@
         "required": [
           "name"
         ]
+      }
+    },
+    {
+      "name": "debug_session",
+      "description": "Drive ONE whole VB6 debug session inside a SINGLE call: arm the given breakpoints, START the program WITHOUT saving the project, wait for a breakpoint hit, then execute the ordered actions (step_over/step_into/step_out/eval/continue/stop) and return transcript[] {seq,kind,position{module,proc,paneLine,diskLine},proc,callstack,locals,output,err} plus stopReason/wedged. The VB6 IDE is single-threaded (STA), so a debug session cannot be driven by concurrent calls - it is compressed into this one call. This tool NEVER saves the project (preRunSave=false: the run path deliberately bypasses control_execution, whose run does a pre-run flush); call save_project first if the project must be on disk. The session REQUESTS control_execution(end) and then waits a BOUNDED 3 s inside the call; because End is a QUEUED command in a single-threaded IDE, that wait cannot observe it - a state that still reads break/run is reported as endQueued=true + howToFinish, NOT as wedged. wedged=true means the call could not recover the IDE in-call: an EbMode=2 break context held while the CommandBars model is gone, and one activate_component attempt did not clear it. EVERY return path (normal/timeout/error) also reports diskVbpShaAfter/savedDuringCall/reorderedDuringCall. Refused with reason=already_in_break when the IDE is already broken (end it first). Every breakpoint is echoed with armed/paneLine/diskLine/hitCount, and the .vbp is read from DISK before and after (diskVbpShaBefore/diskVbpShaAfter) - equality is the 'nothing was written' proof. The IDE may still be finishing the queued end/start commands after this call returns: confirm with ide_state and call control_execution{end} if needed (howToFinish is provided when that is the case).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "runArgs": {
+            "type": "string",
+            "description": "Command line arguments passed to the started program (optional)"
+          },
+          "env": {
+            "type": "object",
+            "description": "{NAME: value} environment variables for the started program (optional)"
+          },
+          "breakpoints": {
+            "type": "array",
+            "description": "Array of {component, line (PANE line space), condition?, hitCount?, enabled?}"
+          },
+          "actions": {
+            "type": "array",
+            "description": "Array of {op: step_over|step_into|step_out|eval|continue|stop, expr? (eval only)}"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Hard budget for the WHOLE session in ms (default 60000)"
+          },
+          "attach": {
+            "type": "boolean",
+            "description": "true = drive an ALREADY running/broken IDE (no Start click); false (default) = arm + start and return startedPending"
+          },
+          "watch": {
+            "type": "array",
+            "description": "Optional expressions evaluated at every break/step and merged into transcript[].watch as [{expr, value?, typeName?, error?}]. ONLY identifiers enumerated by an earlier get_locals in this IDE session are evaluated; an unknown name is recorded as {expr, error:\"unknown_identifier_refused\"} and NEVER evaluated (an unknown identifier can hang the in-flight call - measured). Each entry is individually wrapped in a gate backstop."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "run_until_break",
+      "description": "Run the project and stop at one of FOUR outcomes: break / process exit / unhandled error / timeout. TWO-PHASE because the VB6 IDE is single-threaded (STA) and Start is a QUEUED command: call ONE with attach=false - it arms breakpoints, clicks Start and returns startedPending=true + howToContinue (the program starts only AFTER the call returns); call TWO with attach=true - it OBSERVES and returns the UNIFIED debug receipt {ok,state,position,proc,callstack,locals,output,err,timeoutMs,wedged,stopReason,hitCountTotal,transcript[]} plus diskVbpShaBefore/diskVbpShaAfter and savedDuringCall/reorderedDuringCall (the debug path never saves). hitCount>1 is the engine-independent equivalent of a conditional breakpoint: every hit still stops the engine, the driver auto-continues the first N-1 hits and stops on the Nth (VB6 has NO conditional breakpoints; expression conditions are NOT supported and are not accepted). The single-flight gate is backstopped with ArmGateRelease(timeout_ms + 8 s): if this call never returns, a later read-only call can force-release it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Budget for the OBSERVATION phase in ms (default 30000, capped at 600000). The gate backstop is armed for this budget + 8 s so a read-only call can force-release a call that never returns."
+          },
+          "attach": {
+            "type": "boolean",
+            "description": "false (default) = arm + START and return startedPending immediately (Start is a QUEUED command in the STA IDE); true = OBSERVE the already running/broken IDE until break / process exit / unhandled error / timeout"
+          },
+          "breakpoints": {
+            "type": "array",
+            "description": "Array of {component, line (PANE line space), hitCount?} armed before starting (attach=false only). hitCount N means: stop on the Nth hit, auto-continue the earlier hits."
+          },
+          "watch": {
+            "type": "array",
+            "description": "Optional expressions evaluated at every break and merged into transcript[].watch; ONLY identifiers enumerated by an earlier get_locals are evaluated, an unknown name is recorded as {expr, error:\"unknown_identifier_refused\"} and never evaluated."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "breakpoints",
+      "description": "Manage REAL IDE breakpoints by component + source anchor / PANE line: set (injected source marker OR native Debug-menu toggle), clear, enable, disable, list, clear_all. ENUMERATION SOURCE is declared on every receipt: the list merges (a) source-marker breakpoints this add-in injected (readable again through list_breakpoints) and (b) native breakpoints set BY THIS ADD-IN's session (tracked in memory only); IDE-native breakpoints set by a HUMAN inside the IDE cannot be enumerated or verified because the VBIDE object model has NO breakpoint API - that limit is reported, never guessed. Every entry carries BOTH coordinate spaces: paneLine (the line an edit tool takes) and diskLine (paneLine + the component's SharedHeaderOffset), plus the coordinate-source note. hitCount is the engine-independent equivalent of a conditional breakpoint (stop on the Nth hit, auto-continue the earlier hits); expression conditions are NOT supported and not accepted. enable/disable for mode=native toggles the IDE breakpoint (its on/off state cannot be read back, so the receipt says nativeStateVerified:false and relies on the session record).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "list | set | clear | enable | disable | clear_all (default list)"
+          },
+          "component": {
+            "type": "string",
+            "description": "Component name (set/clear/enable/disable)"
+          },
+          "anchor": {
+            "type": "string",
+            "description": "For mode=injected: the source line to break before (must match uniquely inside a procedure body)"
+          },
+          "line": {
+            "type": "integer",
+            "description": "PANE line number (1-based) for mode=native (and the position to clear)"
+          },
+          "mode": {
+            "type": "string",
+            "description": "injected (default: a source-marker Debug.Assert block, survives the session, rewritten by the IDE only through this tool) | native (Debug-menu toggle on the caret line: NO source write, but the VBIDE has no breakpoint API so its state cannot be READ back)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable handle (default: generated)"
+          },
+          "hitCount": {
+            "type": "integer",
+            "description": "Stop on the Nth hit (default 1). Enforced by run_until_break / debug_session, not by the engine; a conditional EXPRESSION is not supported (VB6 has no conditional breakpoints)"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "get_locals",
+      "description": "Read the CURRENT procedure parameters and declared locals in BREAK mode, with their engine values. SOURCE DECLARATION: variable NAMES come from the SOURCE of the current procedure (parameter list plus Dim/Static declarations in its body); the VALUES are read by binding the VBA6 evaluation frame (vba6_probe frame_set path) and evaluating each name in the IDE immediate context - localsSource is echoed on every receipt. Nothing is invented: when no value can be read the receipt returns localsUnavailable:true + localsUnavailableReason + the raw frame diagnostics. Each value carries typeName + value (or error) and, for arrays/Dictionary/objects, a SHALLOW inspection with explicit depthLimit=2 / widthLimit=20, truncatedDepth, truncatedWidth and cycleDetected (ObjPtr identity). VB6 has no reflection, so a custom class reports its TypeName/ObjPtr and fieldsUnavailable:true rather than guessed fields. The per-value shape is the SAME one transcript[].watch uses (one helper).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "frame_index": {
+            "type": "integer",
+            "description": "0 = innermost frame (default). frame_set binds the VBA6 evaluation frame before every read."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "eval_at_frame",
+      "description": "Evaluate an expression in the IDE immediate context with an EXPLICIT SAFETY CONTRACT. frameBinding is ALWAYS ideImmediateContext and it is NOT the break frame: measured on the live bed, a*2 read 0 while a had been assigned 7 in the broken frame. The VBA6 frame-set thunk is FORBIDDEN here (measured: it terminated the VB6 process / pipe_stalled) - OUTER frame_index is refused, never attempted. In DESIGN the expression is evaluated normally. In BREAK (and RUN) evaluation is REFUSED with reason=eval_in_break_unsafe + howToUnblock, because a raising expression can hang the in-flight call (measured); pass allowUnsafeEval=true to execute anyway - the call is then wrapped in ArmGateRelease(timeout_ms, default 5000) and the receipt proves gateReleased. howToRecover is always present: ide_state{release_inflight:true, release_min_held_ms:<ms>} frees a hung single-flight gate; restart the IDE if the process itself is wedged. For object/array/Dictionary values a shallow inspection is returned ONLY in a safe context (design or allowUnsafeEval): depthLimit=2, widthLimit=20, truncatedDepth, truncatedWidth, cycleDetected. A failure NEVER returns a fabricated value: stopped_at + raw diagnostic text instead. CALLER BUDGET CONTRACT: timeoutMs (default 5000) is a HINT - the add-in cannot preempt an executing VB statement, so if it does not return within that budget the caller must stop waiting and recover with ide_state{release_inflight:true, release_min_held_ms:5000} (restart the IDE if needed). ANY state can hang an evaluation (design included: Array(1,2,3) hung in a measured run), so do NOT wait on a 120 s transport budget.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "expr": {
+            "type": "string",
+            "description": "VB expression to evaluate (e.g. i*2)"
+          },
+          "frame_index": {
+            "type": "integer",
+            "description": "0 = the IDE's current frame (default). OUTER frames are refused: reaching them needs the engine frame-set thunk, which is FORBIDDEN because it terminated the VB6 process (measured)."
+          },
+          "allowUnsafeEval": {
+            "type": "boolean",
+            "description": "false (default). In BREAK (and RUN) the immediate context is NOT the break frame and a raising expression can hang the in-flight call (measured), so evaluation there is REFUSED unless this is true. When true the call is wrapped in ArmGateRelease(timeout_ms) and a receipt proves the gate was released; recovery for a hang = ide_state{release_inflight:true, release_min_held_ms:...} and, if needed, restart the IDE."
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "description": "CALLER BUDGET HINT in ms (default 5000). The add-in CANNOT preempt a VB statement that is already executing: if this budget passes without a return, the CALLER must time out and use howToRecover (ide_state{release_inflight:true, release_min_held_ms:5000}, restart the IDE if needed). The internal ArmGateRelease is armed for this value + slack regardless."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Alias of timeoutMs (kept for compatibility)"
+          }
+        },
+        "required": [
+          "expr"
+        ]
+      }
+    },
+    {
+      "name": "run_project",
+      "description": "Start the OPEN project from the VB6 IDE with control over ENVIRONMENT and (where supported) command-line arguments, in TWO PHASES (Start is a QUEUED command in the STA IDE): phase 1 applies env (SetEnvironmentVariable, BEFORE Start - the IDE and the IDE-run program are the same process, so Environ() reads it) and returns startedPending + howToContinue; phase 2 observes and returns {startedPid, runningState, firstBreakpointHit, err}. env is restored when the program ends (envApplied[]/envRestored). VB6 CANNOT attach to an -Embedding process that is already running: the supported path is always to start a debuggable instance from the IDE. A Standard EXE started from the IDE does NOT receive Command$ (the Debugging-tab arguments belong to the ActiveX Component start mode), so a non-empty commandLineArgs is REFUSED with commandLineArgsSupported:false instead of silently ignored. The project start mode is a project property and is echoed, never switched at run time.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "commandLineArgs": {
+            "type": "string",
+            "description": "Arguments the started program should see as Command$. LIMITATION (documented): a Standard EXE started from the VB6 IDE does NOT receive Command$; only the ActiveX Component start mode has Debugging-tab arguments. When this is non-empty the tool REFUSES to start (commandLineArgsSupported:false) instead of pretending - build the EXE and run it with args, or use an ActiveX project."
+          },
+          "env": {
+            "type": "object",
+            "description": "{NAME: value} environment variables applied to the IDE process BEFORE Start (same process as the IDE-run program, so Environ() sees them). Previous values are captured and restored when the program ends; envApplied[] lists every one."
+          },
+          "startMode": {
+            "type": "string",
+            "description": "Standalone (default) | ActiveX Component. NOTE: the start mode is a PROJECT property and cannot be switched at run time - the receipt echoes the project's current startMode and says startModeApplied:false when it differs."
+          },
+          "observe": {
+            "type": "boolean",
+            "description": "false (default) = PHASE 1: apply env, click Start, return startedPending + howToContinue; true = PHASE 2: observe until break / exit / error dialog / timeout, then restore env"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Observation budget in ms (default 15000, capped 120000)"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "last_error",
+      "description": "Return the UNHANDLED-ERROR context WITHOUT evaluating in the break frame: {errorDialog{present,title,body,buttons[]}, errNumber/errDescription/errSource + errParsed{...}, callstack, localsNames[] (the names an earlier get_locals enumerated), position, proc, module, stopped_at, howToRecover}. SOURCE DECLARATION: the error text comes from the runtime-error dialog BODY (Win32 window channel), the stack from the VBA6 callstack probe, and the NAME list from get_locals' source-declaration scan; NOTHING is read by break-frame evaluation. Fields that cannot be parsed are returned as null with parsed:false - never guessed. The box is MODAL: dismiss it with dismiss:true (send_window_message click on the End button) or the IDE stays blocked.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dismiss": {
+            "type": "boolean",
+            "description": "true = dismiss the runtime-error box by clicking its End button with send_window_message (the ONLY working channel: close_active_dialogs refuses it by the safe whitelist - measured). Nothing is clicked when false."
+          }
+        },
+        "required": []
       }
     },
     {
@@ -1845,7 +2162,8 @@
             "type": "integer",
             "description": "How many recent entries (default 50)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1908,7 +2226,8 @@
       "description": "Catalog of the VB6 debug commands this server knows, for use with the CommandBars path. Per entry: id (this server's stable command NAME, e.g. step_into - NOT a CommandBar id), keys (shortcut), english (English caption), menuId (the live CommandBar Control.Id, or the measured table value when the control cannot be resolved live), shortcutText, caption (LOCALIZED - the Chinese IDE returns Chinese) and idSource (live|table). It is a FIXED list, not a live probe of the IDE: it carries no menu path and no enabled/visible state. For ids, captions, paths and enabled flags call command_bars action=list.",
       "inputSchema": {
         "type": "object",
-        "properties": {}
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1921,14 +2240,17 @@
             "type": "integer",
             "description": "Target process id (default: the IDE process hosting this add-in)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "desktop_probe",
       "description": "Read the LIVE desktop/interactivity state of the process that hosts the add-in: {ok, windowStation, desktop, sessionId, interactive, canSendInput, foregroundHwnd, foregroundReadable, probeBasis, note}. Every value is MEASURED on each call (GetProcessWindowStation + GetUserObjectInformationW(UOI_NAME) + GetThreadDesktop + OpenInputDesktop + GetForegroundWindow + IsWindow + ProcessIdToSessionId, all inside the add-in process; the input-desktop handle it opens is closed again). The foreground/desktop state is reported as a LIVE structured value: foregroundHwnd can be 0 on a non-interactive or locked desktop and that is reported as-is. The probe never steals focus to obtain it (no SetForegroundWindow) and never derives send-input capability from a window-station name: this add-in delivers input as PostMessage(WM_KEYDOWN/WM_KEYUP/WM_MOUSEWHEEL) to windows of its OWN process, measured to deliver while ANOTHER process owns the foreground. If any of those APIs cannot be called, or returns no handle, the tool answers ok:false + failureKind=api_unavailable + failedApi + apiError + apiErrorText + measured:false instead of a zero-filled picture, and the desktop{} block on the input-family receipts carries measured:false as well. A missing Alias clause on a Declare surfaces here as VB error 453 rather than as zeros. Read-only.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1936,7 +2258,8 @@
       "description": "Ordered plan for the VBA6.DLL debug-engine probes (read-only first, writes last) with preconditions. Run only inside the IDE process.",
       "inputSchema": {
         "type": "object",
-        "properties": {}
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -1953,7 +2276,8 @@
             "type": "boolean",
             "description": "Light mode (default false): return only the member list (kind/name/sig) and skip the TSV spec text, which also skips a second parse of the same text. This tool never compares anything, so membersOnly is OUTPUT SIZE only (no comparison is skipped). Unknown argument names are refused with reason=unknown_argument + acceptedArguments."
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -1994,7 +2318,8 @@
             "type": "integer",
             "description": "Optional WALL-CLOCK budget for THIS call (overrides VB6MCP_BUDGET_MS and the 30 s default). The wall clock is a separate last-resort cutoff reported as timingTruncated; a large project needs both this and char_quota raised for a complete graph (measured: about 35 s for a 41,637-line project)."
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2007,7 +2332,8 @@
             "type": "string",
             "description": "Component name"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2020,7 +2346,8 @@
             "type": "string",
             "description": "Component name"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2068,7 +2395,8 @@
       "description": "List installed extension packs with enabled state, tool count and file path.",
       "inputSchema": {
         "type": "object",
-        "properties": {}
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -2081,7 +2409,8 @@
             "type": "string",
             "description": "Extension pack name"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2094,7 +2423,8 @@
             "type": "string",
             "description": "Extension pack name"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2102,7 +2432,8 @@
       "description": "Rescan mcp_extensions and report pack / enabled-tool counts.",
       "inputSchema": {
         "type": "object",
-        "properties": {}
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -2131,7 +2462,8 @@
             "type": "string",
             "description": "Extension pack name"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2148,7 +2480,8 @@
             "type": "boolean",
             "description": "Reset the dropped-events counter after reading"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2161,7 +2494,8 @@
             "type": "integer",
             "description": "Maximum frames to return (default 32, cap 128)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2370,7 +2704,8 @@
             "type": "integer",
             "description": "Accepted for compatibility with the probe plan; this build's callstack probe reports the engine's own frames (use cs_fn for one explicit frame)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2504,7 +2839,8 @@
             "type": "boolean",
             "description": "Also list references that resolve fine (default false = problems only)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2727,7 +3063,8 @@
             "type": "string",
             "description": "Repository directory for the git half (default: the active project folder)"
           }
-        }
+        },
+        "required": []
       }
     },
     {
@@ -2743,22 +3080,31 @@
           "path": {
             "type": "string",
             "description": "Optional disk path override"
+          },
+          "baseline": {
+            "type": "string",
+            "description": "Optional lint baseline (a previous verify/check_component receipt text or its stableKey lines). Diagnostics matching the baseline are filtered, so pre-existing lint noise cannot inflate the numbers; the pass/fail/unknown counters keep pass+fail+unknown==checked."
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "todo_status",
       "description": "READ-ONLY task-board snapshot. Scans an OPTIONAL in-repo task folder (tasks/ + reports/ Markdown) and returns {taskCount, openTasks, tasks[], reportCount, reports[], readOnly}. A missing task folder is a normal result (0 tasks), not an error.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
       "name": "mcp_info",
       "description": "Read-only version stamp for this server: {ok, product, contract, toolCount, build:{sha256, builtAt}, breaking[], migrations[], changelog[]}. build.sha256 is the SHA-256 of the DLL file on disk, read at call time (never a compile-time literal), so an independent Get-FileHash can be compared with it; builtAt is that file's LastWriteTime. breaking[] lists the contract changes that alter how existing calls must be made. Call this once after initialize to learn which contract the server implements.",
       "inputSchema": {
-        "type": "object"
+        "type": "object",
+        "properties": {},
+        "required": []
       }
     },
     {
@@ -2833,12 +3179,13 @@
             "type": "boolean",
             "description": "Default FALSE: restore changes the component's PANE text only, the file on disk is NEVER touched by default. true is not supported yet and is refused with reason=to_disk_not_supported - use save_project to flush the project."
           }
-        }
+        },
+        "required": []
       }
     },
     {
       "name": "immediate_eval",
-      "description": "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:\"value_not_parsed\"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).",
+      "description": "Evaluate a SCALAR EXPRESSION in the VB6 IDE immediate context and return its VALUE: {ok, value, valueKind, typeName, output, elapsedMs}. Object/array EXPRESSIONS (CreateObject(/GetObject(/New/Array() are REFUSED BEFORE EXECUTION with reason=object_expression_unsupported: the immediate channel does not support them (measured: a plain object assignment hangs the call). Assign the object to a PROJECT variable first and read scalar members; scalar results are unchanged. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:\"value_not_parsed\"} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).",
       "inputSchema": {
         "type": "object",
         "properties": {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""task-154 - build-source encoding guard for the VB6 project.
+"""Build-source encoding guard for the VB6 project.
 
 WHY
     VB6 reads every .bas / .cls / .frm as the SYSTEM ANSI CODE PAGE (ACP; 936/GBK

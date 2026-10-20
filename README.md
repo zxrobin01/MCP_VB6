@@ -47,9 +47,9 @@ AI 编程助手已经能很好地处理现代语言，却**够不到 VB6**：它
 也点不了那个「生成工程」对话框。本项目就是补这个缺口。
 
 **做法**：不另造编辑器，而是**把 VB6 IDE 本身变成一个 MCP 服务器**——加载一个插件，IDE
-就对外提供 110 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
+就对外提供 120 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
 弹窗处理、窗体与项目元数据、快照与回滚、打包。此外还有 10 个 **hub 面**工具（IDE 实例管理与
-经验库）在 IDE 进程外提供，客户端合计可见 120 个。
+经验库）在 IDE 进程外提供，客户端合计可见 130 个。
 **因为工具就住在 IDE 进程里**，它能做进程外方案做不到的事：真的去点那个对话框、真的按运行、
 真的读断点处的局部变量。
 
@@ -81,7 +81,7 @@ MCP_VB6/
 ├─ McpServer.cls          MCP/JSON-RPC 协议分发 + HTTP 路由
 ├─ HttpConn.cls           HTTP/1.1 请求缓冲与解析（支持 keep-alive）
 ├─ ServerForm.frm         隐藏窗体，承载 Winsock 监听 + 端口探测定时器
-├─ CodeTools.cls          110 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
+├─ CodeTools.cls          120 个 MCP 工具的实现（完整 VBIDE 对象模型 + 文件系统 + 语法门禁/编辑安全/编译权威）
 ├─ JsonLib.bas            零依赖 JSON 解析/序列化
 ├─ Utf8.bas               UTF-8/ANSI/UTF-16 转换（kernel32 API）
 ├─ Util.bas               日志、端口文件
@@ -184,7 +184,7 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
   默认 `http://127.0.0.1:8767`（用 `--port` 或环境变量 `VB6MCP_BRIDGE_PORT` 改；`VB6MCP_BRIDGE_HOST` 只接受回环地址）。
 - **非回环绑定不可能**：绑定到非回环地址会被拒绝，并以**退出码 6** 结束，**没有覆盖开关**。
 - MCP 客户端经 **hub** `bridge/vb6mcp_hub.mjs`（Node，零依赖，stdio）接入：hub 提供 `ide_*` 与经验库共 10 个工具，
-  并把插件面的 110 个工具转发给中间服务；hub 用环境变量 `VB6MCP_BRIDGE_URL` 找中间服务（源码默认 `http://127.0.0.1:8767`）。
+  并把插件面的 120 个工具转发给中间服务；hub 用环境变量 `VB6MCP_BRIDGE_URL` 找中间服务（源码默认 `http://127.0.0.1:8767`）。
 - 插件只接受**命名管道**（每个 IDE 实例一条；同一条管道**不允许并发连接**）⇒ 客户端应在**同一条连接上复用请求 id**，
   或把调用串行化；管道忙时回执给 `pipeBusy`，而不是「没有 IDE」。
 - **传输选择** `VB6MCP_TRANSPORT=auto|pipe|tcp`（默认 `auto`：优先管道，不可用时**可见地**回退到插件的 HTTP；
@@ -197,7 +197,7 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
 
 ### 哪些工具免 IDE、哪些必须有活 IDE
 
-**插件面 110 个工具：必须有活的 IDE。** 它们全部由运行在 `VB6.EXE` 进程内的插件实现（读/改代码、静态检查、编译、断点、窗体、快照……），没有可执行的实例就没有执行者。**列出**工具可以在没有 IDE 时进行（hub 会用随包快照回 `tools/list`，标 `faceSource=snapshot`），但**调用**它们需要本机有活实例，或显式寻址一个有活实例的远端端点；没有活实例时的拒绝码见下一小节。
+**插件面 120 个工具：必须有活的 IDE。** 它们全部由运行在 `VB6.EXE` 进程内的插件实现（读/改代码、静态检查、编译、断点、窗体、快照……），没有可执行的实例就没有执行者。**列出**工具可以在没有 IDE 时进行（hub 会用随包快照回 `tools/list`，标 `faceSource=snapshot`），但**调用**它们需要本机有活实例，或显式寻址一个有活实例的远端端点；没有活实例时的拒绝码见下一小节。
 
 **hub 面 10 个工具：在 IDE 进程之外运行，调用它们不需要加载插件**，但依赖各不相同：
 
@@ -247,7 +247,7 @@ VB6 不允许同一个 `.vbp` 被打开两次，而同一个工程**可以有很
 - **日志与审计**：服务日志由启动器写到 `%ProgramData%\vb6mcp\logs\middle-service.log`；远端模式（`--allow-remote` + TLS + token）要求 `--audit-log`，安装器默认指向 `%ProgramData%\vb6mcp\logs\remote-audit.jsonl`（JSONL，仅记录外网来源的请求）。两者在卸载时**保留**。
 - **token 轮换**：token 来源优先 `VB6MCP_TOKEN`（不落盘），否则 `VB6MCP_TOKEN_FILE`。轮换时把旧 token 传给 `--token-prev`（或 `VB6MCP_TOKEN_PREV`）⇒ 新旧在一个窗口内同时有效，客户端切换完成后去掉旧值。安装器只**引用** token 文件，不创建也不删除。
 - **端口必须一致**：`VB6MCP_BRIDGE_URL` 必须与安装器的 `-Port` 指向**同一个**服务端口（安装器默认 **8797**；`bridge` 源码自身默认是 `8767`，用安装器时以 `-Port` 为准）。改端口要**同时**改安装器与客户端配置，否则 hub 连不上。
-- **故障排查**：`status` 报 `listener.listening:false` ⇒ 任务没起或进程已退（看日志与任务上次结果 `lastTaskResult`）；`health.httpStatus:401` ⇒ 服务在跑但 token 不匹配（核对 `-TokenFile` 与客户端 token）；hub 报 `127.0.0.1:null/rpc`、`RemoteDisconnected` 或所有插件工具静默失败 ⇒ **没有服务在监听该端口**（本轮曾因此让 110 个插件工具全部静默）；`verdict:degraded` ⇒ 任务存在但端口未监听，重启任务并复看日志。
+- **故障排查**：`status` 报 `listener.listening:false` ⇒ 任务没起或进程已退（看日志与任务上次结果 `lastTaskResult`）；`health.httpStatus:401` ⇒ 服务在跑但 token 不匹配（核对 `-TokenFile` 与客户端 token）；hub 报 `127.0.0.1:null/rpc`、`RemoteDisconnected` 或所有插件工具静默失败 ⇒ **没有服务在监听该端口**（本轮曾因此让 120 个插件工具全部静默）；`verdict:degraded` ⇒ 任务存在但端口未监听，重启任务并复看日志。
 
 ## 三、接入 MCP 客户端
 
@@ -318,13 +318,13 @@ URL: http://127.0.0.1:8767/mcp
 
 验证链路是否打通：`python tests/smoke_test.py --port <中间服务端口>`（该脚本**不发送 token**，只在服务端未配置凭据时可用；且需要**先打开 VB6 IDE 并加载插件** —— 这不是离线自检）。
 
-## 四、工具列表（插件面 110 + hub 面 10 = 120 个）
+## 四、工具列表（插件面 120 + hub 面 10 = 130 个）
 
 > 权威清单见 **`docs/TOOL_CATALOG.md`**（由运行中的 add-in 经 `tools/list` 导出，再并入 hub 自有工具），
 > 离线基线为 `tools/schema_baseline.json`，可用 `tools/check_live_tools.py docs/tools_schema.json` 做离线交叉比对。
 >
-> 工具来自**两个面**：**插件面 110 个**（`docs/tools_schema.json`，住在 VB6 IDE 进程内）与
-> **hub 面 10 个**（`bridge/hub_tools.json`，在 IDE 进程外）。下面按功能把两个面共 **120 个**工具分组，
+> 工具来自**两个面**：**插件面 120 个**（`docs/tools_schema.json`，住在 VB6 IDE 进程内）与
+> **hub 面 10 个**（`bridge/hub_tools.json`，在 IDE 进程外）。下面按功能把两个面共 **130 个**工具分组，
 > 每个工具只出现一次：插件面分 16 类，hub 面见第 17 节；`关键参数` 一列直接取自各自的
 > `inputSchema`（必填参数在前），不是凭记忆写的。hub 面的 5 个经验库工具**无需 IDE 在线即可用**。
 
@@ -381,6 +381,9 @@ URL: http://127.0.0.1:8767/mcp
 | `preview_edit` | 只回统一 diff 预览，不写任何内容 | `name`, `edits` |
 | `replace_in_files` | 跨组件字面/正则替换，默认只计划不写 | `path`, `query`, `replacement` |
 | `rename_symbol` | 按词法重命名标识符，跳过字符串与注释 | `path`, `old_name`, `new_name` |
+| `move_procedure` | 事务化移动整个过程块（源删除 + 目标插入，任一侧失败双侧回滚） | `from_component`, `proc`, `to_component` |
+| `delete_procedures` | 一次事务删除多个过程（每个受影响组件先写 undo 快照，失败全部恢复） | `procedures`, `component` |
+| `edit_by_byte_anchor` | 按 GBK/ANSI **原始字节**锚点改文件（base64 进出；拒绝切开双字节字符，失败不写盘） | `path`, `old_bytes_b64`, `new_bytes_b64` |
 
 ### 5. 语法门禁与工程校验
 
@@ -425,6 +428,13 @@ URL: http://127.0.0.1:8767/mcp
 | `native_breakpoint` | 经调试菜单切换真实 IDE 断点或全部清除 | `action`, `component`, `line` |
 | `fault_inject` | 在过程入口注入受控故障：抛错、返回、延时 | `name`, `procedure`, `mode`, `id` |
 | `clear_faults` | 移除先前注入的故障块 | `name`, `id`, `expected_sha256` |
+| `debug_session` | 一次调用跑完整个调试会话：设断点 → 不保存工程启动 → 等命中 → 按序执行动作 | `runArgs`, `actions` |
+| `run_until_break` | 运行到断点 / 进程退出 / 未处理错误 / 超时（两段式：Start 是排队命令） | `timeout_ms`, `attach`, `breakpoints`, `watch` |
+| `breakpoints` | 管理真实 IDE 断点：设/清/启用/禁用/列出（组件 + 源码锚点或 pane 行） | `action`, `component`, `anchor`, `line` |
+| `get_locals` | 断点态读当前过程的参数与局部变量（名字来自源码，值来自引擎） | `frame_index` |
+| `eval_at_frame` | 在 IDE 立即上下文求值（显式安全契约；对象/数组表达式先拒绝） | `expr` |
+| `run_project` | 从 IDE 启动当前工程（可设环境变量 / 命令行参数；两段式） | `commandLineArgs`, `env`, `start_mode`, `observe`, `timeout_ms` |
+| `last_error` | 读未处理错误的上下文：对话框正文 + 错误号 + 调用栈 + 局部变量名字 | `dismiss` |
 
 ### 9. 追踪、调用栈与进程内执行
 
@@ -787,7 +797,7 @@ URL: http://127.0.0.1:8767/mcp
   1. **连接对象未被持久化** ⇒ 一条请求跨 TCP 段到达时会丢掉前半段，要等 30 s 空闲清扫才断开；
   2. **close-after-send 的判定顺序**放在队列已经清空之后 ⇒ `Connection: close` 的响应会滞留到空闲清扫才被发出；
   3. **flush 的累积 `Mid$` 起点越过 64 KiB**，且 `send()=-1` 伴随 `WSAGetLastError()=0` 被误判为致命错误 ⇒ 正文被截断。
-- 三处都已修好。**工具面与参数表没有因此变化**（插件 110 + hub 10 = 120 不变）：这是一次**行为修复**，升级后不需要改任何调用方式。
+- 三处都已修好。**工具面与参数表没有因此变化**（当时插件 110 + hub 10 = 120，不变）：这是一次**行为修复**，升级后不需要改任何调用方式。
 
 ## 许可证
 

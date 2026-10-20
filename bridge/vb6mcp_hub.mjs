@@ -89,8 +89,8 @@ let middleServiceState = { reachable: false, url: BRIDGE_URL, pid: null, started
                            reason: BRIDGE_MODE === 'inproc' ? 'inproc_mode' : 'not_checked',
                            lockFile: null, spawnAttemptedAt: null, portTakenByOther: false, foreignPid: null };
 let middleServiceEnsure = null;   // single-flight: two concurrent calls never race a spawn
-let middleSpawnedPid = null;     // the ONLY pid this hub process may ever signal (task-108 (4))
-// ---- P1 (task-110): PROVABLE code identity ------------------------------------------------
+let middleSpawnedPid = null;     // the ONLY pid this hub process may ever signal (only-kill-what-we-spawned rule)
+// ---- P1: PROVABLE code identity ------------------------------------------------
 // A DSH restart can leave an OLDER hub alive (measured: pid 12172 from 17:21 served a file that
 // was rewritten at 19:27), so "which code answered" must come from a receipt, never a pid guess.
 const HUB_SELF_PATH = fileURLToPath(import.meta.url);
@@ -105,7 +105,7 @@ function hubCodeStamps() {
   if (BRIDGE_MODE === 'inproc') return null;
   return { hubCodeRev: HUB_CODE_REV, hubStartedAt: HUB_STARTED_AT, fileMtime: HUB_FILE_MTIME };
 }
-// ---- P2 (task-110): "a forward just worked" is liveness evidence ---------------------------
+// ---- P2: "a forward just worked" is liveness evidence ---------------------------
 const FORWARD_EVIDENCE_TTL_MS = parseInt(process.env.VB6MCP_FORWARD_EVIDENCE_TTL_MS || '120000', 10);
 const lastForwardOk = new Map();   // pid -> Date.now() of the last SUCCESSFUL forward
 function noteForwardSuccess(pick) {
@@ -118,7 +118,7 @@ function forwardAnsweredOk(stamped) {
   const obj = firstBodyObject(stamped.result);
   return !(obj && obj.ok === false);
 }
-// ---- P3 (task-110): lastEnsure persistence + a READ-ONLY report probe ----------------------
+// ---- P3: lastEnsure persistence + a READ-ONLY report probe ----------------------
 function middleStatePath() {
   return path.join(os.tmpdir(), 'vb6mcp', 'middle.' + (bridgePortHint() || 'default') + '.state.json');
 }
@@ -379,7 +379,7 @@ bridgeLastFailure = null; //: a healthy bridge clears the recorded failure
 // One JSON-RPC POST to the bridge - the SAME wire shape rpcAt() uses against an add-in, so the
 // bridge is just another endpoint as far as this file is concerned.
 async function bridgeRpc(method, params, timeoutMs) {
-  // task-108 (3): a FOREIGN listener on the configured port is fail-closed for EVERY caller.  A
+  // RULE: a FOREIGN listener on the configured port is fail-closed for EVERY caller.  A
   // history bug read a python listener as a live IDE with 110 tools; no path may POST /rpc to a
   // service that did not identify itself as vb6mcp-bridge.
   if (BRIDGE_MODE !== 'inproc' && middleServiceState.portTakenByOther) {
@@ -419,7 +419,7 @@ function mergeHubFace(faceTools) {
 // that are undefined, so the bridge's transport / transportReason / *Fallback / pipeBusy marks
 // SURVIVE into the receipt and are never overwritten.
 async function bridgeForwardCall(name, argsIn, snap, note, pick) {
-  // task-108: the hub OWNS the dependency.  Ensure the middle service exists before the first
+  // The hub OWNS the dependency.  Ensure the middle service exists before the first
   // forward.  A FOREIGN listener on the configured port is fail-closed here - it is never read
   // as an IDE and never forwarded to (that is the historical fake-IDE incident).
   const msr = (BRIDGE_MODE === 'inproc') ? null : await ensureMiddleService();
@@ -700,6 +700,28 @@ async function instanceAlive(i, listening) {
 // that reports one of them also carries the rule VERBATIM plus the evidence it was derived from.
 const LIVENESS_RULE = 'liveness.state = responding (the ADD-IN ITSELF answered an MCP tools/call (mcp_info) over the SAME route a forwarded call uses) | not_responding (a peer was found but did not answer: probe failed / the pipe is not available - the SAME verdict a forwarded call reports as wedged|noIde) | unknown (no fresh verdict: probe still pending, or only a CACHED verdict older than the discovery TTL). probeStatus is DERIVED from this one verdict (ok <=> responding; not_responding => failed + probeReason), so ide_list and a forwarded call cannot disagree, and a cached ok is never re-published as a fresh one. basis names the evidence, evidenceAgeMs dates it.';
 const OWNERSHIP_RULE = 'ownership = hub_started (the hub that is answering started this pid: in-memory startedByHub) | registry_started_by_hub (the instance REGISTRATION itself says startedByHub=true) | not_owned (neither). owned = the first two. The PORT is NOT an ownership criterion: a pipe-only instance publishes port 0 on purpose, so "no port" never means "not ours" (N12). The port stays a SECOND, independent safety guard: an instance whose KNOWN port is < 8767 is foreign (8766 belongs to an external process on this machine) and is refused even when owned. ide_list / ide_stop / ide_restart all call ownershipOf() and report ownership + ownershipBasis + ownershipRule.';
+// ---- ONE attribution verdict ---------------------------------------------------
+// THREE entrances answered "is this instance OURS?" three different ways, and the PORT was allowed
+// to stand in for the answer:
+//   * ide_list reported a per-instance STRING (registry_started_by_hub / not_owned);
+//   * the forwarded ide_state receipt carried hubInstance.ownership = pick.ownership, which is NULL
+//     for every pick the hub resolved itself => "not ours" printed next to ide_list's "ours";
+//   * ide_restart read a port outside its own range as foreign.
+// The SAME instance could therefore be "ours and alive" on one entrance and "foreign" on another.
+// This block is the ONE resolver; its output is shipped VERBATIM by ide_list (per instance AND per
+// residual registration), by the forwarded ide_state receipt, and by ide_restart.
+//
+// TWO AXES, deliberately separated (they answer different questions and drive different actions):
+//   * legacy ownership / ownedByHub = "did THIS hub process start it?" -> the PERMISSION axis for
+//     ide_stop / ide_restart.  Unchanged; its predicate stays ownershipOf().
+//   * ownershipVerdict.verdict = "whose instance IS it?" -> the ATTRIBUTION axis.  It never grants
+//     permission: a user-launched IDE of this machine is owned here and still NOT stoppable.
+const OWNERSHIP_VERDICT_RULE = "ownershipVerdict.verdict = owned | foreign | unknown (ATTRIBUTION: whose instance is it? It is NOT the permission axis - legacy ownership/ownedByHub decides whether ide_stop/ide_restart may act, and that predicate is unchanged). owned: the instance is attributable to THIS machine's add-in installation - the hub-started evidence is present (this hub process started the pid, or its registration says startedByHub=true), OR the pid is registered, ALIVE and the ADD-IN ITSELF answered mcp_info over its own route (a user-launched IDE is owned, NOT foreign: it is this machine's IDE, someone else simply started it). foreign: POSITIVE evidence only - (1) the registered pid is NOT alive while its port still ANSWERS, (2) the listening port is owned by an OS pid other than the pid the registration names, (3) the known port is inside the reserved range (< 8767; 8766 belongs to an external process) and ANSWERS, (4) the pid that serves the instance differs from the pid its OWN registration names. unknown: EVERYTHING else - above all portAvailable=false: a pipe-only registration publishes port 0 ON PURPOSE and an unreachable/unknown port is NOT evidence that the instance belongs to someone else. basis[] names every fact used; registryAlive and portAvailable are the raw inputs.";
+// The defect this resolver exists for, as ONE named constant: a port that CANNOT be obtained must
+// never be read as foreignership.  A test flips it to reproduce the pre-fix reading (mutant), so
+// the guard is load-bearing instead of folklore.
+const OWNERSHIP_PORT_UNAVAILABLE_IS_NOT_FOREIGN = true;
+
 const PROCESS_KIND_RULE = 'processKind = vb6_ide (an add-in registration: %TEMP%\\vb6mcp\\instances\\<pid>.json, pid alive and its transport reachable) | middle_service (the loopback TCP listener that IS this hub\'s configured middle service: the port of VB6MCP_BRIDGE_URL, or the process that owns that port) | unknown_listener (a listening port with neither an add-in registration nor a middle-service identity). instances[] is the AUTHORITATIVE IDE view and lists ONLY vb6_ide; every excluded listener is kept in nonIdeListeners[] with the basis that excluded it, so the middle service process can never be read as an IDE .';
 const TARGET_RESOLUTION_RULE = 'default target ladder, used when _target is omitted or "auto" (after the ide_target default has been tried): 1) the ONLY live IDE; 2) else the ONLY hub-owned IDE (see ownershipRule); 3) else the ONLY IDE that is RESPONDING (see livenessRule); 4) else REFUSE with reason=ambiguous_target and list every candidate + a concrete suggestion - never guess. An EXPLICIT _target that matches nothing is target_mismatch (the live set is never silently substituted for it); one that matches several is target_conflict. Every receipt that resolved a target carries resolution{rule,step,liveCount,selectedBy,candidates,ladder}.';
 // The rule ide_list restates verbatim (kept in ONE constant so it cannot drift from the ladder).
@@ -780,6 +802,168 @@ function ownershipOf(inst) {
       : 'port null/0 (pipe-only): the port rule CANNOT apply - "no port" never means "not ours" (N12)'
   };
 }
+// ---- the ONE ownership/attribution resolver ------------------------------------
+// Inputs, all named in basis[]: the registration (%TEMP%\vb6mcp\instances\<pid>.json), whether the
+// registered pid is ALIVE, whether the port is OBTAINABLE (and, when netstat is available, WHO owns
+// it), the project path, and the in-memory startedByHub map of THIS hub process.
+// Output = the block below, reused by ide_list / the forwarded ide_state / ide_restart verbatim.
+let ownershipRegCache = { at: 0, map: null };
+function ownershipRegistrationOf(pid) {
+  if (!pid) return null;
+  if (!ownershipRegCache.map || Date.now() - ownershipRegCache.at > 1000) {
+    const map = {};
+    try { for (const e of (readRegistry().entries || [])) { if (e && e.pid) map[String(e.pid)] = e; } } catch (e) { }
+    ownershipRegCache = { at: Date.now(), map: map };
+  }
+  return ownershipRegCache.map[String(pid)] || null;
+}
+// The registration the INSTANCE came from (its registryFile), which is not necessarily keyed by the
+// pid the instance view ended up using: the portscan/adoption path keys an instance by the LISTENER
+// pid from netstat.  That difference is ownership evidence, not noise (rule (4)).
+function ownershipRegistrationByFile(file) {
+  if (!file) return null;
+  try {
+    const base = path.basename(String(file));
+    for (const e of (readRegistry().entries || [])) { if (e && e.file && path.basename(e.file) === base) return e; }
+  } catch (e) { }
+  return null;
+}
+// WHO owns a listening port, per the OPERATING SYSTEM.  Unavailable => UNKNOWN (null), never
+// "nobody" and never "foreign" - an absent fact is not a negative fact.
+function portOwnerPidsOf(port) {
+  if (!port) return { available: false, pids: null, why: 'no_port' };
+  if (process.env.VB6MCP_HUB_NO_NETSTAT === '1') return { available: false, pids: null, why: 'netstat_disabled' };
+  try {
+    const map = listeningPortsCached();
+    if (!map) return { available: false, pids: null, why: 'netstat_failed' };
+    const pids = map[port] || [];
+    return { available: true, pids: pids.map(Number), why: pids.length ? 'listening' : 'not_listening' };
+  } catch (e) { return { available: false, pids: null, why: 'netstat_failed' }; }
+}
+function ownershipVerdictBlock(f, verdict, basis, ownedEv, foreignEv) {
+  return { verdict: verdict,
+           basis: basis,
+           registryAlive: !!(f.registryPresent && f.pidAlive),
+           portAvailable: (f.portAvailable === undefined) ? null : f.portAvailable,
+           pid: (f.pid === undefined) ? null : f.pid,
+           port: f.port || null,
+           project: f.project || null,
+           projectPath: f.projectPath || null,
+           registryFile: f.registryFile || null,
+           registryPresent: !!f.registryPresent,
+           registryStartedByHub: !!f.registryStartedByHub,
+           inMemoryStartedByHub: !!f.inMemory,
+           pidAlive: !!f.pidAlive,
+           probeAnswered: !!f.probeAnswered,
+           registeredPid: (f.registeredPid === undefined) ? null : f.registeredPid,
+           portOwnerPids: f.portOwnerPids || null,
+           portOwnerWhy: f.portOwnerWhy || null,
+           netstatAvailable: !!f.netstatAvailable,
+           ownedEvidence: ownedEv,
+           foreignEvidence: foreignEv,
+           rule: OWNERSHIP_VERDICT_RULE };
+}
+// PURE: facts in, verdict out.  No I/O, so ide_list / ide_state / ide_restart cannot drift.
+function ownershipVerdictOf(f) {
+  const basis = [], ownedEv = [], foreignEv = [];
+  f = f || { pid: null, port: 0 };
+  if (f.remote) {
+    basis.push("remote endpoint: the pid/port/registration belong to ANOTHER machine, so attribution is not judged here");
+    return ownershipVerdictBlock(f, 'unknown', basis, ownedEv, foreignEv);
+  }
+  // ---- the FACTS, each one named (a verdict without its evidence is not auditable) ------------
+  if (f.pid) basis.push('pid ' + f.pid + (f.pidAlive ? ' is ALIVE' : ' is NOT alive'));
+  if (f.registryPresent) {
+    basis.push('registration ' + (f.registryFile || ('instances/' + f.registeredPid + '.json')) + ' is present (registered pid ' + f.registeredPid + ')' + (f.registryStartedByHub ? ', startedByHub=true' : ', and it does NOT say startedByHub'));
+  } else {
+    basis.push('no instance registration is visible for pid ' + f.pid + ' (attribution can only rest on the in-memory startedByHub map or on the instance answering)');
+  }
+  if (f.inMemory) basis.push('THIS hub process started pid ' + f.pid + ' (in-memory startedByHub map)');
+  if (f.port > 0) basis.push('known port ' + f.port);
+  if (f.portAvailable === true) {
+    basis.push('port ' + (f.port || '?') + ' ANSWERED a reachability test' + (f.portEvidence ? ' (' + f.portEvidence + ')' : ''));
+  } else if (f.portAvailable === false) {
+    basis.push('portAvailable=false: ' + (f.port ? ('port ' + f.port + ' did not answer a reachability test (' + (f.portEvidence || '?') + ')') : 'no port is obtainable at all (a pipe-only registration publishes port 0 ON PURPOSE)') + ' - an unobtainable port is NOT evidence of foreignership');
+  } else {
+    basis.push('port availability is UNKNOWN (no reachability test was possible)');
+  }
+  if (f.probeAnswered) basis.push("the ADD-IN ITSELF answered mcp_info over this instance's route (a real add-in of this machine answered)");
+  if (f.netstatAvailable) {
+    basis.push('OS listener table (netstat): ' + ((f.portOwnerPids && f.portOwnerPids.length) ? ('port ' + f.port + ' is owned by pid(s) ' + f.portOwnerPids.join(',')) : ('nothing is listed as listening on port ' + (f.port || '?'))));
+  } else if (!f.port) {
+    basis.push('OS listener table: there is NO PORT to look up (a pipe-only registration publishes port 0 ON PURPOSE), so no port owner can incriminate this instance');
+  } else {
+    basis.push('OS listener table unavailable (' + ((f.portOwnerWhy === 'netstat_disabled') ? 'VB6MCP_HUB_NO_NETSTAT=1' : 'netstat did not answer') + '): the port OWNER is unknown - not foreign');
+  }
+  // ---- OWNED (attribution) evidence -----------------------------------------------------------
+  if (f.inMemory) ownedEv.push('in-memory startedByHub map of THIS hub process lists pid ' + f.pid);
+  if (f.registryStartedByHub) ownedEv.push('the registration ' + (f.registryFile || '') + ' says startedByHub=true (a hub wrote it)');
+  if (!f.inMemory && !f.registryStartedByHub && f.registryPresent && f.pidAlive && f.probeAnswered) {
+    ownedEv.push('pid ' + f.pid + ' is registered, ALIVE and the ADD-IN ITSELF answered over its own route: this machine add-in installation, whoever started the process');
+  }
+  // ---- FOREIGN evidence: positive facts only --------------------------------------------------
+  if (f.registryPresent && !f.pidAlive && f.portAvailable === true) {
+    foreignEv.push('the registered pid ' + f.registeredPid + ' is NOT alive, but its port ' + f.port + ' still ANSWERS: another process holds that port');
+  }
+  if (f.portAvailable === true && f.portOwnerPids && f.portOwnerPids.length && f.registeredPid &&
+      f.portOwnerPids.indexOf(Number(f.registeredPid)) < 0) {
+    foreignEv.push('port ' + f.port + ' is LISTENING and is owned by OS pid(s) ' + f.portOwnerPids.join(',') + ', NOT by the pid the registration names (' + f.registeredPid + ')');
+  }
+  if (f.port > 0 && f.port < 8767 && f.portAvailable === true) {
+    foreignEv.push('port ' + f.port + ' is inside the reserved foreign range (< 8767; 8766 belongs to an external process) and it ANSWERS');
+  }
+  if (f.pid && f.registeredPid && Number(f.registeredPid) !== Number(f.pid)) {
+    foreignEv.push('the instance is served as pid ' + f.pid + ', but the registration it came from (' + (f.registryFile || '?') + ') names pid ' + f.registeredPid + ': the process that answers is NOT the registered process');
+  }
+  if (!OWNERSHIP_PORT_UNAVAILABLE_IS_NOT_FOREIGN && f.portAvailable === false && !f.inMemory) {
+    foreignEv.push('PRE-FIX PORT-ONLY READING: no obtainable port treated as foreign (the reading this resolver exists to forbid)');
+  }
+  const verdict = foreignEv.length ? 'foreign' : (ownedEv.length ? 'owned' : 'unknown');
+  if (!ownedEv.length && !foreignEv.length) {
+    basis.push('no owned evidence and no positive foreign evidence: the honest verdict is UNKNOWN (nothing was assumed)');
+  }
+  return ownershipVerdictBlock(f, verdict, basis, ownedEv, foreignEv);
+}
+// The async half: gathers the facts the instance object does not already carry (registration, pid
+// liveness, port reachability, OS port owner) and hands them to the PURE verdict function above.
+async function resolveOwnership(inst, opts) {
+  opts = opts || {};
+  const pid = inst && inst.pid ? Number(inst.pid) : null;
+  const port = Number(inst && inst.port) || 0;
+  const remote = !!(inst && inst.remote);
+  const inMemory = !!(pid && startedByHub.has(pid));
+  // the registration the instance CAME FROM wins; falling back to the one keyed by its pid.
+  const byFile = (inst && inst.registryFile) ? ownershipRegistrationByFile(inst.registryFile) : null;
+  const byPid = pid ? ownershipRegistrationOf(pid) : null;
+  const reg = byFile || byPid;
+  const registryPresent = !!reg;
+  const registeredPid = reg && reg.pid ? Number(reg.pid) : pid;
+  const registryStartedByHub = !!(reg && reg.startedByHub);
+  const pidAliveNow = pid ? pidAlive(pid) : false;
+  const probeAnswered = !!(inst && (inst.probeStatus === 'ok' ||
+    (inst.liveness && (inst.liveness.state === 'responding' || inst.liveness.evidenceByForward))));
+  let portAvailable = null, portEvidence = null;
+  if (remote) { portAvailable = null; portEvidence = 'remote_endpoint(not tested on this machine)'; }
+  else if (!port) { portAvailable = false; portEvidence = 'no_port_published(pipe-only)'; }
+  else if (opts.portAvailable !== undefined) { portAvailable = !!opts.portAvailable; portEvidence = 'caller_supplied'; }
+  else if (probeAnswered) { portAvailable = true; portEvidence = 'addin_answered_on_that_port'; }
+  else {
+    try { portAvailable = await tcpListening(port, 200); } catch (e) { portAvailable = false; }
+    portEvidence = 'tcp_connect_test';
+  }
+  const po = portOwnerPidsOf(port);
+  return ownershipVerdictOf({
+    pid: pid, port: port, remote: remote, inMemory: inMemory,
+    registryPresent: registryPresent, registryStartedByHub: registryStartedByHub,
+    registeredPid: registeredPid,
+    registryFile: (inst && inst.registryFile) || (reg && reg.file ? path.basename(reg.file) : null),
+    pidAlive: pidAliveNow, portAvailable: portAvailable, portEvidence: portEvidence,
+    portOwnerPids: po.pids, portOwnerWhy: po.why, netstatAvailable: po.available, probeAnswered: probeAnswered,
+    project: (inst && inst.project) || (reg && reg.project) || null,
+    projectPath: (inst && inst.projectPath) || (reg && reg.projectPath) || null
+  });
+}
+
 // ONE liveness verdict per instance.  probeStatus is DERIVED from it, never taken from the
 // registry alone, and a fresh add-in answer is required before "responding" is claimed.
 function forwardRouteOf(i) {
@@ -995,7 +1179,10 @@ function faceFingerprintNow() {
 }
 function saveFaceCache(d) {
   try {
-    fs.writeFileSync(FACE_CACHE, JSON.stringify({ at: Date.now(), faceFingerprint: faceFingerprintNow(), instances: d.instances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir }, null, 2), 'utf8');
+    const rec = { at: Date.now(), faceFingerprint: faceFingerprintNow(), instances: d.instances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir };
+    const prev = readJson(FACE_CACHE, null);
+    if (prev && prev.faceNotify) rec.faceNotify = prev.faceNotify;   // the change record outlives a discovery write
+    fs.writeFileSync(FACE_CACHE, JSON.stringify(rec, null, 2), 'utf8');
   } catch (e) { }
 }
 let faceCacheStatus = { reason: 'not_read' };
@@ -1018,6 +1205,204 @@ function loadFaceCache() {
   }
   faceCacheStatus = { reason: 'hit', faceFingerprint: want };
   return c;
+}
+
+// ---- tools face change -> notifications/tools/list_changed --------------------------------
+// A client keeps its tool registry until it is TOLD that the face changed, and a notification is
+// useful only to a client that is ALREADY initialized (its listChanged callback registered) and
+// whose own table is stale.  Two failures shaped this code:
+//   * a notification sent during hub startup - before the client had finished initialize - looked
+//     successful in the hub log and was dropped by the client; the old code then recorded it as
+//     "announced" and never retried, so the client stayed at an empty/stale table;
+//   * a single global face record cannot describe several client generations: the baseline must
+//     belong to THE CONNECTION, seeded from the cross-process record and refreshed whenever that
+//     connection pulls tools/list.
+// So the order is: per-connection knownFace + an explicit re-align AFTER notifications/initialized
+// (the first moment the callback is guaranteed live), and the persisted record is a cross-process
+// BASELINE only - never evidence that this connection has seen anything.  A record written by the
+// old startup-notify shape is deliberately IGNORED as a baseline (it proves a send, not a sync).
+//
+// Fingerprint = the name set plus a sort-stable hash of name/description/inputSchema for every
+// tool: exactly the bytes a client would have to re-learn.  In inproc mode NOTHING here runs:
+// no capability is added, no timer is armed, no notification is sent and no record is written.
+const FACE_PROBE_MIN_MS = Math.max(2000, parseInt(process.env.VB6MCP_FACE_PROBE_MIN_MS || '2000', 10));
+const FACE_NOTIFY_MIN_MS = Math.max(2000, parseInt(process.env.VB6MCP_FACE_NOTIFY_MIN_MS || '2000', 10));
+let connSeq = 0;
+// ONE stdio connection per process, but the state is per-connection on purpose: a second
+// initialize resets it, so a reconnect starts from a NEW baseline instead of a reused verdict.
+const conn = { id: 0, initialized: false, knownFace: null };
+let lastFaceFp = null;             // cross-process baseline: last face a client was known to hold
+let pendingFaceChange = null;      // {fp, why}: observed, not announced to THIS connection yet
+let lastFaceProbeAt = 0;
+let lastFaceNotifyAt = 0;
+let faceProbeInFlight = null;
+let faceFlushTimer = null;
+let facePeriodicTimer = null;
+
+function canonicalJson(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+  const t = typeof v;
+  if (t === 'undefined') return 'null';
+  if (t === 'string' || t === 'number' || t === 'boolean') return JSON.stringify(v);
+  if (t === 'object') {
+    const keys = Object.keys(v).sort();
+    return '{' + keys.map(function (k) { return JSON.stringify(k) + ':' + canonicalJson(v[k]); }).join(',') + '}';
+  }
+  return JSON.stringify(String(v));
+}
+function faceFingerprintOf(tools) {
+  const rows = (Array.isArray(tools) ? tools : [])
+    .filter(function (t) { return t && typeof t.name === 'string'; })
+    .map(function (t) { return { name: t.name,
+                                 description: (typeof t.description === 'string' ? t.description : ''),
+                                 inputSchema: (t.inputSchema === undefined ? null : t.inputSchema) }; })
+    .sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+  const hash = crypto.createHash('sha256').update(canonicalJson(rows)).digest('hex');
+  return { fingerprint: hash, toolCount: rows.length };
+}
+function readFaceNotifyRecord() {
+  const c = readJson(FACE_CACHE, null);
+  const n = (c && c.faceNotify && typeof c.faceNotify === 'object') ? c.faceNotify : null;
+  if (!n) return null;
+  // ONLY the new shape carries a trustworthy baseline; the old shape recorded a SEND, not a sync.
+  const baseline = (n.baseline && typeof n.baseline.fingerprint === 'string') ? n.baseline : null;
+  return { baseline: baseline, lastGlobalNotify: n.lastGlobalNotify || null };
+}
+function writeFaceNotifyRecord(fields) {
+  // fields: {reason, fingerprint, toolCount, delivered}
+  const prev = readFaceNotifyRecord();
+  const at = new Date().toISOString();
+  const rec = { at: at,
+    baseline: { at: at, reason: fields.reason, fingerprint: fields.fingerprint,
+                toolCount: fields.toolCount, connId: conn.id },
+    lastGlobalNotify: fields.delivered
+      ? { at: at, reason: fields.reason, fingerprint: fields.fingerprint, toolCount: fields.toolCount, connId: conn.id }
+      : (prev && prev.lastGlobalNotify) || null };
+  const tmp = FACE_CACHE + '.tmp-' + process.pid;
+  try {
+    const cur = readJson(FACE_CACHE, null);
+    if (!cur || typeof cur !== 'object') { dbg('face notify: hub_face_cache.json unreadable -> the record was not persisted'); return; }
+    cur.faceNotify = rec;
+    fs.writeFileSync(tmp, JSON.stringify(cur, null, 2), 'utf8');
+    fs.renameSync(tmp, FACE_CACHE);      // atomic: a concurrent reader never sees a half file
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { }
+    dbg('face notify: record write failed: ' + String((e && e.message) || e));
+  }
+}
+async function currentFaceFingerprint() {
+  const res = await toolsListResult(await discoverSoft(LIST_GRACE_MS));
+  return faceFingerprintOf((res && res.tools) || []);
+}
+// The client just RECEIVED tools/list on this connection: that face is what it now holds, so this
+// is the only event that may advance the per-connection AND the cross-process baseline.
+function noteFaceSynced(tools) {
+  try {
+    const fp = faceFingerprintOf(tools || []);
+    conn.knownFace = fp.fingerprint;
+    lastFaceFp = fp.fingerprint;
+    pendingFaceChange = null;
+    lastFaceProbeAt = Date.now();
+    writeFaceNotifyRecord({ reason: 'served', fingerprint: fp.fingerprint, toolCount: fp.toolCount, delivered: false });
+    return fp;
+  } catch (e) { return null; }
+}
+function flushFaceChange() {
+  if (BRIDGE_MODE === 'inproc' || !pendingFaceChange) return;
+  if (!conn.initialized) return;               // callback not guaranteed live yet: keep it pending
+  const wait = (lastFaceNotifyAt || 0) + FACE_NOTIFY_MIN_MS - Date.now();
+  if (wait > 0) {                              // one change = one notification, >= 2 s apart
+    if (!faceFlushTimer) {
+      faceFlushTimer = setTimeout(function () { faceFlushTimer = null; flushFaceChange(); }, wait);
+      if (faceFlushTimer.unref) faceFlushTimer.unref();
+    }
+    return;
+  }
+  const p = pendingFaceChange;
+  pendingFaceChange = null;
+  lastFaceNotifyAt = Date.now();
+  try {
+    send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+  } catch (e) {
+    pendingFaceChange = p;                     // stdout is gone: a later probe may retry
+    dbg('tools/list_changed send failed: ' + String((e && e.message) || e));
+    return;
+  }
+  conn.knownFace = p.fp.fingerprint;
+  lastFaceFp = p.fp.fingerprint;
+  writeFaceNotifyRecord({ reason: p.why, fingerprint: p.fp.fingerprint, toolCount: p.fp.toolCount, delivered: true });
+  try {
+    process.stderr.write('[hub-face] notifications/tools/list_changed sent conn=' + conn.id +
+      ' reason=' + p.why + ' tools=' + p.fp.toolCount + ' fingerprint=' + p.fp.fingerprint.slice(0, 16) + '\n');
+  } catch (e) { }
+}
+async function checkFaceChange(why, force) {
+  if (BRIDGE_MODE === 'inproc') return null;
+  if (faceProbeInFlight) return faceProbeInFlight;
+  const now = Date.now();
+  if (!force && now - lastFaceProbeAt < FACE_PROBE_MIN_MS) return null;
+  lastFaceProbeAt = now;
+  faceProbeInFlight = (async function () {
+    let fp = null;
+    try { fp = await currentFaceFingerprint(); }
+    catch (e) { dbg('face probe failed: ' + String((e && e.message) || e)); }
+    if (!fp) return null;
+    if (lastFaceFp === null) { lastFaceFp = fp.fingerprint; return null; }   // first probe = baseline
+    if (fp.fingerprint === lastFaceFp) return null;
+    lastFaceFp = fp.fingerprint;
+    pendingFaceChange = { fp: fp, why: why || 'change' };
+    flushFaceChange();
+    return fp;
+  })();
+  try { return await faceProbeInFlight; } finally { faceProbeInFlight = null; }
+}
+// notifications/initialized is the FIRST moment the client's listChanged callback is guaranteed
+// live, so a face change that happened before/around initialize is announced exactly here.
+async function alignClientFace() {
+  if (BRIDGE_MODE === 'inproc') return;
+  let fp = null;
+  try { fp = await currentFaceFingerprint(); }
+  catch (e) { dbg('client_init face probe failed: ' + String((e && e.message) || e)); }
+  if (!fp) return;
+  if (conn.knownFace === null) {          // nothing to compare yet: the client will pull the face
+    conn.knownFace = fp.fingerprint;
+    lastFaceFp = fp.fingerprint;
+    return;
+  }
+  if (conn.knownFace === fp.fingerprint) { lastFaceFp = fp.fingerprint; return; }
+  pendingFaceChange = { fp: fp, why: 'client_init' };
+  flushFaceChange();
+}
+function newConnection() {
+  connSeq += 1;
+  conn.id = connSeq;
+  conn.initialized = false;
+  // Seed ONLY from the persisted cross-process baseline: that is the face the PREVIOUS client
+  // generation held.  lastFaceFp may already be the LIVE face (the startup probe advanced it),
+  // so using it here would hide exactly the race this function exists to repair.
+  let seeded = null;
+  try {
+    const rec = readFaceNotifyRecord();
+    if (rec && rec.baseline && typeof rec.baseline.fingerprint === 'string') seeded = rec.baseline.fingerprint;
+  } catch (e) { }
+  conn.knownFace = seeded;
+  pendingFaceChange = null;
+}
+function bootFaceNotify() {
+  if (BRIDGE_MODE === 'inproc') return;
+  try {
+    const rec = readFaceNotifyRecord();
+    if (rec && rec.baseline && typeof rec.baseline.fingerprint === 'string') lastFaceFp = rec.baseline.fingerprint;
+  } catch (e) { }
+  checkFaceChange('startup').catch(function () { });   // baseline only: nothing is sent before initialize
+}
+function startFaceNotifyTimer() {
+  if (BRIDGE_MODE === 'inproc' || facePeriodicTimer) return;
+  facePeriodicTimer = setInterval(function () {
+    checkFaceChange('periodic').catch(function () { });
+  }, FACE_PROBE_MIN_MS);
+  if (facePeriodicTimer.unref) facePeriodicTimer.unref();
 }
 const state = { target: null };
 const startedByHub = new Map(); // pid -> { project, port }
@@ -1354,7 +1739,7 @@ async function probe(port, knownProject, pids, transport) {
   pids = pids || [];
   if (!pids.length) return null;
   if (!port && BRIDGE_MODE !== 'inproc') {
-    // task-108: a pipe-only probe goes THROUGH the middle service, so the service must be safely
+    // A pipe-only probe goes THROUGH the middle service, so the service must be safely
     // ours BEFORE any /rpc is attempted.  A foreign listener is never probed as an IDE.
     const ms = await ensureMiddleService();
     if (ms && ms.portTakenByOther) {
@@ -2428,7 +2813,7 @@ async function faceState(d, spellings, ctx) {
     // MEASURED 2026-10-17 on this host: after ide_list the same registration file is byte-identical
     // (size/mtime/sha256 unchanged) and no .pruned/.bak residue appears. A registration is removed
     // ONLY by ide_restart, after a CONFIRMED stop of that same target (registryCleared=true).
-    // task-108: WHO addresses the pipe-only IDEs, and whether a hub started/kept it.  Omitted
+    // WHO addresses the pipe-only IDEs, and whether a hub started/kept it.  Omitted
     // entirely in inproc mode, so that rollback receipt stays byte-for-byte unchanged.
     ...(function () { const m = middleServiceReceipt(); return m ? { middleService: m } : {}; })(),
     registryWrites: 0,
@@ -2596,6 +2981,22 @@ async function hubState(opts) {
       }
     }
   }
+  // The ONE attribution verdict on every instance of the authoritative IDE view AND
+  // on every RESIDUAL registration (staleRegistry), so ide_list / the forwarded ide_state /
+  // ide_restart cannot disagree about the same instance.  ide_list is the only consumer of
+  // hubState(), so this never slows the initialize/tools-list handshake.
+  if (Array.isArray(st.instances)) {
+    for (const r of st.instances) {
+      try { r.ownershipVerdict = await resolveOwnership(r); } catch (e) { r.ownershipVerdict = null; }
+    }
+    st.ownershipVerdictRule = OWNERSHIP_VERDICT_RULE;
+  }
+  if (Array.isArray(st.staleRegistry)) {
+    for (const s of st.staleRegistry) {
+      if (!s || typeof s !== 'object') continue;
+      try { s.ownershipVerdict = await resolveOwnership({ pid: s.pid, port: s.port, registryFile: s.file }); } catch (e) { s.ownershipVerdict = null; }
+    }
+  }
   // P1: the receipt can PROVE which code answered (sha16 of the running file + start time).
   const hcStamps = hubCodeStamps();
   if (hcStamps) st.hubCode = hcStamps;
@@ -2662,9 +3063,14 @@ async function hubTool(name, args) {
     }
     if (!inst) { inst = { pid: Number(pid), startedByHub: startedByHub.has(Number(pid)) }; instSource = 'in_memory_map'; }
     const own = ownershipOf(inst);
+    // : the same ATTRIBUTION block ide_list / ide_state / ide_restart publish, so the four
+    // entrances cannot describe one pid four ways.  The DECISION below still uses the permission
+    // axis (own.owned) - attribution never grants the right to kill a process.
+    const ovStop = await resolveOwnership(inst);
     const body = { ok: false, stopped: 0, pid: Number(pid), ownership: own.ownership, ownershipBasis: own.ownershipBasis,
                    ownedByHub: own.owned, port: own.port, portRuleApplies: own.portRuleApplies, portBasis: own.portBasis,
-                   ownershipRule: OWNERSHIP_RULE, liveness: inst && inst.liveness ? inst.liveness : null,
+                   ownershipRule: OWNERSHIP_RULE, ownershipVerdict: ovStop, ownershipVerdictRule: OWNERSHIP_VERDICT_RULE,
+                   liveness: inst && inst.liveness ? inst.liveness : null,
                    instanceSource: instSource, registryFile: inst.registryFile || null, startedByHub: !!inst.startedByHub,
                    alsoForeignPort: !!own.foreignPort };
     // OWNERSHIP FIRST. The port guard is a SECONDARY veto and must never mask the
@@ -2713,6 +3119,17 @@ function registryAliveCandidates(wantPid) {
   }
   return res;
 }
+// The refusal an UNKNOWN attribution produces.  It must NOT be reported as not_owned: "not ours"
+// and "cannot tell" are different answers (that conflation is exactly the original complaint).
+// The legacy string the pre-fix code would have used rides along as legacyReason, so an existing
+// consumer that only knows the old vocabulary is not broken by the honesty.
+function ownershipUnknownRefusal(out, blk, legacyReason) {
+  out.refused_reason = 'ownership_unknown';
+  out.legacyReason = legacyReason || 'not_owned';
+  out.ownershipUnknown = true;
+  out.howToDisambiguate = 'nothing was stopped. To settle WHOSE instance this is: (1) pass the exact pid AND project=<the absolute .vbp> so the target cannot be a recycled pid; (2) start the middle service (VB6MCP_BRIDGE_URL) if the registration is pipe-only, or make its port reachable, so the add-in can ANSWER mcp_info - a registered+alive pid that answers is attributable (owned); (3) if the registration is a residue, remove %TEMP%\\vb6mcp\\instances\\<pid>.json and retry; (4) if the port ANSWERED without the registered pid being alive, that is foreign evidence (not unknown) and the verdict says so.';
+  return out;
+}
 function registryCandidateView(list) {
   return (list || []).map(function (a) {
     return { pid: a.pid, port: a.port, transport: a.transport, project: a.project,
@@ -2735,6 +3152,11 @@ function registryCandidateView(list) {
       vb6Exe: '', vb6ExeSource: '', vb6ExeTried: [], waitMs: 0, readyWaitMs: 0, instances: [], steps: [], note: '',
 // /N12: the ownership verdict and its basis are part of EVERY path's key set.
       ownershipBasis: '', ownedByHub: false, portRuleApplies: false, portBasis: '', ownershipRule: OWNERSHIP_RULE,
+      // The ATTRIBUTION verdict (whose instance is it?) is a SEPARATE axis from the
+      // permission axis above (did THIS hub start it?).  The block is present on EVERY path (null
+      // when there is no candidate instance at all), so the key set stays fixed.
+      ownershipVerdict: null, ownershipVerdictRule: OWNERSHIP_VERDICT_RULE,
+      ownershipUnknown: false, legacyReason: '', howToDisambiguate: '',
       liveness: null, processKindRule: PROCESS_KIND_RULE,
       // the honesty keys - EVERY path carries them (discipline 98), so 'no_ide_running'
       // can no longer stand in for 'an instance is alive but did not answer'.
@@ -2779,6 +3201,17 @@ function registryCandidateView(list) {
           out.checkedRegistryDir = instancesDir();
           out.manualCommand = 'Stop-Process -Id ' + a.pid + ' -Force';
           out.truth = 'instance_registered_and_pid_alive';
+          // : ATTRIBUTION is decided by the ONE resolver, and an unknown attribution is
+          // reported as such instead of being dressed up as not_owned.
+          const ovA1 = await resolveOwnership(a);
+          out.ownershipVerdict = ovA1;
+          if (ovA1.verdict === 'unknown') {
+            ownershipUnknownRefusal(out, ovA1, o.foreignPort ? 'not_ours_by_red_line' : 'instance_found_but_unresponsive');
+            out.truth = 'instance_found_but_ownership_unknown';
+            out.note = 'pid ' + wantPid + ' is registered (' + a.registryFile + ') and its process is ALIVE, but WHOSE instance it is cannot be established: ' + ovA1.basis.join('; ') + '. Nothing was stopped.';
+            out.nextStep = 'disambiguate first (howToDisambiguate): the manual command "' + out.manualCommand + '" is only for an instance you have confirmed is yours.';
+            return textResult(out, snap.contractVersion);
+          }
           out.refused_reason = o.foreignPort ? 'not_ours_by_red_line' : 'instance_found_but_unresponsive';
           out.note = 'pid ' + wantPid + ' is not a LIVE instance, but it IS registered (' + a.registryFile + ') and its process is ALIVE, so it is unresponsive rather than absent. ' + (o.foreignPort ? o.portBasis + '; not ours, nothing was stopped.' : 'Ownership: ' + o.ownershipBasis + '. Nothing was stopped.');
           out.nextStep = 'run "' + out.manualCommand + '" on the machine that owns the pid and retry, or use ide_stop{pid:' + a.pid + '} when the ownership verdict above is owned.';
@@ -2826,6 +3259,15 @@ function registryCandidateView(list) {
       out.truth = 'instance_registered_and_pid_alive';
       // the SAME precedence as ide_stop/ide_restart - ownership first, the port guard second.
       out.alsoForeignPort = !!o0.foreignPort;
+      const ov0 = await resolveOwnership(a0);
+      out.ownershipVerdict = ov0;
+      if (ov0.verdict === 'unknown') {
+        ownershipUnknownRefusal(out, ov0, o0.foreignPort ? 'not_ours_by_red_line' : 'instance_found_but_unresponsive');
+        out.truth = 'instance_found_but_ownership_unknown';
+        out.note = 'pid ' + a0.pid + ' is registered (' + a0.registryFile + ') and its process is ALIVE, but WHOSE instance it is cannot be established: ' + ov0.basis.join('; ') + '. Nothing was stopped.';
+        out.nextStep = 'disambiguate first (howToDisambiguate): the manual command "' + out.manualCommand + '" is only for an instance you have confirmed is yours.';
+        return textResult(out, snap.contractVersion);
+      }
       if (!o0.owned) {
         out.refused_reason = 'not_owned';
         out.note = 'pid ' + a0.pid + ' IS REGISTERED AND ALIVE but is not ours (' + o0.ownershipBasis + '), so nothing was stopped'
@@ -2903,6 +3345,16 @@ function registryCandidateView(list) {
     // pid). The port guard stays a SECONDARY veto: it can only fire for an instance that IS ours and
     // whose KNOWN port is below 8767 (the reserved range); it can never stand in for 'not owned'.
     out.alsoForeignPort = !!own.foreignPort;
+    // : the ATTRIBUTION verdict (whose instance is it?) is decided by the ONE resolver and
+    // reported on every path.  It is a DIFFERENT axis from the permission decision below.
+    const ovT = await resolveOwnership(target);
+    out.ownershipVerdict = ovT;
+    if (ovT.verdict === 'unknown') {
+      ownershipUnknownRefusal(out, ovT, (!own.owned ? 'not_owned' : (own.foreignPort ? 'not_ours_by_red_line' : 'instance_found_but_unresponsive')));
+      out.truth = 'instance_found_but_ownership_unknown';
+      out.note = 'pid ' + target.pid + ' is alive, but WHOSE instance it is cannot be established: ' + ovT.basis.join('; ') + '. Nothing was stopped.';
+      return textResult(out, snap.contractVersion);
+    }
     if (!own.owned) {
       out.refused_reason = 'not_owned';
       out.truth = 'instance_found_but_not_owned';
@@ -3082,6 +3534,41 @@ function registryCandidateView(list) {
   return textResult({ ok: false, reason: 'unknown_hub_tool', name: name }, snap.contractVersion);
 }
 
+// ---- schema shape on the WIRE ---------------------------------------------------------------
+// Strict MCP clients validate the WHOLE tools/list result: ONE tool whose inputSchema.required is
+// an EMPTY OBJECT ({} instead of []) makes them reject the entire result (INVALID_RESULT) and
+// register ZERO tools of this server.  Measured 2026-10-20: six new tools carrying required:{}
+// cost all 130 registrations.  Fix the SHAPE only, at the single exit every client sees; the
+// inproc rollback path keeps its exact bytes.
+const schemaShapeLogged = new Set();
+function normalizeRequiredShape(tool) {
+  const sch = (tool && typeof tool === 'object') ? tool.inputSchema : null;
+  if (!sch || typeof sch !== 'object' || Array.isArray(sch)) return tool;
+  if (!Object.prototype.hasOwnProperty.call(sch, 'required')) return tool;
+  const req = sch.required;
+  if (Array.isArray(req)) return tool;
+  let out, why;
+  if (typeof req === 'string') { out = [req]; why = 'string->array'; }
+  else if (req && typeof req === 'object') { out = Object.keys(req).filter(function (k) { return !!req[k]; }); why = 'object->array'; }
+  else { out = undefined; why = 'omitted'; }
+  const copy = Object.assign({}, tool);
+  const schCopy = Object.assign({}, sch);
+  if (out === undefined) delete schCopy.required; else schCopy.required = out;
+  copy.inputSchema = schCopy;
+  const name = (tool && tool.name) ? tool.name : '?';
+  const key = name + ':' + why;
+  if (!schemaShapeLogged.has(key)) {
+    schemaShapeLogged.add(key);
+    try { process.stderr.write('[hub-schema] normalized ' + name + ' required=' + why +
+      (out ? ' [' + out.join(', ') + ']' : '') + '\n'); } catch (e) { }
+  }
+  return copy;
+}
+function normalizeToolSchemas(tools) {
+  if (BRIDGE_MODE === 'inproc') return tools;          // rollback path: byte-identical
+  if (!Array.isArray(tools)) return tools;
+  return tools.map(function (t) { return normalizeRequiredShape(t); });
+}
 async function toolsListResult(d) {
   // ---- thin shell (b): the bridge owns the add-in face ---------------------------------
   // Bridge ONLINE  -> its 110-tool face + the 10 hub tools (each name once) = the SAME 120.
@@ -3096,7 +3583,7 @@ async function toolsListResult(d) {
         const tools = (tl && tl.result && tl.result.tools) || null;
         if (tools && tools.length) {
           dbg('bridge tools/list tools=' + tools.length);
-          return { tools: mergeHubFace(tools) };     // strict: EXACTLY {tools}
+          return { tools: normalizeToolSchemas(mergeHubFace(tools)) };     // strict: EXACTLY {tools}
         }
       } catch (e) { dbg('bridge tools/list FAILED: ' + String((e && e.message) || e)); }
     }
@@ -3127,7 +3614,7 @@ async function toolsListResult(d) {
     merged.push(t);
   }
   // Strict: EXACTLY {tools}.
-  return { tools: merged };
+  return { tools: normalizeToolSchemas(merged) };
 }
 
 // ---- failureKind: the machine-readable distinction of a forward failure ----------------------
@@ -3242,7 +3729,7 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
   }
   const pickNote = {};
   const midRec = middleServiceReceipt();
-  if (midRec) pickNote.middleService = midRec;   // task-108: every forwarded receipt names its addresser
+  if (midRec) pickNote.middleService = midRec;   // every forwarded receipt names its addresser
   const hcPick = hubCodeStamps();               // P1: same code-proof on the direct path
   if (hcPick) pickNote.hubCode = hcPick;
   if (pick.selectedBy) pickNote.selectedBy = pick.selectedBy;
@@ -3257,6 +3744,10 @@ async function forwardPicked(pick, name, args, snap, explicit, rawRequest) {
   // forwarded tool can never be read as contradicting ide_list - both name one fact source.
   const hv = hubVerdictNote(pick, rawRequest);
   if (hv) { for (const k of Object.keys(hv)) { if (pickNote[k] === undefined) pickNote[k] = hv[k]; } }
+  // : the SAME attribution block ide_list publishes, on the forwarded diagnostic receipt
+  // (stampBody only fills keys the add-in did not set, so an add-in envelope is never overwritten).
+  const ovNote = await ownershipNoteFor(pick, name);
+  for (const k of Object.keys(ovNote)) { if (pickNote[k] === undefined) pickNote[k] = ovNote[k]; }
   if (isRemote) { pickNote.remote = true; pickNote.endpoint = pick.endpoint; pickNote.endpointUrl = pick.endpointUrl; }
   if (pick.matchedBy === 'project_path') {
     pickNote.targetKey = pick.targetKey;
@@ -3361,13 +3852,27 @@ async function resolveLocalPick(tgt, explicit, rawRequest) {
 function hubVerdictNote(pick, rawRequest, step) {
   if (!pick) return null;
   const live = pick.liveness || (pick.probeStatus ? livenessOf(pick, bridgeIdentitySync()) : null);
+  // : hubInstance.ownership used to be pick.ownership, which is UNDEFINED for every pick
+  // the hub resolves itself - so the forwarded receipt printed "no ownership" next to ide_list's
+  // "registry_started_by_hub" for the SAME pid.  It is now the same predicate ide_list publishes.
+  let legacyOwn = pick.ownership || null;
+  if (!legacyOwn) { try { legacyOwn = ownershipOf(pick).ownership; } catch (e) { legacyOwn = null; } }
   return { hubInstance: { pid: pick.pid || null, port: pick.port || null, project: pick.project || null,
                           projectPath: pick.projectPath || null, targetKey: pick.targetKey || null,
-                          processKind: pick.processKind || 'vb6_ide', ownership: pick.ownership || null },
+                          processKind: pick.processKind || 'vb6_ide', ownership: legacyOwn },
            hubLiveness: live ? { state: live.state, basis: live.basis, probeStatus: live.probeStatus, forwardRoute: live.forwardRoute, pipeState: live.pipeState } : null,
            livenessRule: LIVENESS_RULE,
            targetResolution: pick.resolution || null, targetRequested: rawRequest, targetResolutionRule: TARGET_RESOLUTION_RULE,
            targetNote: step || null };
+}
+// The attribution block for the forwarded DIAGNOSTIC entrance.  ide_state is
+// the tool whose answer was read as a second opinion about the SAME instance ide_list listed, so it
+// carries the SAME ownershipVerdict block, computed by the SAME resolver, from the same facts.
+async function ownershipNoteFor(pick, name) {
+  if (name !== 'ide_state' || !pick || !pick.pid) return {};
+  let blk = null;
+  try { blk = await resolveOwnership(pick); } catch (e) { blk = null; }
+  return blk ? { ownershipVerdict: blk, ownershipVerdictRule: OWNERSHIP_VERDICT_RULE } : {};
 }
 async function handleCall(params) {
   const name = params && params.name;
@@ -3440,7 +3945,8 @@ async function handleCall(params) {
       const note = Object.assign({ hubTargetNotRewritten: true, targetRequested: rawRequest,
                                    hubSelectorSent: String(argsIn._target), hubSelectorForm: 'verbatim_explicit' },
         (localRes && localRes.pick && localRes.pick.ok) ? hubVerdictNote(localRes.pick, rawRequest,
-          'explicit _target "' + String(argsIn._target) + '" was handed to the middle service VERBATIM (the hub never rewrites an explicit target)') : {});
+          'explicit _target "' + String(argsIn._target) + '" was handed to the middle service VERBATIM (the hub never rewrites an explicit target)') : {},
+        await ownershipNoteFor(localRes && localRes.pick, name));
       const stampedEx = await bridgeForwardCall(name, argsIn, snap, note, localRes && localRes.pick);
   if (forwardAnsweredOk(stampedEx)) noteForwardSuccess(localRes && localRes.pick);
       if (stampedEx) {
@@ -3462,6 +3968,7 @@ async function handleCall(params) {
       const note = Object.assign({}, hubVerdictNote(localRes.pick, rawRequest,
         'the hub resolved _target (step=' + ((localRes.pick.resolution && localRes.pick.resolution.step) || '?')
           + ') and handed the middle service the canonical selector "' + sel + '" (form=' + form + ')'),
+        await ownershipNoteFor(localRes.pick, name),
         { targetResolved: sel, targetResolvedBy: 'hub', hubSelectorSent: sel, hubSelectorForm: form,
           hubTargetNotRewritten: false });
       const stamped = await bridgeForwardCall(name, argsOut, snap, note, localRes && localRes.pick);
@@ -3543,7 +4050,7 @@ async function handleCall(params) {
 }
 
 function send(obj) {
-  // FAIL-CLOSED last line of defence (task-107): no JSON-RPC payload may carry a null/undefined
+  // FAIL-CLOSED last line of defence: no JSON-RPC payload may carry a null/undefined
   // port URL.  The per-receipt guards make this unreachable in normal operation; if some future
   // path still builds one, the caller gets a structured replacement instead of a URL parse error.
   let out = JSON.stringify(obj);
@@ -3578,25 +4085,50 @@ async function handle(line) {
     const snap = snapshot();
     const d = await discoverSoft(DISCOVERY_GRACE_MS);
     const st = await faceState(d);
-    return send({ jsonrpc: '2.0', id: id, result: {
+    // listChanged is advertised ONLY outside inproc: the rollback path keeps its exact bytes.
+    const capabilities = BRIDGE_MODE === 'inproc' ? { tools: {} } : { tools: { listChanged: true } };
+    send({ jsonrpc: '2.0', id: id, result: {
       protocolVersion: v,
-      capabilities: { tools: {} },
+      capabilities: capabilities,
       serverInfo: SERVER,
       instructions: await buildInstructions(await resolveDiscovery(d), snap),
       faceSource: st.faceSource,
       contractVersion: st.contractVersion,
       toolCount: st.toolCount
     } });
+    if (BRIDGE_MODE !== 'inproc') {
+      newConnection();
+      startFaceNotifyTimer();
+    }
+    return;
   }
-  if (method && method.indexOf('notifications/') === 0) return;
-  if (method === 'tools/list') return send({ jsonrpc: '2.0', id: id, result: await toolsListResult(await discoverSoft(LIST_GRACE_MS)) });
-  if (method === 'tools/call') return send({ jsonrpc: '2.0', id: id, result: await handleCall(req.params) });
+  if (method && method.indexOf('notifications/') === 0) {
+    if (method === 'notifications/initialized' && BRIDGE_MODE !== 'inproc') {
+      conn.initialized = true;
+      alignClientFace().catch(function () { });
+    }
+    return;
+  }
+  if (method === 'tools/list') {
+    const face = await toolsListResult(await discoverSoft(LIST_GRACE_MS));
+    send({ jsonrpc: '2.0', id: id, result: face });
+    if (BRIDGE_MODE !== 'inproc') noteFaceSynced(face.tools);
+    return;
+  }
+  if (method === 'tools/call') {
+    const result = await handleCall(req.params);
+    if (BRIDGE_MODE !== 'inproc') checkFaceChange('call').catch(function () { });
+    return send({ jsonrpc: '2.0', id: id, result: result });
+  }
   if (method === 'ping') return send({ jsonrpc: '2.0', id: id, result: {} });
   return send({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'method not found: ' + method } });
 }
 
 // Warm the discovery cache as soon as the process starts (background; never blocks a reply).
 setTimeout(function () { discover().catch(function () { }); }, 0);
+// First face probe at startup: a restarted hub compares the face the PREVIOUS client generation
+// saw (hub_face_cache.json) with the current one and, if a client then initializes, announces it.
+setTimeout(function () { bootFaceNotify(); }, 0);
 // Warm the lessons cache too, so the FIRST initialize does not pay the python spawn.
 setTimeout(function () { lessonsText().catch(function () { }); }, 0);
 
@@ -3660,7 +4192,7 @@ function flushResidual(reason) {
   }
   dispatch(rem);
 }
-// task-108 (author addendum): the middle service must be RESIDENT even when NO VB IDE exists at
+// The middle service must be RESIDENT even when NO VB IDE exists at
 // all, so the lazy ensure is ALSO kicked at HUB STARTUP (background - it must never delay
 // initialize/tools/list, hence the timer and the ignored promise).  A later IDE needs no restart
 // of the service: the bridge caches "no instance" for VB6MCP_DISCOVERY_TTL_MS (2 s) and a failed

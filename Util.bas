@@ -69,6 +69,32 @@ Private Declare Function UtilProcess32Next Lib "kernel32" Alias "Process32Next" 
 Private Declare Function UtilOpenProcess Lib "kernel32" Alias "OpenProcess" (ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As Long
 Private Declare Function UtilCloseHandle Lib "kernel32" Alias "CloseHandle" (ByVal hObject As Long) As Long
 Private Declare Function UtilGetExitCodeProcess Lib "kernel32" Alias "GetExitCodeProcess" (ByVal hProcess As Long, ByRef lpExitCode As Long) As Long
+
+' ---------------------------------------------------------------------------
+' P1/P12: canonical (real) path resolution.
+'
+' VB6 keeps the spelling it was OPENED with, so a project opened through a
+' directory junction keeps the LINK ALIAS in FileName. Anything computed from
+' that spelling can land beside the real tree instead of inside it (a relative
+' Reference= then resolves one level too shallow).
+'
+' GetFinalPathNameByHandleW is the only API that RESOLVES a junction / reparse
+' point. GetLongPathNameW is NOT a substitute - it only expands 8.3 names and
+' leaves the link unresolved (a fake canonical path), so it is not used here.
+'
+' UtilRealPathTiers() reports which of its three tiers produced the answer:
+'   1  CreateFileW(the path, access 0, share RWD, OPEN_EXISTING,
+'      FILE_FLAG_BACKUP_SEMANTICS) -> GetFinalPathNameByHandleW
+'   2  that open refused (another process holds the file) -> the same call on
+'      the PARENT DIRECTORY, then the file name appended
+'   3  both refused -> empty string plus the two refusal texts (never a guess)
+' ---------------------------------------------------------------------------
+Private Const UTIL_OPEN_EXISTING As Long = 3
+Private Const UTIL_FILE_SHARE_RWD As Long = &H7
+Private Const UTIL_FILE_FLAG_BACKUP_SEMANTICS As Long = &H2000000
+Private Const UTIL_INVALID_HANDLE_VALUE As Long = -1
+Private Declare Function UtilCreateFileW Lib "kernel32" Alias "CreateFileW" (ByVal lpFileName As Long, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As Long, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As Long) As Long
+Private Declare Function UtilGetFinalPathNameByHandleW Lib "kernel32" Alias "GetFinalPathNameByHandleW" (ByVal hFile As Long, ByVal lpszFilePath As Long, ByVal cchFilePath As Long, ByVal dwFlags As Long) As Long
 Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 
 ' THE contract banner - a single source of truth. The first line of
@@ -160,7 +186,75 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 '   * v1.11.11: 10 vba6_probe PARAMETER descriptions no longer carry internal experiment ids or
 '     reverse-engineering round numbers (same meaning, no parameter added/removed/retyped), and the
 '     remaining internal experiment ids and round numbers are gone from the shipped comments.
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.11.11"
+' v1.11.12 (write semantics + .vbp order + hard budgets + host-modal evidence; tool count
+' unchanged 110, no tool/parameter/description change):
+'   * apply_edits op "D" deletes the WHOLE matched block; a D op's text is THREE-STATE
+'     (absent or empty = delete, non-empty = refused with reason=delete_with_text), a batch
+'     that would empty the component is refused (would_empty_component), and the receipt
+'     adds deletedLines + deletedText (capped: deletedTextLimit=4000 characters).
+'   * reload_component / save_project publish .vbp order + RevisionVer evidence and
+'     save_project RESTORES a pure reorder (vbpOrderRestored / vbpOrderFinalPreserved; raw
+'     lists capped at 400 lines, change list at 50); reload_component reports
+'     inMemoryOrderMoved / inMemoryOrderChanges.
+'   * build / make_project: the external compiler subprocess runs under a HARD, CLAMPED
+'     budget that TERMINATES and VERIFIES the child (timedOut / budgetEnforced / budgetMs /
+'     budgetSource / killMethod / childPid / compilerElapsedMs / childLeftover; make_project
+'     also isolatedMake{}). make_project adds host_modal_blocking / host_modal{} /
+'     stopReason, INDEPENDENT of timedOut. The isolated-compile wait pumps the message
+'     queue, so ide_state and other read-only diagnostics stay answerable during a long
+'     compile (no schema change: receipts only).
+'   * hub side (no add-in change): ide_list / ide_state / ide_restart share ONE
+'     ownership{verdict,basis,...} resolver; portAvailable=false alone is unknown, not foreign.
+' v1.12.0 (debug capability + write/verify/build hardening; tool count 110 -> 120, TEN new tools,
+' parameters added to existing tools; receipts additive):
+'   * NEW debug_session / run_until_break / breakpoints / get_locals / eval_at_frame /
+'     run_project / last_error / move_procedure / delete_procedures / edit_by_byte_anchor.
+'   * Start and end are QUEUED IDE commands: one add-in call cannot cover start->break. The
+'     two-phase protocol is start (startedPending + howToContinue) then attach. debug_session
+'     never saves the project (preRunSave=false) and reports endQueued instead of a false
+'     wedged verdict; wedged means the call could not recover the IDE.
+'   * breakpoints carry paneLine and diskLine plus an explicit source declaration; a native
+'     breakpoint set by hand cannot be enumerated or verified (nativeStateVerified=false).
+'     A conditional breakpoint is expressed as hitCount (auto-continue N-1, stop on N).
+'   * get_locals reads NAMES from the source declarations; the immediate-window context is NOT
+'     the break frame, so local VALUES are not readable (localsUnavailable + reason).
+'     eval_at_frame is IDE-immediate-context only and REFUSES in break/run unless
+'     allowUnsafeEval=true; object/array expressions are refused BEFORE evaluation
+'     (object_expression_unsupported) because they can hang the IDE; every evaluation is
+'     gate-armed and timeoutMs is a caller budget hint (the add-in cannot preempt a statement).
+'   * run_project: two-phase, sets env before Start (Environ reads it), command line arguments
+'     are refused for a Standard EXE started from the IDE, and a running -Embedding process
+'     cannot be attached. last_error returns the error dialog body + callstack + local NAMES.
+'   * move_procedure / delete_procedures are transactional (snapshot + rollback);
+'     edit_by_byte_anchor edits raw ANSI bytes with GBK lead/trail boundary checks and a
+'     roundtrip check, and a failed anchor NEVER writes (fileUntouched + equal sha).
+'   * build / make_project add sourceFreshness (per component disk-vs-pane; only NORMALIZED
+'     TEXT is compared, sha is informational), final{} sampled AFTER the LAA patch
+'     (sha256/size/mtime/peFlags/laaFlag/fileVersion/revisionVer + verifiedOnDisk), an optional
+'     project for the cli route with a CLSID InprocServer32 guard (registrationBefore/After/
+'     Rewritten/Restored/Untouched), and compileLogHint + diagnoseRecommended when nothing was
+'     compiled (cache hit); a cache hit never parses a stale compiler log.
+'   * verify adds semanticDiff (case/attribute/trailing-space normalization + per line
+'     paneLine/diskLine/category), failureLayers{ideDiskDiff,lint,build,modal} and
+'     overallBasis; verify_scope counts ONLY a proven IDE!=disk as fail
+'     (failBasis=ide_disk_diff_proven) and takes a baseline. The invariant
+'     pass+fail+unknown==checked is always published as countsConsistent.
+'   * add_component / remove_component keep the .vbp line and the component file in sync
+'     atomically (the file is written FIRST, then the .vbp; the .vbp keeps exactly one
+'     trailing CRLF; a failure rolls BOTH sides back), and a Form/UserControl add is refused
+'     (pairedBinaryUnsupported).
+'   * write_file / write_source refuse EMPTY content on an existing non-empty file
+'     (empty_content_would_truncate) unless confirm_truncate=true; a VB source file is never
+'     written empty.
+'   * dependency_graph publishes minQuotaHint{charQuota,budgetMs,basis} when partial, so one
+'     re-run with those values returns the complete graph; cannotComplete is reported instead
+'     of a fabricated hint.
+'   * Every inputSchema now carries properties (an object, {} when there are no
+'     parameters) and required (an ARRAY of names, [] when nothing is required).
+'     Six new tools had emitted "required":{} (an empty Dictionary passed where a
+'     list belonged); the schema builder now coerces/refuses that shape, so a
+'     JSON-Schema validator can never be handed a non-array required again.
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.12.0"
 ' message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
@@ -1273,4 +1367,205 @@ Public Function EnvLongOr(ByVal name As String, ByVal dflt As Long) As Long
     If d > 2147483000# Then d = 2147483000#
     EnvLongOr = CLng(d)
     Err.Clear
+End Function
+
+' ---------------------------------------------------------------------------
+' P1/P12: path helpers used to keep .vbp Reference= paths resolvable.
+' ---------------------------------------------------------------------------
+
+' The canonical (real) path of an existing file OR directory, or "" when it
+' cannot be resolved (then UtilRealPathTiers() explains why - never a guess).
+Public Function UtilRealPath(ByVal path As String) As String
+    Dim tier As Long, errText As String
+    UtilRealPath = UtilRealPathTiers(path, tier, errText)
+End Function
+
+' Same as UtilRealPath, plus WHICH tier answered and, on failure, the refusal
+' text of every tier that was tried. tierOut: 0 = unresolved, 1 = the path
+' itself, 2 = its parent directory.
+Public Function UtilRealPathTiers(ByVal path As String, ByRef tierOut As Long, ByRef errOut As String) As String
+    Dim full As String, got As String, tier1Err As String
+    Dim parent As String, leaf As String
+    tierOut = 0
+    errOut = ""
+    UtilRealPathTiers = ""
+    full = UtilAbsolutePath(path)
+    If Len(full) = 0 Then
+        errOut = "the path could not be turned into an absolute path"
+        Exit Function
+    End If
+    got = UtilFinalPathOfHandle(full, errOut)
+    If Len(got) > 0 Then
+        tierOut = 1
+        errOut = ""
+        UtilRealPathTiers = got
+        Exit Function
+    End If
+    tier1Err = errOut
+    parent = UtilParentDir(full)
+    leaf = UtilLeafName(full)
+    If Len(parent) > 0 And Len(leaf) > 0 Then
+        got = UtilFinalPathOfHandle(parent, errOut)
+        If Len(got) > 0 Then
+            tierOut = 2
+            errOut = ""
+            UtilRealPathTiers = UtilJoinPath(got, leaf)
+            Exit Function
+        End If
+        errOut = "tier 1 (the path itself): " & tier1Err & "; tier 2 (its parent directory): " & errOut
+        Exit Function
+    End If
+    errOut = "tier 1 (the path itself): " & tier1Err & "; tier 2 not attempted (the parent directory or the file name is not derivable from " & full & ")"
+End Function
+
+' the GetFinalPathNameByHandleW step for one already-absolute path.
+Private Function UtilFinalPathOfHandle(ByVal full As String, ByRef errOut As String) As String
+    Dim h As Long, n As Long, cch As Long, buf As String, tries As Long
+    errOut = ""
+    h = UtilCreateFileW(StrPtr(full), 0&, UTIL_FILE_SHARE_RWD, 0&, UTIL_OPEN_EXISTING, UTIL_FILE_FLAG_BACKUP_SEMANTICS, 0&)
+    If h = 0 Or h = UTIL_INVALID_HANDLE_VALUE Then
+        errOut = "CreateFileW refused the path (GetLastError=" & CStr(Err.LastDllError) & ")"
+        Exit Function
+    End If
+    cch = 1024
+    Do While tries < 3
+        tries = tries + 1
+        buf = String$(cch, vbNullChar)
+        n = UtilGetFinalPathNameByHandleW(h, StrPtr(buf), cch, 0&)
+        If n <= 0 Then
+            errOut = "GetFinalPathNameByHandleW failed (GetLastError=" & CStr(Err.LastDllError) & ")"
+            Exit Do
+        End If
+        If n < cch Then
+            UtilFinalPathOfHandle = UtilStripNtPrefix(Left$(buf, n))
+            Exit Do
+        End If
+        If n >= 32767 Then
+            errOut = "the canonical path is longer than a VB6 string can carry"
+            Exit Do
+        End If
+        cch = n + 1
+    Loop
+    UtilCloseHandle h
+End Function
+
+' the NT prefix is stripped: the device form and the UNC device form both
+' reduce to the plain path VB6 can use.
+Private Function UtilStripNtPrefix(ByVal p As String) As String
+    Dim s As String
+    s = p
+    If Len(s) >= 4 Then
+        If Left$(s, 4) = "\\?\" Then s = Mid$(s, 5)
+    End If
+    If Len(s) >= 4 Then
+        If UCase$(Left$(s, 4)) = "UNC\" Then s = "\\" & Mid$(s, 5)
+    End If
+    UtilStripNtPrefix = s
+End Function
+
+' True when the path is RELATIVE (drive-absolute, UNC and root-absolute are
+' not), and false for a path carrying an environment placeholder like $(WinDir),
+' which this module never rewrites because it cannot be resolved here.
+Public Function UtilPathIsRelative(ByVal path As String) As Boolean
+    Dim s As String
+    UtilPathIsRelative = False
+    s = Trim$(path)
+    If Len(s) = 0 Then Exit Function
+    If InStr(s, "$(") > 0 Then Exit Function
+    If Len(s) >= 2 Then
+        If Mid$(s, 2, 1) = ":" Then Exit Function
+    End If
+    If Left$(s, 2) = "\\" Then Exit Function
+    If Left$(s, 1) = "\" Then Exit Function
+    UtilPathIsRelative = True
+End Function
+
+' the path of target RELATIVE TO baseDir, using ".." components. Empty when the
+' target is not absolute, when the two live on different volumes, or when the
+' base is empty. Example: base <root>\old\proj\src, target <root>\old\libs\x.tlb
+' -> ..\..\libs\x.tlb
+Public Function UtilRelPath(ByVal baseDir As String, ByVal target As String) As String
+    Dim b As String, t As String, s As String, k As Long, n As Long
+    Dim bp() As String, tp() As String
+    UtilRelPath = ""
+    If Len(Trim$(baseDir)) = 0 Then Exit Function
+    If UtilPathIsRelative(target) Then Exit Function
+    t = UtilAbsolutePath(target)
+    b = UtilAbsolutePath(baseDir)
+    If Len(b) = 0 Or Len(t) = 0 Then Exit Function
+    b = UtilTrimSep(b)
+    t = UtilTrimSep(t)
+    bp = Split(b, "\")
+    tp = Split(t, "\")
+    n = 0
+    Do While n <= UBound(bp) And n <= UBound(tp)
+        If StrComp(bp(n), tp(n), vbTextCompare) <> 0 Then Exit Do
+        n = n + 1
+    Loop
+    If n = 0 Then Exit Function
+    If StrComp(bp(0), tp(0), vbTextCompare) <> 0 Then Exit Function
+    For k = n To UBound(bp)
+        If Len(bp(k)) > 0 Then s = s & "..\"
+    Next
+    If Right$(s, 1) = "\" Then s = Left$(s, Len(s) - 1)
+    For k = n To UBound(tp)
+        If Len(tp(k)) > 0 Then
+            If Len(s) > 0 Then s = s & "\"
+            s = s & tp(k)
+        End If
+    Next
+    UtilRelPath = s
+End Function
+
+' absolute form of a path through the Scripting.FileSystemObject (it collapses
+' "." / ".." textually and does not require the file to exist).
+Private Function UtilAbsolutePath(ByVal path As String) As String
+    Dim s As String
+    Dim fso As Object
+    s = Trim$(path)
+    If Left$(s, 1) = Chr$(34) Then s = Replace(s, Chr$(34), "")
+    If Len(s) = 0 Then Exit Function
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    s = fso.GetAbsolutePathName(s)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+    UtilAbsolutePath = s
+End Function
+
+Private Function UtilParentDir(ByVal full As String) As String
+    Dim fso As Object
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    UtilParentDir = fso.GetParentFolderName(full)
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Function UtilLeafName(ByVal full As String) As String
+    Dim p As Long
+    UtilLeafName = ""
+    p = InStrRev(full, "\")
+    If p > 0 Then UtilLeafName = Mid$(full, p + 1)
+End Function
+
+Private Function UtilJoinPath(ByVal baseDir As String, ByVal leaf As String) As String
+    If Right$(baseDir, 1) = "\" Then
+        UtilJoinPath = baseDir & leaf
+    Else
+        UtilJoinPath = baseDir & "\" & leaf
+    End If
+End Function
+
+Private Function UtilTrimSep(ByVal p As String) As String
+    Dim s As String
+    s = p
+    Do While Len(s) > 3
+        If Right$(s, 1) = "\" Then s = Left$(s, Len(s) - 1) Else Exit Do
+    Loop
+    UtilTrimSep = s
 End Function

@@ -57,11 +57,11 @@ neither see the project open in the IDE nor click that "Make Project" dialog. Th
 fills that gap.
 
 **The approach**: rather than building another editor, **turn the VB6 IDE itself into an MCP
-server**. Load one add-in and the IDE exposes 110 tools: read/search/edit code, static
+server**. Load one add-in and the IDE exposes 120 tools: read/search/edit code, static
 checking, anchor-based editing with safe transactions, compilation, run and single-step,
 dialog handling, form and project metadata, snapshots and rollback, packaging. Ten more
 **hub-face** tools (IDE instance management plus the lesson store) run outside the IDE
-process, so a client sees 120 tools in total. **Because the tools live inside the IDE process**,
+process, so a client sees 130 tools in total. **Because the tools live inside the IDE process**,
 they can do what an out-of-process approach cannot: actually click that dialog, actually press
 Run, actually read the local variables at a breakpoint.
 
@@ -95,7 +95,7 @@ MCP_VB6/
 |-- McpServer.cls          MCP/JSON-RPC dispatch + HTTP routing
 |-- HttpConn.cls           HTTP/1.1 request buffering and parsing (keep-alive supported)
 |-- ServerForm.frm         hidden form hosting the Winsock listener + port-probe timer
-|-- CodeTools.cls          the 110 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
+|-- CodeTools.cls          the 120 MCP tools (full VBIDE object model + file system + syntax gate / edit safety / compile authority)
 |-- JsonLib.bas            zero-dependency JSON parser/serializer
 |-- Utf8.bas               UTF-8/ANSI/UTF-16 conversion (kernel32 APIs)
 |-- Util.bas               logging, port file
@@ -207,7 +207,7 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
 - **Non-loopback binding is impossible**: binding to a non-loopback address is refused and the process
   exits with **code 6** - there is **no override switch**.
 - MCP clients come in through the **hub** `bridge/vb6mcp_hub.mjs` (Node, zero dependencies, stdio): the
-  hub serves the 10 `ide_*` and lesson tools and forwards the add-in face (110 tools) to the middle
+  hub serves the 10 `ide_*` and lesson tools and forwards the add-in face (120 tools) to the middle
   service; it finds the service through `VB6MCP_BRIDGE_URL` (source default `http://127.0.0.1:8767`).
 - The add-in accepts only a **named pipe** (one per IDE instance; a single pipe **does not allow
   concurrent connections**) => clients should multiplex by request id **on one connection** or
@@ -225,7 +225,7 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
 
 ### Which tools need no IDE, and which need a live IDE
 
-**The add-in face (110 tools): a live IDE is required.** Every one of them is implemented by the add-in that runs inside the `VB6.EXE` process (reading and editing code, static checks, building, breakpoints, forms, snapshots, ...), so with no executable instance there is nothing to run them. **Listing** them works without an IDE (the hub answers `tools/list` from the bundled snapshot, marked `faceSource=snapshot`), but **calling** one needs a live local instance, or an explicitly addressed remote endpoint that has one. The refusal codes for "no IDE" are in the next subsection.
+**The add-in face (120 tools): a live IDE is required.** Every one of them is implemented by the add-in that runs inside the `VB6.EXE` process (reading and editing code, static checks, building, breakpoints, forms, snapshots, ...), so with no executable instance there is nothing to run them. **Listing** them works without an IDE (the hub answers `tools/list` from the bundled snapshot, marked `faceSource=snapshot`), but **calling** one needs a live local instance, or an explicitly addressed remote endpoint that has one. The refusal codes for "no IDE" are in the next subsection.
 
 **The hub face (10 tools): they run outside the IDE process and need no add-in loaded**, but their dependencies differ:
 
@@ -275,7 +275,7 @@ The middle service (`bridge/vb6mcp_bridge.py`) is a **resident layer**, not an o
 - **Logs and audit**: the launcher writes the service log to `%ProgramData%\vb6mcp\logs\middle-service.log`; remote mode (`--allow-remote` + TLS + token) requires `--audit-log`, which the installer points at `%ProgramData%\vb6mcp\logs\remote-audit.jsonl` (JSONL; only requests from remote peers are recorded). Both are **kept** on uninstall.
 - **Token rotation**: the token comes from `VB6MCP_TOKEN` first (never on disk), otherwise `VB6MCP_TOKEN_FILE`. During rotation pass the old token as `--token-prev` (or `VB6MCP_TOKEN_PREV`) so both stay valid for one window; drop the old value once clients have switched. The installer only **references** the token file - it never creates or deletes it.
 - **The port must match**: `VB6MCP_BRIDGE_URL` must point at the **same** service port as the installer's `-Port` (the installer defaults to **8797**; the bridge source defaults to `8767`, and with the installer `-Port` wins). Change both sides together, or the hub will fail to connect.
-- **Troubleshooting**: `listener.listening:false` => the task never started or the process exited (check the log and the task's `lastTaskResult`); `health.httpStatus:401` => the service is up but the token does not match (compare `-TokenFile` with the client token); `127.0.0.1:null/rpc`, `RemoteDisconnected`, or every add-in tool failing silently => **nothing is listening on that port** (this is what made 110 add-in tools go silent in one round); `verdict:degraded` => the task exists but the port is not listening - restart the task and read the log.
+- **Troubleshooting**: `listener.listening:false` => the task never started or the process exited (check the log and the task's `lastTaskResult`); `health.httpStatus:401` => the service is up but the token does not match (compare `-TokenFile` with the client token); `127.0.0.1:null/rpc`, `RemoteDisconnected`, or every add-in tool failing silently => **nothing is listening on that port** (this is what made 120 add-in tools go silent in one round); `verdict:degraded` => the task exists but the port is not listening - restart the task and read the log.
 
 ## 3. Connecting an MCP client
 
@@ -353,16 +353,16 @@ The same as Claude Desktop: `command: node`, `args: ["<repo>/bridge/vb6mcp_hub.m
 
 To check the whole chain: `python tests/smoke_test.py --port <middle-service port>` (that script sends **no token**, so it only works while the server has no credential configured; and it **needs the VB6 IDE open with the add-in loaded** - this is not an offline self-check).
 
-## 4. Tool list (add-in face 110 + hub face 10 = 120 tools)
+## 4. Tool list (add-in face 120 + hub face 10 = 130 tools)
 
 > The authoritative list is `docs/TOOL_CATALOG.md` (exported from a running add-in via
 > `tools/list` and merged with the hub's own tools); the offline baseline is
 > `tools/schema_baseline.json`, and `tools/check_live_tools.py docs/tools_schema.json`
 > compares the shipped snapshot against that baseline.
 >
-> Tools come from **two faces**: the **add-in face, 110 tools** (`docs/tools_schema.json`, inside
+> Tools come from **two faces**: the **add-in face, 120 tools** (`docs/tools_schema.json`, inside
 > the VB6 IDE process) and the **hub face, 10 tools** (`bridge/hub_tools.json`, outside it). Below,
-> all **120** tools are grouped: 16 add-in categories plus the hub section (17); each tool
+> all **130** tools are grouped: 16 add-in categories plus the hub section (17); each tool
 > appears exactly once. The key-parameter column is taken straight from each tool's own
 > `inputSchema` (required parameters first), never typed from memory. The five hub lesson tools
 > **work with no IDE online**.
@@ -420,6 +420,9 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `preview_edit` | Preview anchor edits as a unified diff, writing nothing | `name`, `edits` |
 | `replace_in_files` | Cross-component literal or regex replace, dry_run by default | `path`, `query`, `replacement` |
 | `rename_symbol` | Rename an identifier lexically, skipping strings and comments | `path`, `old_name`, `new_name` |
+| `move_procedure` | Move a whole procedure block transactionally (delete from source + insert into target, both sides roll back on failure) | `from_component`, `proc`, `to_component` |
+| `delete_procedures` | Delete several procedures in one transaction (an undo snapshot per touched component; all restored on failure) | `procedures`, `component` |
+| `edit_by_byte_anchor` | Edit a file by **GBK/ANSI raw-byte** anchor (base64 in/out; refuses splitting a double-byte character, never writes on failure) | `path`, `old_bytes_b64`, `new_bytes_b64` |
 
 ### 5. Syntax gating & project checks
 
@@ -464,6 +467,13 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `native_breakpoint` | Toggle a real IDE breakpoint through the Debug menu | `action`, `component`, `line` |
 | `fault_inject` | Inject a guarded fault at a procedure start: raise, return, delay | `name`, `procedure`, `mode`, `id` |
 | `clear_faults` | Remove a previously injected fault block | `name`, `id`, `expected_sha256` |
+| `debug_session` | Run a whole debug session in one call: arm breakpoints, start without saving, wait for a hit, then run ordered actions | `runArgs`, `actions` |
+| `run_until_break` | Run to a breakpoint / process exit / unhandled error / timeout (two-phase: Start is a queued command) | `timeout_ms`, `attach`, `breakpoints`, `watch` |
+| `breakpoints` | Manage real IDE breakpoints: set, clear, enable, disable, list (component + source anchor or pane line) | `action`, `component`, `anchor`, `line` |
+| `get_locals` | Read the current procedure's parameters and declared locals in break mode (names from source, values from the engine) | `frame_index` |
+| `eval_at_frame` | Evaluate an expression in the IDE immediate context under an explicit safety contract (object/array expressions refused first) | `expr` |
+| `run_project` | Start the open project from the IDE with environment and (where supported) command-line arguments; two-phase | `commandLineArgs`, `env`, `start_mode`, `observe`, `timeout_ms` |
+| `last_error` | Read the unhandled-error context: dialog text + error number + call stack + local variable names | `dismiss` |
 
 ### 9. Tracing, call stack & in-process execution
 
@@ -868,7 +878,7 @@ This generation closed several places where a failure used to be silent, under o
   1. **the per-connection object was never persisted** => a request arriving in more than one TCP segment lost its head and was only dropped by the 30 s idle sweep;
   2. **close-after-send was decided after the queue had already been cleared** => a `Connection: close` response lingered until the idle sweep;
   3. **the flush path grew a cumulative `Mid$` start past 64 KiB**, and `send()=-1` with `WSAGetLastError()=0` was treated as fatal => bodies were truncated.
-- All three are fixed. **The tool face and the parameter table did not change because of it** (add-in 110 + hub 10 = 120): this is a **behaviour fix**, so no call has to change after upgrading.
+- All three are fixed. **The tool face and the parameter table did not change because of it** (add-in 110 + hub 10 = 120 at the time): this is a **behaviour fix**, so no call has to change after upgrading.
 
 ## License
 

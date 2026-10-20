@@ -13,6 +13,10 @@ Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = False
 Option Explicit
 
+Private Declare Function SetEnvironmentVariableW Lib "kernel32" _
+    (ByVal lpName As Long, ByVal lpValue As Long) As Long
+Private Declare Function DbGetCurrentProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As Long
+
 ' All MCP tools operating on the VB6 IDE (VBIDE extensibility) and the
 ' project files on disk. Covers the complete VBIDE 5.3 object model:
 ' VBE / VBProjects / VBProject / VBComponents / VBComponent / CodeModule /
@@ -143,6 +147,22 @@ Private Const MODAL_GUARD_WAIT_MAKE_MS As Long = 120000
 ' hand their line to EbExecuteLine; if that call never comes back, the NEXT tool call
 ' sees the age and force-releases the gate by itself, so one bad statement cannot leave
 ' the session permanently busy.
+Private m_stateRecovered As Boolean
+Private m_bpSession As Object
+' the breakpoint records armed by run_until_break PHASE 1, kept for PHASE 2 (the observe call
+' is a DIFFERENT call, so the hitCount targets must survive it).
+Private m_rubBreakpoints As Object
+' W-H2: the watch expressions of the CURRENT top-level debug call (evaluated at every break/step).
+Private m_watchExprs As Collection
+Private m_watchFrame As Long
+' W-H2: the identifier names the LAST get_locals enumerated. transcript[].watch may only
+' evaluate names from this list (an unknown name can raise inside the immediate context and
+' hang the in-flight call - measured), so an unknown watch expression is REFUSED, not evaluated.
+Private m_lastLocalNames As Collection
+' W-H3: the env vars applied by run_project phase 1, restored when the program ends.
+Private m_envRestore As Collection
+' W-C guard: true only when confirm_truncate:true allowed emptying an existing NON-VB file.
+Private m_wcTruncateAllowed As Boolean
 Private m_armTool As String
 Private m_armMs As Long
 Private m_armAt As Long
@@ -191,6 +211,21 @@ Private Const MAKE_LAND_WAIT_MAX_MS As Long = 120000
 ' hunk cap for the multi-hunk minimal write, and the hunk count of
 ' the last write (reported in the receipts next to writeCalls).
 Private Const MAX_HUNKS As Long = 16
+' v1.11.12: caps for the .vbp order / deleted-text receipts. They live HERE, with the other
+' receipt caps, because VB6 resolves module-level constants in source order.
+Private Const VBP_ORDER_MAX_CHANGES As Long = 50
+Private Const VBP_ORDER_MAX_LINES As Long = 400
+Private Const VBP_DELETED_MAX_CHARS As Long = 4000
+' v1.11.12: HARD budgets for the EXTERNAL compiler subprocesses. A budget is CLAMPED
+' (never unbounded), the child process is TERMINATED at the deadline, and the receipt says
+' which rule decided the applied value (budgetSource) and on which pid (childPid /
+' isolatedMake.pid). The in-IDE Make has no compiler subprocess, so no budget applies there.
+Private Const BUILD_BUDGET_DEFAULT_MS As Long = 180000
+Private Const BUILD_BUDGET_MIN_MS As Long = 1000
+Private Const BUILD_BUDGET_MAX_MS As Long = 600000
+Private Const DIAG_MAKE_BUDGET_DEFAULT_MS As Long = 120000
+Private Const DIAG_MAKE_BUDGET_MIN_MS As Long = 5000
+Private Const DIAG_MAKE_BUDGET_MAX_MS As Long = 600000
 Private m_lastWriteHunks As Long
 ' per-PHASE timings of the last minimal write, in milliseconds.
 ' These are pure additions next to the existing writeMs/writeCalls/hunks, whose
@@ -273,7 +308,8 @@ Public Function BuildToolsListResult() As Object
     Set pIs("release_inflight") = Prop("boolean", "FORCE-RELEASE the single-flight gate when the call that holds it never came back. Only acts when the in-flight call is OLDER than release_min_held_ms; the receipt gives {released, releasedTool, heldMs, abandonedSeq, statementInterrupted:false, note}. Safe to send while the gate is held, because this tool is READ-ONLY and therefore never refused by the gate.")
     Set pIs("release_min_held_ms") = Prop("integer", "The age threshold for release_inflight, in ms (default 60000). The gate is NOT touched while the in-flight call is younger than this, so a healthy long call keeps the single-flight guarantee.")
     tools.Add MakeTool("ide_state", _
-        "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to ASK the in-flight call to stop, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000). BOTH ARE BEST EFFORT: while a call holds the message-pump point no second call is executed - the request may not even be delivered - so the reliable exits are WAIT or terminate the VB6 process from outside.", _
+        "Read the VB6 IDE mode RIGHT NOW (design/run/break) together with the raw VBA6 debug-engine flag, main window title, project name and a running flag. Never cached - a mode switch is visible on the very next call. The receipt ALWAYS carries inflight{active,tool,sinceMs,serviceable,kind} (who is in flight and whether it is a read or a write) and cancel{requested,applied,targetTool,targetKind,sinceMs,reason,note} plus release{released,releasedTool,heldMs,abandonedSeq,statementInterrupted,note}; pass cancel_inflight=true to ASK the in-flight call to stop, or release_inflight=true to FORCE-RELEASE the gate of a call that never came back (only when it is older than release_min_held_ms, default 60000). BOTH ARE BEST EFFORT: while a call holds the message-pump point no second call is executed - the request may not even be delivered - so the reliable exits are WAIT or terminate the VB6 process from outside. " & _
+        "It also reports stateSource (ebMode | commandBars | ebMode+commandBars), commandBarsSuspended and notRunning, and clears a detected post-run suspended CommandBars window with ONE activate_component (autoRecover in the receipt) so a following attach call cannot mistake design for run. Waits are resolved EbMode-FIRST: EbMode=2 is break; while the CommandBars model is suspended EbMode=1 is run and EbMode=0 is design (nothing is running), never run.", _
         SchemaWith(pIs))
 
     tools.Add MakeTool("current_position", _
@@ -396,6 +432,34 @@ Public Function BuildToolsListResult() As Object
     Set pAddComp("type") = pAddComp_type
     Set pAddComp("name") = Prop("string", "Desired component name (default: IDE-generated)")
     Set pAddComp("code") = Prop("string", "Optional initial code (added via AddFromString)")
+    Dim pMv As Object
+    Set pMv = CreateObject("Scripting.Dictionary")
+    Set pMv("from_component") = Prop("string", "Source component name")
+    Set pMv("proc") = Prop("string", "Procedure name to move (exact, case-insensitive)")
+    Set pMv("to_component") = Prop("string", "Target component name")
+    Set pMv("insert_anchor") = Prop("string", "Optional exact line in the target after which the block is inserted; omit to APPEND at the end of the target")
+    tools.Add MakeTool("move_procedure", _
+        "Move a WHOLE procedure block between components in ONE transaction: take the block from the SOURCE pane, insert it into the TARGET (after insert_anchor, or appended), then delete it from the SOURCE. Any failure rolls BOTH panes back (rolledBack:true, restoreVerified proves the read-back). .vbp is never touched. Receipt: moved{from,to,proc,lineCount,insertAfterLine}, sourceSha256Before/After, targetSha256Before/After, rolledBack, restoreVerified, snapshots[], encoding/roundtrip_ok/bom, vbpTouched:false.", _
+        SchemaWith(pMv, Req("from_component", "proc", "to_component")))
+
+    Dim pDp As Object
+    Set pDp = CreateObject("Scripting.Dictionary")
+    Set pDp("procedures") = Prop("array", "Procedure list: either [{component,proc}, ...] or plain proc names (then component names the single component)")
+    Set pDp("component") = Prop("string", "Component used for plain proc-name entries")
+    tools.Add MakeTool("delete_procedures", _
+        "Delete SEVERAL procedures in ONE transaction: a pre-edit _undo pane snapshot is written for every touched component (undo_edit can restore it); if any deletion fails every touched pane is restored. Receipt: deleted[]{component,proc,fromLine,toLine,lineCount}, snapshotId, rolledBack, restoreVerified, shas[].", _
+        SchemaWith(pDp, Req("procedures")))
+
+    Dim pBa As Object
+    Set pBa = CreateObject("Scripting.Dictionary")
+    Set pBa("path") = Prop("string", "Absolute or project-relative file path")
+    Set pBa("old_bytes_b64") = Prop("string", "Base64 of the exact ORIGINAL bytes to replace (GBK/ANSI bytes as stored on disk)")
+    Set pBa("new_bytes_b64") = Prop("string", "Base64 of the replacement bytes (may be empty to delete, or contain an INSERTION)")
+    Set pBa("all_matches") = Prop("boolean", "default false = the anchor must occur exactly once; true = replace every occurrence")
+    tools.Add MakeTool("edit_by_byte_anchor", _
+        "Replace bytes in a file using GBK/ANSI RAW-BYTE anchors (base64 in, base64 out) - the only byte-exact edit path for mixed Chinese/ASCII sources. Refuses an anchor that would split a double-byte GBK character (lead 0x81..0xFE / trail 0x40..0xFE) with reason=anchor_splits_gbk_char; reports encoding_mismatch when the bytes are valid text but the file is not in that encoding. A round-trip self-check (decode->encode) runs BEFORE writing and a failure refuses the write (roundtrip_ok:false). Receipt: encoding, bom{...}, gbkBoundarySafe, anchorByteOffset, matches, sha256Before/After, bytesBefore/After, roundtrip_ok.", _
+        SchemaWith(pBa, Req("path", "old_bytes_b64", "new_bytes_b64")))
+
     tools.Add MakeTool("add_component", _
         "Create a new component in the active project with optional name and initial code. Standard forms fall back to a generated .frm + AddFile when VBComponents.Add(vbext_ct_MSForm) fails with E_FAIL.", _
         SchemaWith(pAddComp, Req("type")))
@@ -548,6 +612,7 @@ Public Function BuildToolsListResult() As Object
     Set pWrite("create_dirs") = Prop("boolean", "Create missing parent directories (default: true). The directories actually created are listed in the receipt as createdDirs[] and counted by createdDirsCount; if a parent cannot be created the call answers ok:false + reason=parent_dir_missing + missingPath (reasonLegacy=parent_not_creatable) and writes nothing.")
     Set pWrite("backup") = Prop("boolean", "Keep a .bak copy of the previous file (default: true)")
     Set pWrite("validate") = PropValidate()
+    Set pWrite("confirm_truncate") = Prop("boolean", "default false. Guard against ACCIDENTAL data loss: when the target ALREADY EXISTS and is NON-EMPTY and content is empty/blank, the write is REFUSED with reason=empty_content_would_truncate. Pass true to intentionally empty a NON-VB file. VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are ALWAYS refused, even with confirm_truncate:true - an empty VB source cannot compile; delete the file explicitly if that is really intended.")
     tools.Add MakeTool("write_file", _
         "Write a text file to disk with the given encoding. For files of the open project use reload_component afterwards (or replace_code for in-memory edits). VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
         SchemaWith(pWrite, Req("path", "content")))
@@ -577,6 +642,7 @@ Public Function BuildToolsListResult() As Object
     Set pMake("output_path") = Prop("string", "Optional output path (sets VBProject.BuildFileName before compiling)")
     Set pMake("route") = Prop("string", "ide (default) = compile inside the VB6 IDE via VBProject.MakeCompiledFile; cli = run an isolated VB6.EXE /make <vbp> /out <log> subprocess, the route that yields a REAL compiler log (the build tool's receipt shape is returned); auto = same as ide here, because make_project always acts on the project the IDE has open.")
     Set pMake("out_path") = Prop("string", "route=cli: compiler log path (default %TEMP%\vb6mcp_build.log)")
+    Set pMake("project") = Prop("string", "Optional ABSOLUTE path of ANY .vbp to compile (route=cli only). When set, that project is compiled even if a DIFFERENT project is open in the IDE; a CLI build registers a CLSID snapshot around the /make and restores/ reports it. route=ide refuses this parameter (the IDE route compiles whatever the IDE holds).")
     Set pMake("timeout_ms") = Prop("integer", "route=cli: bounds ONLY the VB6.EXE /make subprocess (default 180000)")
     Set pMake("allow_host_modal") = Prop("boolean", "Default false. When VB6's own Make Project box is already up, confirming it starts a long host-modal compile that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy until the IDE is restarted. false = leave the box alone and report modal_blocked=true with its hwnd/title/controls instead of clicking it.")
     Set pMake("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned." & _
@@ -596,7 +662,8 @@ Public Function BuildToolsListResult() As Object
     Set pExec_mode("enum") = EnumList("run", "full_compile", "break", "continue", "resume", "stop", "step_into", "step_over", "step_out", "run_to_cursor", "end", "restart")
     Set pExec("mode") = pExec_mode
     tools.Add MakeTool("control_execution", _
-        "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken.", _
+        "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken. " & _
+        "An end/stop that finds NOTHING running (EbMode=0 and design) returns ok:true + state_not_changed:true + alreadyNotRunning:true instead of ok:false: in the post-run suspended CommandBars window the End item is disabled precisely because the program has already ended.", _
         SchemaWith(pExec, Req("mode")))
 
     ' ---- test host (T5 C8-C11: TestHost.bas existed but had no tool) ----
@@ -921,6 +988,7 @@ Public Function BuildToolsListResult() As Object
     Set pWs("text") = Prop("string", "Text to write (ASCII string literals only for VB files)")
     Set pWs("encoding") = Prop("string", "auto|ansi|utf-8|utf-16le (default auto: VB files -> ansi)")
     Set pWs("validate") = PropValidate()
+    Set pWs("confirm_truncate") = Prop("boolean", "default false. An EXISTING NON-EMPTY target plus empty/blank text is REFUSED with reason=empty_content_would_truncate; VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are ALWAYS refused even with confirm_truncate:true (an empty VB source cannot compile).")
     tools.Add MakeTool("write_source", _
         "Write a VB source/text file with explicit encoding and byte-level sha256 (does not touch the IDE). The parent directory is created when missing and reported as createdDirs[]/createdDirsCount; a parent that cannot be created is a structured refusal (ok:false + reason=parent_dir_missing + missingPath + reasonLegacy=parent_not_creatable) and nothing is written. Every success is READ BACK from the target path and must match the intended sha256 byte for byte - the receipt carries exists/size/sha256/verifiedOnDisk and a write that cannot be read back is never reported as written. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
         SchemaWith(pWs, Req("path", "text")))
@@ -933,6 +1001,115 @@ Public Function BuildToolsListResult() As Object
     tools.Add MakeTool("verify", _
         "Aggregate verdict for one component: IDE==DISK + lint diagnostics + optional baseline filter.", _
         SchemaWith(pVf, Req("name")))
+    ' W-H4: ONE-call debug session (face 110 -> 111; refreeze deferred to the window).
+    Dim pDs As Object
+    Set pDs = CreateObject("Scripting.Dictionary")
+    Set pDs("runArgs") = Prop("string", "Command line arguments passed to the started program (optional)")
+    Set pDs("env") = Prop("object", "{NAME: value} environment variables for the started program (optional)")
+    Set pDs("breakpoints") = Prop("array", "Array of {component, line (PANE line space), condition?, hitCount?, enabled?}")
+    Set pDs("actions") = Prop("array", "Array of {op: step_over|step_into|step_out|eval|continue|stop, expr? (eval only)}")
+    Set pDs("timeout_ms") = Prop("integer", "Hard budget for the WHOLE session in ms (default 60000)")
+    Set pDs("attach") = Prop("boolean", "true = drive an ALREADY running/broken IDE (no Start click); false (default) = arm + start and return startedPending")
+    Set pDs("watch") = Prop("array", "Optional expressions evaluated at every break/step and merged into transcript[].watch as [{expr, value?, typeName?, error?}]. ONLY identifiers enumerated by an earlier get_locals in this IDE session are evaluated; an unknown name is recorded as {expr, error:""unknown_identifier_refused""} and NEVER evaluated (an unknown identifier can hang the in-flight call - measured). Each entry is individually wrapped in a gate backstop.")
+    tools.Add MakeTool("debug_session", _
+        "Drive ONE whole VB6 debug session inside a SINGLE call: arm the given breakpoints, START the program WITHOUT saving the project, " & _
+        "wait for a breakpoint hit, then execute the ordered actions (step_over/step_into/step_out/eval/continue/stop) and return transcript[] " & _
+        "{seq,kind,position{module,proc,paneLine,diskLine},proc,callstack,locals,output,err} plus stopReason/wedged. The VB6 IDE is single-threaded " & _
+        "(STA), so a debug session cannot be driven by concurrent calls - it is compressed into this one call. This tool NEVER saves the project " & _
+        "(preRunSave=false: the run path deliberately bypasses control_execution, whose run does a pre-run flush); call save_project first if the " & _
+        "project must be on disk. The session REQUESTS control_execution(end) and then waits a BOUNDED 3 s inside the call; because End is a QUEUED command in a single-threaded IDE, that wait cannot observe it - a state that still reads break/run is reported as endQueued=true + howToFinish, NOT as wedged. " & _
+        "wedged=true means the call could not recover the IDE in-call: an EbMode=2 break context held while the CommandBars model is gone, and one activate_component attempt did not clear it. EVERY return path (normal/timeout/error) also reports diskVbpShaAfter/savedDuringCall/reorderedDuringCall. Refused with " & _
+        "reason=already_in_break when the IDE is already broken (end it first). Every breakpoint is echoed with armed/paneLine/diskLine/hitCount, " & _
+        "and the .vbp is read from DISK before and after (diskVbpShaBefore/diskVbpShaAfter) - equality is the 'nothing was written' proof. " & _
+        "The IDE may still be finishing the queued end/start commands after this call returns: confirm with ide_state and call control_execution{end} if needed (howToFinish is provided when that is the case).", _
+        SchemaWith(pDs, Req()))
+
+    ' ---- W-H1: run_until_break (face 111 -> 112; refreeze deferred to the window) ----
+    Dim pRub As Object
+    Set pRub = CreateObject("Scripting.Dictionary")
+    Set pRub("timeout_ms") = Prop("integer", "Budget for the OBSERVATION phase in ms (default 30000, capped at 600000). The gate backstop is armed for this budget + 8 s so a read-only call can force-release a call that never returns.")
+    Set pRub("attach") = Prop("boolean", "false (default) = arm + START and return startedPending immediately (Start is a QUEUED command in the STA IDE); true = OBSERVE the already running/broken IDE until break / process exit / unhandled error / timeout")
+    Set pRub("breakpoints") = Prop("array", "Array of {component, line (PANE line space), hitCount?} armed before starting (attach=false only). hitCount N means: stop on the Nth hit, auto-continue the earlier hits.")
+    Set pRub("watch") = Prop("array", "Optional expressions evaluated at every break and merged into transcript[].watch; ONLY identifiers enumerated by an earlier get_locals are evaluated, an unknown name is recorded as {expr, error:""unknown_identifier_refused""} and never evaluated.")
+    tools.Add MakeTool("run_until_break", _
+        "Run the project and stop at one of FOUR outcomes: break / process exit / unhandled error / timeout. " & _
+        "TWO-PHASE because the VB6 IDE is single-threaded (STA) and Start is a QUEUED command: call ONE with attach=false - it arms breakpoints, clicks Start " & _
+        "and returns startedPending=true + howToContinue (the program starts only AFTER the call returns); call TWO with attach=true - it OBSERVES and returns " & _
+        "the UNIFIED debug receipt {ok,state,position,proc,callstack,locals,output,err,timeoutMs,wedged,stopReason,hitCountTotal,transcript[]} plus " & _
+        "diskVbpShaBefore/diskVbpShaAfter and savedDuringCall/reorderedDuringCall (the debug path never saves). hitCount>1 is the engine-independent equivalent " & _
+        "of a conditional breakpoint: every hit still stops the engine, the driver auto-continues the first N-1 hits and stops on the Nth (VB6 has NO conditional " & _
+        "breakpoints; expression conditions are NOT supported and are not accepted). The single-flight gate is backstopped with ArmGateRelease(timeout_ms + 8 s): " & _
+        "if this call never returns, a later read-only call can force-release it.", _
+        SchemaWith(pRub, Req()))
+
+    ' ---- W-H1: breakpoints (face 112 -> 113; refreeze deferred to the window) ----
+    Dim pBp As Object
+    Set pBp = CreateObject("Scripting.Dictionary")
+    Set pBp("action") = Prop("string", "list | set | clear | enable | disable | clear_all (default list)")
+    Set pBp("component") = Prop("string", "Component name (set/clear/enable/disable)")
+    Set pBp("anchor") = Prop("string", "For mode=injected: the source line to break before (must match uniquely inside a procedure body)")
+    Set pBp("line") = Prop("integer", "PANE line number (1-based) for mode=native (and the position to clear)")
+    Set pBp("mode") = Prop("string", "injected (default: a source-marker Debug.Assert block, survives the session, rewritten by the IDE only through this tool) | native (Debug-menu toggle on the caret line: NO source write, but the VBIDE has no breakpoint API so its state cannot be READ back)")
+    Set pBp("id") = Prop("string", "Stable handle (default: generated)")
+    Set pBp("hitCount") = Prop("integer", "Stop on the Nth hit (default 1). Enforced by run_until_break / debug_session, not by the engine; a conditional EXPRESSION is not supported (VB6 has no conditional breakpoints)")
+    tools.Add MakeTool("breakpoints", _
+        "Manage REAL IDE breakpoints by component + source anchor / PANE line: set (injected source marker OR native Debug-menu toggle), clear, enable, disable, list, clear_all. " & _
+        "ENUMERATION SOURCE is declared on every receipt: the list merges (a) source-marker breakpoints this add-in injected (readable again through list_breakpoints) and (b) native breakpoints set BY THIS ADD-IN's session (tracked in memory only); IDE-native breakpoints set by a HUMAN inside the IDE cannot be enumerated or verified because the VBIDE object model has NO breakpoint API - that limit is reported, never guessed. " & _
+        "Every entry carries BOTH coordinate spaces: paneLine (the line an edit tool takes) and diskLine (paneLine + the component's SharedHeaderOffset), plus the coordinate-source note. " & _
+        "hitCount is the engine-independent equivalent of a conditional breakpoint (stop on the Nth hit, auto-continue the earlier hits); expression conditions are NOT supported and not accepted. " & _
+        "enable/disable for mode=native toggles the IDE breakpoint (its on/off state cannot be read back, so the receipt says nativeStateVerified:false and relies on the session record).", _
+        SchemaWith(pBp, Req()))
+
+    ' ---- W-H2: get_locals / eval_at_frame (face 113 -> 115; refreeze deferred) ----
+    Dim pGl As Object
+    Set pGl = CreateObject("Scripting.Dictionary")
+    Set pGl("frame_index") = Prop("integer", "0 = innermost frame (default). frame_set binds the VBA6 evaluation frame before every read.")
+    tools.Add MakeTool("get_locals", _
+        "Read the CURRENT procedure parameters and declared locals in BREAK mode, with their engine values. " & _
+        "SOURCE DECLARATION: variable NAMES come from the SOURCE of the current procedure (parameter list plus Dim/Static declarations in its body); the VALUES are read by binding the VBA6 evaluation frame (vba6_probe frame_set path) and evaluating each name in the IDE immediate context - localsSource is echoed on every receipt. " & _
+        "Nothing is invented: when no value can be read the receipt returns localsUnavailable:true + localsUnavailableReason + the raw frame diagnostics. " & _
+        "Each value carries typeName + value (or error) and, for arrays/Dictionary/objects, a SHALLOW inspection with explicit depthLimit=2 / widthLimit=20, truncatedDepth, truncatedWidth and cycleDetected (ObjPtr identity). VB6 has no reflection, so a custom class reports its TypeName/ObjPtr and fieldsUnavailable:true rather than guessed fields. " & _
+        "The per-value shape is the SAME one transcript[].watch uses (one helper).", _
+        SchemaWith(pGl, Req()))
+
+    Dim pEaf As Object
+    Set pEaf = CreateObject("Scripting.Dictionary")
+    Set pEaf("expr") = Prop("string", "VB expression to evaluate (e.g. i*2)")
+    Set pEaf("frame_index") = Prop("integer", "0 = the IDE's current frame (default). OUTER frames are refused: reaching them needs the engine frame-set thunk, which is FORBIDDEN because it terminated the VB6 process (measured).")
+    Set pEaf("allowUnsafeEval") = Prop("boolean", "false (default). In BREAK (and RUN) the immediate context is NOT the break frame and a raising expression can hang the in-flight call (measured), so evaluation there is REFUSED unless this is true. When true the call is wrapped in ArmGateRelease(timeout_ms) and a receipt proves the gate was released; recovery for a hang = ide_state{release_inflight:true, release_min_held_ms:...} and, if needed, restart the IDE.")
+    Set pEaf("timeoutMs") = Prop("integer", "CALLER BUDGET HINT in ms (default 5000). The add-in CANNOT preempt a VB statement that is already executing: if this budget passes without a return, the CALLER must time out and use howToRecover (ide_state{release_inflight:true, release_min_held_ms:5000}, restart the IDE if needed). The internal ArmGateRelease is armed for this value + slack regardless.")
+    Set pEaf("timeout_ms") = Prop("integer", "Alias of timeoutMs (kept for compatibility)")
+    tools.Add MakeTool("eval_at_frame", _
+        "Evaluate an expression in the IDE immediate context with an EXPLICIT SAFETY CONTRACT. " & _
+        "frameBinding is ALWAYS ideImmediateContext and it is NOT the break frame: measured on the live bed, a*2 read 0 while a had been assigned 7 in the broken frame. The VBA6 frame-set thunk is FORBIDDEN here (measured: it terminated the VB6 process / pipe_stalled) - OUTER frame_index is refused, never attempted. " & _
+        "In DESIGN the expression is evaluated normally. In BREAK (and RUN) evaluation is REFUSED with reason=eval_in_break_unsafe + howToUnblock, because a raising expression can hang the in-flight call (measured); pass allowUnsafeEval=true to execute anyway - the call is then wrapped in ArmGateRelease(timeout_ms, default 5000) and the receipt proves gateReleased. " & _
+        "howToRecover is always present: ide_state{release_inflight:true, release_min_held_ms:<ms>} frees a hung single-flight gate; restart the IDE if the process itself is wedged. " & _
+        "For object/array/Dictionary values a shallow inspection is returned ONLY in a safe context (design or allowUnsafeEval): depthLimit=2, widthLimit=20, truncatedDepth, truncatedWidth, cycleDetected. A failure NEVER returns a fabricated value: stopped_at + raw diagnostic text instead. " & _
+        "CALLER BUDGET CONTRACT: timeoutMs (default 5000) is a HINT - the add-in cannot preempt an executing VB statement, so if it does not return within that budget the caller must stop waiting and recover with ide_state{release_inflight:true, release_min_held_ms:5000} (restart the IDE if needed). ANY state can hang an evaluation (design included: Array(1,2,3) hung in a measured run), so do NOT wait on a 120 s transport budget.", _
+        SchemaWith(pEaf, Req("expr")))
+
+    ' ---- W-H3: run_project / last_error (face 115 -> 117; refreeze deferred) ----
+    Dim pRp As Object
+    Set pRp = CreateObject("Scripting.Dictionary")
+    Set pRp("commandLineArgs") = Prop("string", "Arguments the started program should see as Command$. LIMITATION (documented): a Standard EXE started from the VB6 IDE does NOT receive Command$; only the ActiveX Component start mode has Debugging-tab arguments. When this is non-empty the tool REFUSES to start (commandLineArgsSupported:false) instead of pretending - build the EXE and run it with args, or use an ActiveX project.")
+    Set pRp("env") = Prop("object", "{NAME: value} environment variables applied to the IDE process BEFORE Start (same process as the IDE-run program, so Environ() sees them). Previous values are captured and restored when the program ends; envApplied[] lists every one.")
+    Set pRp("startMode") = Prop("string", "Standalone (default) | ActiveX Component. NOTE: the start mode is a PROJECT property and cannot be switched at run time - the receipt echoes the project's current startMode and says startModeApplied:false when it differs.")
+    Set pRp("observe") = Prop("boolean", "false (default) = PHASE 1: apply env, click Start, return startedPending + howToContinue; true = PHASE 2: observe until break / exit / error dialog / timeout, then restore env")
+    Set pRp("timeout_ms") = Prop("integer", "Observation budget in ms (default 15000, capped 120000)")
+    tools.Add MakeTool("run_project", _
+        "Start the OPEN project from the VB6 IDE with control over ENVIRONMENT and (where supported) command-line arguments, in TWO PHASES (Start is a QUEUED command in the STA IDE): phase 1 applies env (SetEnvironmentVariable, BEFORE Start - the IDE and the IDE-run program are the same process, so Environ() reads it) and returns startedPending + howToContinue; phase 2 observes and returns {startedPid, runningState, firstBreakpointHit, err}. " & _
+        "env is restored when the program ends (envApplied[]/envRestored). VB6 CANNOT attach to an -Embedding process that is already running: the supported path is always to start a debuggable instance from the IDE. " & _
+        "A Standard EXE started from the IDE does NOT receive Command$ (the Debugging-tab arguments belong to the ActiveX Component start mode), so a non-empty commandLineArgs is REFUSED with commandLineArgsSupported:false instead of silently ignored. The project start mode is a project property and is echoed, never switched at run time.", _
+        SchemaWith(pRp, Req()))
+
+    Dim pLe As Object
+    Set pLe = CreateObject("Scripting.Dictionary")
+    Set pLe("dismiss") = Prop("boolean", "true = dismiss the runtime-error box by clicking its End button with send_window_message (the ONLY working channel: close_active_dialogs refuses it by the safe whitelist - measured). Nothing is clicked when false.")
+    tools.Add MakeTool("last_error", _
+        "Return the UNHANDLED-ERROR context WITHOUT evaluating in the break frame: {errorDialog{present,title,body,buttons[]}, errNumber/errDescription/errSource + errParsed{...}, callstack, localsNames[] (the names an earlier get_locals enumerated), position, proc, module, stopped_at, howToRecover}. " & _
+        "SOURCE DECLARATION: the error text comes from the runtime-error dialog BODY (Win32 window channel), the stack from the VBA6 callstack probe, and the NAME list from get_locals' source-declaration scan; NOTHING is read by break-frame evaluation. Fields that cannot be parsed are returned as null with parsed:false - never guessed. " & _
+        "The box is MODAL: dismiss it with dismiss:true (send_window_message click on the End button) or the IDE stays blocked.", _
+        SchemaWith(pLe, Req()))
 
     Dim pIt As Object
     Set pIt = CreateObject("Scripting.Dictionary")
@@ -1368,6 +1545,7 @@ Public Function BuildToolsListResult() As Object
     Set pVs = CreateObject("Scripting.Dictionary")
     Set pVs("components") = Prop("array", "Optional component names to check (default: every component of the active project)")
     Set pVs("path") = Prop("string", "Optional disk path override")
+    Set pVs("baseline") = Prop("string", "Optional lint baseline (a previous verify/check_component receipt text or its stableKey lines). Diagnostics matching the baseline are filtered, so pre-existing lint noise cannot inflate the numbers; the pass/fail/unknown counters keep pass+fail+unknown==checked.")
     tools.Add MakeTool("verify_scope", _
         "Read-only: for a set of components report {component, ideEqualsDisk, lintErrors, lintWarnings, firstDiagnostic} with pass/fail/unknown counters; only failing (and unknown) components are listed in detail. COUNT SEMANTICS (v1.11.9): the three counters are mutually exclusive - pass = verify answered PASS, fail = verify answered FAIL (a PROVEN inconsistency), unknown = the verdict could not be proven either way (e.g. only the build evidence is missing) and is NOT a fail. SCALE OF THE BUILD EVIDENCE: it is PROJECT-level - buildOk/buildSource/buildNote are read from a project-wide build cache, so no single component can be the only one missing it (on a never-built project every consistent component is UNKNOWN and pass is unreachable). INVARIANT: pass + fail + unknown == checked on every receipt, failures[] holds proven inconsistencies only, unknowns[] holds the unknowns only, and no component appears in both; countsConsistent publishes the check.", _
         SchemaWith(pVs))
@@ -1416,7 +1594,10 @@ Public Function BuildToolsListResult() As Object
     Set pImE("expression_file") = Prop("string", "Path to a UTF-8/ANSI text file whose text is used as expression. Mutually exclusive with expression; both given => reason both_inline_and_file; a missing file => reason input_file_not_found with path; a file larger than 65536 bytes => reason input_file_too_large. On success the receipt echoes inputFile/inputBytes/inputEncoding.")
     Set pImE("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout - the add-in cannot preempt a statement.")
     tools.Add MakeTool("immediate_eval", _
-        "Evaluate an EXPRESSION in the VB6 IDE's own immediate context and return its VALUE, with the caller NOT having to write Open/Print/Close: {ok, value, typeName, output, elapsedMs}. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).", _
+        "Evaluate a SCALAR EXPRESSION in the VB6 IDE immediate context and return its VALUE: {ok, value, valueKind, typeName, output, elapsedMs}. " & _
+        "Object/array EXPRESSIONS (CreateObject(/GetObject(/New/Array() are REFUSED BEFORE EXECUTION with reason=object_expression_unsupported: the immediate channel does not support them (measured: a plain object assignment hangs the call). " & _
+        "Assign the object to a PROJECT variable first and read scalar members; scalar results are unchanged. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. " & _
+        "An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).", _
         SchemaWith(pImE, Req("expression")))
 
     Dim pImR As Object
@@ -2774,6 +2955,117 @@ Private Sub MergeModalGuard(ByRef root As Object)
     Err.Clear
 End Sub
 
+' v1.11.12: the HOST-MODAL block, computed from LIVE windows of THIS process and kept
+' INDEPENDENT of timedOut. blocking = a #32770 box is up AND (risk=known OR it
+' owner-disables its owner). hwnd/title/controls describe the FIRST box (the dialogs[]
+' array carries every box with its own hwnd/title/controls/ownerDisabled).
+Private Sub ApplyHostModalFields(ByRef root As Object, ByVal stage As String)
+    On Error Resume Next
+    Dim risk As String, reason As String, riskClass As String, details As String
+    Dim ndlg As Long
+    ndlg = WinOps.HostModalRiskProbe("#32770", risk, reason, riskClass, details)
+    Dim dialogs As Object
+    Set dialogs = New Collection
+    Dim cols As Object
+    Set cols = New Collection
+    Dim firstHwnd As Long, firstTitle As String, anyOwned As Boolean
+    firstHwnd = 0
+    firstTitle = ""
+    anyOwned = False
+    ' the full dialog tree (hwnd/title/controls/ownerDisabled) comes from the SAME reader
+    ' read_active_dialogs uses; a parse failure keeps the block with dialogs=[]
+    Dim js As String
+    js = WinOps.ReadActiveDialogsJson("#32770", True, 0)
+    If Len(js) > 0 Then
+        Dim v As Variant
+        If JsonParse(js, v) Then
+            If IsObject(v) Then
+                Dim rd As Object
+                Set rd = v
+                Dim ds As Variant
+                Dim isObj As Boolean
+                If JsonGet(rd, "dialogs", ds, isObj) Then
+                    If isObj Then
+                        Dim col As Collection
+                        Set col = ds
+                        Dim i As Long, k As Long
+                        For i = 1 To col.Count
+                            If IsObject(col.Item(i)) Then
+                                Dim dobj As Object
+                                Set dobj = col.Item(i)
+                                Dim e As Object
+                                Set e = CreateObject("Scripting.Dictionary")
+                                e("hwnd") = JsonGetLong(dobj, "hwnd", 0)
+                                e("title") = JsonGetStr(dobj, "title", "")
+                                Dim od As Boolean
+                                od = JsonGetBool(dobj, "ownerDisabled", False)
+                                e("ownerDisabled") = od
+                                If od Then anyOwned = True
+                                Dim kids As Variant
+                                Dim isK As Boolean
+                                If Not JsonGet(dobj, "controls", kids, isK) Then
+                                    Set kids = New Collection
+                                ElseIf Not isK Then
+                                    Set kids = New Collection
+                                End If
+                                Set e("controls") = kids
+                                dialogs.Add e
+                                If firstHwnd = 0 Then
+                                    firstHwnd = CLng(e("hwnd"))
+                                    firstTitle = CStr(e("title"))
+                                    Set cols = kids
+                                End If
+                            End If
+                        Next
+                    End If
+                End If
+            End If
+        End If
+    End If
+    ' the ARMED modal guard is a second, independent observer: it reports a box it SAW
+    ' during this call even after the box was dismissed (the live probe below then sees
+    ' nothing). Both sources say "the host was modal during this call".
+    Dim mg As Object
+    Set mg = WinOps.WoModalGuardReceipt()
+    Dim guardSeen As Boolean
+    Dim gHwnd As Long, gTitle As String
+    guardSeen = False
+    gHwnd = 0
+    gTitle = ""
+    If Not mg Is Nothing Then
+        If mg.Exists("modalDetected") Then guardSeen = CBool(mg("modalDetected"))
+        If mg.Exists("modalHwnd") Then gHwnd = CLng(Val(CStr(mg("modalHwnd"))))
+        If mg.Exists("modalTitle") Then gTitle = CStr(mg("modalTitle"))
+    End If
+    If firstHwnd = 0 And gHwnd <> 0 Then firstHwnd = gHwnd
+    If Len(firstTitle) = 0 Then firstTitle = gTitle
+    Dim blocking As Boolean
+    blocking = ((ndlg > 0) And ((risk = "known") Or anyOwned)) Or guardSeen
+    root("host_modal_blocking") = blocking
+    root("host_modal_stage") = stage
+    Dim hm As Object
+    Set hm = CreateObject("Scripting.Dictionary")
+    hm("blocking") = blocking
+    hm("stage") = stage
+    hm("count") = ndlg
+    hm("risk") = risk
+    hm("riskReason") = reason
+    hm("riskClass") = riskClass
+    hm("ownerDisabled") = anyOwned
+    hm("hwnd") = firstHwnd
+    hm("title") = firstTitle
+    Set hm("controls") = cols
+    Set hm("dialogs") = dialogs
+    hm("observedDuringCall") = guardSeen
+    hm("source") = "live #32770 enumeration of THIS process (WinOps.ReadActiveDialogsJson + WinOps.HostModalRiskProbe) PLUS the armed modal guard's own observation (WinOps.WoModalGuardReceipt.modalDetected); read-only, nothing is sent"
+
+    Set root("host_modal") = hm
+    If blocking Then
+        If Len(CStr(root("stopReason"))) = 0 Then root("stopReason") = "host_modal_blocking"
+    End If
+    Err.Clear
+End Sub
+
 ' The same receipt as a JSON FRAGMENT (no outer braces), for the tools whose reply is a
 ' JSON TEXT rather than a Dictionary (vba6_probe). Built by serialising a Dictionary and
 ' stripping its braces, so no hand-rolled escaping can break the shape.
@@ -2851,9 +3143,15 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "replace_code"
             outText = ToolReplaceCode(JsonGetStr(args, "name"), JsonGetStr(args, "operation"), JsonGetLong(args, "start_line"), JsonGetLong(args, "end_line"), JsonGetStr(args, "code"), JsonGetStr(args, "expected_sha256"), JsonGetStr(args, "validate"), SnapshotOptIn(args))
         Case "add_component"
-            outText = ToolAddComponent(JsonGetStr(args, "type"), JsonGetStr(args, "name"), JsonGetStr(args, "code"))
+            outText = WcAddComponentVbp(args)
+        Case "edit_by_byte_anchor"
+            outText = ToolEditByByteAnchor(args)
+        Case "move_procedure"
+            outText = ToolMoveProcedure(JsonGetStr(args, "from_component"), JsonGetStr(args, "proc"), JsonGetStr(args, "to_component"), JsonGetStr(args, "insert_anchor"))
+        Case "delete_procedures"
+            outText = ToolDeleteProcedures(AnyObjOf(args, "procedures"), JsonGetStr(args, "component"))
         Case "remove_component"
-            outText = ToolRemoveComponent(JsonGetStr(args, "name"))
+            outText = WcRemoveComponentVbp(args)
         Case "import_component"
             outText = ToolImportComponent(JsonGetStr(args, "path"), JsonGetStr(args, "mode", "file"))
         Case "export_component"
@@ -2881,15 +3179,29 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "read_file"
             outText = ToolReadFile(JsonGetStr(args, "path"), JsonGetLong(args, "max_lines", 0))
         Case "write_file"
-            outText = ToolWriteFile(JsonGetStr(args, "path"), JsonGetStr(args, "content"), JsonGetStr(args, "encoding", "auto"), JsonGetBool(args, "create_dirs", True), JsonGetBool(args, "backup", True), JsonGetStr(args, "validate"))
+            outText = WcGuardedWriteFile(args)
         Case "search_in_files"
             outText = ToolSearchInFiles(JsonGetStr(args, "query"), JsonGetStr(args, "path"), JsonGetStr(args, "pattern"), JsonGetBool(args, "is_regex"), JsonGetBool(args, "case_sensitive"), JsonGetLong(args, "max_results", 200))
         Case "save_project"
             outText = ToolSaveProject(JsonGetStr(args, "path"))
         Case "make_project"
-            outText = ToolMakeProject(JsonGetStr(args, "output_path"), JsonGetStr(args, "route"), JsonGetStr(args, "out_path"), JsonGetLong(args, "timeout_ms"), JsonGetBool(args, "allow_host_modal", False), HasArg(args, "laa"), JsonGetBool(args, "laa", True), JsonGetBool(args, "diagnose", False), JsonGetLong(args, "wait_for_build", 0))
+            outText = ToolMakeProject(JsonGetStr(args, "output_path"), JsonGetStr(args, "route"), JsonGetStr(args, "out_path"), JsonGetLong(args, "timeout_ms"), JsonGetBool(args, "allow_host_modal", False), HasArg(args, "laa"), JsonGetBool(args, "laa", True), JsonGetBool(args, "diagnose", False), JsonGetLong(args, "wait_for_build", 0), JsonGetStr(args, "project"))
         Case "control_execution"
             outText = ToolControlExecution(JsonGetStr(args, "mode"))
+        Case "debug_session"
+            outText = ToolDebugSession(args)
+        Case "run_until_break"
+            outText = ToolRunUntilBreak(args)
+        Case "breakpoints"
+            outText = ToolBreakpoints(args)
+        Case "get_locals"
+            outText = ToolGetLocals(args)
+        Case "eval_at_frame"
+            outText = ToolEvalAtFrame(args)
+        Case "run_project"
+            outText = ToolRunProject(args)
+        Case "last_error"
+            outText = ToolLastError(args)
         Case "test_host"
             outText = ToolTestHost(JsonGetStr(args, "action"), JsonGetStr(args, "vbp_path"), JsonGetStr(args, "module_name"), _
                                    JsonGetStr(args, "module_under_test"), JsonGetStr(args, "assertions_path"), _
@@ -2978,7 +3290,7 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "preview_edit"
             outText = ToolPreviewEdit(JsonGetStr(args, "name"), JsonGetAny(args, "edits"), JsonGetStr(args, "match"))
         Case "write_source"
-            outText = ToolWriteSource(JsonGetStr(args, "path"), JsonGetStr(args, "text"), JsonGetStr(args, "encoding"), JsonGetStr(args, "validate"))
+            outText = WcGuardedWriteSource(args)
         Case "verify"
             outText = ToolVerify(JsonGetStr(args, "name"), JsonGetStr(args, "disk_path"), JsonGetStr(args, "baseline"))
         Case "inject_trace"
@@ -3136,7 +3448,7 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "workspace_status"
             outText = ToolWorkspaceStatus(JsonGetStr(args, "repo"))
         Case "verify_scope"
-            outText = ToolVerifyScope(AnyObjOf(args, "components"), JsonGetStr(args, "path"))
+            outText = ToolVerifyScope(AnyObjOf(args, "components"), JsonGetStr(args, "path"), JsonGetStr(args, "baseline"))
         Case "todo_status"
             outText = ToolTodoStatus()
         Case "mcp_info"
@@ -3277,6 +3589,14 @@ Private Function ToolGetProjectInfo() As String
         Set d("components") = New Collection
         Set d("references") = New Collection
         Set d("projects") = New Collection
+        d("projectPath") = Null
+        d("realProjectPath") = Null
+        d("projectPathIsAlias") = False
+        d("realPathTier") = 0
+        d("realPathError") = ""
+        d("warning") = ""
+        d("refsBase") = ""
+        d("refsFromAlias") = RefsFromAliasOn()
         d("note") = "the add-in has no live VBIDE connection; nothing could be read"
         ToolGetProjectInfo = JsonStringify(d)
         Exit Function
@@ -3289,6 +3609,14 @@ Private Function ToolGetProjectInfo() As String
         Set d("components") = New Collection
         Set d("references") = New Collection
         Set d("projects") = New Collection
+        d("projectPath") = Null
+        d("realProjectPath") = Null
+        d("projectPathIsAlias") = False
+        d("realPathTier") = 0
+        d("realPathError") = ""
+        d("warning") = ""
+        d("refsBase") = ""
+        d("refsFromAlias") = RefsFromAliasOn()
         d("note") = "no project is open in the IDE; the project-scoped fields are null/empty"
         ToolGetProjectInfo = JsonStringify(d)
         Exit Function
@@ -3328,6 +3656,19 @@ Private Function ToolGetProjectInfo() As String
     Set d("references") = ReferenceListArr()
     Set d("projects") = ProjectListArr()
     On Error GoTo 0
+    ' P1/P12: the spelling the project was opened with, the canonical path it really
+    ' lives at, and the base the relative Reference= paths are computed from.
+    Dim pInfo As Object
+    Set pInfo = ProjectPathInfo(p)
+    d("projectPath") = pInfo("projectPath")
+    d("realProjectPath") = pInfo("realProjectPath")
+    d("projectPathIsAlias") = pInfo("projectPathIsAlias")
+    d("realPathTier") = pInfo("realPathTier")
+    d("realPathError") = pInfo("realPathError")
+    d("warning") = pInfo("warning")
+    If Len(CStr(pInfo("warningDetail"))) > 0 Then d("warningDetail") = pInfo("warningDetail")
+    d("refsBase") = pInfo("refsBase")
+    d("refsFromAlias") = pInfo("refsFromAlias")
     ToolGetProjectInfo = JsonStringify(d)
 End Function
 
@@ -4515,6 +4856,30 @@ Private Function ToolImmediateRun(ByVal code As String, ByVal codeFile As String
     ToolImmediateRun = JsonStringify(o)
 End Function
 
+ ' CONSERVATIVE static refusal for expressions that CREATE objects/arrays. MEASURED: the
+ ' immediate channel HANGS on a plain (no-Set) object assignment - a line like
+ ' v513 = CreateObject("Scripting.Dictionary") never returned and the single-flight gate stayed held.
+ ' Set v511 = New Collection and Set v511 = CreateObject(...) alone are fine, but the tool cannot
+ ' know the shape before it runs, so these expressions are REFUSED instead of being sent to the
+ ' engine: the product contract simply does not include object/array EXPRESSIONS in this channel.
+Private Function ImObjectExprProblem(ByVal expr As String) As String
+    ImObjectExprProblem = ""
+    Dim t As String
+    t = LCase$(expr)
+    If Len(t) = 0 Then Exit Function
+    If InStr(1, t, "createobject(", vbTextCompare) > 0 Then
+        ImObjectExprProblem = "CreateObject("
+    ElseIf InStr(1, t, "getobject(", vbTextCompare) > 0 Then
+        ImObjectExprProblem = "GetObject("
+    ElseIf InStr(1, t, "array(", vbTextCompare) > 0 Then
+        ImObjectExprProblem = "Array("
+    ElseIf InStr(1, t, " new ", vbTextCompare) > 0 Then
+        ImObjectExprProblem = "New"
+    ElseIf Left$(t, 4) = "new " Then
+        ImObjectExprProblem = "New"
+    End If
+End Function
+
 Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As String, ByVal timeoutMs As Long) As Object
     Dim o As Object
     Set o = CreateObject("Scripting.Dictionary")
@@ -4523,6 +4888,7 @@ Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As Strin
     o("ok") = False
     o("reason") = ""
     o("valueParsed") = False
+    o("valueKind") = "scalar"
     o("value") = ""
     o("typeName") = ""
     o("output") = ""
@@ -4555,6 +4921,19 @@ Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As Strin
         Set ImExecuteImmediate = o
         Exit Function
     End If
+    If mode = "eval" Then
+        Dim objProblem As String
+        objProblem = ImObjectExprProblem(payload)
+        If Len(objProblem) > 0 Then
+            o("reason") = "object_expression_unsupported"
+            o("rejectedToken") = objProblem
+            o("guidance") = "object/array EXPRESSIONS are not supported by the immediate channel (measured: a plain object assignment hangs the call). Assign the object to a PROJECT variable first and then read SCALAR members (e.g. MyDict.Count), or evaluate a scalar expression instead."
+            o("howToRecover") = "nothing was executed by this call, so no IDE recovery is needed; if an earlier unrelated call hung, use ide_state{release_inflight:true, release_min_held_ms:5000}"
+            o("note") = "REFUSED BEFORE EXECUTION: the expression was never sent to the immediate context."
+            Set ImExecuteImmediate = o
+            Exit Function
+        End If
+    End If
     Dim sink As String
     sink = ImSinkPath(mode)
     o("sinkFile") = sink
@@ -4569,7 +4948,17 @@ Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As Strin
     If mode = "eval" Then
         ' Evaluate ONCE into a Variant, then print "TypeName|value". The leading Close #511
         ' makes the handle idempotent even if an earlier line died holding it.
-        body = "v511 = " & flat & ": Print #" & CStr(IM_FILE_NUM) & ", TypeName(v511) & ""|"" & v511"
+        ' TYPE-AWARE SINK. The old line concatenated the VALUE into the sink string
+        ' (TypeName(v511) & "|" & v511); for an object/array that conversion inside the
+        ' immediate context HANGS the in-flight call (measured: CreateObject("Scripting.Dictionary")
+        ' and Array(1,2,3) both hung ~120 s). Objects/arrays now print a placeholder only, so the
+        ' type is still reported and NOTHING is converted.
+        Dim fn As String
+        fn = "#" & CStr(IM_FILE_NUM)
+        ' Phase 1 prints ONLY the TypeName: no value is concatenated, so an object/array result
+        ' cannot hang the conversion. The scalar VALUE is fetched in phase 2, and only when the
+        ' type name proves it is a scalar (Wh2IsScalarType).
+        body = "v511 = " & flat & ": Print " & fn & ", TypeName(v511)"
     Else
         body = ImRewriteDebugPrint(flat, rewrites)
         o("debugPrintRewrites") = rewrites
@@ -4620,11 +5009,51 @@ Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As Strin
             o("note") = "EbExecuteLine returned " & CStr(o("retHex")) & " (ret=" & CStr(o("ret")) & "), so the line was NOT executed. On this channel ret=40036 (0x9C64) means the line was REFUSED - measured for an embedded CRLF and for any line carrying On Error Resume Next."
         End If
     End If
+    ' an OBJECT expression cannot be assigned to a Variant without Set: retry ONCE with Set.
+    ' ret<>0 is the only signal we need; no sink content is interpreted here.
+    If mode = "eval" Then
+        If CLng(Val(JsonFieldRaw(raw, "ret"))) <> 0 Then
+            Dim setLine As String
+            setLine = "Close #" & CStr(IM_FILE_NUM) & ": Open """ & sink & """ For Output As #" & CStr(IM_FILE_NUM) & ": Set v511 = " & flat & ": Print #" & CStr(IM_FILE_NUM) & ", TypeName(v511): Close #" & CStr(IM_FILE_NUM)
+            o("lineSetAttempt") = setLine
+            Dim rawSet As String
+            rawSet = Vba6Probe.ExecLineJson(setLine, 0, 0, 0, False, False, False)
+            o("rawSetAttempt") = Left$(rawSet, 400)
+            If CLng(Val(JsonFieldRaw(rawSet, "ret"))) = 0 Then
+                o("ret") = 0
+                o("retHex") = "0x0"
+                o("reason") = ""
+                o("createdWithSet") = True
+            End If
+        End If
+    End If
     ' ---- read the sink back (the ONLY result channel)
     Dim txt As String
     Dim trunc As Boolean
     trunc = False
     txt = ImReadSink(sink, trunc)
+    ' An OBJECT expression assigned WITHOUT Set can report ret=0 yet print nothing (the
+    ' statement raised inside the immediate context). If phase 1 produced no sink text at all,
+    ' retry ONCE with "Set v511 = ..." - this is what makes CreateObject(...)/Array(...) safe.
+    If mode = "eval" Then
+        If Len(Trim$(ImJoinLines(txt))) = 0 Then
+            On Error Resume Next
+            If Len(Dir$(sink)) > 0 Then Kill sink
+            On Error GoTo 0
+            Dim retryLine As String
+            retryLine = "Close #" & CStr(IM_FILE_NUM) & ": Open """ & sink & """ For Output As #" & CStr(IM_FILE_NUM) & ": Set v511 = " & flat & ": Print #" & CStr(IM_FILE_NUM) & ", TypeName(v511): Close #" & CStr(IM_FILE_NUM)
+            o("lineSetAttempt2") = retryLine
+            Dim rawSet2 As String
+            rawSet2 = Vba6Probe.ExecLineJson(retryLine, 0, 0, 0, False, False, False)
+            If CLng(Val(JsonFieldRaw(rawSet2, "ret"))) = 0 Then
+                o("createdWithSet") = True
+                o("ret") = 0
+                o("retHex") = "0x0"
+                o("reason") = ""
+            End If
+            txt = ImReadSink(sink, trunc)
+        End If
+    End If
     o("outputBytes") = Len(txt)
     o("outputTruncated") = trunc
     o("output") = ImJoinLines(txt)
@@ -4635,16 +5064,49 @@ Private Function ImExecuteImmediate(ByVal mode As String, ByVal payload As Strin
         Dim joined As String
         Dim firstLine As String
         Dim nl As Long
-        Dim bar As Long
         joined = ImJoinLines(txt)
         firstLine = joined
         nl = InStr(joined, vbLf)
         If nl > 0 Then firstLine = Left$(joined, nl - 1)
-        bar = InStr(firstLine, "|")
-        If bar > 0 Then
-            o("typeName") = Left$(firstLine, bar - 1)
-            o("value") = Mid$(firstLine, bar + 1)
+        o("typeName") = Trim$(firstLine)
+        If Len(CStr(o("typeName"))) > 0 Then
             o("valueParsed") = True
+            If Wh2IsScalarType(CStr(o("typeName"))) Then
+                ' Phase 2: fetch the scalar VALUE only (the type name already proves it is safe).
+                Dim sink2 As String
+                sink2 = ImSinkPath(mode)
+                On Error Resume Next
+                If Len(Dir$(sink2)) > 0 Then Kill sink2
+                On Error GoTo 0
+                Dim fn2 As String
+                fn2 = "#" & CStr(IM_FILE_NUM)
+                Dim line2 As String
+                line2 = "Close " & fn2 & ": Open """ & sink2 & """ For Output As " & fn2 & ": Print " & fn2 & ", v511: Close " & fn2
+                Dim raw2 As String
+                raw2 = Vba6Probe.ExecLineJson(line2, 0, 0, 0, False, False, False)
+                Dim txt2 As String
+                Dim trunc2 As Boolean
+                trunc2 = False
+                txt2 = ImReadSink(sink2, trunc2)
+                o("sinkDeleted") = ImDeleteSink(sink2)
+                Dim j2 As String
+                j2 = ImJoinLines(txt2)
+                Dim first2 As String
+                first2 = j2
+                Dim nl2 As Long
+                nl2 = InStr(j2, vbLf)
+                If nl2 > 0 Then first2 = Left$(j2, nl2 - 1)
+                o("valueKind") = "scalar"
+                o("value") = RTrim$(first2)
+            Else
+                If InStr(1, CStr(o("typeName")), "()", vbTextCompare) > 0 Then
+                    o("valueKind") = "array"
+                Else
+                    o("valueKind") = "object"
+                End If
+                o("value") = Null
+                o("note") = "the expression returned an " & CStr(o("valueKind")) & ": only its TypeName is reported and value is null (concatenating an object/array into the sink string hangs the immediate context - measured)"
+            End If
         End If
     End If
     If o("reason") = "" Then
@@ -7334,12 +7796,95 @@ Private Function ToolReloadComponent(ByVal name As String) As String
         boundFile = ""
     End If
     On Error GoTo 0
+    ' v1.11.12: a Reload MOVES the component to the end of the IDE's in-memory component
+    ' list, and the NEXT save_project writes the .vbp in that order. Snapshot the .vbp line
+    ' order AND the in-memory component order HERE, so the receipt can prove what moved and
+    ' save_project can put the original order back.
+    Dim vbpPathR As String
+    Dim vbpTextRBefore As String, vbpTextRAfter As String
+    Dim vbpSeqRBefore() As String, vbpIdxRBefore() As Long
+    Dim vbpSeqRAfter() As String, vbpIdxRAfter() As Long
+    Dim vbpLinesR() As String
+    Dim vbpReadyR As Boolean
+    Dim orderBefore As String, orderAfter As String
+    vbpPathR = ""
+    vbpTextRBefore = ""
+    vbpReadyR = False
+    Dim ppR As VBIDE.VBProject
+    On Error Resume Next
+    Set ppR = GetProject()
+    If Not ppR Is Nothing Then vbpPathR = ppR.FileName
+    Err.Clear
+    On Error GoTo 0
+    If Len(vbpPathR) > 0 Then
+        vbpTextRBefore = ProjShip.ReadTextFile(vbpPathR)
+        If Len(vbpTextRBefore) > 0 Then
+            vbpLinesR = TextLines(vbpTextRBefore)
+            vbpSeqRBefore = VbpOrderSeq(vbpLinesR, vbpIdxRBefore)
+            vbpReadyR = True
+        End If
+    End If
+    orderBefore = CompOrderKey()
     comp.Reload
+    orderAfter = CompOrderKey()
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     root("reloaded") = compName
     root("requested") = name
     root("file") = boundFile
+    ' v1.11.12: did the Reload move the component inside the project (in memory)?
+    Dim moved As Object
+    Set moved = CompOrderMoves(orderBefore, orderAfter)
+    root("inMemoryOrderMoved") = (moved.Count > 0)
+    Set root("inMemoryOrderChanges") = moved
+    root("inMemoryOrderBefore") = orderBefore
+    root("inMemoryOrderAfter") = orderAfter
+    ' v1.11.12: the .vbp ORDER contract (same key names as save_project).
+    root("vbpPath") = vbpPathR
+    root("vbpOrderChecked") = vbpReadyR
+    root("vbpOrderPreserved") = True
+    root("vbpOrderRestored") = False
+    root("vbpRevisionBefore") = ""
+    root("vbpRevisionAfter") = ""
+    root("vbpRevisionBumped") = False
+    root("vbpOrderLinesCapped") = VBP_ORDER_MAX_LINES
+    Set root("vbpOrderChanges") = EmptyJsonArray()
+    If vbpReadyR Then
+        Dim revB As String, revA As String
+        revB = VbpSettingValue(vbpTextRBefore, "RevisionVer")
+        root("vbpRevisionBefore") = revB
+        vbpTextRAfter = ProjShip.ReadTextFile(vbpPathR)
+        If Len(vbpTextRAfter) > 0 Then
+            revA = VbpSettingValue(vbpTextRAfter, "RevisionVer")
+            root("vbpRevisionAfter") = revA
+            Dim revBumpedR As Boolean
+            revBumpedR = False
+            If Len(revB) > 0 Then
+                If Len(revA) > 0 Then
+                    If revB <> revA Then revBumpedR = True
+                End If
+            End If
+            root("vbpRevisionBumped") = revBumpedR
+            Dim afterLinesR() As String
+            afterLinesR = TextLines(vbpTextRAfter)
+            vbpSeqRAfter = VbpOrderSeq(afterLinesR, vbpIdxRAfter)
+            Dim deltaR As Object
+            Set deltaR = VbpOrderDelta(vbpSeqRBefore, vbpIdxRBefore, vbpSeqRAfter, vbpIdxRAfter)
+            root("vbpOrderPreserved") = CBool(deltaR("preserved"))
+            Set root("vbpOrderChanges") = deltaR("changes")
+            Set root("vbpOrderLinesBefore") = VbpSeqJsonArray(vbpSeqRBefore)
+            Set root("vbpOrderLinesAfter") = VbpSeqJsonArray(vbpSeqRAfter)
+            root("vbpOrderNote") = "Reload does NOT rewrite the .vbp itself: vbpOrderPreserved describes the on-disk file before/after this call. inMemoryOrderMoved=true means the IDE's component list moved; the next save_project would have written that order into the .vbp, and save_project restores the pre-save order (vbpOrderRestored=true). vbpRevisionBefore/After are READ from the two file snapshots, not inferred."
+        Else
+            Set root("vbpOrderLinesBefore") = EmptyJsonArray()
+            Set root("vbpOrderLinesAfter") = EmptyJsonArray()
+            root("vbpOrderNote") = "the .vbp could not be read back after the reload, so the on-disk order could not be compared"
+        End If
+    Else
+        Set root("vbpOrderLinesBefore") = EmptyJsonArray()
+        Set root("vbpOrderLinesAfter") = EmptyJsonArray()
+        root("vbpOrderNote") = "the project has no .vbp on disk, so the .vbp order contract cannot be evaluated for this call"
+    End If
     ToolReloadComponent = JsonStringify(root)
 End Function
 
@@ -8535,6 +9080,1269 @@ Private Function FirstDifferingLine(ByVal before As String, ByVal after As Strin
     FirstDifferingLine = n + 2
 End Function
 
+' v1.11.12 helpers: .vbp line order + deleted-lines evidence.
+' =====================================================================
+' .vbp LINE-ORDER PRESERVATION
+'
+' VB6 rewrites the whole .vbp on SaveAs and writes the components in the order the IDE
+' holds them in memory. A component Reload MOVES that component to the end of the
+' in-memory list, so the next save rewrote the Class= / Module= / Form= lines in a
+' different order: a semantically empty diff that polluted git and the gates. These
+' helpers snapshot the non-comment line order BEFORE a save, detect a pure reorder after
+' it, and put the ORIGINAL order back without dropping anything VB6 wrote. Only the ORDER
+' is restored; every line comes from the file VB6 just wrote.
+'
+' A .vbp comment line starts with an apostrophe; blank lines are cosmetic. The
+' ORDER-SENSITIVE sequence is therefore "every non-blank, non-comment line".
+' =====================================================================
+
+' the ORDER-SENSITIVE sequence of a line array, plus each entry's 0-based PHYSICAL line
+' index. (TextLines already splits CRLF / CR / LF.)
+Private Function VbpOrderSeq(ByRef lines() As String, ByRef outIdx() As Long) As String()
+    Dim i As Long, n As Long, s As String
+    Dim tmp() As String
+    ReDim tmp(0 To UBound(lines))
+    ReDim outIdx(0 To UBound(lines))
+    n = 0
+    For i = 0 To UBound(lines)
+        s = Trim$(lines(i))
+        If Len(s) > 0 Then
+            If Left$(s, 1) <> "'" Then
+                tmp(n) = lines(i)
+                outIdx(n) = i
+                n = n + 1
+            End If
+        End If
+    Next
+    If n = 0 Then
+        ReDim tmp(0 To 0)
+        ReDim outIdx(0 To 0)
+    Else
+        ReDim Preserve tmp(0 To n - 1)
+        ReDim Preserve outIdx(0 To n - 1)
+    End If
+    VbpOrderSeq = tmp
+End Function
+
+' True when the two sequences carry the SAME multiset of lines, i.e. the difference can
+' only be an ORDER change. Duplicates are matched one-for-one, so two identical
+' Reference= lines cannot make a reorder look like a content change.
+Private Function VbpSameLineSet(ByRef a() As String, ByRef b() As String) As Boolean
+    VbpSameLineSet = False
+    Dim i As Long, j As Long
+    If UBound(a) <> UBound(b) Then Exit Function
+    If UBound(a) = 0 Then
+        VbpSameLineSet = (Len(a(0)) = 0 And Len(b(0)) = 0)
+        Exit Function
+    End If
+    Dim used() As Boolean
+    ReDim used(0 To UBound(b))
+    Dim found As Boolean
+    For i = 0 To UBound(a)
+        found = False
+        For j = 0 To UBound(b)
+            If Not used(j) Then
+                If b(j) = a(i) Then
+                    used(j) = True
+                    found = True
+                    Exit For
+                End If
+            End If
+        Next
+        If Not found Then Exit Function
+    Next
+    VbpSameLineSet = True
+End Function
+
+' the setting name of a .vbp line ("Class=CodeTools; CodeTools.cls" -> "Class"), or the
+' whole trimmed line when it carries no "=".
+Private Function VbpLineKey(ByVal line As String) As String
+    Dim p As Long
+    p = InStr(line, "=")
+    If p > 1 Then
+        VbpLineKey = Trim$(Left$(line, p - 1))
+    Else
+        VbpLineKey = Trim$(line)
+    End If
+End Function
+
+' {preserved, sameSet, changes[]}: every line that MOVED, with its physical before/after
+' line number and its 1-based order index on both sides (capped at VBP_ORDER_MAX_CHANGES).
+Private Function VbpOrderDelta(ByRef beforeSeq() As String, ByRef beforeIdx() As Long, _
+                               ByRef afterSeq() As String, ByRef afterIdx() As Long) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim changes As Object
+    Set changes = New Collection
+    d("preserved") = True
+    d("sameSet") = VbpSameLineSet(beforeSeq, afterSeq)
+    Set d("changes") = changes
+    If UBound(beforeSeq) <> UBound(afterSeq) Then
+        d("preserved") = False
+        Set VbpOrderDelta = d
+        Exit Function
+    End If
+    Dim used() As Boolean
+    ReDim used(0 To UBound(afterSeq))
+    Dim i As Long, j As Long, hit As Long, s As String
+    For i = 0 To UBound(beforeSeq)
+        hit = -1
+        For j = 0 To UBound(afterSeq)
+            If Not used(j) Then
+                If afterSeq(j) = beforeSeq(i) Then
+                    used(j) = True
+                    hit = j
+                    Exit For
+                End If
+            End If
+        Next
+        If hit < 0 Then
+            d("preserved") = False
+        ElseIf hit <> i Then
+            d("preserved") = False
+            If changes.Count < VBP_ORDER_MAX_CHANGES Then
+                Dim c As Object
+                Set c = CreateObject("Scripting.Dictionary")
+                s = beforeSeq(i)
+                c("key") = VbpLineKey(s)
+                c("line") = s
+                c("beforeLine") = beforeIdx(i) + 1
+                c("afterLine") = afterIdx(hit) + 1
+                c("beforeOrder") = i + 1
+                c("afterOrder") = hit + 1
+                changes.Add c
+            End If
+        End If
+    Next
+    Set VbpOrderDelta = d
+End Function
+
+' Rewrite AFTER so its non-comment lines follow BEFORE's order. True ONLY when AFTER
+' carries the SAME multiset of lines (a pure reorder); a content change is refused rather
+' than shuffled, because that would move lines VB6 changed for a reason.
+Private Function VbpRestoreOrder(ByVal afterText As String, ByRef beforeSeq() As String, _
+                                 ByRef restoredText As String) As Boolean
+    VbpRestoreOrder = False
+    restoredText = ""
+    Dim lines() As String
+    lines = TextLines(afterText)
+    Dim seq() As String, idx() As Long
+    seq = VbpOrderSeq(lines, idx)
+    If Not VbpSameLineSet(beforeSeq, seq) Then Exit Function
+    If UBound(idx) <> UBound(beforeSeq) Then Exit Function
+    Dim k As Long
+    For k = 0 To UBound(beforeSeq)
+        lines(idx(k)) = beforeSeq(k)
+    Next
+    Dim eol As String
+    eol = vbCrLf
+    If InStr(afterText, vbCrLf) = 0 Then eol = vbLf
+    ' Split/Join is an exact round trip: a trailing terminator becomes a trailing empty
+    ' element and Join puts it back, so no extra terminator may be appended here.
+    restoredText = Join(lines, eol)
+    VbpRestoreOrder = True
+End Function
+
+' value of a "Name=value" line of a .vbp text ("" when the line is absent).
+Private Function VbpSettingValue(ByVal text As String, ByVal settingName As String) As String
+    VbpSettingValue = ""
+    If Len(text) = 0 Then Exit Function
+    Dim lines() As String, i As Long
+    lines = TextLines(text)
+    For i = 0 To UBound(lines)
+        If Left$(lines(i), Len(settingName) + 1) = settingName & "=" Then
+            VbpSettingValue = Trim$(Mid$(lines(i), Len(settingName) + 2))
+            Exit Function
+        End If
+    Next
+End Function
+
+' the order sequence as a JSON array, CAPPED at VBP_ORDER_MAX_LINES so a 110-component
+' project cannot blow up the receipt. vbpOrderLinesCapped reports the cap.
+Private Function VbpSeqJsonArray(ByRef seq() As String) As Object
+    Dim out As Object
+    Set out = New Collection
+    Dim i As Long
+    For i = 0 To UBound(seq)
+        If i >= VBP_ORDER_MAX_LINES Then Exit For
+        out.Add seq(i)
+    Next
+    Set VbpSeqJsonArray = out
+End Function
+
+' an empty JSON array (a Collection), so a receipt can always publish [] instead of dropping
+' the key.
+Private Function EmptyJsonArray() As Object
+    Dim c As Object
+    Set c = New Collection
+    Set EmptyJsonArray = c
+End Function
+
+' the component order the IDE holds IN MEMORY, as a lowercase "a|b|c|" key.
+Private Function CompOrderKey() As String
+    CompOrderKey = ""
+    Dim p As VBIDE.VBProject
+    Dim c As VBIDE.VBComponent
+    Dim s As String
+    On Error Resume Next
+    Set p = GetProject()
+    If p Is Nothing Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    For Each c In p.VBComponents
+        s = s & LCase$(c.Name) & "|"
+    Next
+    Err.Clear
+    On Error GoTo 0
+    CompOrderKey = s
+End Function
+
+' every component whose 1-based index changed between two CompOrderKey() snapshots.
+Private Function CompOrderMoves(ByVal beforeKey As String, ByVal afterKey As String) As Object
+    Dim out As Object
+    Set out = New Collection
+    If Len(beforeKey) = 0 Or Len(afterKey) = 0 Then
+        Set CompOrderMoves = out
+        Exit Function
+    End If
+    Dim a() As String, b() As String
+    Dim i As Long, j As Long, nm As String, hit As Long
+    a = Split(beforeKey, "|")
+    b = Split(afterKey, "|")
+    For i = 0 To UBound(a)
+        nm = a(i)
+        If Len(nm) > 0 Then
+            hit = -1
+            For j = 0 To UBound(b)
+                If b(j) = nm Then
+                    hit = j
+                    Exit For
+                End If
+            Next
+            If hit >= 0 Then
+                If hit <> i Then
+                    Dim d As Object
+                    Set d = CreateObject("Scripting.Dictionary")
+                    d("component") = nm
+                    d("beforeIndex") = i + 1
+                    d("afterIndex") = hit + 1
+                    out.Add d
+                End If
+            End If
+        End If
+    Next
+    Set CompOrderMoves = out
+End Function
+
+' v1.11.12: how many lines a batch REMOVED and the removed text (capped). Counted from
+' the SAME line-level LCS preview_edit renders, so the write receipt and the preview
+' cannot disagree about what was removed.
+Private Function DeletedLinesInfo(ByVal before As String, ByVal after As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("deletedLines") = 0
+    d("deletedText") = ""
+    d("deletedTextLines") = 0
+    d("deletedTextTruncated") = False
+    d("deletedTextLimit") = VBP_DELETED_MAX_CHARS
+    Set DeletedLinesInfo = d
+    If before = after Then Exit Function
+    Dim plan As Object
+    Set plan = EditTxn.DiffPlan(before, after, 0, 0)
+    Dim hs As Object
+    Set hs = plan("hunks")
+    Dim a() As String
+    a = TextLines(before)
+    Dim i As Long, j As Long, h As Object, s As String
+    Dim total As Long
+    total = 0
+    For i = 1 To hs.Count
+        Set h = hs(i)
+        If CStr(h("kind")) = "delete" Then total = total + CLng(h("oldCount"))
+    Next
+    Dim txt As String, shown As Long, chars As Long, cut As Boolean
+    txt = ""
+    shown = 0
+    chars = 0
+    cut = False
+    For i = 1 To hs.Count
+        Set h = hs(i)
+        If CStr(h("kind")) = "delete" Then
+            For j = 0 To CLng(h("oldCount")) - 1
+                If Not cut Then
+                    s = a(CLng(h("oldStart")) - 1 + j)
+                    If chars + Len(s) + 2 > VBP_DELETED_MAX_CHARS Then
+                        cut = True
+                    Else
+                        If shown > 0 Then txt = txt & vbCrLf
+                        txt = txt & s
+                        chars = chars + Len(s) + 2
+                        shown = shown + 1
+                    End If
+                End If
+            Next
+        End If
+    Next
+    d("deletedLines") = total
+    d("deletedTextLines") = shown
+    d("deletedTextTruncated") = cut
+    If cut Then
+        d("deletedText") = txt & vbCrLf & "... (truncated: " & CStr(total) & " line(s) removed, " & CStr(shown) & " shown; the cap is VBP_DELETED_MAX_CHARS = " & CStr(VBP_DELETED_MAX_CHARS) & " characters)"
+    Else
+        d("deletedText") = txt
+    End If
+End Function
+
+' =====================================================================
+' W-H4 (D8+D9): ONE-call debug session.
+' The VB6 IDE is STA / single-threaded: while the debugger holds the IDE
+' thread no second call can be dispatched, so a session cannot be driven
+' call by call. This tool compresses run -> hit -> context -> actions ->
+' end into ONE call and returns the transcript.
+' It MUST NOT save: control_execution's "run" performs a pre-run flush, so
+' the Start command is clicked directly here (receipt: preRunSave=false).
+' =====================================================================
+' W-H4: a break is observable through TWO independent signals. EbMode (VBA6) flips to 2
+' the moment the debugger stops, while the caption/toolbar-derived GetIdeState() may lag;
+' polling BOTH (and NOT relying on DoEvents alone, which pumps the host loop and can swallow
+' the transition) is what makes hit observation reliable.
+Private Function DbBreakNow() As Boolean
+    DbBreakNow = False
+    On Error Resume Next
+    If IdeEbMode() = 2 Then DbBreakNow = True
+    Err.Clear
+    On Error GoTo 0
+    If DbBreakNow Then Exit Function
+    If GetIdeState() = "break" Then DbBreakNow = True
+End Function
+
+' W-H4: a bounded REAL wait (busy tick loop, no DoEvents) so the IDE gets CPU time
+' without our pumping swallowing the debug transition.
+Private Sub DbBriefWait(ByVal ms As Long)
+    Dim w As Long
+    w = Util.TickMs()
+    Do While (Util.TickMs() - w) < ms
+    Loop
+End Sub
+
+' W-H4: attribute one observed break to the breakpoint list (increment hitCount).
+' The IDE exposes no per-breakpoint hit API, so the attribution is "first armed breakpoint with
+' the lowest pane line that has not been counted yet" - recorded with hitCountNote so nobody
+' mistakes it for a native counter.
+Private Sub DbNoteHit(ByRef root As Object, ByVal bps As Object)
+    On Error Resume Next
+    root("hitCountTotal") = CLng(root("hitCountTotal")) + 1
+    If bps Is Nothing Then Exit Sub
+    Dim i As Long, rec As Object
+    For i = 1 To bps.Count
+        Set rec = bps(i)
+        If Not rec Is Nothing Then
+            If CBool(rec("armed")) Then
+                rec("hitCount") = CLng(rec("hitCount")) + 1
+                rec("hitCountNote") = "attributed to the first armed breakpoint (no native per-breakpoint hit API)"
+                Exit For
+            End If
+        End If
+    Next
+    Err.Clear
+End Sub
+
+' W-H4: a break entry must NEVER be lost because the position read failed.
+Private Function DbPositionOrFallback(ByRef root As Object) As String
+    DbPositionOrFallback = ""
+    On Error Resume Next
+    DbPositionOrFallback = ToolCurrentPosition()
+    If Err.Number <> 0 Then
+        DbPositionOrFallback = ""
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If Len(DbPositionOrFallback) = 0 Then
+        root("positionUnavailable") = True
+        DbPositionOrFallback = "{""positionSource"":""breakpoint""}"
+    End If
+End Function
+
+Private Function ToolDebugSession(ByVal args As Object) As String
+    Dim root As Object, tr As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    Set tr = New Collection
+    root("tool") = "debug_session"
+    root("ok") = False
+    root("wedged") = False
+    root("endQueued") = False
+    root("preRunSave") = False
+    root("startedPid") = 0
+    root("stopReason") = ""
+    Dim timeoutMs As Long
+    timeoutMs = JsonGetLong(args, "timeout_ms", 60000)
+    If timeoutMs <= 0 Then timeoutMs = 60000
+    If timeoutMs > 600000 Then timeoutMs = 600000
+    root("timeoutMs") = timeoutMs
+    root("hitCountTotal") = 0
+    Set m_watchExprs = DbObjOf(args, "watch")
+    m_watchFrame = 0
+    root("runArgs") = JsonGetStr(args, "runArgs")
+    Dim attach As Boolean
+    attach = JsonGetBool(args, "attach", False)
+    root("attach") = attach
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    Dim vbpPath As String
+    vbpPath = p.FileName
+    root("vbpPath") = vbpPath
+    Dim diskBefore As String
+    diskBefore = ""
+    If Len(vbpPath) > 0 Then diskBefore = Sha256HexFile(vbpPath)
+    root("diskVbpShaBefore") = diskBefore
+    Dim bpsRef As Object
+    Set bpsRef = Nothing
+    Dim leaveRunning As Boolean
+    leaveRunning = True
+    On Error GoTo H4_ERR
+    Dim st0 As String
+    st0 = GetIdeState()
+    root("ideStateBefore") = st0
+    ' ---- ATTACH mode: drive an ALREADY RUNNING/BROKEN IDE (no Start click) ----
+    If attach Then
+        If st0 = "design" Then
+            root("reason") = "attach_not_running"
+            root("howToStart") = "call debug_session once with attach=false (arm+start) and then attach=true with the returned howToContinue arguments"
+            leaveRunning = True
+            DbFinalize root, tr, vbpPath, diskBefore, leaveRunning
+            ToolDebugSession = JsonStringify(root)
+            Exit Function
+        End If
+        If st0 = "run" Then
+            Dim ta As Long
+            ta = Util.TickMs()
+            Do While (Util.TickMs() - ta) < timeoutMs
+                DoEvents
+                DbBriefWait 40
+                If DbBreakNow() Then Exit Do
+            Loop
+            If Not DbBreakNow() Then
+                root("stopReason") = "timeout"
+                root("stillRunning") = True
+                leaveRunning = True
+                DbFinalize root, tr, vbpPath, diskBefore, leaveRunning
+                ToolDebugSession = JsonStringify(root)
+                Exit Function
+            End If
+        End If
+        DbNoteHit root, bpsRef
+        DbAddTranscript tr, "break", DbPositionOrFallback(root), ""
+        DbRunActions args, tr, timeoutMs, root
+        leaveRunning = False
+        DbFinalize root, tr, vbpPath, diskBefore, leaveRunning
+        ToolDebugSession = JsonStringify(root)
+        Exit Function
+    End If
+    ' ---- refuse to start from break (never assume design) --------------
+    If (Not attach) And st0 = "break" Then
+        root("reason") = "already_in_break"
+        root("hint") = "call control_execution{mode:""end""} first, then retry debug_session"
+        leaveRunning = True
+        DbFinalize root, tr, vbpPath, diskBefore, leaveRunning
+        ToolDebugSession = JsonStringify(root)
+        Exit Function
+    End If
+    ' ---- disk identity of the .vbp BEFORE anything (external read, declared above) ----
+    ' ---- arm the breakpoints (pane line space, echoed with disk line) --
+    Set bpsRef = DbArmBreakpoints(args)
+    Set root("breakpoints") = bpsRef
+    ' ---- start the program WITHOUT saving ------------------------------
+    Dim whyStart As String
+    whyStart = ""
+    Dim started As Boolean
+    started = DbClickStart(whyStart)
+    root("executedStart") = started
+    root("startWhy") = whyStart
+    If started Then
+        root("startedPid") = CLng(DbGetCurrentProcessId())
+        ' ---- wait for the first hit / exit / timeout -------------------
+        ' the Run/Debug menu command is processed ASYNCHRONOUSLY: the state is still
+        ' "design" immediately after the click, so waiting for break/design now would
+        ' read the click's own latency as an immediate process exit. Wait (bounded) for
+        ' the state to LEAVE design first, and only then judge break / exit / timeout.
+        Dim tStart As Long
+        Dim stLeave As String
+        tStart = Util.TickMs()
+        stLeave = GetIdeState()
+        Do While (Util.TickMs() - tStart) < 8000
+            If Util.CanPump() Then DoEvents
+            stLeave = GetIdeState()
+            If stLeave <> "design" Then Exit Do
+        Loop
+        Dim t0 As Long
+        Dim stNow As String
+        Dim dbgIter As Long
+        t0 = Util.TickMs()
+        stNow = GetIdeState()
+        dbgIter = 0
+        Do While (Util.TickMs() - t0) < timeoutMs
+            DoEvents
+            DbBriefWait 40
+            stNow = GetIdeState()
+            dbgIter = dbgIter + 1
+            If DbBreakNow() Then Exit Do
+            If stNow = "design" Then Exit Do
+        Loop
+        root("ideStateAfterWait") = stNow
+        If stNow = "break" Then
+            root("stopReason") = "initial_break"
+            DbNoteHit root, bpsRef
+            DbAddTranscript tr, "break", DbPositionOrFallback(root), ""
+            DbRunActions args, tr, timeoutMs, root
+            leaveRunning = False
+        ElseIf stNow = "design" Then
+            ' STA: the Start command is executed only AFTER this call returns. Do not lie with process_exit.
+            root("startedPending") = True
+            root("stopReason") = "started"
+            root("ideStateAtReturn") = GetIdeState()
+            Dim hc As Object
+            Set hc = CreateObject("Scripting.Dictionary")
+            hc("tool") = "debug_session"
+            Dim ha As Object
+            Set ha = CreateObject("Scripting.Dictionary")
+            ha("attach") = True
+            ha("timeout_ms") = timeoutMs
+            Set hc("arguments") = ha
+            Set root("howToContinue") = hc
+            leaveRunning = True
+        Else
+            root("stopReason") = "timeout"
+            root("stillRunning") = True
+            leaveRunning = True
+        End If
+    Else
+        root("reason") = "start_command_not_found"
+        root("detail") = whyStart
+        leaveRunning = True
+    End If
+    ' ---- ONE finaliser on EVERY path (D2): end attempt + disk identity --
+    DbFinalize root, tr, vbpPath, diskBefore, leaveRunning
+    ToolDebugSession = JsonStringify(root)
+    Exit Function
+
+H4_ERR:
+    Dim em As String
+    em = Err.Description
+    On Error Resume Next
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = em
+    root("ideStateAfter") = GetIdeState()
+    If root("ideStateAfter") = "break" Or root("ideStateAfter") = "run" Then
+        root("endQueued") = True
+        Set root("howToFinish") = DbHowToFinish()
+    End If
+    If Len(CStr(root("stopReason"))) = 0 Then root("stopReason") = "error"
+    DbFinalizeDiskAndHits root, vbpPath, diskBefore, tr
+    ToolDebugSession = JsonStringify(root)
+End Function
+
+' (D1/D2) ONE finaliser for EVERY debug_session return path.
+' D1: the End command is QUEUED while the call holds the IDE thread, so an in-call wait can
+' never observe it. A still-broken/still-running state after the bounded wait is therefore
+' reported as endQueued=true + howToFinish, NOT as wedged. wedged=true is reserved for the
+' case where an EbMode=2 break context is held while the IDE's CommandBars model is gone AND
+' one activate_component recovery attempt did not bring it back.
+' D2: the disk identity (diskVbpShaAfter / savedDuringCall / reorderedDuringCall) is computed
+' on EVERY path, including the timeout and the error paths.
+Private Sub DbFinalize(ByRef root As Object, ByRef tr As Object, ByVal vbpPath As String, _
+                       ByVal diskBefore As String, ByVal leaveRunning As Boolean)
+    On Error Resume Next
+    Dim stNow As String
+    stNow = GetIdeState()
+    root("ideStateAfter") = stNow
+    If Not leaveRunning Then
+        ' request the end; the command is QUEUED (STA) and is executed only after this call
+        ' returns, so the wait below is a bounded confirmation - never proof of failure.
+        root("endRequested") = True
+        root("endClicked") = DbClickEnd()
+        Dim tEnd As Long
+        tEnd = Util.TickMs()
+        Do While (Util.TickMs() - tEnd) < 3000
+            If Util.CanPump() Then DoEvents
+            stNow = GetIdeState()
+            If stNow = "design" Then Exit Do
+        Loop
+        root("ideStateAfter") = stNow
+        If stNow = "break" Or stNow = "run" Then
+            root("endQueued") = True
+            Set root("howToFinish") = DbHowToFinish()
+            If IdeEbMode() = 2 And (Not IdeBarsUsable()) Then
+                Set root("autoRecover") = DbNudgeBarsOut()
+                If IdeEbMode() = 2 And (Not IdeBarsUsable()) Then
+                    root("wedged") = True
+                    root("wedgedNote") = "an EbMode=2 break context is held while the IDE CommandBars model is gone, and one activate_component recovery attempt did not bring it back"
+                End If
+            End If
+        End If
+    Else
+        If stNow = "break" Or stNow = "run" Then
+            root("stillRunning") = True
+            Set root("howToFinish") = DbHowToFinish()
+        End If
+    End If
+    DbFinalizeDiskAndHits root, vbpPath, diskBefore, tr
+    Err.Clear
+End Sub
+
+Private Function DbHowToFinish() As Object
+    Dim hf As Object
+    Set hf = CreateObject("Scripting.Dictionary")
+    hf("tool") = "control_execution"
+    Dim hfa As Object
+    Set hfa = CreateObject("Scripting.Dictionary")
+    hfa("mode") = "end"
+    Set hf("arguments") = hfa
+    Set DbHowToFinish = hf
+End Function
+
+' (D2) transcript + disk identity + verdict, ALWAYS, on every return path.
+Private Sub DbFinalizeDiskAndHits(ByRef root As Object, ByVal vbpPath As String, _
+                                  ByVal diskBefore As String, ByRef tr As Object)
+    On Error Resume Next
+    Dim diskAfter As String
+    diskAfter = ""
+    If Len(vbpPath) > 0 Then
+        If DbFileExists(vbpPath) Then diskAfter = Sha256HexFile(vbpPath)
+    End If
+    root("diskVbpShaAfter") = diskAfter
+    root("vbpShaBefore") = diskBefore
+    root("vbpShaAfter") = diskAfter
+    root("savedDuringCall") = (Len(diskBefore) > 0 And StrComp(diskBefore, diskAfter, vbTextCompare) <> 0)
+    root("reorderedDuringCall") = False
+    root("vbpRewrittenByIde") = (Len(diskBefore) > 0 And StrComp(diskBefore, diskAfter, vbTextCompare) <> 0)
+    Set root("transcript") = tr
+    root("transcriptCount") = tr.Count
+    Dim sr As String
+    sr = CStr(root("stopReason"))
+    If Len(sr) = 0 Then
+        sr = "error"
+        root("stopReason") = "error"
+    End If
+    If sr = "initial_break" Or sr = "process_exit" Or sr = "actions_done" Or sr = "started" Or sr = "stopped" Or sr = "break" Or sr = "unhandled_error" Then
+        root("ok") = True
+    Else
+        root("ok") = False
+    End If
+    Err.Clear
+End Sub
+
+' Click the End menu item WITHOUT the 12 s state wait of control_execution: that wait cannot
+' observe a QUEUED command, so the finaliser does its own bounded 3 s confirmation instead.
+Private Function DbClickEnd() As Boolean
+    DbClickEnd = False
+    On Error Resume Next
+    Dim ctrl As Object
+    Dim why As String
+    why = ""
+    Set ctrl = FindCmd("end", "Debug|Run|" & ChrW$(&H8C03) & ChrW$(&H8BD5) & "|" & ChrW$(&H8FD0) & ChrW$(&H884C), "End|" & ChrW$(&H7ED3) & ChrW$(&H675F))
+    If ctrl Is Nothing Then Set ctrl = m_cachedEnd Else Set m_cachedEnd = ctrl
+    If ctrl Is Nothing Then Exit Function
+    DbClickEnd = (ExecIfEnabledWhy(ctrl, "end", why) > 0)
+    Err.Clear
+End Function
+
+' (D1/D3) one bounded recovery attempt for a suspended CommandBars window + its receipt block.
+Private Function DbNudgeBarsOut() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("attempted") = False
+    d("recovered") = False
+    d("component") = ""
+    d("via") = "activate_component"
+    On Error Resume Next
+    Dim nm As String
+    nm = DbNudgeComponentName()
+    d("component") = nm
+    If Len(nm) = 0 Then
+        d("note") = "no component to activate"
+    Else
+        d("attempted") = True
+        Dim rj As String
+        rj = ""
+        rj = ToolActivateComponent(nm, "code")
+        If Err.Number <> 0 Then
+            d("error") = Err.Description
+            Err.Clear
+        End If
+        d("thisCallAnswered") = (Len(rj) > 0)
+        d("recovered") = IdeBarsUsable()
+    End If
+    Err.Clear
+    On Error GoTo 0
+    Set DbNudgeBarsOut = d
+End Function
+
+' The component to activate when the CommandBars window must be cleared: the ACTIVE one when
+' the IDE still knows it, else the first component of the project.
+Private Function DbNudgeComponentName() As String
+    On Error Resume Next
+    DbNudgeComponentName = ""
+    Dim c As VBIDE.VBComponent
+    Set c = m_vbe.ActiveVBComponent
+    If Err.Number = 0 Then
+        If Not c Is Nothing Then
+            DbNudgeComponentName = c.Name
+            Exit Function
+        End If
+    End If
+    Err.Clear
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    If p Is Nothing Then Exit Function
+    If p.VBComponents.Count = 0 Then Exit Function
+    Set c = p.VBComponents.Item(1)
+    If Err.Number = 0 Then DbNudgeComponentName = c.Name
+    Err.Clear
+End Function
+
+' {NAME:value} objects from the args bag, or Nothing.
+Private Function DbObjOf(ByVal args As Object, ByVal key As String) As Object
+    Set DbObjOf = Nothing
+    If args Is Nothing Then Exit Function
+    On Error Resume Next
+    If Not args.Exists(key) Then Exit Function
+    If Not IsObject(args(key)) Then Exit Function
+    Set DbObjOf = args(key)
+    Err.Clear
+End Function
+
+' arm every requested breakpoint through the EXISTING native_breakpoint toggle
+' path (no new breakpoint code), echo paneLine/diskLine/armed/hitCount.
+Private Function DbArmBreakpoints(ByVal args As Object) As Object
+    Dim out As Object
+    Set out = New Collection
+    Dim bps As Object
+    Set bps = DbObjOf(args, "breakpoints")
+    If bps Is Nothing Then
+        Set DbArmBreakpoints = out
+        Exit Function
+    End If
+    Dim i As Long
+    For i = 1 To bps.Count
+        Dim one As Object
+        Set one = Nothing
+        If IsObject(bps(i)) Then Set one = bps(i)
+        Dim comp As String, lineN As Long
+        comp = ""
+        lineN = 0
+        If Not one Is Nothing Then
+            If one.Exists("component") Then comp = CStr(one("component"))
+            If one.Exists("line") Then lineN = CLng(one("line"))
+        End If
+        Dim rec As Object
+        Set rec = CreateObject("Scripting.Dictionary")
+        rec("component") = comp
+        rec("paneLine") = lineN
+        rec("diskLine") = lineN
+        rec("diskLineExact") = False
+        rec("mappingResolved") = False
+        On Error Resume Next
+        Dim cdA As Object
+        Set cdA = CoordsDictOfName(comp, lineN, "ide")
+        If Err.Number = 0 Then
+            If Not cdA Is Nothing Then
+                If cdA.Exists("diskLine") Then rec("diskLine") = cdA("diskLine")
+                If cdA.Exists("diskLineExact") Then rec("diskLineExact") = cdA("diskLineExact")
+                If cdA.Exists("mappingResolved") Then rec("mappingResolved") = cdA("mappingResolved")
+            End If
+        End If
+        Err.Clear
+        On Error GoTo 0
+        rec("armed") = False
+        rec("hitCount") = 0
+        ' W-H1: stop only on the Nth hit (the engine has no conditional breakpoints, so this is
+        ' the equivalent capability: the driver re-runs until the target hit is reached).
+        rec("hitCountTarget") = 1
+        If Not one Is Nothing Then
+            If one.Exists("hitCount") Then rec("hitCountTarget") = CLng(one("hitCount"))
+        End If
+        If CLng(rec("hitCountTarget")) < 1 Then rec("hitCountTarget") = 1
+        If lineN > 0 Then
+            Dim bpa As Object
+            Set bpa = CreateObject("Scripting.Dictionary")
+            bpa("action") = "toggle"
+            bpa("component") = comp
+            bpa("line") = lineN
+            Dim rj As String
+            rj = ""
+            On Error Resume Next
+            rj = ToolNativeBreakpoint(bpa)
+            If Err.Number <> 0 Then
+                rj = ""
+                Err.Clear
+            End If
+            On Error GoTo 0
+            rec("toggleReceipt") = Left$(rj, 400)
+            ' armed = the toggle receipt reports the breakpoint ON (or at least no refusal)
+            If InStr(1, rj, """breakpointOn"":true", vbTextCompare) > 0 Then
+                rec("armed") = True
+            ElseIf Len(rj) > 0 And InStr(1, rj, """reason""", vbTextCompare) = 0 Then
+                rec("armed") = True
+            End If
+        End If
+        out.Add rec
+    Next
+    Set DbArmBreakpoints = out
+End Function
+
+' click the Start/Continue menu command WITHOUT the pre-run flush
+Private Function DbClickStart(ByRef whyOut As String) As Boolean
+    whyOut = ""
+    DbClickStart = False
+    Dim barCands As String, cands As String
+    barCands = "Debug|Run|" & ChrW$(&H8C03) & ChrW$(&H8BD5) & "|" & ChrW$(&H8FD0) & ChrW$(&H884C)
+    If GetIdeState() = "break" Then
+        cands = "Continue|" & ChrW$(&H7EE7) & ChrW$(&H7EED)
+    Else
+        cands = "Start|" & ChrW$(&H542F) & ChrW$(&H52A8) & "|Continue|" & ChrW$(&H7EE7) & ChrW$(&H7EED)
+    End If
+    Dim ctrl As Object
+    Set ctrl = FindCmd("start", barCands, cands)
+    If ctrl Is Nothing Then Set ctrl = m_cachedStart
+    If ctrl Is Nothing Then Set ctrl = FindBarControlDeep(cands)
+    If ctrl Is Nothing Then
+        whyOut = "start menu command not found (searched " & cands & ")"
+        Exit Function
+    End If
+    Set m_cachedStart = ctrl
+    Dim n As Long
+    n = ExecIfEnabledWhy(ctrl, "start", whyOut)
+    ' (D3) the post-run suspended CommandBars window leaves the item DISABLED although nothing
+    ' is running (measured). Clear it ONCE, re-resolve and retry ONCE instead of reporting a
+    ' start failure that is really an IDE-state artefact.
+    If n = 0 And InStr(1, whyOut, "disabled", vbTextCompare) > 0 Then
+        Dim nr As Object
+        Set nr = DbNudgeBarsOut()
+        If CBool(nr("attempted")) Then
+            Set ctrl = Nothing
+            Set ctrl = FindCmd("start", barCands, cands)
+            If ctrl Is Nothing Then Set ctrl = FindBarControlDeep(cands)
+            If Not ctrl Is Nothing Then
+                whyOut = ""
+                n = ExecIfEnabledWhy(ctrl, "start", whyOut)
+                Set m_cachedStart = ctrl
+            End If
+        End If
+    End If
+    DbClickStart = (n > 0)
+End Function
+
+Private Sub DbAddTranscript(ByRef tr As Object, ByVal kind As String, ByVal posJson As String, ByVal stackJson As String)
+    Dim e As Object
+    Dim sj As String
+    sj = ""
+    On Error Resume Next
+    sj = Vba6Probe.CallstackJson(32)
+    If Err.Number <> 0 Then
+        sj = ""
+        Err.Clear
+    End If
+    On Error GoTo 0
+    Set e = CreateObject("Scripting.Dictionary")
+    e("seq") = tr.Count + 1
+    e("kind") = kind
+    e("position") = posJson
+    e("callstack") = sj
+    If Len(sj) = 0 Then e("callstackUnavailable") = True
+    Set e("locals") = EmptyJsonArray()
+    e("localsUnavailable") = True
+    e("output") = ""
+    e("err") = ""
+    ' W-H2: watch expressions evaluated at THIS stop, same per-value shape as get_locals.
+    If Not m_watchExprs Is Nothing Then
+        If m_watchExprs.Count > 0 Then Set e("watch") = DbWatchArray()
+    End If
+    tr.Add e
+End Sub
+
+Private Sub DbRunActions(ByVal args As Object, ByRef tr As Object, ByVal timeoutMs As Long, ByRef root As Object)
+    Dim acts As Object
+    Set acts = DbObjOf(args, "actions")
+    If acts Is Nothing Then
+        root("stopReason") = "actions_done"
+        Exit Sub
+    End If
+    Dim i As Long
+    For i = 1 To acts.Count
+        Dim a As Object
+        Set a = Nothing
+        If IsObject(acts(i)) Then Set a = acts(i)
+        Dim op As String
+        op = ""
+        If Not a Is Nothing Then
+            If a.Exists("op") Then op = LCase$(CStr(a("op")))
+        End If
+        If op = "stop" Then
+            root("stopReason") = "stopped"
+            Exit Sub
+        ElseIf op = "eval" Then
+            Dim expr As String
+            expr = ""
+            If a.Exists("expr") Then expr = CStr(a("expr"))
+            Dim ev As String
+            ev = ""
+            On Error Resume Next
+            ev = ToolImmediateEval(expr, "", 5000)
+            If Err.Number <> 0 Then
+                ev = ""
+                Err.Clear
+            End If
+            On Error GoTo 0
+            Dim e2 As Object
+            Set e2 = CreateObject("Scripting.Dictionary")
+            e2("seq") = tr.Count + 1
+            e2("kind") = "eval"
+            e2("position") = ToolCurrentPosition()
+            e2("expr") = expr
+            e2("output") = Left$(ev, 2000)
+            e2("callstack") = ""
+            Set e2("locals") = EmptyJsonArray()
+            e2("err") = ""
+            tr.Add e2
+        ElseIf op = "continue" Then
+            On Error Resume Next
+            ToolControlExecution "continue"
+            If Err.Number <> 0 Then Err.Clear
+            On Error GoTo 0
+            Dim t1 As Long
+            ' same asynchronous-start problem as after DbClickStart
+            Dim tC As Long
+            tC = Util.TickMs()
+            Dim stC As String
+            stC = GetIdeState()
+            Do While (Util.TickMs() - tC) < 8000
+                If Util.CanPump() Then DoEvents
+                stC = GetIdeState()
+                If Not DbBreakNow() Then Exit Do
+            Loop
+            t1 = Util.TickMs()
+            Dim st As String
+            st = GetIdeState()
+            Do While (Util.TickMs() - t1) < timeoutMs
+                If Util.CanPump() Then DoEvents
+                st = GetIdeState()
+                If DbBreakNow() Then Exit Do
+                If st = "design" Then Exit Do
+            Loop
+            If st = "break" Then
+                DbAddTranscript tr, "break", DbPositionOrFallback(root), ""
+            ElseIf st = "design" Then
+                root("stopReason") = "process_exit"
+                Exit Sub
+            Else
+                root("stopReason") = "timeout"
+                Exit Sub
+            End If
+        ElseIf op = "step_over" Or op = "step_into" Or op = "step_out" Then
+            On Error Resume Next
+            ToolControlExecution op
+            If Err.Number <> 0 Then Err.Clear
+            On Error GoTo 0
+            Dim t2 As Long
+            t2 = Util.TickMs()
+            Dim st2 As String
+            st2 = GetIdeState()
+            Do While (Util.TickMs() - t2) < 10000
+                If Util.CanPump() Then DoEvents
+                st2 = GetIdeState()
+                If DbBreakNow() Then Exit Do
+                If st2 = "design" Then Exit Do
+            Loop
+            If st2 = "break" Then
+                DbAddTranscript tr, "break", DbPositionOrFallback(root), ""
+            ElseIf st2 = "design" Then
+                root("stopReason") = "process_exit"
+                Exit Sub
+            End If
+        End If
+    Next
+    If Len(CStr(root("stopReason"))) = 0 Then root("stopReason") = "actions_done"
+End Sub
+
+Private Function DbFileExists(ByVal p As String) As Boolean
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    DbFileExists = fso.FileExists(p)
+    If Err.Number <> 0 Then
+        DbFileExists = False
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+' =====================================================================
+' P1/P12: .vbp Reference= paths and junction (link) aliases.
+'
+' Symptom this exists for: VB6 computes the RELATIVE path of a Reference=
+' against the directory the project was OPENED from, so a project opened
+' through a directory junction carries a path that resolves only while the
+' alias exists. Read from the canonical location the same line resolves beside
+' the real tree and the reference is MISSING, although the IDE built fine.
+'
+' The repair never guesses: a relative path is resolved to a REAL file first
+' (alias base, then the canonical base), the real file is re-expressed relative
+' to the canonical project directory, and the new value must itself resolve back
+' to that same real file before it is written. Absolute, UNC and placeholder
+' paths are reported and left alone. The switch VB6MCP_REFS_FROM_ALIAS=1
+' restores the legacy behaviour (references left relative to the alias
+' directory) for A/B comparison only.
+' =====================================================================
+
+' the directory part of a path ("" when there is none).
+Private Function DirOfPath(ByVal p As String) As String
+    Dim i As Long
+    DirOfPath = ""
+    If Len(p) = 0 Then Exit Function
+    i = InStrRev(p, "\")
+    If i > 0 Then DirOfPath = Left$(p, i - 1)
+End Function
+
+' the legacy-behaviour switch: 1/true/on/yes => compute references from the
+' directory the project was opened from (default: from the canonical path).
+Private Function RefsFromAliasOn() As Boolean
+    Dim s As String
+    s = LCase$(Trim$(Environ$("VB6MCP_REFS_FROM_ALIAS")))
+    If Len(s) = 0 Then Exit Function
+    If s = "1" Or s = "true" Or s = "on" Or s = "yes" Then RefsFromAliasOn = True
+End Function
+
+' {projectPath, realProjectPath, projectPathIsAlias, realPathTier,
+'  realPathError, warning, warningDetail, refsBase, refsFromAlias} for the OPEN
+' project. projectPath is the spelling the IDE holds; realProjectPath is what
+' GetFinalPathNameByHandleW resolves it to.
+Private Function ProjectPathInfo(p As VBIDE.VBProject) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim opened As String, real As String, tier As Long, errText As String
+    Dim aliasOn As Boolean
+    d("projectPath") = ""
+    d("realProjectPath") = ""
+    d("projectPathIsAlias") = False
+    d("realPathTier") = 0
+    d("realPathError") = ""
+    d("warning") = ""
+    d("warningDetail") = ""
+    d("refsFromAlias") = False
+    d("refsBase") = ""
+    If p Is Nothing Then
+        Set ProjectPathInfo = d
+        Exit Function
+    End If
+    aliasOn = RefsFromAliasOn()
+    d("refsFromAlias") = aliasOn
+    d("refsBase") = "canonical"
+    If aliasOn Then d("refsBase") = "alias"
+    On Error Resume Next
+    opened = p.FileName
+    If Err.Number <> 0 Then
+        opened = ""
+        Err.Clear
+    End If
+    On Error GoTo 0
+    d("projectPath") = opened
+    If Len(opened) = 0 Then
+        Set ProjectPathInfo = d
+        Exit Function
+    End If
+    real = Util.UtilRealPathTiers(opened, tier, errText)
+    d("realPathTier") = tier
+    d("realPathError") = errText
+    If Len(real) = 0 Then
+        d("warning") = "the canonical path of the project file could not be resolved (" & errText & "); relative references keep the directory the project was opened from"
+        Set ProjectPathInfo = d
+        Exit Function
+    End If
+    d("realProjectPath") = real
+    If StrComp(LCase$(Replace(real, "/", "\")), LCase$(Replace(opened, "/", "\")), vbTextCompare) <> 0 Then
+        d("projectPathIsAlias") = True
+        d("warning") = "relative references are computed from the canonical path, not the link alias"
+        d("warningDetail") = "the .vbp was opened as " & opened & " which resolves to " & real
+    End If
+    Set ProjectPathInfo = d
+End Function
+
+' the per-call reference evidence: canonicalized[] / skipped[] / unresolvedCount.
+Private Function NewRefsInfo() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Set d("canonicalized") = New Collection
+    Set d("skipped") = New Collection
+    d("unresolvedCount") = 0
+    Set NewRefsInfo = d
+End Function
+
+' the path field of a .vbp Reference= line ("" when the line carries none).
+' Layout: Reference=*\G{GUID}#<version>#<lcid>#<path>#<description>
+Private Function VbpRefPathOf(ByVal line As String, ByRef refName As String) As String
+    Dim t As String, parts() As String
+    VbpRefPathOf = ""
+    refName = ""
+    t = Trim$(line)
+    If Len(t) < 10 Then Exit Function
+    If StrComp(Left$(t, 10), "Reference=", vbTextCompare) <> 0 Then Exit Function
+    parts = Split(t, "#", 5)
+    If UBound(parts) < 3 Then Exit Function
+    VbpRefPathOf = Trim$(parts(3))
+    If UBound(parts) >= 4 Then refName = Trim$(parts(4))
+End Function
+
+' the same Reference= line with ONLY its path field replaced.
+Private Function VbpRefLineWith(ByVal line As String, ByVal newPath As String) As String
+    Dim parts() As String, out As String, i As Long
+    parts = Split(Trim$(line), "#", 5)
+    out = parts(0)
+    For i = 1 To UBound(parts)
+        out = out & "#"
+        If i = 3 Then out = out & newPath Else out = out & parts(i)
+    Next
+    VbpRefLineWith = out
+End Function
+
+Private Sub RefsRecord(ByRef info As Object, ByVal refName As String, ByVal before As String, _
+                       ByVal after As String, ByVal changed As Boolean, ByVal relativeTo As String, _
+                       ByVal target As String)
+    Dim c As Object
+    Set c = CreateObject("Scripting.Dictionary")
+    c("name") = refName
+    c("before") = before
+    c("after") = after
+    c("changed") = changed
+    c("relativeTo") = relativeTo
+    c("target") = target
+    c("exists") = True
+    info("canonicalized").Add c
+End Sub
+
+Private Sub RefsSkip(ByRef info As Object, ByVal refPath As String, ByVal reason As String, ByVal detail As String)
+    Dim c As Object
+    Set c = CreateObject("Scripting.Dictionary")
+    c("path") = refPath
+    c("reason") = reason
+    c("detail") = detail
+    info("skipped").Add c
+End Sub
+
+' A/B mode (legacy switch on): rewrite NOTHING, but report every reference path
+' so the two arms of the switch can be compared line by line.
+Private Sub VbpRefReportOnly(ByVal text As String, ByRef info As Object)
+    Dim lines() As String, i As Long, ln As String, refPath As String, refName As String
+    lines = TextLines(text)
+    For i = 0 To UBound(lines)
+        ln = lines(i)
+        If Len(ln) > 10 Then
+            If StrComp(Left$(ln, 10), "Reference=", vbTextCompare) = 0 Then
+                refPath = VbpRefPathOf(ln, refName)
+                If Len(refPath) > 0 Then
+                    RefsSkip info, refPath, "refs_from_alias", "the legacy switch is ON: relative references are NOT rewritten (A/B mode)"
+                End If
+            End If
+        End If
+    Next
+End Sub
+
+' Rewrites the RELATIVE path field of every Reference= line so it resolves from
+' realDir. The text is transformed IN MEMORY; the caller writes it once.
+Private Function VbpRefRewriteText(ByVal text As String, ByVal aliasDir As String, _
+                                   ByVal realDir As String, ByVal projPaths As Object, _
+                                   ByRef info As Object) As String
+    Dim lines() As String, eol As String, i As Long, ln As String
+    Dim refPath As String, refName As String, candA As String, candB As String
+    Dim realTarget As String, newPath As String, verifyPath As String
+    Dim wrote As Boolean
+    VbpRefRewriteText = text
+    If Len(text) = 0 Then Exit Function
+    If CBool(projPaths("refsFromAlias")) Then
+        VbpRefReportOnly text, info
+        Exit Function
+    End If
+    If Len(aliasDir) = 0 Or Len(realDir) = 0 Then Exit Function
+    lines = TextLines(text)
+    eol = vbCrLf
+    If InStr(text, vbCrLf) = 0 Then eol = vbLf
+    wrote = False
+    For i = 0 To UBound(lines)
+        ln = lines(i)
+        If Len(ln) > 10 Then
+            If StrComp(Left$(ln, 10), "Reference=", vbTextCompare) = 0 Then
+                refPath = VbpRefPathOf(ln, refName)
+                If Len(refPath) > 0 Then
+                    If InStr(refPath, "$(") > 0 Then
+                        RefsSkip info, refPath, "environment_placeholder", "the path carries an environment placeholder, so it is never rewritten here"
+                    ElseIf Not Util.UtilPathIsRelative(refPath) Then
+                        RefsSkip info, refPath, "absolute_or_unc", "the path is absolute or UNC, so it does not depend on the project directory"
+                    Else
+                        candA = CtlJoinPath(aliasDir, refPath)
+                        candB = CtlJoinPath(realDir, refPath)
+                        realTarget = ""
+                        If CtlFileExists(candA) Then realTarget = Util.UtilRealPath(candA)
+                        If Len(realTarget) = 0 Then
+                            If CtlFileExists(candB) Then realTarget = Util.UtilRealPath(candB)
+                        End If
+                        If Len(realTarget) = 0 Then
+                            info("unresolvedCount") = CLng(info("unresolvedCount")) + 1
+                            RefsSkip info, refPath, "unresolved", "neither " & candA & " nor " & candB & " names an existing file, so no canonical value is guessed"
+                        Else
+                            newPath = Util.UtilRelPath(realDir, realTarget)
+                            If Len(newPath) = 0 Then
+                                info("unresolvedCount") = CLng(info("unresolvedCount")) + 1
+                                RefsSkip info, refPath, "relpath_failed", "no relative path from " & realDir & " to " & realTarget
+                            Else
+                                verifyPath = CtlJoinPath(realDir, newPath)
+                                If Not CtlFileExists(verifyPath) Then
+                                    info("unresolvedCount") = CLng(info("unresolvedCount")) + 1
+                                    RefsSkip info, refPath, "verify_failed", "the rewritten path " & verifyPath & " does not name an existing file"
+                                ElseIf StrComp(Util.UtilRealPath(verifyPath), realTarget, vbTextCompare) <> 0 Then
+                                    info("unresolvedCount") = CLng(info("unresolvedCount")) + 1
+                                    RefsSkip info, refPath, "verify_failed", "the rewritten path " & verifyPath & " resolves to " & Util.UtilRealPath(verifyPath) & ", not to " & realTarget
+                                Else
+                                    If StrComp(newPath, refPath, vbTextCompare) = 0 Then
+                                        ' the same path, only the SPELLING differs (case / 8.3):
+                                        ' keep the file's own spelling so a plain save stays
+                                        ' byte-stable instead of churning the line.
+                                        RefsRecord info, refName, refPath, refPath, False, realDir, realTarget
+                                    Else
+                                        lines(i) = VbpRefLineWith(ln, newPath)
+                                        wrote = True
+                                        RefsRecord info, refName, refPath, newPath, True, realDir, realTarget
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next
+    If wrote Then VbpRefRewriteText = Join(lines, eol)
+End Function
+
+' the repair for a save path that does not go through save_project (the in-IDE
+' compile route saves the project itself). Returns 1 when the .vbp was written.
+Private Function VbpRefsRepairOnDisk(ByVal vbpPath As String, ByVal projPaths As Object, _
+                                     ByRef info As Object) As Long
+    Dim aliasDir As String, realDir As String, text As String, outText As String
+    VbpRefsRepairOnDisk = 0
+    If Len(vbpPath) = 0 Then Exit Function
+    If CBool(projPaths("refsFromAlias")) Then Exit Function
+    aliasDir = DirOfPath(CStr(projPaths("projectPath")))
+    realDir = DirOfPath(CStr(projPaths("realProjectPath")))
+    If Len(aliasDir) = 0 Or Len(realDir) = 0 Then Exit Function
+    text = ProjShip.ReadTextFile(vbpPath)
+    If Len(text) = 0 Then Exit Function
+    outText = VbpRefRewriteText(text, aliasDir, realDir, projPaths, info)
+    If outText = text Then Exit Function
+    If ProjShip.WriteTextFile(vbpPath, outText) Then VbpRefsRepairOnDisk = 1
+End Function
+
 Private Function ToolSaveProject(Optional ByVal path As String) As String
     Dim p As VBIDE.VBProject
     Set p = GetProject()
@@ -8652,6 +10460,24 @@ Private Function ToolSaveProject(Optional ByVal path As String) As String
     ElseIf Len(p.FileName) > 0 Then
         vbpPath = p.FileName
     End If
+    ' v1.11.12: snapshot the .vbp NON-COMMENT line order BEFORE the flush. VB6 writes the
+    ' components in the order the IDE holds them in memory, and a component Reload moves a
+    ' component to the end of that list, so the save came back with the same lines in a
+    ' different order (a semantically empty diff that polluted git and the gates).
+    Dim vbpOrderReady As Boolean
+    Dim vbpBeforeSeq() As String, vbpBeforeIdx() As Long
+    Dim vbpTextBefore As String
+    vbpOrderReady = False
+    vbpTextBefore = ""
+    If Len(vbpPath) > 0 Then
+        vbpTextBefore = ProjShip.ReadTextFile(vbpPath)
+        If Len(vbpTextBefore) > 0 Then
+            Dim vbpBeforeLines() As String
+            vbpBeforeLines = TextLines(vbpTextBefore)
+            vbpBeforeSeq = VbpOrderSeq(vbpBeforeLines, vbpBeforeIdx)
+            vbpOrderReady = True
+        End If
+    End If
     Dim vbpBefore As Object
     Set vbpBefore = FileSnapOf(vbpPath)
     Dim projectSaveErr As String
@@ -8669,6 +10495,127 @@ Private Function ToolSaveProject(Optional ByVal path As String) As String
     End If
     Dim vbpAfter As Object
     Set vbpAfter = FileSnapOf(vbpPath)
+    ' v1.11.12: ORDER + REVISION evidence, then PUT THE ORIGINAL ORDER BACK when VB6 only
+    ' reordered the same lines. Only the ORDER is restored - every line comes from the file
+    ' VB6 just wrote - so nothing the IDE wrote is dropped.
+    Dim vbpTextAfter As String
+    Dim vbpAfterSeq() As String, vbpAfterIdx() As Long
+    Dim vbpOrderPreserved As Boolean, vbpOrderRestored As Boolean, vbpOrderFinalOk As Boolean
+    Dim vbpSameSet As Boolean, vbpRestoreFailed As Boolean, vbpAfterSeqOk As Boolean
+    Dim vbpDelta As Object, vbpOrderChanges As Object
+    Dim vbpRestoreErr As String, vbpOrderNote As String
+    Dim vbpRevBefore As String, vbpRevAfter As String
+    Set vbpOrderChanges = New Collection
+    vbpOrderPreserved = True
+    vbpOrderRestored = False
+    vbpOrderFinalOk = True
+    vbpSameSet = False
+    vbpAfterSeqOk = False
+    vbpRestoreFailed = False
+    vbpRestoreErr = ""
+    vbpOrderNote = ""
+    vbpTextAfter = ""
+    vbpRevBefore = VbpSettingValue(vbpTextBefore, "RevisionVer")
+    vbpRevAfter = ""
+    ' P1/P12: WHERE the project is open (alias spelling) and WHERE it really
+    ' lives (canonical spelling). Computed ONCE and published by the receipt; it
+    ' is also the base the Reference= rewrite below uses.
+    Dim projPaths As Object
+    Set projPaths = ProjectPathInfo(p)
+    Dim refsInfo As Object
+    Set refsInfo = NewRefsInfo()
+    Dim refsRewritePasses As Long
+    refsRewritePasses = 0
+    Dim refsAliasDir As String, refsRealDir As String
+    refsAliasDir = DirOfPath(CStr(projPaths("projectPath")))
+    refsRealDir = DirOfPath(CStr(projPaths("realProjectPath")))
+    If vbpOrderReady Then
+        vbpTextAfter = ProjShip.ReadTextFile(vbpPath)
+        If Len(vbpTextAfter) > 0 Then
+            Dim vbpAfterLines() As String
+            vbpAfterLines = TextLines(vbpTextAfter)
+            vbpAfterSeq = VbpOrderSeq(vbpAfterLines, vbpAfterIdx)
+            vbpAfterSeqOk = True
+            Set vbpDelta = VbpOrderDelta(vbpBeforeSeq, vbpBeforeIdx, vbpAfterSeq, vbpAfterIdx)
+            vbpOrderPreserved = CBool(vbpDelta("preserved"))
+            vbpSameSet = CBool(vbpDelta("sameSet"))
+            Set vbpOrderChanges = vbpDelta("changes")
+            ' v1.11.12 order restore and the P1/P12 Reference= rewrite are applied
+            ' to the SAME in-memory text and flushed in ONE write pass, so a save
+            ' never rewrites the .vbp twice.
+            Dim vbpRestoreNeeded As Boolean
+            Dim vbpWriteText As String
+            vbpRestoreNeeded = False
+            vbpWriteText = vbpTextAfter
+            If Not vbpOrderPreserved Then
+                If vbpSameSet Then
+                    Dim vbpRestoredText As String
+                    If VbpRestoreOrder(vbpTextAfter, vbpBeforeSeq, vbpRestoredText) Then
+                        vbpWriteText = vbpRestoredText
+                        vbpRestoreNeeded = True
+                    Else
+                        vbpRestoreFailed = True
+                        vbpRestoreErr = "the reordered .vbp does not carry the same line set, so a pure reorder could not be rebuilt"
+                    End If
+                Else
+                    vbpOrderNote = "the .vbp CONTENT changed (a line was added, removed or edited), so only a pure reorder can be restored; the ORDER was left exactly as VB6 wrote it and is reported in vbpOrderChanges[]"
+                End If
+            End If
+            If Not vbpRestoreFailed Then
+                vbpWriteText = VbpRefRewriteText(vbpWriteText, refsAliasDir, refsRealDir, projPaths, refsInfo)
+            End If
+            If Not vbpRestoreFailed Then
+                If StrComp(vbpWriteText, vbpTextAfter, vbBinaryCompare) <> 0 Then
+                    If ProjShip.WriteTextFile(vbpPath, vbpWriteText) Then
+                        refsRewritePasses = 1
+                        Dim vbpBack As String
+                        vbpBack = ProjShip.ReadTextFile(vbpPath)
+                        If Len(vbpBack) > 0 Then
+                            vbpTextAfter = vbpBack
+                            Dim vbpBackLines() As String
+                            vbpBackLines = TextLines(vbpBack)
+                            vbpAfterSeq = VbpOrderSeq(vbpBackLines, vbpAfterIdx)
+                            vbpAfterSeqOk = True
+                            vbpOrderRestored = vbpRestoreNeeded
+                            If vbpRestoreNeeded Then
+                                Dim z As Long
+                                vbpOrderRestored = VbpSameLineSet(vbpBeforeSeq, vbpAfterSeq)
+                                If vbpOrderRestored Then
+                                    If UBound(vbpAfterSeq) <> UBound(vbpBeforeSeq) Then
+                                        vbpOrderRestored = False
+                                    Else
+                                        For z = 0 To UBound(vbpBeforeSeq)
+                                            If vbpAfterSeq(z) <> vbpBeforeSeq(z) Then vbpOrderRestored = False
+                                        Next
+                                    End If
+                                End If
+                                If Not vbpOrderRestored Then
+                                    vbpRestoreFailed = True
+                                    vbpRestoreErr = "the original order was written back but the READ-BACK .vbp still does not carry it"
+                                End If
+                            End If
+                        Else
+                            vbpRestoreFailed = True
+                            vbpRestoreErr = "the .vbp could not be read back after the order/reference rewrite"
+                        End If
+                    Else
+                        vbpRestoreFailed = True
+                        vbpRestoreErr = "writing the original line order / repaired references back failed (ProjShip.WriteTextFile returned False: the bytes could not be read back)"
+                    End If
+                End If
+            End If
+            vbpOrderFinalOk = (vbpOrderPreserved Or vbpOrderRestored)
+            If vbpRestoreFailed Then vbpOrderFinalOk = False
+            Set vbpAfter = FileSnapOf(vbpPath)
+        Else
+            vbpOrderFinalOk = False
+            vbpRestoreFailed = True
+            vbpRestoreErr = "the .vbp could not be read back after the save, so the line order could not be verified"
+        End If
+        vbpRevAfter = VbpSettingValue(vbpTextAfter, "RevisionVer")
+    Else
+        vbpOrderNote = "no pre-save snapshot of the .vbp was possible (the project had no file on disk before this call), so the order contract was not evaluated"
+    End If
     Dim vbpMissing As String
     vbpMissing = VbpMissingProps(vbpPath, p)
     Dim badComps As Object
@@ -8753,6 +10700,21 @@ Private Function ToolSaveProject(Optional ByVal path As String) As String
     pf("mtimeAfter") = vbpAfter("mtimeText")
     pf("missingProjectValues") = vbpMissing
     Set root("projectFile") = pf
+    ' P1/P12: WHERE the project is open vs WHERE it really lives, and what the
+    ' single .vbp write pass did to the relative Reference= paths.
+    root("projectPath") = projPaths("projectPath")
+    root("realProjectPath") = projPaths("realProjectPath")
+    root("projectPathIsAlias") = projPaths("projectPathIsAlias")
+    root("realPathTier") = projPaths("realPathTier")
+    root("realPathError") = projPaths("realPathError")
+    root("warning") = projPaths("warning")
+    If Len(CStr(projPaths("warningDetail"))) > 0 Then root("warningDetail") = projPaths("warningDetail")
+    root("refsBase") = projPaths("refsBase")
+    root("refsFromAlias") = projPaths("refsFromAlias")
+    root("refsRewritePasses") = refsRewritePasses
+    Set root("refsCanonicalized") = refsInfo("canonicalized")
+    Set root("refsSkipped") = refsInfo("skipped")
+    root("refsUnresolvedCount") = refsInfo("unresolvedCount")
     ' reopen: per-component evidence behind "this component was saved".
     ' ALWAYS present (empty array when nothing was saved). Each record carries
     ' designerComponent / designerCheck (code-only for .frm/.ctl/.dsr/.pag),
@@ -8777,6 +10739,58 @@ Private Function ToolSaveProject(Optional ByVal path As String) As String
     On Error GoTo 0
     ManifestMergeUndo pdw
     Set root("projectDirWrites") = pdw
+    ' v1.11.12: .vbp ORDER + REVISION evidence (the top-level field names are the contract).
+    root("vbpOrderChecked") = vbpOrderReady
+    root("vbpOrderPreserved") = vbpOrderPreserved
+    root("vbpOrderRestored") = vbpOrderRestored
+    root("vbpOrderFinalPreserved") = vbpOrderFinalOk
+    Set root("vbpOrderChanges") = vbpOrderChanges
+    root("vbpOrderChangeCount") = vbpOrderChanges.Count
+    root("vbpRevisionBefore") = vbpRevBefore
+    root("vbpRevisionAfter") = vbpRevAfter
+    Dim vbpRevBumped As Boolean
+    vbpRevBumped = False
+    If Len(vbpRevBefore) > 0 Then
+        If Len(vbpRevAfter) > 0 Then
+            If vbpRevBefore <> vbpRevAfter Then vbpRevBumped = True
+        End If
+    End If
+    root("vbpRevisionBumped") = vbpRevBumped
+    root("vbpOrderLinesCapped") = VBP_ORDER_MAX_LINES
+    If vbpOrderReady Then
+        Set root("vbpOrderLinesBefore") = VbpSeqJsonArray(vbpBeforeSeq)
+        If vbpAfterSeqOk Then
+            Set root("vbpOrderLinesAfter") = VbpSeqJsonArray(vbpAfterSeq)
+        Else
+            Set root("vbpOrderLinesAfter") = EmptyJsonArray()
+        End If
+    Else
+        Set root("vbpOrderLinesBefore") = EmptyJsonArray()
+        Set root("vbpOrderLinesAfter") = EmptyJsonArray()
+    End If
+    If Len(vbpOrderNote) = 0 Then
+        If CBool(root("vbpRevisionBumped")) Then
+            vbpOrderNote = "RevisionVer WAS bumped by this save: both values were READ from the .vbp on disk before and after the flush (" & vbpRevBefore & " -> " & vbpRevAfter & ")."
+        Else
+            vbpOrderNote = "RevisionVer was NOT bumped by this save: both values were READ from the .vbp on disk before and after the flush (" & vbpRevBefore & " -> " & vbpRevAfter & ")."
+        End If
+        If vbpOrderPreserved Then
+            vbpOrderNote = vbpOrderNote & " The non-comment line order was preserved by VB6 (no reorder was observed)."
+        ElseIf vbpOrderRestored Then
+            vbpOrderNote = vbpOrderNote & " VB6 wrote the same lines in a different order; the pre-save order was RESTORED on disk (vbpOrderRestored=true) and read back."
+        Else
+            vbpOrderNote = vbpOrderNote & " VB6 wrote a different order and it was NOT restored: " & vbpRestoreErr
+        End If
+    End If
+    root("vbpOrderNote") = vbpOrderNote
+    If vbpRestoreFailed Then
+        ' a save that leaves the .vbp reordered when it COULD be restored is reported as a
+        ' structured failure instead of a quiet success.
+        root("ok") = False
+        root("projectSaved") = okSave
+        root("reason") = "vbp_order_restore_failed"
+        root("okReason") = "the project file was saved but its original line order could NOT be restored: " & vbpRestoreErr
+    End If
     ToolSaveProject = JsonStringify(root)
 End Function
 
@@ -9864,7 +11878,9 @@ End Function
 Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeoutMs As Long, ByVal reason As String)
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
-    d("attempted") = True
+    ' (review D5) attempted means a CHILD PROCESS REALLY STARTED, so it starts FALSE and is
+    ' set only after the isolated /make receipt proves a pid / a kill.
+    d("attempted") = False
     d("reason") = reason
     d("route") = "isolated_copy_make"
     d("ok") = False
@@ -9877,6 +11893,23 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
     d("logBytes") = 0
     d("errorCount") = 0
     d("exitCode") = -1
+    ' v1.11.12: the isolated compile's HARD budget (see RunExeHardBudget). Defaults make the
+    ' key set fixed on EVERY exit of this procedure; attempted=true only once a subprocess ran.
+    d("timedOut") = False
+    d("budgetEnforced") = False
+    d("budgetMs") = 0
+    d("budgetSource") = "not_applicable"
+    Dim imD As Object
+    Set imD = CreateObject("Scripting.Dictionary")
+    imD("attempted") = False
+    imD("pid") = 0
+    imD("exitCode") = -1
+    imD("killed") = False
+    imD("killMethod") = ""
+    imD("elapsedMs") = 0
+    imD("leftover") = False
+    imD("budgetMs") = 0
+    Set d("isolatedMake") = imD
     d("artifactPath") = ""
     d("artifactExists") = False
     d("artifactSize") = 0
@@ -9905,7 +11938,13 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
     d("tmpDir") = tmpDir
     Dim vbpCopy As String, nCopied As Long, missing As String, copyErr As String, compatCopy As String
     If Not CopyProjectForIsolatedMake(vbp, tmpDir, vbpCopy, nCopied, missing, copyErr, compatCopy) Then
+        ' (review D5) no child was started: budget stays 0 / not_applicable and the failure is
+        ' named as a preflight (copy) error, not as a compiler result.
         d("error") = copyErr
+        d("preflightError") = copyErr
+        d("budgetMs") = 0
+        d("budgetSource") = "not_applicable"
+        d("budgetEnforced") = False
         Set root("diagnosis") = d
         Exit Sub
     End If
@@ -9923,11 +11962,29 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
     Dim logPath As String
     logPath = PathJoin(tmpDir, "isolated_make.log")
     d("logPath") = logPath
+    ' v1.11.12: CLAMPED hard budget for the isolated compiler. timeout_ms<=0 uses the DEFAULT
+    ' (never "unbounded"); the receipt names the rule that decided the applied value.
+    Dim diagBudget As Long, diagSrc As String
+    diagSrc = "timeout_ms"
+    diagBudget = timeoutMs
+    If diagBudget <= 0 Then
+        diagBudget = DIAG_MAKE_BUDGET_DEFAULT_MS
+        diagSrc = "default"
+    End If
+    If diagBudget < DIAG_MAKE_BUDGET_MIN_MS Then
+        diagBudget = DIAG_MAKE_BUDGET_MIN_MS
+        diagSrc = "clamped_min"
+    ElseIf diagBudget > DIAG_MAKE_BUDGET_MAX_MS Then
+        diagBudget = DIAG_MAKE_BUDGET_MAX_MS
+        diagSrc = "clamped_max"
+    End If
+    ' (review D5) d(budgetMs)/d(budgetSource) are written only AFTER the receipt proves a
+    ' child ran; a start failure leaves the not_applicable defaults in place.
     ' ToolBuild already knows how to run an isolated VB6.EXE /make, read the log
     ' and locate the first error; reuse it. laaWant=False: the isolated image is
     ' throwaway - the REAL artifact is patched by the caller.
     Dim json As String
-    json = ToolBuild(vbpCopy, "", logPath, timeoutMs, True, False, False)
+    json = ToolBuild(vbpCopy, "", logPath, diagBudget, True, False, False)
     Dim parsed As Variant
     If Not JsonLib.JsonParse(json, parsed) Then
         d("error") = "the isolated /make receipt could not be parsed"
@@ -9942,6 +11999,29 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
     Dim o As Object
     Set o = parsed
     If o.Exists("exitCode") Then d("exitCode") = CLng(Val(CStr(o("exitCode"))))
+    ' v1.11.12: the hard-budget facts of the isolated compiler (see RunExeHardBudget).
+    If o.Exists("timedOut") Then d("timedOut") = CBool(o("timedOut"))
+    If o.Exists("budgetEnforced") Then d("budgetEnforced") = CBool(o("budgetEnforced"))
+    imD("exitCode") = CLng(d("exitCode"))
+    imD("killed") = CBool(d("budgetEnforced"))
+    If o.Exists("childPid") Then imD("pid") = CLng(Val(CStr(o("childPid"))))
+    ' (review D5) a pid (or a kill) is the proof that a compiler process really started.
+    If imD("pid") > 0 Or CBool(d("timedOut")) Then d("attempted") = True
+    imD("attempted") = CBool(d("attempted"))
+    If CBool(d("attempted")) Then
+        d("budgetMs") = diagBudget
+        d("budgetSource") = diagSrc
+        imD("budgetMs") = diagBudget
+    Else
+        d("budgetMs") = 0
+        d("budgetSource") = "not_applicable"
+        d("budgetEnforced") = False
+        d("timedOut") = False
+        imD("budgetMs") = 0
+    End If
+    If o.Exists("killMethod") Then imD("killMethod") = CStr(o("killMethod"))
+    If o.Exists("compilerElapsedMs") Then imD("elapsedMs") = CLng(Val(CStr(o("compilerElapsedMs"))))
+    If o.Exists("childLeftover") Then imD("leftover") = CBool(o("childLeftover"))
     If o.Exists("logBytes") Then d("logBytes") = CLng(Val(CStr(o("logBytes"))))
     If o.Exists("log") Then d("log") = CStr(o("log"))
     ' (step B): carry the reader's measured pair into the diagnosis too, so the
@@ -9972,7 +12052,10 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
             If Not fe2 Is Nothing Then Set d("firstError") = fe2
         End If
     End If
-    If CLng(d("errorCount")) = 0 And CBool(d("artifactExists")) Then
+    If CBool(d("timedOut")) Then
+        d("ok") = False
+        d("error") = "the isolated /make was KILLED at the " & CStr(diagBudget) & " ms hard budget (pid " & CStr(imD("pid")) & "; " & CStr(imD("killMethod")) & "); a timed-out compile is NOT a compile verdict" & IIf(CBool(imD("leftover")), " - WARNING: the child was still listed by tasklist right after the kill", " - tasklist confirmed no leftover child")
+    ElseIf CLng(d("errorCount")) = 0 And CBool(d("artifactExists")) Then
         d("ok") = True
     ElseIf CLng(d("errorCount")) > 0 Then
         d("error") = "the isolated /make reported " & CStr(d("errorCount")) & " error(s); see firstError and log"
@@ -10082,6 +12165,50 @@ Private Function MakeReceiptEmpty() As Object
     m("diagnosisMissingFiles") = ""
     m("diagnosisError") = ""
     m("diagnosisNote") = ""
+    ' ---- v1.11.12: hard budget + host-modal evidence (FIXED KEY SET on every path) ----
+    m("timedOut") = False
+    m("budgetEnforced") = False
+    m("budgetMs") = 0
+    m("budgetSource") = "not_applicable"
+    m("killMethod") = ""
+    m("childPid") = 0
+    m("compilerElapsedMs") = 0
+    m("childLeftover") = False
+    m("stopReason") = ""
+    m("stopReasonPriority") = "when timedOut and host_modal_blocking are BOTH true, timedOut is the TERMINAL reason (a killed child IS the event that ended the call); host_modal_blocking then describes the host's state. Neither flag is inferred from the other."
+    m("host_modal_blocking") = False
+    m("host_modal_stage") = "none"
+    m("timeoutNote") = ""
+    m("budgetNote") = "budgetMs is the value ACTUALLY applied after clamping (build: default " & CStr(BUILD_BUDGET_DEFAULT_MS) & " ms, min " & CStr(BUILD_BUDGET_MIN_MS) & ", max " & CStr(BUILD_BUDGET_MAX_MS) & "; make_project diagnose: default " & CStr(DIAG_MAKE_BUDGET_DEFAULT_MS) & " ms, min " & CStr(DIAG_MAKE_BUDGET_MIN_MS) & ", max " & CStr(DIAG_MAKE_BUDGET_MAX_MS) & "). budgetSource names the rule that decided it; the in-IDE Make starts no compiler subprocess, so it reports 0 / not_applicable."
+    Dim hmEmpty As Object
+    Set hmEmpty = CreateObject("Scripting.Dictionary")
+    hmEmpty("blocking") = False
+    hmEmpty("stage") = "none"
+    hmEmpty("count") = 0
+    hmEmpty("risk") = "none"
+    hmEmpty("riskReason") = ""
+    hmEmpty("riskClass") = ""
+    hmEmpty("ownerDisabled") = False
+    hmEmpty("hwnd") = 0
+    hmEmpty("title") = ""
+    Dim hmCtlEmpty As Object
+    Set hmCtlEmpty = New Collection
+    Set hmEmpty("controls") = hmCtlEmpty
+    Dim hmDlgEmpty As Object
+    Set hmDlgEmpty = New Collection
+    Set hmEmpty("dialogs") = hmDlgEmpty
+    Set m("host_modal") = hmEmpty
+    Dim imEmpty As Object
+    Set imEmpty = CreateObject("Scripting.Dictionary")
+    imEmpty("attempted") = False
+    imEmpty("pid") = 0
+    imEmpty("exitCode") = -1
+    imEmpty("killed") = False
+    imEmpty("killMethod") = ""
+    imEmpty("elapsedMs") = 0
+    imEmpty("leftover") = False
+    imEmpty("budgetMs") = 0
+    Set m("isolatedMake") = imEmpty
     Dim diagEmpty As Object
     Set diagEmpty = CreateObject("Scripting.Dictionary")
     diagEmpty("attempted") = False
@@ -10094,7 +12221,8 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
                                  ByVal outPath As String, ByVal timeoutMs As Long, _
                                  ByVal allowHostModal As Boolean, _
                                  ByVal laaGiven As Boolean, ByVal laaParam As Boolean, _
-                                 ByVal diagnoseWant As Boolean, ByVal waitForBuildMs As Long) As String
+                                 ByVal diagnoseWant As Boolean, ByVal waitForBuildMs As Long, _
+                                 ByVal projectParam As String) As String
     Dim t0 As Long
     t0 = GetTickCount()
     Dim p As VBIDE.VBProject
@@ -10124,6 +12252,22 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     If Len(effRoute) = 0 Then effRoute = "auto"
     If effRoute = "cli" Then
         If timeoutMs <= 0 Then timeoutMs = 180000
+        ' W-C: an EXPLICIT project is honoured on the CLI route (compiles that .vbp, not the open one).
+        Dim cliTarget As String
+        cliTarget = ""
+        If Len(projectParam) > 0 Then cliTarget = ResolvePath(projectParam)
+        If Len(projectParam) > 0 And Len(cliTarget) = 0 Then
+            Dim badProj As Object
+            Set badProj = MakeReceiptEmpty()
+            badProj("ok") = False
+            badProj("verdict") = "project_not_found"
+            badProj("requestedProject") = projectParam
+            badProj("route") = "cli"
+            badProj("note") = "route=cli was asked for an explicit project, but the path did not resolve; nothing was compiled"
+            ToolMakeProject = JsonStringify(badProj)
+            Exit Function
+        End If
+        If Len(cliTarget) = 0 Then cliTarget = p.FileName
         Dim prevOverride As String
         prevOverride = m_makeRouteOverride
         ' break the cycle: if build decides the IDE holds this project it must fall
@@ -10134,7 +12278,7 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         cliErr = 0
         cliDesc = ""
         On Error Resume Next
-        cliJson = ToolBuild(p.FileName, "", outPath, timeoutMs, laaGiven, laaParam, False)
+        cliJson = ToolBuild(cliTarget, "", outPath, timeoutMs, laaGiven, laaParam, False)
         cliErr = Err.Number
         cliDesc = Err.Description
         Err.Clear
@@ -10156,6 +12300,18 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         ToolMakeProject = cliJson
         Exit Function
     End If
+    If Len(projectParam) > 0 Then
+        Dim ideNoProj As Object
+        Set ideNoProj = MakeReceiptEmpty()
+        ideNoProj("ok") = False
+        ideNoProj("verdict") = "project_requires_cli_route"
+        ideNoProj("requestedProject") = projectParam
+        ideNoProj("route") = "ide"
+        ideNoProj("note") = "route=ide compiles whatever the IDE holds, so an explicit project is meaningless there; use route=cli (or the build tool) with project=<absolute .vbp>"
+        ideNoProj("howToProceed") = "call make_project{route:""cli"", project:""<absolute .vbp>""} or build{project:""<absolute .vbp>""}"
+        ToolMakeProject = JsonStringify(ideNoProj)
+        Exit Function
+    End If
     On Error Resume Next
     Dim saveErr As Long
     Dim saveDesc As String
@@ -10168,6 +12324,19 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     End If
     On Error GoTo 0
     If saveErr <> 0 Then Err.Raise vbObjectError + 40, "CodeTools", "Could not save the project before compiling: " & saveDesc
+    ' P1/P12: the in-IDE route saves the project itself (it does not go through
+    ' save_project), so the canonical Reference= repair runs here too. At most one
+    ' extra .vbp write pass, and only when a relative path actually changes.
+    Dim mpPaths As Object
+    Set mpPaths = ProjectPathInfo(p)
+    Dim mpRefs As Object
+    Set mpRefs = NewRefsInfo()
+    Dim mpRefsPasses As Long
+    mpRefsPasses = 0
+    On Error Resume Next
+    mpRefsPasses = VbpRefsRepairOnDisk(p.FileName, mpPaths, mpRefs)
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
     ' ---- (A10 sidecar): resolve WHERE the LAA decision comes from ----
     Dim laaWant As Boolean, laaSrc As String, laaProjFile As String, laaSrcNote As String, laaCfgErr As String
     Dim laaUsable As Boolean
@@ -10182,6 +12351,21 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     root("requestedRoute") = effRoute
     root("artifactPath") = targetExe
     root("route") = "ide"
+    ' P1/P12: same path fields as save_project, plus the one write pass the
+    ' canonical Reference= repair may have performed above.
+    root("projectPath") = mpPaths("projectPath")
+    root("realProjectPath") = mpPaths("realProjectPath")
+    root("projectPathIsAlias") = mpPaths("projectPathIsAlias")
+    root("realPathTier") = mpPaths("realPathTier")
+    root("realPathError") = mpPaths("realPathError")
+    root("warning") = mpPaths("warning")
+    If Len(CStr(mpPaths("warningDetail"))) > 0 Then root("warningDetail") = mpPaths("warningDetail")
+    root("refsBase") = mpPaths("refsBase")
+    root("refsFromAlias") = mpPaths("refsFromAlias")
+    root("refsRewritePasses") = mpRefsPasses
+    Set root("refsCanonicalized") = mpRefs("canonicalized")
+    Set root("refsSkipped") = mpRefs("skipped")
+    root("refsUnresolvedCount") = mpRefs("unresolvedCount")
     Set root("output") = before
     ' ---- (the pump-gate review interlock): a box that ALREADY existed -------------
     ' A host-modal box that predates this call was not opened by us, so confirming it
@@ -10217,6 +12401,10 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         root("host_modal_risk_reason") = preReason
         root("host_modal_risk_class") = preClass
         root("modalDialogs") = preDetails
+        ' v1.11.12: the host-modal block is INDEPENDENT of timedOut; a box that predates the
+        ' call ends it as host_modal_blocking (no compiler was started).
+        Call ApplyHostModalFields(root, "preflight")
+        root("stopReason") = "host_modal_blocking"
         root("verdict") = "modal_blocked"
         root("logUnavailableReason") = "no compile was attempted, so no compiler log exists"
         root("suggested_action") = "read the box with read_active_dialogs and close it with close_active_dialogs (dry_run=true previews it, including host_modal_risk); pass allow_host_modal=true only if you deliberately want THIS call to confirm it."
@@ -10280,6 +12468,8 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         root("logUnavailableReason") = "no compile was attempted, so no compiler log exists"
         root("note") = "the target artifact is held by another process, so this call was refused BEFORE any compile: nothing was compiled, the artifact was NOT moved aside and NOT rewritten. See artifact_holder_pid / artifact_locked_advice."
         root("elapsedMs") = GetTickCount() - t0
+        Call ApplyHostModalFields(root, "preflight")
+        If Len(CStr(root("stopReason"))) = 0 Then root("stopReason") = "refused"
         WinOps.WoModalGuardDisarm
         DisarmGateRelease
         Call MergeModalGuard(root)
@@ -10625,6 +12815,8 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         End If
     End If
     root("artifactChanged") = artChanged
+    ' W-C (P5): per-component disk-vs-pane freshness (route=ide compiles the IDE MEMORY).
+    Set root("sourceFreshness") = SourceFreshnessJson(True)
     ' ---- (3.2): is the artifact held by a running process? ---------
     Dim holderPid As Long
     holderPid = 0
@@ -10693,6 +12885,8 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         root("verdict") = "compiled-no-artifact-change"
         root("artifactLockedHint") = "the Make returned without error but the artifact was not rewritten: it is most likely held open by another process (close it), or the build wrote identical bytes"
         root("artifactNote") = "treat this as NOT built: artifactChanged is false"
+        ' W-D (P11): a false artifactChanged with no log must still tell the caller HOW to get one.
+        WcAttachCompileLogHint root
     ElseIf restored Then
         root("verdict") = "restored-previous-artifact"
     ElseIf Not compiled Then
@@ -10825,6 +13019,16 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     root("laaProjectFile") = laaProjFile
     root("laaSourceNote") = laaSrcNote
     root("laaConfigError") = laaCfgErr
+    ' W-C (P6): FINAL artifact identity - sampled HERE, i.e. AFTER the LAA patch, then read back.
+    Dim wcDetail As String
+    wcDetail = "after_compile"
+    If CBool(root("laaSet")) Or CBool(root("laaAlready")) Then wcDetail = "after_laa_patch"
+    Set root("final") = WcFinalArtifactJson(targetExe, wcDetail, WcVbpRevisionText(p.FileName))
+    root("artifactChangedBasedOn") = "final"
+    If CBool(root("laaSet")) Then
+        root("artifactChanged") = True
+        root("artifactChangedNote") = "the LAA PE patch changed the artifact bytes AFTER the compile, so artifactChanged is true on the FINAL bytes"
+    End If
     ' ---- (item 1): compiled-but-nothing-produced must
     ' never read like a success ------------------------------------------------
     If (Not artChanged) And compiled Then
@@ -10852,6 +13056,10 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         If dgDlgs > 0 Then
             root("diagnosisSkipped") = True
             root("diagnosisSkippedReason") = "a host-modal box is up (" & CStr(dgDlgs) & " #32770 window(s), host_modal_risk=" & dgRisk & "), and the isolated-copy diagnosis pumps messages (DoEvents) - with a box up that pump enters the host's modal loop and never returns (measured). No diagnosis was attempted, so this call returns bounded."
+            ' v1.11.12: the diagnosis was skipped BECAUSE a host modal box is up - that is a
+            ' host_modal_blocking fact, not a timeout.
+            Call ApplyHostModalFields(root, "diagnosis")
+            root("stopReason") = "host_modal_blocking"
             Dim dgSkip As Object
             Set dgSkip = CreateObject("Scripting.Dictionary")
             dgSkip("attempted") = False
@@ -10868,6 +13076,23 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
             root("diagnosisCopiedFiles") = CLng(dg("copiedFiles"))
             root("diagnosisMissingFiles") = CStr(dg("missingFiles"))
             root("diagnosisError") = CStr(dg("error"))
+            ' v1.11.12: the isolated compile's hard-budget facts, INDEPENDENT of host_modal_blocking.
+            If dg.Exists("timedOut") Then root("timedOut") = CBool(dg("timedOut"))
+            If dg.Exists("budgetEnforced") Then root("budgetEnforced") = CBool(dg("budgetEnforced"))
+            If dg.Exists("budgetMs") Then root("budgetMs") = CLng(dg("budgetMs"))
+            If dg.Exists("budgetSource") Then root("budgetSource") = CStr(dg("budgetSource"))
+            If dg.Exists("isolatedMake") Then
+                If IsObject(dg("isolatedMake")) Then Set root("isolatedMake") = dg("isolatedMake")
+            End If
+            If CBool(root("timedOut")) Then
+                root("ok") = False
+                root("verdict") = "timeout"
+                root("buildState") = "failed"
+                root("pending") = False
+                root("stopReason") = "timeout"
+                root("timeoutNote") = "the isolated COPY compile of this project was KILLED at its hard budget (see isolatedMake{pid,killMethod,leftover}). The in-IDE Make result (if any) is NOT a compile verdict."
+                root("okReason") = "the isolated copy compile timed out; the artifact state is reported separately"
+            End If
             root("diagnosisAvailable") = True
             root("diagnosisUnavailableReason") = ""
             root("diagnosisAlternative") = ""
@@ -10922,7 +13147,7 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         Dim dg2 As Object
         Set dg2 = root("diagnosis")
         If Not dg2 Is Nothing Then
-            If CBool(dg2("attempted")) And (Not CBool(dg2("ok"))) And (Not artChanged) Then
+            If CBool(dg2("attempted")) And (Not CBool(dg2("ok"))) And (Not artChanged) And (Not CBool(root("timedOut"))) Then
                 root("pending") = False
                 root("pendingOverriddenByDiagnosis") = True
                 root("verdict") = "compile_failed"
@@ -10940,6 +13165,16 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     ' box), so make_watchdog_clicked can legitimately be false while the box WAS
     ' dismissed - the modal* fields say by whom.
     root("modalWatchdogRelationship") = "while the generic modal guard is armed, the one-shot make watchdog (WinOps.WoConfirmArm/WoConfirmTick) STANDS DOWN, because it only ever presses a CONFIRM caption and on VB6's Make Project box that caption starts the compile inside the host's modal loop. So make_watchdog_clicked=false next to modalClickedButton='Cancel' is the EXPECTED, correct combination - not a failure of the watchdog."
+    ' v1.11.12: host-modal evidence on the FINAL path (independent of timedOut), then the
+    ' terminal stopReason when nothing above set one.
+    Call ApplyHostModalFields(root, "final")
+    If Len(CStr(root("stopReason"))) = 0 Then
+        If CBool(root("ok")) Then
+            root("stopReason") = "completed"
+        Else
+            root("stopReason") = "refused"
+        End If
+    End If
     WinOps.WoModalGuardDisarm
     DisarmGateRelease
     Call MergeModalGuard(root)
@@ -11042,6 +13277,7 @@ Private Function ToolControlExecution(ByVal mode As String) As String
     ' remember the state BEFORE the command so the response can prove a
     ' transition instead of reporting a stale snapshot.
     Dim beforeState As String
+    m_stateRecovered = False
     beforeState = GetIdeState()
     If m = "restart" Then
         Set ctrl = FindCmd("end", "Debug|Run|" & ChrW$(&H8C03) & ChrW$(&H8BD5) & "|" & ChrW$(&H8FD0) & ChrW$(&H884C), "End|" & ChrW$(&H7ED3) & ChrW$(&H675F))
@@ -11134,6 +13370,24 @@ Private Function ToolControlExecution(ByVal mode As String) As String
             Exit Function
         End If
         execCount = ExecIfEnabledWhy(ctrl, m, whyExec)
+        ' (D3) a suspended CommandBars window (post-run) makes these items look disabled while
+        ' nothing is running. Clear it ONCE and retry ONCE; the receipt records the recovery.
+        If execCount = 0 And InStr(1, whyExec, "disabled", vbTextCompare) > 0 Then
+            If m = "run" Or m = "continue" Or m = "resume" Or m = "break" Or m = "step_into" Or m = "step_over" Or m = "step_out" Or m = "run_to_cursor" Then
+                Dim nr2 As Object
+                Set nr2 = DbNudgeBarsOut()
+                If CBool(nr2("attempted")) Then
+                    Set ctrl = Nothing
+                    Set ctrl = FindCmd(m, barCands, cands)
+                    If ctrl Is Nothing Then Set ctrl = FindBarControlDeep(cands)
+                    If Not ctrl Is Nothing Then
+                        whyExec = ""
+                        execCount = ExecIfEnabledWhy(ctrl, m, whyExec)
+                        m_stateRecovered = CBool(nr2("recovered"))
+                    End If
+                End If
+            End If
+        End If
     End If
     ' break/end/stop: yield so the debug toolbar reflects the new
     ' state. run/full_compile/restart: DoEvents would block inside
@@ -11168,12 +13422,22 @@ Private Function ToolControlExecution(ByVal mode As String) As String
         Else
             root("reason") = "not_executed"
         End If
+        ' (D3) an End/Stop that finds NOTHING running is a SUCCESS, not a failure. In the
+        ' post-run suspended window the End item is disabled precisely BECAUSE the program has
+        ' already ended (measured: EbMode=0, 0% CPU, End disabled, the old state read said run).
+        If (m = "end" Or m = "stop") And IdeEbMode() = 0 And GetIdeState() = "design" Then
+            root("ok") = True
+            root("state_not_changed") = True
+            root("alreadyNotRunning") = True
+            root("reason") = "already_not_running"
+        End If
     End If
     On Error Resume Next
     root("caption") = ctrl.Caption
     On Error GoTo 0
     If m = "restart" Then root("restartPending") = True
     root("state") = afterState
+    If m_stateRecovered Then root("stateRecovered") = True
     ' (receipt honesty, same discipline as the A batch): a menu item that was
     ' found and executed is NOT proof that the IDE changed state. If a command that must
     ' change the state did not, say so structurally instead of reporting executed:true.
@@ -14656,48 +16920,114 @@ Private Function FindCmd(ByVal key As String, ByVal barCands As String, ByVal ct
     Set FindCmd = FindBarControlById(m_vbe, barCands, ctrlCands, i, sc)
 End Function
 
+' (D3, 2026-10-20) EB_MODE-FIRST state decision.
+' Measured on the live bed: after a program ENDS, VB6 can leave its CommandBars model
+' suspended for a while. The old fallback read that as "run" (the fallback existed ONLY
+' for "the object model is suspended, which happens only while the program runs"), so
+' ide_state reported run while EbMode=0, the process burned 0% CPU and the End menu item
+' was DISABLED - i.e. nothing was running. A later debug_session{attach:true} then waited
+' for a break that could never come. The order is now:
+'   1. EbMode=2                    -> break   (engine signal, locale-free)
+'   2. the Debug menu items resolve -> their enabled pattern decides design/run/break
+'   3. the bars do NOT resolve      -> EbMode=1 means a program really runs ("run");
+'                                      EbMode=0 is the post-run suspended window and is
+'                                      reported as "design" (nothing is running).
+' stateSource / commandBarsSuspended are exposed by ide_state so the caller sees WHY.
 Private Function GetIdeState() As String
+    Dim ss As String
+    Dim bs As Boolean
+    ss = ""
+    bs = False
+    GetIdeState = GetIdeStateEx(ss, bs)
+End Function
+
+Private Function GetIdeStateEx(ByRef stateSourceOut As String, ByRef barsSuspendedOut As Boolean) As String
     On Error Resume Next
     Dim startCtrl As Object
     Dim breakCtrl As Object
     Dim endCtrl As Object
-    Set startCtrl = FindCmd("start", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "Start|" & ChrW$(&H542F) & ChrW$(&H52A8) & "|Continue|" & ChrW$(&H7EE7) & ChrW$(&H7EED))
-    If startCtrl Is Nothing Then Set startCtrl = m_cachedStart Else Set m_cachedStart = startCtrl
-    Set breakCtrl = FindCmd("break", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "Break|" & ChrW$(&H4E2D) & ChrW$(&H65AD))
-    If breakCtrl Is Nothing Then Set breakCtrl = m_cachedBreak Else Set m_cachedBreak = breakCtrl
-    Set endCtrl = FindCmd("end", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "End|" & ChrW$(&H7ED3) & ChrW$(&H675F))
-    If endCtrl Is Nothing Then Set endCtrl = m_cachedEnd Else Set m_cachedEnd = endCtrl
     Dim startEnabled As Boolean
     Dim breakEnabled As Boolean
     Dim endEnabled As Boolean
+    Dim live As Long
+    Dim eb As Long
+    stateSourceOut = ""
+    barsSuspendedOut = False
     startEnabled = False
     breakEnabled = False
     endEnabled = False
-    If Not startCtrl Is Nothing Then startEnabled = startCtrl.Enabled
-    If Not breakCtrl Is Nothing Then breakEnabled = breakCtrl.Enabled
-    If Not endCtrl Is Nothing Then endEnabled = endCtrl.Enabled
-    ' order matters: in break mode the Start button becomes Continue
-    ' (继续) and is enabled, so check break first, then end, then start
-    ' (i18n): EbMode is a VBA6 debug-engine signal that does not
-    ' depend on any localized text: 2 = break context, 0 = no debug context.
-    If IdeEbMode() = 2 Then
-        GetIdeState = "break"
+    live = 0
+    eb = IdeEbMode()
+    ' 1) the engine's own signal: 2 = break context
+    If eb = 2 Then
+        GetIdeStateEx = "break"
+        stateSourceOut = "ebMode"
         Exit Function
     End If
-    If breakEnabled Then
-        GetIdeState = "run"
-    ElseIf endEnabled Then
-        GetIdeState = "break"
-    ElseIf startEnabled Then
-        GetIdeState = "design"
+    ' 2) the Debug menu items (design/run; the CommandBars model is suspended while running)
+    ' ONLY a LIVE FindCmd hit counts as "the bars resolve": the cached controls survive the
+    ' suspension with Enabled=False, so counting them made the post-run window look usable and
+    ' the zombie state was never detected (measured: a restarted IDE kept Start disabled while
+    ' the cached-object path reported design).
+    Set startCtrl = FindCmd("start", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "Start|" & ChrW$(&H542F) & ChrW$(&H52A8) & "|Continue|" & ChrW$(&H7EE7) & ChrW$(&H7EED))
+    If Not startCtrl Is Nothing Then
+        live = live + 1
+        Set m_cachedStart = startCtrl
     Else
-        ' run mode suspends the CommandBars object model: fall back to
-        ' the IDE main window caption ([运行] / [设计] / [中断])
-        ' (i18n): no localized caption sniffing any more. When
-        ' every CommandBars lookup fails the object model is suspended, which
-        ' happens ONLY while the program runs.
-        GetIdeState = "run"
+        Set startCtrl = m_cachedStart
     End If
+    Set breakCtrl = FindCmd("break", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "Break|" & ChrW$(&H4E2D) & ChrW$(&H65AD))
+    If Not breakCtrl Is Nothing Then
+        live = live + 1
+        Set m_cachedBreak = breakCtrl
+    Else
+        Set breakCtrl = m_cachedBreak
+    End If
+    Set endCtrl = FindCmd("end", "Debug|" & ChrW$(&H8C03) & ChrW$(&H8BD5), "End|" & ChrW$(&H7ED3) & ChrW$(&H675F))
+    If Not endCtrl Is Nothing Then
+        live = live + 1
+        Set m_cachedEnd = endCtrl
+    Else
+        Set endCtrl = m_cachedEnd
+    End If
+    Err.Clear
+    If live > 0 Then
+        If Not startCtrl Is Nothing Then startEnabled = startCtrl.Enabled
+        If Not breakCtrl Is Nothing Then breakEnabled = breakCtrl.Enabled
+        If Not endCtrl Is Nothing Then endEnabled = endCtrl.Enabled
+        stateSourceOut = "commandBars"
+        If breakEnabled Then
+            GetIdeStateEx = "run"
+        ElseIf endEnabled Then
+            GetIdeStateEx = "break"
+        ElseIf startEnabled Then
+            GetIdeStateEx = "design"
+        Else
+            ' the bars resolve but every item is disabled: no menu state to trust
+            stateSourceOut = "ebMode+commandBars"
+            If eb = 1 Then GetIdeStateEx = "run" Else GetIdeStateEx = "design"
+        End If
+        Exit Function
+    End If
+    ' 3) suspended bars: EbMode tells a RUNNING program apart from the post-run window
+    barsSuspendedOut = True
+    stateSourceOut = "ebMode+commandBars"
+    If eb = 1 Then
+        GetIdeStateEx = "run"
+    Else
+        GetIdeStateEx = "design"
+    End If
+End Function
+
+' True when the Debug menu items are resolvable (the CommandBars model is NOT suspended).
+Private Function IdeBarsUsable() As Boolean
+    Dim ss As String
+    Dim bs As Boolean
+    Dim dummy As String
+    ss = ""
+    bs = False
+    dummy = GetIdeStateEx(ss, bs)
+    IdeBarsUsable = (Not bs)
 End Function
 
 Private Function ProjectDir() As String
@@ -15379,11 +17709,39 @@ Private Function MakeTool(ByVal name As String, ByVal desc As String, ByVal sche
 End Function
 
 Private Function SchemaWith(ByVal props As Object, Optional ByVal required As Object) As Object
+    ' JSON Schema shape is NORMALISED here, once, for every tool:
+    '   properties : ALWAYS an object (an empty Dictionary when there are no parameters)
+    '   required   : ALWAYS an ARRAY (an empty Collection when nothing is required)
+    ' A caller that passes a Dictionary by mistake is coerced to its KEYS, so a
+    ' malformed "required": {} can never reach the wire again (a JSON-Schema
+    ' validator is entitled to reject a non-array required).
     Dim s As Object
+    Dim reqList As Object
+    Dim one As Variant
+    Dim k As Variant
     Set s = CreateObject("Scripting.Dictionary")
     s("type") = "object"
-    If Not props Is Nothing Then Set s("properties") = props
-    If Not required Is Nothing Then Set s("required") = required
+    If props Is Nothing Then
+        Set s("properties") = CreateObject("Scripting.Dictionary")
+    Else
+        Set s("properties") = props
+    End If
+    Set reqList = New Collection
+    If Not required Is Nothing Then
+        If TypeOf required Is Collection Then
+            For Each one In required
+                reqList.Add CStr(one)
+            Next one
+        Else
+            ' vbObject: accept any object that exposes Keys (Scripting.Dictionary)
+            On Error Resume Next
+            For Each k In required.Keys
+                reqList.Add CStr(k)
+            Next k
+            On Error GoTo 0
+        End If
+    End If
+    Set s("required") = reqList
     Set SchemaWith = s
 End Function
 
@@ -17564,6 +19922,121 @@ Private Function HeaderOffsetForDiskName(ByVal file As String) As Long
     Next
 End Function
 
+' =====================================================================
+' v1.11.12: an external compiler subprocess with a HARD budget.
+'
+' WHY. WScript.Shell.Exec + a polling wait is the only way this add-in can know the
+' child's pid and KILL it. Build.RunExe reports False for BOTH "could not start" and
+' "killed at the timeout", so a timeout used to surface as a bare raise
+' ("build process failed to run") and the caller could not tell the two apart.
+'
+' The wait loop PUMPS the message queue (Util.PumpNow) instead of Sleep-only, so a
+' read-only diagnostic (ide_state) can be SERVED while the compiler runs: the
+' single-flight gate already allows read-only tools at depth>0, and the pump is what
+' lets that request be dispatched at all. PumpNow refuses DoEvents while a host modal
+' box is up, so this loop can never enter the host's modal loop.
+'
+' Returns True when a process WAS started (including timed-out-and-killed); False only
+' when the shell could not start it. Everything interesting is returned ByRef so the
+' caller can publish it: timedOut, childPid, killMethod, procElapsedMs, childLeftover,
+' appliedBudgetMs, budgetSource.
+' =====================================================================
+Private Function RunExeHardBudget(ByVal exePath As String, ByVal args As String, _
+                                  ByVal budgetMs As Long, ByRef exitCode As Long, _
+                                  ByRef timedOut As Boolean, ByRef childPid As Long, _
+                                  ByRef killMethod As String, ByRef procElapsedMs As Long, _
+                                  ByRef childLeftover As Boolean) As Boolean
+    RunExeHardBudget = False
+    exitCode = -1
+    timedOut = False
+    childPid = 0
+    killMethod = ""
+    procElapsedMs = 0
+    childLeftover = False
+    On Error GoTo Fail
+    ' (review D3) The CALLER owns both numbers: it applied the default and the clamp and it
+    ' decided which rule produced the value (timeout_ms | default | clamped_min |
+    ' clamped_max). This routine must NEVER reinterpret or overwrite them - it only enforces
+    ' the value it is handed, and it reports the OUTCOME (timedOut/pid/kill/leftover).
+    Dim sh As Object, ex As Object
+    Dim t0 As Long
+    t0 = GetTickCount()
+    Set sh = CreateObject("WScript.Shell")
+    Set ex = sh.Exec(Chr$(34) & exePath & Chr$(34) & " " & args)
+    On Error Resume Next
+    childPid = CLng(Val(CStr(ex.ProcessID)))
+    Err.Clear
+    On Error GoTo Fail
+    Do While ex.Status = 0
+        If (GetTickCount() - t0) >= budgetMs Then
+            timedOut = True
+            ' Terminate() first (the handle we own), then taskkill /F /T for a process tree.
+            ' Both are reported, and the result is VERIFIED with tasklist instead of assumed.
+            On Error Resume Next
+            ex.Terminate
+            Err.Clear
+            On Error GoTo Fail
+            killMethod = "WshScriptExec.Terminate"
+            If childPid > 0 Then
+                childLeftover = TasklistHasPid(childPid)
+                If childLeftover Then
+                    Dim rcKill As Long
+                    rcKill = 0
+                    On Error Resume Next
+                    rcKill = sh.Run("cmd /c taskkill /F /T /PID " & CStr(childPid) & " >nul 2>&1", 0, True)
+                    Err.Clear
+                    On Error GoTo Fail
+                    killMethod = killMethod & " + taskkill /F /T /PID " & CStr(childPid) & " (rc=" & CStr(rcKill) & ")"
+                    childLeftover = TasklistHasPid(childPid)
+                End If
+            End If
+            procElapsedMs = GetTickCount() - t0
+            exitCode = -1
+            RunExeHardBudget = True
+            Exit Function
+        End If
+        Sleep 50
+        ' the pump is the point: it keeps ide_state answerable while a compiler runs.
+        Util.PumpNow
+        MaybeHonorCancel
+    Loop
+    exitCode = ex.ExitCode
+    procElapsedMs = GetTickCount() - t0
+    RunExeHardBudget = True
+    Exit Function
+Fail:
+    procElapsedMs = GetTickCount() - t0
+    exitCode = -1
+    RunExeHardBudget = False
+End Function
+
+' TRUE when tasklist still lists this pid. Used ONLY right after a kill, so the receipt
+' can publish leftover=false (verified) instead of asserting that the kill worked. A
+' probe that cannot run returns TRUE - never claim a clean kill that was not observed.
+Private Function TasklistHasPid(ByVal pid As Long) As Boolean
+    TasklistHasPid = True
+    If pid <= 0 Then Exit Function
+    On Error GoTo Fail
+    Dim sh As Object, ex As Object, s As String
+    Dim t0 As Long
+    Set sh = CreateObject("WScript.Shell")
+    Set ex = sh.Exec("cmd /c tasklist /FI " & Chr$(34) & "PID eq " & CStr(pid) & Chr$(34) & " /NH")
+    t0 = GetTickCount()
+    Do While ex.Status = 0
+        Sleep 20
+        If GetTickCount() - t0 > 5000 Then Exit Do
+    Loop
+    On Error Resume Next
+    s = ""
+    If Not ex.StdOut.AtEndOfStream Then s = ex.StdOut.ReadAll
+    Err.Clear
+    On Error GoTo Fail
+    TasklistHasPid = (InStr(1, s, CStr(pid), vbTextCompare) > 0)
+    Exit Function
+Fail:
+    TasklistHasPid = True
+End Function
+
 Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByVal outPath As String, ByVal timeoutMs As Long, _
                           ByVal laaGiven As Boolean, ByVal laaParam As Boolean, ByVal diagnoseWant As Boolean) As String
     Dim vbp As String, logPath As String, cmdArgs As String
@@ -17572,6 +20045,8 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     ' before the compiler starts, compileMs the compiler subprocess itself.
     Dim el0 As Long
     el0 = GetTickCount()
+    Dim regBefore As String
+    regBefore = ""
     If Len(project) > 0 Then
         vbp = ResolvePath(project)
     Else
@@ -17606,7 +20081,23 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     Dim laaWant As Boolean, laaSrc As String, laaProjFile As String, laaSrcNote As String, laaCfgErr As String
     Dim laaUsable As Boolean
     laaUsable = LaaResolve(vbp, laaGiven, laaParam, laaWant, laaSrc, laaProjFile, laaSrcNote, laaCfgErr)
-    If timeoutMs <= 0 Then timeoutMs = 180000
+    ' v1.11.12: HARD, CLAMPED budget for the compiler subprocess. The value APPLIED (after the
+    ' clamp) is what the receipt publishes as budgetMs; budgetSource names the rule.
+    Dim hbAppliedBudget As Long, hbBudgetSrc As String
+    hbBudgetSrc = "timeout_ms"
+    If timeoutMs <= 0 Then
+        timeoutMs = BUILD_BUDGET_DEFAULT_MS
+        hbBudgetSrc = "default"
+    End If
+    hbAppliedBudget = timeoutMs
+    If hbAppliedBudget < BUILD_BUDGET_MIN_MS Then
+        hbAppliedBudget = BUILD_BUDGET_MIN_MS
+        hbBudgetSrc = "clamped_min"
+    ElseIf hbAppliedBudget > BUILD_BUDGET_MAX_MS Then
+        hbAppliedBudget = BUILD_BUDGET_MAX_MS
+        hbBudgetSrc = "clamped_max"
+    End If
+    timeoutMs = hbAppliedBudget
     ' (criterion 3): when the requested project IS the one open in
     ' the IDE, an isolated VB6.EXE /make cannot compile it - the IDE holds the file
     ' (measured: exit 1 with no error text). Prefer the in-IDE Make path there and
@@ -17764,6 +20255,8 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
                 croot("artifactPath") = CStr(cache("artifact"))
                 croot("artifactChanged") = False
                 croot("artifactUnchangedReason") = "cache hit: VB6.EXE was not launched, so nothing rewrote the artifact"
+                ' W-D (P11): the cache-hit path is the NATURAL artifactChanged=false branch of this tool.
+                WcAttachCompileLogHint croot
                 Dim cArtEx As Boolean, cArtSz As Double, cArtTm As Double
                 ArtifactSnap CStr(cache("artifact")), cArtEx, cArtSz, cArtTm
                 If cArtEx Then croot("artifactMtime") = ArtifactMtimeText(True, cArtTm)
@@ -17777,15 +20270,37 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
                 croot("projectPath") = vbp
                 ' the cached path publishes the SAME key set as a real
                 ' build, so a caller never has to branch on which route answered.
+                ' W-F (cache-hit log ownership): NOTHING is parsed on a cache hit. The recorded
+                ' log path may have been overwritten by another project's build (measured: VB6MCP_build.log
+                ' held a BadProj syntax error while a VT cache hit was reported), so a cached receipt must
+                ' never derive errorCount/firstError from it.
                 Dim cLog As String
                 cLog = ""
+                croot("logAvailable") = False
+                croot("logBytes") = 0
+                croot("logSuppressed") = "cache_hit_no_fresh_log"
+                croot("errorCount") = Null
+                croot("firstError") = Null
+                Dim own As Object
+                Set own = CreateObject("Scripting.Dictionary")
+                own("verified") = False
+                own("reason") = "a cache hit runs NO compiler, so no log can belong to this call; a stale file on the recorded path is reported but never parsed"
+                Set croot("logOwnership") = own
+                croot("logStale") = False
+                Dim stalePath As String
+                stalePath = CStr(cache("logPath"))
                 On Error Resume Next
-                If Len(CStr(cache("logPath"))) > 0 Then
-                    If Dir$(CStr(cache("logPath"))) <> "" Then cLog = Build.ReadLogAnsi(CStr(cache("logPath")))
+                If Len(stalePath) > 0 Then
+                    If Len(Dir$(stalePath)) > 0 Then
+                        croot("logStale") = True
+                        croot("staleLogPath") = stalePath
+                        croot("staleLogSha256") = Build.FileSha256(stalePath)
+                        croot("staleLogMtime") = Format$(FileDateTime(stalePath), "yyyy-mm-dd hh:nn:ss")
+                        croot("staleLogNote") = "REPORTED ONLY: this file is not parsed on a cache hit, so it cannot produce errorCount/firstError for this call (it may belong to another project)"
+                    End If
                 End If
+                Err.Clear
                 On Error GoTo 0
-                croot("logAvailable") = (Len(cLog) > 0)
-                croot("logBytes") = Len(cLog)
                 ' (step B): the same measured pair as a real build, taken from the text this
                 ' call actually read off the recorded logPath (the cached path publishes the SAME key
                 ' set as a real build, so the pair may not be missing here).
@@ -17872,6 +20387,15 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     ArtifactSnap artifact, aBeforeExists, aBeforeSize, aBeforeTime
     Dim ideMakeJson As String
     ideMakeJson = ""
+    ' v1.11.12: hard-budget facts of the compiler subprocess (see RunExeHardBudget).
+    Dim hbTimedOut As Boolean, hbChildPid As Long, hbKillMethod As String
+    Dim hbProcMs As Long, hbLeftover As Boolean, hbStarted As Boolean
+    hbTimedOut = False
+    hbChildPid = 0
+    hbKillMethod = ""
+    hbProcMs = 0
+    hbLeftover = False
+    hbStarted = False
     Dim br As TBuildResult
     If useIde Then
         ' in-IDE Make: no compiler log exists on this route, so the freshly written
@@ -17886,17 +20410,39 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
         br.reportedLine = 0
         br.diskLine = 0
         br.exitCode = 0
+        ' (review D4) the in-IDE route starts NO compiler subprocess, so the subprocess budget
+        ' is structurally NOT APPLICABLE: report 0 / not_applicable, never the 180 s default.
+        hbAppliedBudget = 0
+        hbBudgetSrc = "not_applicable"
         ' the 9th argument is wait_for_build; 0 = the historical 15 s default.
-        ideMakeJson = ToolMakeProject("", "ide", "", 0, False, laaGiven, laaParam, diagnoseWant, 0)
+        ideMakeJson = ToolMakeProject("", "ide", "", 0, False, laaGiven, laaParam, diagnoseWant, 0, "")
         ec = 0
         Build.ApplyArtifactVerdict br, artifact, tBefore
     Else
         On Error Resume Next
         Kill logPath
         On Error GoTo 0
-        If Not Build.RunExe(m_vbe.FullName, cmdArgs, timeoutMs, ec) Then Err.Raise vbObjectError + 87, "CodeTools", "build process failed to run"
+        ' ---- W-C: CLSID registration guard around the CLI /make ----
+        ' MEASURED (why this exists): a /make over a COPY rewrote the InprocServer32 value of this
+        ' add-in's CLSID to point at that copy's DLL. The value is captured BEFORE the compiler runs
+        ' and put back if it changed; an unchanged value is reported as registrationUntouched.
+        regBefore = WcInprocRead()
+        Dim regAfter As String
+        Dim regRewritten As Boolean
+        Dim regRestored As Boolean
+        regAfter = ""
+        regRewritten = False
+        regRestored = False
+        hbStarted = RunExeHardBudget(m_vbe.FullName, cmdArgs, hbAppliedBudget, ec, hbTimedOut, hbChildPid, hbKillMethod, hbProcMs, hbLeftover)
+        If Not hbStarted Then Err.Raise vbObjectError + 87, "CodeTools", "build process failed to run"
         br = Build.ParseBuild(logPath, -1)
         Build.ApplyArtifactVerdict br, artifact, tBefore
+        regAfter = WcInprocRead()
+        If Len(regBefore) > 0 And StrComp(regBefore, regAfter, vbTextCompare) <> 0 Then
+            regRewritten = True
+            regRestored = WcInprocWrite(regBefore)
+            regAfter = WcInprocRead()
+        End If
     End If
     Dim aAfterExists As Boolean, aAfterSize As Double, aAfterTime As Double
     ArtifactSnap artifact, aAfterExists, aAfterSize, aAfterTime
@@ -17917,8 +20463,40 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     If off >= 0 And br.reportedLine > 0 Then br.diskLine = br.reportedLine + off + 1
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
+    ' W-C (P5): freshness is meaningful only when this build has an IDE surface for the .vbp.
+    Set root("sourceFreshness") = SourceFreshnessJson(useIde)
+    ' W-C: CLSID registration evidence (the guard runs on the CLI route only).
+    root("registrationClsid") = "{4CB64903-3CBA-4AF6-852B-D534862A893D}"
+    root("registrationKey") = "HKLM\Software\Wow6432Node\Classes\CLSID\{4CB64903-3CBA-4AF6-852B-D534862A893D}\InprocServer32 (32-bit view)"
+    root("registrationBefore") = regBefore
+    root("registrationAfter") = regAfter
+    root("registrationRewritten") = regRewritten
+    root("registrationRestored") = regRestored
+    If Len(regBefore) = 0 Then
+        root("registrationApplicable") = False
+        root("registrationNote") = "the CLSID InprocServer32 value could not be read before the build, so the guard could not run (registrationApplicable:false - not claimed as untouched)"
+    ElseIf regRewritten Then
+        root("registrationApplicable") = True
+        If Not regRestored Then
+            root("registrationRestoreFailed") = True
+            root("howToRecover") = "the CLSID InprocServer32 was rewritten by /make and could not be put back; run: regsvr32 <the shipped VB6MCP.dll> and verify HKLM\Software\Wow6432Node\Classes\CLSID\{4CB64903-...}\InprocServer32 equals that DLL path"
+        End If
+    Else
+        root("registrationApplicable") = True
+        root("registrationUntouched") = True
+    End If
     root("ok") = br.ok
     root("exitCode") = ec
+    ' v1.11.12: HARD BUDGET evidence (additive). On every NON-timeout path the historical
+    ' ok / verdict values are untouched; only a KILLED compiler overrides them (at the end).
+    root("timedOut") = hbTimedOut
+    root("budgetEnforced") = hbTimedOut
+    root("budgetMs") = hbAppliedBudget
+    root("budgetSource") = hbBudgetSrc
+    root("killMethod") = hbKillMethod
+    root("childPid") = hbChildPid
+    root("compilerElapsedMs") = hbProcMs
+    root("childLeftover") = hbLeftover
     ' file/line are reported ONLY when the log actually carried a file(line) STRUCTURE.
     ' A project-level error must leave them ABSENT - filling reportedLine = 0 as if it were a real
     ' line is exactly the fabrication this card is about.
@@ -17981,6 +20559,7 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
         root("artifactNote") = "the project declares no ExeName32 and no in-IDE Make target, so the artifact path is unknown and artifactChanged cannot be judged"
     Else
         root("artifactChanged") = artChanged
+        If Not artChanged Then WcAttachCompileLogHint root
         If aAfterExists Then root("artifactMtime") = ArtifactMtimeText(True, aAfterTime)
     End If
     If Len(artifact) > 0 And Not artChanged Then
@@ -18077,7 +20656,9 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
     ncache("verdict") = br.verdict
     ncache("okByKeyword") = br.okByKeyword
     Set ncache("comps") = comps
-    Build.CacheSave ncache
+    ' v1.11.12: NEVER cache a TIMED-OUT build as a result - a later call must not short-circuit
+    ' to "no component changed" behind a call that never got a compiler verdict.
+    If Not hbTimedOut Then Build.CacheSave ncache
 skipCache:
     If Not br.ok Then
         ' Classic failure: the project is OPEN IN THE IDE, so the isolated
@@ -18219,7 +20800,34 @@ skipCache:
     root("laaProjectFile") = laaProjFile
     root("laaSourceNote") = laaSrcNote
     root("laaConfigError") = laaCfgErr
+    ' W-C (P6): FINAL artifact identity - sampled AFTER the LAA patch, verified by a second read.
+    Dim wcDetail2 As String
+    wcDetail2 = "after_compile"
+    If CBool(root("laaSet")) Or CBool(root("laaAlready")) Then wcDetail2 = "after_laa_patch"
+    Set root("final") = WcFinalArtifactJson(artifact, wcDetail2, WcVbpRevisionText(vbp))
+    root("artifactChangedBasedOn") = "final"
+    If CBool(root("laaSet")) Then
+        root("artifactChanged") = True
+        root("artifactChangedNote") = "the LAA PE patch changed the artifact bytes AFTER the compile, so artifactChanged is true on the FINAL bytes"
+    End If
     If useIde Then root("laaNote") = "the route was the in-IDE Make (see ideMake), which already ran the LAA step; this receipt re-read the artifact and reports its real state"
+    ' v1.11.12: the TERMINAL stop reason. timedOut wins over every other state: a killed
+    ' compiler is NOT a compile verdict, so ok/verdict/pending are overridden ONLY here and
+    ' ONLY when the child was actually killed.
+    If hbTimedOut Then
+        root("ok") = False
+        root("verdict") = "timeout"
+        root("pending") = False
+        root("buildState") = "failed"
+        root("timeoutNote") = "the isolated VB6.EXE compiler subprocess was KILLED at the " & CStr(hbAppliedBudget) & " ms hard budget (childPid " & CStr(hbChildPid) & "; " & hbKillMethod & "). A timed-out compile is NOT a compile verdict and the artifact state is reported separately in output{}. " & IIf(hbLeftover, "WARNING: tasklist still listed the child right after the kill.", "tasklist did not list the child after the kill (no leftover).")
+        root("suggestedAction") = "the compile did not finish inside budgetMs: raise timeout_ms (max " & CStr(BUILD_BUDGET_MAX_MS) & " ms), or build a smaller project, then retry. Do not read ok=false as a compiler error."
+    Else
+        If Not CBool(root("ok")) Then
+            root("budgetNote") = "the budget did not expire, so ok/verdict are the compiler result (unchanged semantics)."
+        Else
+            root("budgetNote") = "the compile finished inside budgetMs; ok/verdict are the compiler result (unchanged semantics)."
+        End If
+    End If
     ToolBuild = JsonStringify(root)
 End Function
 
@@ -18499,6 +21107,17 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
             ToolApplyEdits = JsonStringify(bd)
             Exit Function
         End If
+        ' v1.11.12: op "D" deletes the whole matched block and never carries text. The old
+        ' code DROPPED a caller's text without a word, so "delete this block and put that
+        ' in its place" looked like it had worked. The three states are now fixed: text
+        ' ABSENT and text "" both mean delete (both decode to an empty payload), and a
+        ' NON-EMPTY text is refused as delete_with_text instead of being ignored.
+        If op = "D" And Len(txt) > 0 Then
+            ToolApplyEdits = GuardReject(name, "apply_edits", "delete_with_text", _
+                "op " & CStr(i) & " is D (delete) but carries " & CStr(Len(txt)) & " character(s) of text; a D op deletes the WHOLE matched block and its text must be absent or empty. Use op ""R"" with the replacement text to replace a block, or drop the text.", _
+                hitLine, hitLine + spanLinesA - 1, LineCount(cur))
+            Exit Function
+        End If
         If op = "R" Or op = "D" Then
             If IsContinuationTail(curLines, hitLine) Then
                 ToolApplyEdits = GuardReject(name, "apply_edits", "inside_continuation", _
@@ -18516,8 +21135,10 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
         End If
         If firstHit = 0 Then firstHit = hitLine
         colOps.Add op & vbTab & CStr(hitLine) & vbTab & txt
-        ' the rest of a multi-line anchor match is REMOVED.
-        If op = "R" And spanLinesA > 1 Then
+        ' the rest of a multi-line anchor match is REMOVED. Since v1.11.12 this holds for
+        ' op "D" as well: a D op on a MULTI-LINE anchor deletes the WHOLE matched block
+        ' (one line-addressed D per matched line), which is what the block semantics say.
+        If (op = "R" Or op = "D") And spanLinesA > 1 Then
             Dim dq As Long
             For dq = 1 To spanLinesA - 1
                 colOps.Add "D" & vbTab & CStr(hitLine + dq)
@@ -18548,6 +21169,15 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
         engTagA = EngineRefusalTag(em, ops, cur, matchMode)
         If Len(engTagA) > 0 Then Err.Raise vbObjectError + 84, "CodeTools", engTagA
         Err.Raise vbObjectError + 84, "CodeTools", em
+    End If
+    ' v1.11.12: deleting the LAST line(s) of a component is a structured refusal. An empty
+    ' code pane is not a usable editing outcome (the caller cannot restore it with a second
+    ' anchor edit), so refuse it instead of writing an empty module.
+    If Len(Trim$(nx)) = 0 Then
+        ToolApplyEdits = GuardReject(name, "apply_edits", "would_empty_component", _
+            "the batch would remove every line of component '" & name & "' (it has " & CStr(LineCount(cur)) & " line(s) now). Deleting the last line of a component is refused; keep at least one line, or remove the component with remove_component.", _
+            1, LineCount(cur), LineCount(cur))
+        Exit Function
     End If
     ' (the structural-gate review reverse direction): the same result-level judgement for the batch.
     Dim ppRefB As String
@@ -18582,6 +21212,18 @@ Private Function ToolApplyEdits(ByVal name As String, ByVal edits As Object, ByV
     extra("lintMs") = tLint - tPredict
     extra("writeMs") = tWrite - tLint
     AddWritePhases extra
+    ' v1.11.12: the receipt states exactly how many lines the batch REMOVED and shows the
+    ' removed text (capped). Before this a delete op left no machine-readable trace of what
+    ' it removed. The count comes from the SAME line-level LCS preview_edit renders, so the
+    ' two tools cannot disagree.
+    Dim delInfo As Object
+    Set delInfo = DeletedLinesInfo(cur, nx)
+    extra("deletedLines") = delInfo("deletedLines")
+    extra("deletedText") = delInfo("deletedText")
+    extra("deletedTextLines") = delInfo("deletedTextLines")
+    extra("deletedTextTruncated") = delInfo("deletedTextTruncated")
+    extra("deletedTextLimit") = delInfo("deletedTextLimit")
+    extra("deleteTextPolicy") = "op D accepts an ABSENT text and an EMPTY text (both decode to an empty payload and delete the matched block); a NON-EMPTY text is refused with reason=delete_with_text. Use op R to replace a block."
     ' report every per-op key this tool cannot honour (it reads
     ' op/anchor/text plus match/occurrence) instead of ignoring it without a word.
     OpKeyAuditInto extra, edits, "|op|anchor|text|match|occurrence|", NoteApplyEditsOpKeys()
@@ -18964,6 +21606,14 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
             If Len(engTag) > 0 Then Err.Raise vbObjectError + 84, "CodeTools", engTag
             Err.Raise vbObjectError + 84, "CodeTools", etxt
         End If
+        ' v1.11.12: the SAME three-state D text rule the write applies, byte for byte, so a
+        ' preview can never say OK for a batch the write refuses (and vice versa).
+        If op = "D" And Len(txt) > 0 Then
+            ToolPreviewEdit = GuardReject(name, "preview_edit", "delete_with_text", _
+                "op " & CStr(i) & " is D (delete) but carries " & CStr(Len(txt)) & " character(s) of text; a D op deletes the WHOLE matched block and its text must be absent or empty. Use op ""R"" with the replacement text to replace a block, or drop the text.", _
+                hitLine, hitLine + spanPre - 1, LineCount(cur))
+            Exit Function
+        End If
         ' beta-2 continuation refusal: byte for byte the rule ToolApplyEdits applies. The
         ' preview used to have NO guard here, so a range that splits a continued statement
         ' previewed as OK and was then REFUSED by the write.
@@ -18983,9 +21633,10 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
             End If
         End If
         colPre.Add op & vbTab & CStr(hitLine) & vbTab & txt
-        ' the rest of a multi-line anchor match is REMOVED, exactly as
-        ' ToolApplyEdits does, so the preview predicts the write byte for byte.
-        If op = "R" And spanPre > 1 Then
+        ' the rest of a multi-line anchor match is REMOVED, exactly as ToolApplyEdits does
+        ' (now including op "D", whose multi-line anchor deletes the WHOLE block), so the
+        ' preview predicts the write byte for byte.
+        If (op = "R" Or op = "D") And spanPre > 1 Then
             Dim dqPre As Long
             For dqPre = 1 To spanPre - 1
                 colPre.Add "D" & vbTab & CStr(hitLine + dqPre)
@@ -19008,6 +21659,14 @@ Private Function ToolPreviewEdit(ByVal name As String, ByVal edits As Object, By
         engTag = EngineRefusalTag(em, ops, cur, "")
         If Len(engTag) > 0 Then Err.Raise vbObjectError + 84, "CodeTools", engTag
         Err.Raise vbObjectError + 84, "CodeTools", em
+    End If
+    ' v1.11.12: the SAME would-empty refusal the write answers, so preview cannot promise
+    ' a deletion the write refuses.
+    If Len(Trim$(nx)) = 0 Then
+        ToolPreviewEdit = GuardReject(name, "preview_edit", "would_empty_component", _
+            "the batch would remove every line of component '" & name & "' (it has " & CStr(LineCount(cur)) & " line(s) now). Deleting the last line of a component is refused; keep at least one line, or remove the component with remove_component.", _
+            1, LineCount(cur), LineCount(cur))
+        Exit Function
     End If
     ' the preview must predict the SAME structural refusal the write
     ' gives - otherwise "preview OK, write refused" comes back one tool later.
@@ -19615,12 +22274,30 @@ Private Function ToolIdeState(Optional ByVal cancelInflight As Boolean = False, 
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     Dim st As String
-    st = GetIdeState()
+    Dim stateSource As String
+    Dim barsSuspended As Boolean
+    stateSource = ""
+    barsSuspended = False
+    st = GetIdeStateEx(stateSource, barsSuspended)
     root("state") = st
     root("ebMode") = IdeEbMode()
     root("title") = IdeMainTitle()
     root("project") = ProjectNameSafe()
     root("running") = (st = "run")
+    root("notRunning") = (st = "design")
+    root("commandBarsSuspended") = barsSuspended
+    root("stateSource") = stateSource
+    ' (D3) a suspended-bars window with NO debug context is the post-run window: clear it with
+    ' ONE activate_component so the NEXT debug_session{attach:true} is not misled into "run".
+    If IdeEbMode() = 0 And (barsSuspended Or stateSource = "ebMode+commandBars") Then
+        Set root("autoRecover") = DbNudgeBarsOut()
+        st = GetIdeStateEx(stateSource, barsSuspended)
+        root("state") = st
+        root("running") = (st = "run")
+        root("notRunning") = (st = "design")
+        root("commandBarsSuspended") = barsSuspended
+        root("stateSource") = stateSource
+    End If
     ' the pump gate is MEASURABLE from a read-only tool, so a caller can see that a
     ' pump was WITHHELD (and why) instead of having to guess. Additive; no new tool, no
     ' parameter change.
@@ -19725,6 +22402,7 @@ Private Function ToolCurrentPosition() As String
     root("ebMode") = IdeEbMode()
     If st <> "break" Then
         root("available") = False
+        root("positionSource") = "none"
         root("reason") = "not_in_break"
         ToolCurrentPosition = JsonStringify(root)
         Exit Function
@@ -19733,6 +22411,7 @@ Private Function ToolCurrentPosition() As String
     Set cp = m_vbe.ActiveCodePane
     If cp Is Nothing Then
         root("available") = False
+        root("positionSource") = "none"
         root("reason") = "no_active_code_pane"
         ToolCurrentPosition = JsonStringify(root)
         Exit Function
@@ -19744,6 +22423,7 @@ Private Function ToolCurrentPosition() As String
     cp.GetSelection sl, sc, el, ec
     If Err.Number <> 0 Then
         root("available") = False
+        root("positionSource") = "none"
         root("reason") = "selection_unavailable"
         root("detail") = Err.Description
         Err.Clear
@@ -19761,6 +22441,7 @@ Private Function ToolCurrentPosition() As String
     proc = cm.ProcOfLine(line, 0)
     If Err.Number <> 0 Then Err.Clear
     root("available") = True
+    root("positionSource") = "paneSelection"
     root("project") = ProjectNameSafe()
     root("module") = CodeModuleOwnerName(cm)
     root("proc") = proc
@@ -21186,7 +23867,7 @@ End Function
 
 ' delta-2: IDE-vs-disk + lint for a set of components, summary first and only the
 ' FAILING components in detail. READ-ONLY.
-Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String) As String
+Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String, ByVal baselineText As String) As String
     Dim root As Object
     Set root = CreateObject("Scripting.Dictionary")
     ' segmented timing (enumerate / read / lint / compare / nested verify).
@@ -21257,7 +23938,7 @@ Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String)
         vo = ""
         tSeg = GetTickCount()
         On Error Resume Next
-        vo = ToolVerify(CStr(nm), pathArg, "")
+        vo = ToolVerify(CStr(nm), pathArg, baselineText)
         On Error GoTo 0
         tVer = tVer + (GetTickCount() - tSeg)
         overall = JsonUnescape(JsonFieldRaw(vo, "overall"))
@@ -21292,13 +23973,25 @@ Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String)
         d("firstDiagnostic") = firstDiag
         d("verifyOverall") = overall
         checkedN = checkedN + 1
-        If overall = "PASS" Then
-            passN = passN + 1
-        ElseIf overall = "FAIL" Then
-            ' a PROVEN inconsistency: counted in `fail` and listed in failures[] only.
+        ' W-D (P11): a scope FAIL means ONE thing only - the IDE text and the disk file are
+        ' PROVEN different. Lint findings are reported per component (lintErrors) and counted
+        ' separately (lintOnly); they never turn into a fail here.
+        Dim provenDiff As Boolean
+        provenDiff = False
+        If Not ideEq Then provenDiff = True
+        Dim vd As String
+        vd = JsonUnescape(JsonFieldRaw(vo, "ideDisk"))
+        If vd = "MISMATCH" Or vd = "NOT-SYNCED" Or vd = "READ-FAIL" Then provenDiff = True
+        If provenDiff Then
+            d("failBasis") = "ide_disk_diff_proven"
             failN = failN + 1
             d("bucket") = "fail"
             fails.Add d
+        ElseIf overall = "FAIL" Or overall = "UNKNOWN" Then
+            d("failBasis") = "none"
+            d("bucket") = "unknown"
+            unknownN = unknownN + 1
+            unknowns.Add d
         Else
             ' UNKNOWN is NOT a fail: counted ONCE in `unknown` and listed in unknowns[] only,
             ' never in failures[] (that array is reserved for proven mismatches).
@@ -22418,6 +25111,13 @@ Private Function ChangelogList() As Object
     c.Add "v1.11.10 CORRECTED - it was NOT wording-only. BEHAVIOUR FIX (winsock transport, three defects): (a) the per-connection object was never persisted, so a request that arrived in more than one TCP segment lost its head and was never served; (b) close-after-send was tested only AFTER the queue had been cleared, so Connection: close responses lingered until the 30 s idle sweep; (c) the flush path grew a cumulative Mid$ start past 64 KiB and treated send()=-1 with WSAGetLastError()=0 as fatal, truncating bodies. Together they closed the intermittent RemoteDisconnected and the >64 KiB truncation."
     c.Add "v1.11.10 (continued) TEXT-ONLY edits in the same batch: 3 tool descriptions (edit_by_anchor / apply_edits / preview_edit: internal-id prefixes removed), 1 tool description (verify_scope: build evidence is PROJECT-level), 2 parameter descriptions (replace_code.expected_sha256 / make_project.wait_for_build), 1 runtime receipt string (make_project.buildStateNote lost its internal-id prefix; fields and semantics unchanged). Tool count 110 -> 110, no parameter added or removed."
     c.Add "v1.11.11 changelog correction + vba6_probe parameter-description hygiene (110 -> 110 tools; no parameter added, removed, retyped or re-required): 10 vba6_probe PARAMETER descriptions no longer carry internal experiment ids or reverse-engineering round numbers (exec_probe, exec_set_frame, frame_probe, frame_set, frame_set_a1, frame_set_a2, worker_call, worker_p2_engine, mem_dump, mem_scan - same meaning), the remaining internal experiment ids and round numbers are gone from the shipped comments, and THIS changelog entry is now accurate about the previous batch. The export audit regex was NOT extended (one-off hygiene, not an audit rule)."
+    c.Add "v1.11.12 write-semantics + hang/diagnostic batch (add-in 110 -> 110, hub 10 -> 10, DSH-facing 120 -> 120; ADDED/REMOVED = 0 and NO tool or parameter description changed, so tools/list is UNCHANGED): (1) apply_edits op D deletes the WHOLE matched block - a multi-line anchor expands to one line-addressed deletion per matched line - and the batch stays all-or-nothing; the text of a D op is a fixed THREE-STATE contract (absent = delete, empty text = delete, non-empty = refused with reason=delete_with_text instead of being dropped silently), and a batch that would leave the component empty is refused with reason=would_empty_component; the receipt adds deletedLines + deletedText (capped, with deletedTextLines/deletedTextTruncated/deletedTextLimit/deleteTextPolicy)." & _
+          " preview_edit applies the SAME two refusals and the same block expansion, so it still predicts the write. (2) reload_component / save_project publish .vbp order + RevisionVer evidence (vbpOrderPreserved / vbpOrderChanges[] / vbpRevisionBefore / vbpRevisionAfter / vbpRevisionBumped; raw order lists capped at vbpOrderLinesCapped=400 and changes at 50) and save_project RESTORES the pre-save non-comment line order when VB6 wrote the same lines in a different order (vbpOrderRestored=true, vbpOrderFinalPreserved=true); reload_component also reports inMemoryOrderMoved / inMemoryOrderChanges." & _
+          " (3) build / make_project: the external compiler subprocess now runs under a HARD, CLAMPED budget (build: default 180000 ms, min 1000, max 600000; make_project diagnose: default 120000 ms, min 5000, max 600000); on the deadline the child is TERMINATED and VERIFIED with tasklist, and the receipt adds timedOut / budgetEnforced / budgetMs / budgetSource / killMethod / childPid / compilerElapsedMs / childLeftover (make_project also isolatedMake{attempted,pid,exitCode,killed,killMethod,elapsedMs,leftover,budgetMs}). A timed-out build keeps the historical ok/verdict semantics on EVERY non-timeout path and overrides them only to ok=false + verdict=timeout." & _
+          " make_project also adds host_modal_blocking + host_modal{blocking,stage,count,risk,riskReason,riskClass,ownerDisabled,hwnd,title,controls[],dialogs[]} + stopReason/stopReasonPriority, INDEPENDENT of timedOut. The isolated-compile wait loop pumps the message queue, so ide_state and other read-only diagnostics stay answerable while a long compile runs (no schema/description change: these are receipts, not parameters)." & _
+          " (4) hub side (no add-in change): ide_list / ide_state / ide_restart share ONE ownership{verdict,basis,registryAlive,portAvailable,pid,port,project} resolver; portAvailable=false alone is unknown, never foreign."
+    c.Add "v1.11.12 write-semantics batch (add-in 110 -> 110, hub 10 -> 10, DSH-facing 120 -> 120; ADDED/REMOVED = 0 and NO tool or parameter description changed, so tools/list is UNCHANGED): (1) apply_edits op D deletes the WHOLE matched block - a multi-line anchor expands to one line-addressed deletion per matched line - and the batch stays all-or-nothing; the text of a D op is a fixed THREE-STATE contract (absent = delete, text:"""" = delete, non-empty = refused with reason=delete_with_text instead of being dropped silently), and a batch that would leave the component empty is refused with reason=would_empty_component; the receipt adds deletedLines + deletedText (capped, with deletedTextLines/deletedTextTruncated/deletedTextLimit/deleteTextPolicy)." & _
+          "preview_edit applies the SAME two refusals and the same block expansion, so it still predicts the write. (2) reload_component / save_project report the .vbp line order and revision: vbpOrderPreserved / vbpOrderChanges[] / vbpRevisionBefore / vbpRevisionAfter / vbpRevisionBumped, and save_project RESTORES the pre-save non-comment line order when VB6 wrote the same lines in a different order (vbpOrderRestored=true, vbpOrderFinalPreserved=true, raw vbpOrderLinesBefore/After capped, vbpOrderLinesCapped); reload_component additionally reports inMemoryOrderMoved / inMemoryOrderChanges / inMemoryOrderBefore / inMemoryOrderAfter."
     Set ChangelogList = c
 End Function
 
@@ -23227,4 +25927,3467 @@ Private Function CsvToCollection(ByVal csv As String, ByVal maxN As Long) As Obj
         If Len(Trim$(parts(i))) > 0 Then c.Add Trim$(parts(i))
     Next
     Set CsvToCollection = c
+End Function
+' =====================================================================
+' W-H1 (D1+D2+D7): run_until_break, breakpoint management, unified debug receipt
+' =====================================================================
+
+
+' {component, line (PANE line space), hitCount?} per the SAME schema debug_session takes.
+Private Function ToolRunUntilBreak(ByVal args As Object) As String
+    Dim root As Object, tr As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    Set tr = New Collection
+    root("tool") = "run_until_break"
+    root("ok") = False
+    root("wedged") = False
+    root("endQueued") = False
+    root("stopReason") = ""
+    root("hitCountTotal") = 0
+    Dim timeoutMs As Long
+    timeoutMs = JsonGetLong(args, "timeout_ms", 30000)
+    If timeoutMs <= 0 Then timeoutMs = 30000
+    If timeoutMs > 600000 Then timeoutMs = 600000
+    root("timeoutMs") = timeoutMs
+    Set m_watchExprs = DbObjOf(args, "watch")
+    m_watchFrame = 0
+    Dim attach As Boolean
+    attach = JsonGetBool(args, "attach", False)
+    root("attach") = attach
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    Dim vbpPath As String
+    vbpPath = p.FileName
+    root("vbpPath") = vbpPath
+    Dim diskBefore As String
+    diskBefore = ""
+    If Len(vbpPath) > 0 Then diskBefore = Sha256HexFile(vbpPath)
+    root("diskVbpShaBefore") = diskBefore
+    ' the gate BACKSTOP: if this call never returns (a tight non-pumping loop), a later
+    ' read-only call can force-release the single-flight gate after this budget.
+    ArmGateRelease "run_until_break", timeoutMs + 8000
+    On Error GoTo RUB_ERR
+    Dim st0 As String
+    st0 = GetIdeState()
+    root("ideStateBefore") = st0
+    Dim res As String
+    If attach Then
+        ' echo (and gate on) the breakpoints armed by phase 1 - they live in this add-in's
+        ' memory because the observe call is a separate call.
+        If Not m_rubBreakpoints Is Nothing Then Set root("breakpoints") = m_rubBreakpoints
+        res = DbObserveUntilBreak(root, tr, timeoutMs)
+        root("stopReason") = res
+        DbFinalize root, tr, vbpPath, diskBefore, True
+        DisarmGateRelease
+        ToolRunUntilBreak = JsonStringify(root)
+        Exit Function
+    End If
+    ' ---- PHASE 1: arm + START, then return (Start is QUEUED in an STA IDE) ----
+    If st0 = "break" Then
+        root("reason") = "already_in_break"
+        root("hint") = "call control_execution{mode:""end""} first, then retry run_until_break"
+        DbFinalize root, tr, vbpPath, diskBefore, True
+        DisarmGateRelease
+        ToolRunUntilBreak = JsonStringify(root)
+        Exit Function
+    End If
+    If st0 = "run" Then
+        root("reason") = "already_running"
+        Set root("howToContinue") = DbRubHowToContinue(timeoutMs)
+        DbFinalize root, tr, vbpPath, diskBefore, True
+        DisarmGateRelease
+        ToolRunUntilBreak = JsonStringify(root)
+        Exit Function
+    End If
+    Dim bps1 As Object
+    Set bps1 = DbArmBreakpoints(args)
+    Set m_rubBreakpoints = bps1
+    Set root("breakpoints") = bps1
+    Dim whyStart As String
+    whyStart = ""
+    Dim started As Boolean
+    started = DbClickStart(whyStart)
+    root("executedStart") = started
+    root("startWhy") = whyStart
+    If started Then
+        root("startedPending") = True
+        root("stopReason") = "started"
+        root("ideStateAtReturn") = GetIdeState()
+        Set root("howToContinue") = DbRubHowToContinue(timeoutMs)
+    Else
+        root("reason") = "start_command_not_found"
+        root("detail") = whyStart
+    End If
+    DbFinalize root, tr, vbpPath, diskBefore, True
+    DisarmGateRelease
+    ToolRunUntilBreak = JsonStringify(root)
+    Exit Function
+RUB_ERR:
+    On Error Resume Next
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    If Len(CStr(root("stopReason"))) = 0 Then root("stopReason") = "error"
+    DbFinalizeDiskAndHits root, vbpPath, diskBefore, tr
+    DisarmGateRelease
+    ToolRunUntilBreak = JsonStringify(root)
+End Function
+
+Private Function DbRubHowToContinue(ByVal timeoutMs As Long) As Object
+    Dim hc As Object
+    Set hc = CreateObject("Scripting.Dictionary")
+    hc("tool") = "run_until_break"
+    Dim ha As Object
+    Set ha = CreateObject("Scripting.Dictionary")
+    ha("attach") = True
+    ha("timeout_ms") = timeoutMs
+    Set hc("arguments") = ha
+    Set DbRubHowToContinue = hc
+End Function
+
+' OBSERVE until one of: break / process_exit / unhandled_error / timeout.
+' Every hit stops the engine (VB6 has no conditional breakpoints); when a breakpoint carries
+' hitCount N, the first N-1 hits are auto-continued here and only the Nth stop is reported.
+Private Function DbObserveUntilBreak(ByRef root As Object, ByRef tr As Object, ByVal timeoutMs As Long) As String
+    On Error Resume Next
+    DbObserveUntilBreak = "timeout"
+    Dim t0 As Long
+    Dim st As String
+    Dim dlgTitle As String
+    t0 = Util.TickMs()
+    root("state") = "run"
+    Do While (Util.TickMs() - t0) < timeoutMs
+        If DbBreakNow() Then
+            Dim gate As String
+            gate = DbBreakGate(root, tr)
+            If gate = "continue" Then
+                ' auto-continue towards the requested hit count
+                root("state") = "run"
+                Dim g1 As Long
+                g1 = Util.TickMs()
+                ToolControlExecution "continue"
+                Do While (Util.TickMs() - g1) < 8000
+                    If DbBreakNow() Then Exit Do
+                    If GetIdeState() = "design" Then Exit Do
+                    If Util.CanPump() Then DoEvents
+                    DbBriefWait 40
+                Loop
+            Else
+                DbObserveUntilBreak = "break"
+                Exit Function
+            End If
+        Else
+            st = GetIdeState()
+            If st = "design" Then
+                root("state") = "design"
+                DbObserveUntilBreak = "process_exit"
+                Exit Function
+            End If
+            dlgTitle = ""
+            If WinOps.HasVisibleHostDialog(dlgTitle) Then
+                root("state") = "break"
+                root("err") = dlgTitle
+                Set root("errorDialog") = DbErrorDialogBlock(dlgTitle)
+                DbObserveUntilBreak = "unhandled_error"
+                Exit Function
+            End If
+        End If
+        If Util.CanPump() Then DoEvents
+        DbBriefWait 40
+    Loop
+    root("state") = GetIdeState()
+End Function
+
+' One observed break: fill the UNIFIED receipt fields and apply the hitCount gate.
+Private Function DbBreakGate(ByRef root As Object, ByRef tr As Object) As String
+    DbBreakGate = "stop"
+    On Error Resume Next
+    Dim posJ As String
+    posJ = DbPositionOrFallback(root)
+    root("state") = "break"
+    root("position") = posJ
+    root("positionSource") = "paneSelection"
+    root("proc") = DbPosField(posJ, "proc")
+    Dim sj As String
+    sj = Vba6Probe.CallstackJson(32)
+    root("callstack") = sj
+    If Len(sj) = 0 Then root("callstackUnavailable") = True
+    Set root("locals") = EmptyJsonArray()
+    root("localsUnavailable") = True
+    root("hitCountTotal") = CLng(root("hitCountTotal")) + 1
+    Dim modName As String
+    modName = DbPosField(posJ, "module")
+    Dim lineN As Long
+    lineN = DbPosLine(posJ)
+    Dim bps As Object
+    Set bps = Nothing
+    If root.Exists("breakpoints") Then
+        If IsObject(root("breakpoints")) Then Set bps = root("breakpoints")
+    End If
+    If Not bps Is Nothing Then
+        Dim i As Long
+        Dim rec As Object
+        Dim tgt As Long
+        For i = 1 To bps.Count
+            Set rec = Nothing
+            If IsObject(bps(i)) Then Set rec = bps(i)
+            If Not rec Is Nothing Then
+                If StrComp(CStr(rec("component")), modName, vbTextCompare) = 0 Then
+                    If CLng(rec("paneLine")) = lineN Or CLng(rec("paneLine")) = lineN - 1 Then
+                        rec("hitCount") = CLng(rec("hitCount")) + 1
+                        tgt = 1
+                        If rec.Exists("hitCountTarget") Then tgt = CLng(rec("hitCountTarget"))
+                        If tgt < 1 Then tgt = 1
+                        If CLng(rec("hitCount")) < tgt Then
+                            root("autoContinues") = CLng(root("autoContinues")) + 1
+                            root("hitCountGateNote") = "the engine has NO conditional breakpoints; the driver auto-continues each hit until the requested hitCount is reached (expression conditions are not supported)"
+                            DbBreakGate = "continue"
+                            Exit Function
+                        End If
+                        Set root("lastBreakpointHit") = rec
+                    End If
+                End If
+            End If
+        Next
+    End If
+    DbAddTranscript tr, "break", posJ, ""
+End Function
+
+Private Function DbErrorDialogBlock(ByVal title As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("present") = True
+    d("title") = title
+    On Error Resume Next
+    Dim body As String
+    body = ""
+    body = WinOps.DialogBodiesText("#32770")
+    If Len(body) > 600 Then body = Left$(body, 600)
+    d("body") = body
+    d("howToFinish") = "read_active_dialogs lists the box and its buttons; close_active_dialogs REFUSES the runtime-error buttons by its safe whitelist (measured: reason=not_on_safe_whitelist), so dismiss it with send_window_message{action:""click"", hwnd:<the 结束/End button hwnd>} (measured working, this call path), then control_execution{end} if the IDE is still in run"
+    Set DbErrorDialogBlock = d
+End Function
+
+Private Function DbPosField(ByVal posJson As String, ByVal key As String) As String
+    On Error Resume Next
+    DbPosField = ""
+    Dim v As Variant
+    If Not JsonParse(posJson, v) Then Exit Function
+    Dim o As Object
+    Set o = v
+    If o Is Nothing Then Exit Function
+    DbPosField = JsonGetStr(o, key, "")
+    Err.Clear
+End Function
+
+Private Function DbPosLine(ByVal posJson As String) As Long
+    On Error Resume Next
+    DbPosLine = 0
+    Dim v As Variant
+    If Not JsonParse(posJson, v) Then Exit Function
+    Dim o As Object
+    Set o = v
+    If o Is Nothing Then Exit Function
+    DbPosLine = JsonGetLong(o, "line", 0)
+    Err.Clear
+End Function
+
+' ---------------------------------------------------------------------
+' breakpoints: set / clear / enable / disable / list / clear_all
+' ---------------------------------------------------------------------
+Private Function BpRegistry() As Object
+    If m_bpSession Is Nothing Then Set m_bpSession = CreateObject("Scripting.Dictionary")
+    Set BpRegistry = m_bpSession
+End Function
+
+Private Function ToolBreakpoints(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "breakpoints"
+    root("ok") = False
+    ' DECLARED SOURCE OF TRUTH (the Lead requirement): never pretend the IDE can be queried.
+    root("sourceDeclaration") = "list[] merges (a) SOURCE-MARKER breakpoints this add-in injected (readable again through list_breakpoints) and (b) NATIVE IDE breakpoints set BY THIS ADD-IN session (tracked in memory only). Native breakpoints set by a HUMAN inside the IDE CANNOT be enumerated or verified: the VBIDE object model exposes no breakpoint API. This limit is reported, never guessed."
+    Dim action As String
+    action = LCase$(Trim$(JsonGetStr(args, "action")))
+    If Len(action) = 0 Then action = "list"
+    root("action") = action
+    root("nativeStateVerified") = False
+    Select Case action
+        Case "list"
+            ToolBreakpoints = BpListJson(root)
+        Case "set"
+            ToolBreakpoints = BpSetJson(args, root)
+        Case "clear"
+            ToolBreakpoints = BpClearJson(args, root)
+        Case "enable"
+            ToolBreakpoints = BpEnableDisableJson(args, root, True)
+        Case "disable"
+            ToolBreakpoints = BpEnableDisableJson(args, root, False)
+        Case "clear_all"
+            ToolBreakpoints = BpClearAllJson(root)
+        Case Else
+            root("reason") = "unknown_action"
+            root("acceptedActions") = "list,set,clear,enable,disable,clear_all"
+            ToolBreakpoints = JsonStringify(root)
+    End Select
+End Function
+
+Private Function BpPaneSha(ByVal comp As String) As String
+    On Error Resume Next
+    BpPaneSha = ""
+    Dim got As Boolean
+    got = False
+    Dim t As String
+    t = PaneTextOfName(comp, got)
+    BpPaneSha = Sha256.Sha256HexTextUtf8(t)
+    Err.Clear
+End Function
+
+Private Function BpNewRecord(ByVal comp As String, ByVal paneLine As Long, ByVal mode As String, ByVal id As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("id") = id
+    d("component") = comp
+    d("paneLine") = paneLine
+    d("mode") = mode
+    d("enabled") = True
+    d("hitCount") = 0
+    d("hits") = 0
+    d("paneShaAtSet") = BpPaneSha(comp)
+    On Error Resume Next
+    Dim cd As Object
+    Set cd = CoordsDictOfName(comp, paneLine, "ide")
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set cd = CreateObject("Scripting.Dictionary")
+    End If
+    Set d("coords") = cd
+    d("diskLine") = paneLine
+    d("diskLineExact") = False
+    d("mappingResolved") = False
+    If Not cd Is Nothing Then
+        If cd.Exists("diskLine") Then d("diskLine") = cd("diskLine")
+        If cd.Exists("diskLineExact") Then d("diskLineExact") = cd("diskLineExact")
+        If cd.Exists("mappingResolved") Then d("mappingResolved") = cd("mappingResolved")
+    End If
+    d("coordsNote") = "paneLine is the line an edit tool takes; diskLine comes from the SAME cumulative pane->disk alignment the edit tools report (coords.mappingResolved=true means exact). While the pane holds edits that are not on disk the alignment can be inexact and diskLineExact=false - the scalar headerOffset fallback is then NOT trusted."
+    Set BpNewRecord = d
+End Function
+
+Private Function BpSetJson(ByVal args As Object, ByRef root As Object) As String
+    Dim comp As String, anchor As String, id As String, mode As String
+    comp = JsonGetStr(args, "component")
+    anchor = JsonGetStr(args, "anchor")
+    id = JsonGetStr(args, "id")
+    mode = LCase$(Trim$(JsonGetStr(args, "mode")))
+    If Len(mode) = 0 Then mode = "injected"
+    root("mode") = mode
+    If Len(comp) = 0 Then
+        root("reason") = "component_required"
+        BpSetJson = JsonStringify(root)
+        Exit Function
+    End If
+    If Len(id) = 0 Then id = "bp-" & CStr(BpRegistry().Count + 1) & "-" & CStr(Int(Timer))
+    root("id") = id
+    Dim hc As Long
+    hc = JsonGetLong(args, "hitCount", 1)
+    If hc < 1 Then hc = 1
+    root("hitCount") = hc
+    Dim rec As Object
+    If mode = "native" Then
+        Dim lineN As Long
+        lineN = JsonGetLong(args, "line", 0)
+        If lineN <= 0 Then
+            root("reason") = "line_required_for_native_mode"
+            BpSetJson = JsonStringify(root)
+            Exit Function
+        End If
+        Dim exists As Object
+        Set exists = BpFindAt(comp, lineN)
+        If Not exists Is Nothing Then
+            root("reason") = "already_set"
+            Set root("existing") = exists
+            root("note") = "a native toggle would REMOVE the breakpoint; call clear first if you meant to replace it"
+            BpSetJson = JsonStringify(root)
+            Exit Function
+        End If
+        Dim bpa As Object
+        Set bpa = CreateObject("Scripting.Dictionary")
+        bpa("action") = "toggle"
+        bpa("component") = comp
+        bpa("line") = lineN
+        Dim rj As String
+        rj = ToolNativeBreakpoint(bpa)
+        root("toggleReceipt") = Left$(rj, 2000)
+        Set rec = BpNewRecord(comp, lineN, "native", id)
+        rec("enabled") = True
+        rec("hitCountTarget") = hc
+        Dim reg As Object
+        Set reg = BpRegistry()
+        reg.Add id, rec
+        Set root("breakpoint") = rec
+        root("nativeStateVerified") = False
+        root("ok") = True
+        BpSetJson = JsonStringify(root)
+        Exit Function
+    End If
+    ' injected (source marker)
+    If Len(anchor) = 0 Then
+        root("reason") = "anchor_required_for_injected_mode"
+        root("hint") = "mode=native takes line=; mode=injected takes anchor=(the source line text to break before)"
+        BpSetJson = JsonStringify(root)
+        Exit Function
+    End If
+    Dim setr As String
+    setr = ToolSetBreakpoint(comp, anchor, id, "")
+    root("setBreakpointReceipt") = Left$(setr, 2000)
+    Dim found As Object
+    Set found = BpFindInjected(id)
+    If found Is Nothing Then
+        root("reason") = "set_breakpoint_failed"
+        BpSetJson = JsonStringify(root)
+        Exit Function
+    End If
+    Dim paneLine As Long
+    paneLine = JsonGetLong(found, "line", 0)
+    Set rec = BpNewRecord(comp, paneLine, "injected", id)
+    rec("markerLine") = JsonGetLong(found, "markerLine", 0)
+    rec("hitCountTarget") = hc
+    Dim reg2 As Object
+    Set reg2 = BpRegistry()
+    reg2.Add id, rec
+    Set root("breakpoint") = rec
+    root("ok") = True
+    BpSetJson = JsonStringify(root)
+End Function
+
+Private Function BpListJson(ByRef root As Object) As String
+    Dim out As Object
+    Set out = New Collection
+    Dim i As Long
+    Dim reg As Object
+    Set reg = BpRegistry()
+    Dim k As Variant
+    For Each k In reg.Keys
+        Dim rec As Object
+        Set rec = reg(k)
+        rec("paneShaNow") = BpPaneSha(CStr(rec("component")))
+        rec("stale") = (Len(CStr(rec("paneShaAtSet"))) > 0 And StrComp(CStr(rec("paneShaAtSet")), CStr(rec("paneShaNow")), vbTextCompare) <> 0)
+        out.Add rec
+    Next
+    ' merge the injected markers that outlived this session (or were set by set_breakpoint)
+    Dim inj As Object
+    Set inj = BpInjectedList()
+    Dim j As Long
+    For j = 1 To inj.Count
+        Dim e As Object
+        Set e = inj(j)
+        Dim eid As String
+        eid = JsonGetStr(e, "id", "")
+        If Len(eid) > 0 Then
+            If Not reg.Exists(eid) Then
+                Dim r2 As Object
+                Set r2 = BpNewRecord(JsonGetStr(e, "component", ""), JsonGetLong(e, "line", 0), "injected", eid)
+                r2("markerLine") = JsonGetLong(e, "markerLine", 0)
+                r2("enabled") = JsonGetBool(e, "enabled", True)
+                r2("session") = False
+                out.Add r2
+            End If
+        End If
+    Next
+    root("ok") = True
+    root("count") = out.Count
+    Set root("list") = out
+    BpListJson = JsonStringify(root)
+End Function
+
+Private Function BpInjectedList() As Object
+    On Error Resume Next
+    Dim out As Object
+    Set out = New Collection
+    Dim rj As String
+    rj = ToolListBreakpoints()
+    Dim v As Variant
+    If Not JsonParse(rj, v) Then Set BpInjectedList = out : Exit Function
+    Dim d As Object
+    Set d = v
+    If d Is Nothing Then Set BpInjectedList = out : Exit Function
+    If Not d.Exists("injected") Then Set BpInjectedList = out : Exit Function
+    ' JsonLib parses an array into a Collection that is STORED with Set; reading it back
+    ' therefore needs Set as well (a plain Variant assignment raises and would look empty).
+    Dim arr As Object
+    Set arr = d("injected")
+    If arr Is Nothing Then Set BpInjectedList = out : Exit Function
+    Dim e As Variant
+    For Each e In arr
+        If IsObject(e) Then out.Add e
+    Next
+    Set BpInjectedList = out
+End Function
+
+Private Function BpRecOf(ByVal id As String) As Object
+    Set BpRecOf = Nothing
+    If Len(id) = 0 Then Exit Function
+    Dim reg As Object
+    Set reg = BpRegistry()
+    If reg.Exists(id) Then Set BpRecOf = reg(id)
+End Function
+
+Private Function BpFindInjected(ByVal id As String) As Object
+    Set BpFindInjected = Nothing
+    Dim inj As Object
+    Set inj = BpInjectedList()
+    Dim i As Long
+    For i = 1 To inj.Count
+        Dim e As Object
+        Set e = inj(i)
+        If StrComp(JsonGetStr(e, "id", ""), id, vbTextCompare) = 0 Then
+            Set BpFindInjected = e
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function BpFindAt(ByVal comp As String, ByVal paneLine As Long) As Object
+    Set BpFindAt = Nothing
+    Dim reg As Object
+    Set reg = BpRegistry()
+    Dim k As Variant
+    For Each k In reg.Keys
+        Dim rec As Object
+        Set rec = reg(k)
+        If StrComp(CStr(rec("component")), comp, vbTextCompare) = 0 Then
+            If CLng(rec("paneLine")) = paneLine Then
+                Set BpFindAt = rec
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+Private Function BpClearJson(ByVal args As Object, ByRef root As Object) As String
+    Dim id As String, comp As String
+    id = JsonGetStr(args, "id")
+    comp = JsonGetStr(args, "component")
+    Dim lineN As Long
+    lineN = JsonGetLong(args, "line", 0)
+    Dim rec As Object
+    Set rec = BpRecOf(id)
+    If rec Is Nothing Then
+        If Len(id) > 0 Then
+            ' an injected marker from an earlier session is still clearable by id, but its
+            ' component must come from the marker itself (never from a guess)
+            Dim injOne As Object
+            Set injOne = BpFindInjected(id)
+            If Not injOne Is Nothing Then
+                Dim rj0 As String
+                rj0 = ToolClearBreakpoints(JsonGetStr(injOne, "component", ""), id, "")
+                root("clearBreakpointReceipt") = Left$(rj0, 1500)
+                root("ok") = InStr(1, rj0, """ok"":true", vbTextCompare) > 0
+                BpClearJson = JsonStringify(root)
+                Exit Function
+            End If
+        ElseIf lineN > 0 Then
+            Set rec = BpFindAt(comp, lineN)
+        End If
+    End If
+    If rec Is Nothing Then
+        root("reason") = "breakpoint_not_found"
+        root("note") = "pass id= (set earlier) or component= + line=; native breakpoints set by a human cannot be found (no breakpoint API)"
+        BpClearJson = JsonStringify(root)
+        Exit Function
+    End If
+    Dim out As String
+    Dim recd As Object
+    Set recd = CreateObject("Scripting.Dictionary")
+    recd("id") = rec("id")
+    recd("component") = rec("component")
+    recd("paneLine") = rec("paneLine")
+    recd("mode") = rec("mode")
+    If StrComp(CStr(rec("mode")), "native", vbTextCompare) = 0 Then
+        Dim bpa As Object
+        Set bpa = CreateObject("Scripting.Dictionary")
+        bpa("action") = "toggle"
+        bpa("component") = rec("component")
+        bpa("line") = rec("paneLine")
+        out = ToolNativeBreakpoint(bpa)
+        root("toggleReceipt") = Left$(out, 1500)
+    Else
+        out = ToolClearBreakpoints(CStr(rec("component")), CStr(rec("id")), "")
+        root("clearBreakpointReceipt") = Left$(out, 1500)
+    End If
+    Dim reg3 As Object
+    Set reg3 = BpRegistry()
+    If reg3.Exists(CStr(rec("id"))) Then reg3.Remove CStr(rec("id"))
+    Set root("cleared") = recd
+    root("ok") = True
+    BpClearJson = JsonStringify(root)
+End Function
+
+Private Function BpEnableDisableJson(ByVal args As Object, ByRef root As Object, ByVal enable As Boolean) As String
+    root("enable") = enable
+    Dim id As String, comp As String
+    id = JsonGetStr(args, "id")
+    comp = JsonGetStr(args, "component")
+    Dim rec As Object
+    Set rec = BpRecOf(id)
+    If rec Is Nothing Then
+        root("reason") = "breakpoint_not_found_in_session"
+        root("note") = "enable/disable acts on a breakpoint SET BY THIS TOOL in this IDE session (id=); native on/off state cannot be read back from the IDE"
+        BpEnableDisableJson = JsonStringify(root)
+        Exit Function
+    End If
+    root("id") = id
+    root("component") = rec("component")
+    root("paneLine") = rec("paneLine")
+    If StrComp(CStr(rec("mode")), "injected", vbTextCompare) = 0 Then
+        Dim rj As String
+        rj = BpToggleInjected(CStr(rec("component")), CStr(rec("id")), enable)
+        root("injectedToggleReceipt") = Left$(rj, 1500)
+        Dim changed As Boolean
+        changed = False
+        Dim v As Variant
+        If JsonParse(rj, v) Then
+            Dim d As Object
+            Set d = v
+            If Not d Is Nothing Then changed = JsonGetBool(d, "changed", False)
+        End If
+        If changed Then rec("enabled") = enable
+        root("changed") = changed
+        root("ok") = changed
+        BpEnableDisableJson = JsonStringify(root)
+        Exit Function
+    End If
+    ' native: the IDE cannot be queried, so the ONLY honest enable/disable is a caret-based toggle
+    ' driven by the session record, and the receipt says the state was not verified.
+    Dim cur As Boolean
+    cur = CBool(rec("enabled"))
+    If cur = enable Then
+        root("ok") = True
+        root("changed") = False
+        root("note") = "the session record already says this native breakpoint is " & IIf(enable, "ENABLED", "DISABLED") & "; nothing was sent (the IDE cannot confirm it either way)"
+        BpEnableDisableJson = JsonStringify(root)
+        Exit Function
+    End If
+    Dim bpa2 As Object
+    Set bpa2 = CreateObject("Scripting.Dictionary")
+    bpa2("action") = "toggle"
+    bpa2("component") = rec("component")
+    bpa2("line") = rec("paneLine")
+    Dim rj2 As String
+    rj2 = ToolNativeBreakpoint(bpa2)
+    root("toggleReceipt") = Left$(rj2, 1500)
+    rec("enabled") = enable
+    root("changed") = True
+    root("nativeStateVerified") = False
+    root("ok") = True
+    BpEnableDisableJson = JsonStringify(root)
+End Function
+
+' enable/disable an INJECTED marker by commenting/uncommenting its assert line (line count and
+' the marker block are preserved byte-for-byte apart from that one line).
+Private Function BpToggleInjected(ByVal comp As String, ByVal id As String, ByVal enable As Boolean) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("component") = comp
+    root("id") = id
+    root("enable") = enable
+    root("ok") = False
+    On Error GoTo BP_ERR
+    Dim got As Boolean
+    got = False
+    Dim txt As String
+    txt = PaneTextOfName(comp, got)
+    If Len(txt) = 0 Then
+        root("reason") = "component_not_found"
+        BpToggleInjected = JsonStringify(root)
+        Exit Function
+    End If
+    Dim arr() As String
+    arr = Split(txt, vbCrLf)
+    Dim beginMark As String
+    Dim endMark As String
+    beginMark = "' @mcp-break " & id & " begin"
+    endMark = "' @mcp-break " & id & " end"
+    Dim i As Long
+    Dim bIdx As Long
+    Dim eIdx As Long
+    bIdx = -1
+    eIdx = -1
+    For i = 0 To UBound(arr)
+        If InStr(1, arr(i), beginMark, vbTextCompare) > 0 Then bIdx = i
+        If InStr(1, arr(i), endMark, vbTextCompare) > 0 Then eIdx = i
+    Next
+    If bIdx < 0 Or eIdx <= bIdx Then
+        root("reason") = "marker_block_not_found"
+        BpToggleInjected = JsonStringify(root)
+        Exit Function
+    End If
+    Dim tIdx As Long
+    tIdx = -1
+    Dim t As String
+    For i = bIdx + 1 To eIdx - 1
+        t = Trim$(arr(i))
+        If StrComp(t, "Debug.Assert False", vbTextCompare) = 0 Then tIdx = i
+        If StrComp(t, "'Debug.Assert False", vbTextCompare) = 0 Then tIdx = i
+    Next
+    If tIdx < 0 Then
+        root("reason") = "assert_line_not_found"
+        BpToggleInjected = JsonStringify(root)
+        Exit Function
+    End If
+    Dim cur As String
+    cur = Trim$(arr(tIdx))
+    If enable Then
+        If StrComp(cur, "'Debug.Assert False", vbTextCompare) = 0 Then arr(tIdx) = "    Debug.Assert False"
+    Else
+        If StrComp(cur, "Debug.Assert False", vbTextCompare) = 0 Then arr(tIdx) = "    'Debug.Assert False"
+    End If
+    Dim after As String
+    after = Join(arr, vbCrLf)
+    Dim changed As Boolean
+    changed = (StrComp(txt, after, vbTextCompare) <> 0)
+    root("changed") = changed
+    root("assertLine") = tIdx + 1
+    If changed Then
+        Dim wc As Long
+        wc = SetCompTextMinimal(comp, txt, after)
+        root("writeCalls") = wc
+        Dim flush As String
+        flush = ToolSaveProject("")
+        root("flushReceipt") = Left$(flush, 800)
+        root("paneSha256After") = Sha256.Sha256HexTextUtf8(PaneTextOfName(comp, got))
+    End If
+    root("ok") = changed
+    BpToggleInjected = JsonStringify(root)
+    Exit Function
+BP_ERR:
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    BpToggleInjected = JsonStringify(root)
+End Function
+
+Private Function BpClearAllJson(ByRef root As Object) As String
+    Dim bpc As Object
+    Set bpc = CreateObject("Scripting.Dictionary")
+    bpc("action") = "clear_all"
+    Dim rj As String
+    rj = ToolNativeBreakpoint(bpc)
+    root("nativeClearAllReceipt") = Left$(rj, 1500)
+    Dim inj As Object
+    Set inj = BpInjectedList()
+    Dim cleared As Object
+    Set cleared = New Collection
+    Dim i As Long
+    For i = 1 To inj.Count
+        Dim e As Object
+        Set e = inj(i)
+        Dim eid As String, ecomp As String
+        eid = JsonGetStr(e, "id", "")
+        ecomp = JsonGetStr(e, "component", "")
+        If Len(eid) > 0 And Len(ecomp) > 0 Then
+            Dim r2 As String
+            r2 = ToolClearBreakpoints(ecomp, eid, "")
+            cleared.Add eid
+        End If
+    Next
+    Set m_bpSession = Nothing
+    root("ok") = True
+    Set root("clearedInjected") = cleared
+    root("clearedCount") = cleared.Count
+    BpClearAllJson = JsonStringify(root)
+End Function
+
+' =====================================================================
+' W-H2: get_locals / eval_at_frame / shallow inspection / watch
+' =====================================================================
+
+Private Function ToolGetLocals(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "get_locals"
+    root("ok") = False
+    root("localsAvailable") = False
+    root("localsUnavailable") = False
+    root("localsUnavailableReason") = ""
+    root("localsSource") = "SOURCE-DECLARED NAMES (current procedure: parameter list + Dim/Static declarations in its body) + VALUES read in the IDE immediate context, which in BREAK mode is the IDE's own current (innermost) call frame. No engine-internal frame call is made (measured: the frame-set thunk terminated the IDE). Names are never invented; values are never guessed."
+    root("depthLimit") = 2
+    root("widthLimit") = 20
+    Dim fi As Long
+    fi = JsonGetLong(args, "frame_index", 0)
+    root("frameIndex") = fi
+    On Error GoTo GL_ERR
+    Dim st As String
+    st = GetIdeState()
+    root("state") = st
+    If st <> "break" Then
+        root("localsUnavailable") = True
+        root("localsUnavailableReason") = "not_in_break: get_locals reads a LIVE call frame; break first (set a breakpoint and run_until_break)"
+        root("position") = DbPositionOrFallback(root)
+        root("positionSource") = "none"
+        root("callstack") = ""
+        ToolGetLocals = JsonStringify(root)
+        Exit Function
+    End If
+    Dim posJ As String
+    posJ = ToolCurrentPosition()
+    root("position") = posJ
+    root("positionSource") = "paneSelection"
+    root("proc") = DbPosField(posJ, "proc")
+    root("module") = DbPosField(posJ, "module")
+    root("line") = DbPosLine(posJ)
+    root("callstack") = Vba6Probe.CallstackJson(32)
+    Dim diag As Object
+    Set diag = CreateObject("Scripting.Dictionary")
+    Dim ctxErr As String
+    ctxErr = Wh2FrameContext(fi, diag)
+    If Len(ctxErr) > 0 Then
+        root("localsUnavailable") = True
+        root("localsUnavailableReason") = ctxErr
+        root("frameBinding") = "ideImmediateContext"
+        Set root("diagnostics") = diag
+        ToolGetLocals = JsonStringify(root)
+        Exit Function
+    End If
+    root("frameBinding") = "ideImmediateContext"
+    root("contextAvailable") = True
+    Dim vars As Object
+    Set vars = Wh2SourceVars(CStr(root("module")), CStr(root("proc")), root)
+    root("sourceVarsCount") = vars.Count
+    Set m_lastLocalNames = New Collection
+    Dim vi As Long
+    For vi = 1 To vars.Count
+        m_lastLocalNames.Add CStr(vars(vi)("name"))
+    Next
+    root("namesAllowList") = "the names below are the ONLY identifiers transcript[].watch will evaluate (unknown names are refused, not evaluated - an unknown identifier can hang the in-flight call)"
+    root("valueContext") = "ideImmediateContext: values are read from the IDE immediate context, which is NOT the break frame (measured: a*2 read 0 while a had been assigned 7) - treat every value as unverified; the NAMES are the reliable part"
+    ' a bounded gate backstop for the value reads
+    ArmGateRelease "get_locals", 8000
+    root("gateArmedMs") = 8000
+    Dim out As Object
+    Set out = New Collection
+    Dim i As Long
+    Dim v As Object
+    Dim rec As Object
+    Dim okAny As Boolean
+    okAny = False
+    For i = 1 To vars.Count
+        Set v = vars(i)
+        Set rec = Wh2ValueShape(CStr(v("name")), fi, diag)
+        rec("kind") = v("kind")
+        rec("declaredType") = v("declaredType")
+        If v.Exists("paneLine") Then rec("paneLine") = v("paneLine")
+        If v.Exists("paneLineSpace") Then rec("paneLineSpace") = v("paneLineSpace")
+        If v.Exists("nameSource") Then rec("nameSource") = v("nameSource")
+        If rec.Exists("error") Then
+            rec("valueRead") = False
+        ElseIf Len(CStr(rec("value"))) = 0 Then
+            If StrComp(CStr(rec("typeName")), "Empty", vbTextCompare) = 0 Then
+                rec("valueRead") = False
+                rec("valueUnavailable") = True
+                rec("note") = "the IDE immediate context returned no value for this name (it is NOT the break frame - measured); the NAME is still valid"
+            Else
+                rec("valueRead") = True
+                okAny = True
+            End If
+        Else
+            rec("valueRead") = True
+            okAny = True
+        End If
+        rec("valueTrust") = "unverified (ideImmediateContext is not the break frame)"
+        out.Add rec
+    Next
+    root("localsCount") = out.Count
+    Set root("locals") = out
+    Set root("diagnostics") = diag
+    If out.Count = 0 Then
+        root("localsUnavailable") = True
+        root("localsUnavailableReason") = "no_declared_locals: the current procedure declares no parameters and no Dim/Static locals"
+    ElseIf Not okAny Then
+        root("localsUnavailable") = True
+        root("localsUnavailableReason") = "values_unreadable: the NAMES above are the correct source declarations (sourceVarsCount>0); the VALUES are unavailable because the IDE immediate context is not the break frame (measured). This is a declared limitation, not a failure of the name scan."
+    End If
+    root("localsAvailable") = okAny
+    root("ok") = okAny
+    DisarmGateRelease
+    root("gateReleased") = True
+    root("releaseNote") = "ArmGateRelease(get_locals, 8000) was armed for the value reads and disarmed on return; if a value read ever hangs, ide_state{release_inflight:true} frees the single-flight gate"
+    ToolGetLocals = JsonStringify(root)
+    Exit Function
+GL_ERR:
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    root("localsUnavailable") = True
+    root("localsUnavailableReason") = "unexpected_error: " & Err.Description
+    ToolGetLocals = JsonStringify(root)
+End Function
+
+Private Function ToolEvalAtFrame(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "eval_at_frame"
+    root("ok") = False
+    root("stopped_at") = ""
+    root("frameBinding") = "ideImmediateContext"
+    root("frameBindingNote") = "the IDE immediate context is NOT the break frame (measured: a*2 read 0 while a had been assigned 7); frame binding via the engine thunk is FORBIDDEN because it terminated the VB6 process (measured)"
+    root("depthLimit") = 2
+    root("widthLimit") = 20
+    root("howToRecover") = "if this call hangs: ide_state{release_inflight:true, release_min_held_ms:30000} frees the single-flight gate; if the IDE process itself is wedged, restart it (a debug-time evaluation does not change the project on disk)"
+    Dim expr As String
+    expr = JsonGetStr(args, "expr")
+    root("expr") = expr
+    Dim fi As Long
+    fi = JsonGetLong(args, "frame_index", 0)
+    root("frameIndex") = fi
+    Dim allowUnsafe As Boolean
+    allowUnsafe = JsonGetBool(args, "allowUnsafeEval", False)
+    root("allowUnsafeEval") = allowUnsafe
+    Dim timeoutMs As Long
+    timeoutMs = JsonGetLong(args, "timeoutMs", 0)
+    If timeoutMs <= 0 Then timeoutMs = JsonGetLong(args, "timeout_ms", 5000)
+    If timeoutMs < 1000 Then timeoutMs = 1000
+    If timeoutMs > 60000 Then timeoutMs = 60000
+    root("timeoutMs") = timeoutMs
+    root("callerBudgetMs") = timeoutMs
+    root("budgetNote") = "timeoutMs is a CALLER BUDGET HINT: the add-in cannot preempt an executing VB statement. If this call does not return within the budget, stop waiting and use howToRecover (ide_state{release_inflight:true, release_min_held_ms:5000}, restart the IDE if needed). The internal ArmGateRelease is armed for the budget + slack regardless."
+    On Error GoTo EF_ERR
+    If Len(expr) = 0 Then
+        root("reason") = "expr_required"
+        ToolEvalAtFrame = JsonStringify(root)
+        Exit Function
+    End If
+    Dim objProblem2 As String
+    objProblem2 = ImObjectExprProblem(expr)
+    If Len(objProblem2) > 0 Then
+        root("stopped_at") = "refused"
+        root("reason") = "object_expression_unsupported"
+        root("rejectedToken") = objProblem2
+        root("error") = "object/array EXPRESSIONS are not supported by the immediate channel (measured: a plain object assignment hangs the call). Assign the object to a PROJECT variable first and read scalar members, or evaluate a scalar expression."
+        root("howToUnblock") = "no unblock exists for object/array expressions; use a project variable + scalar member reads"
+        ToolEvalAtFrame = JsonStringify(root)
+        Exit Function
+    End If
+    If fi <> 0 Then
+        root("stopped_at") = "frame_binding_forbidden"
+        root("reason") = "frame_binding_forbidden"
+        root("error") = "OUTER frame_index is not supported: reaching another frame needs the VBA6 frame-set thunk, which is FORBIDDEN because it terminated the VB6 process (measured). Only frame 0 (the IDE current frame) is available, and even that is the immediate context, not the break frame."
+        ToolEvalAtFrame = JsonStringify(root)
+        Exit Function
+    End If
+    Dim st As String
+    st = GetIdeState()
+    root("state") = st
+    Dim safeCtx As Boolean
+    safeCtx = (st = "design")
+    root("safeContext") = safeCtx
+    If Not safeCtx Then
+        If Not allowUnsafe Then
+            root("stopped_at") = "refused"
+            root("reason") = "eval_in_break_unsafe"
+            root("error") = "evaluation in state '" & st & "' is REFUSED by default: the immediate context is not the break frame and a raising expression can hang the in-flight call (measured)"
+            root("howToUnblock") = "pass allowUnsafeEval:true (the call is then wrapped in ArmGateRelease(timeout_ms, default 5000) and the receipt proves gateReleased), or evaluate in DESIGN where the immediate context is safe"
+            ToolEvalAtFrame = JsonStringify(root)
+            Exit Function
+        End If
+    End If
+    ' ALWAYS arm the backstop: even a DESIGN-mode immediate_eval hung in a measured run
+    ' (Array(1,2,3)), so no state is assumed safe; the gate lets the next read-only call
+    ' force-release a call that never returns.
+    ArmGateRelease "eval_at_frame", timeoutMs + 2000
+    root("gateArmedMs") = timeoutMs + 2000
+    Dim posJ As String
+    posJ = ToolCurrentPosition()
+    root("position") = posJ
+    root("positionSource") = "paneSelection"
+    root("proc") = DbPosField(posJ, "proc")
+    root("module") = DbPosField(posJ, "module")
+    Dim diag As Object
+    Set diag = CreateObject("Scripting.Dictionary")
+    diag("frameBinding") = "ideImmediateContext"
+    Dim ev As Object
+    Set ev = Wh2EvalRaw(expr)
+    If Not ev Is Nothing Then Set root("immediate") = ev
+    Dim parsed As Boolean
+    parsed = False
+    If Not ev Is Nothing Then
+        If ev.Exists("valueParsed") Then parsed = CBool(ev("valueParsed"))
+    End If
+    If parsed Then
+        root("ok") = True
+        root("value") = ev("value")
+        root("typeName") = ev("typeName")
+        root("output") = ev("output")
+        root("outputTrimmed") = ev("outputTrimmed")
+    Else
+        root("stopped_at") = "eval"
+        If ev Is Nothing Then
+            root("error") = "immediate_eval returned nothing"
+        Else
+            root("error") = Left$(CStr(ev("outputTrimmed")), 600)
+            If Len(CStr(root("error"))) = 0 Then root("error") = "no value parsed (ret=" & CStr(ev("ret")) & ", execAnswered=" & CStr(ev("execAnswered")) & ")"
+        End If
+    End If
+    If safeCtx Or allowUnsafe Then
+        Dim tnRoot As String
+        tnRoot = ""
+        If Not ev Is Nothing Then
+            If ev.Exists("typeName") Then tnRoot = CStr(ev("typeName"))
+        End If
+        Set root("inspect") = Wh2Inspect(expr, fi, diag, tnRoot)
+    Else
+        root("inspectSkipped") = "inspection only runs in a safe context (design or allowUnsafeEval)"
+    End If
+    Set root("diagnostics") = diag
+    root("ideStillAnswering") = (Len(GetIdeState()) > 0)
+    root("ideStateAfter") = GetIdeState()
+    DisarmGateRelease
+    root("gateReleased") = True
+    root("releaseNote") = "ArmGateRelease(eval_at_frame) was armed for the evaluation and disarmed on return; a hung call is force-released by the next read-only call (ide_state{release_inflight:true, release_min_held_ms:...})"
+    ToolEvalAtFrame = JsonStringify(root)
+    Exit Function
+EF_ERR:
+    On Error Resume Next
+    DisarmGateRelease
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    root("stopped_at") = "eval"
+    ToolEvalAtFrame = JsonStringify(root)
+End Function
+
+ ' The evaluation CONTEXT used by get_locals / eval_at_frame.
+ ' MEASURED (2026-10-20, live): calling the engine's internal frame-set thunk from a routine
+ ' tool TERMINATED the VB6 process mid-call. A tool that can kill the host is not acceptable,
+ ' so this code NEVER calls the thunk: in BREAK mode the IDE immediate context ALREADY evaluates
+ ' in the current (innermost) frame, which is frame 0. An OUTER frame_index is refused with the
+ ' reason instead of being attempted.
+Private Function Wh2FrameContext(ByVal frameIndex As Long, ByRef diag As Object) As String
+    Wh2FrameContext = ""
+    diag("frameBinding") = "ideImmediateContext (the IDE's own current frame; NO engine-internal frame call is made)"
+    diag("frameBindingNote") = "the VBA6 frame-set thunk is deliberately NOT used: it terminated the IDE in a measured run. Use vba6_probe{frame_set:true} explicitly if you accept that risk."
+    If frameIndex <> 0 Then
+        Wh2FrameContext = "frame_index " & CStr(frameIndex) & " is an OUTER frame: reaching it needs the engine-internal frame-set call, which is refused here because it can terminate the IDE (measured). Only frame 0 (the IDE's current frame) is available."
+        Exit Function
+    End If
+    If GetIdeState() <> "break" Then Wh2FrameContext = "not_in_break"
+End Function
+
+' The immediate_eval receipt as an object (nothing is assumed about its shape beyond the documented keys).
+Private Function Wh2EvalRaw(ByVal expr As String) As Object
+    On Error Resume Next
+    Set Wh2EvalRaw = Nothing
+    Dim rj As String
+    rj = ToolImmediateEval(expr, "", 5000)
+    If Len(rj) = 0 Then Exit Function
+    Dim v As Variant
+    If Not JsonParse(rj, v) Then Exit Function
+    Dim d As Object
+    Set d = v
+    Set Wh2EvalRaw = d
+    Err.Clear
+End Function
+
+' Convenience: the CStr of an expression, or "" when it could not be read.
+Private Function Wh2EvalStr(ByVal expr As String, ByVal frameIndex As Long) As String
+    On Error Resume Next
+    Wh2EvalStr = ""
+    Dim d As Object
+    Set d = Wh2EvalRaw(expr)
+    If d Is Nothing Then Exit Function
+    If d.Exists("outputTrimmed") Then Wh2EvalStr = CStr(d("outputTrimmed"))
+    If Len(Wh2EvalStr) = 0 Then
+        If d.Exists("value") Then Wh2EvalStr = CStr(d("value"))
+    End If
+    Err.Clear
+End Function
+
+' ONE per-value shape shared by get_locals and transcript[].watch.
+Private Function Wh2ValueShape(ByVal expr As String, ByVal frameIndex As Long, ByRef diag As Object) As Object
+    Dim rec As Object
+    Set rec = CreateObject("Scripting.Dictionary")
+    rec("expr") = expr
+    On Error Resume Next
+    Dim d As Object
+    Set d = Wh2EvalRaw(expr)
+    Dim parsed As Boolean
+    parsed = False
+    If Not d Is Nothing Then
+        If d.Exists("valueParsed") Then parsed = CBool(d("valueParsed"))
+    End If
+    If parsed Then
+        rec("value") = d("value")
+        Dim tnv As String
+        tnv = ""
+        If d.Exists("typeName") Then tnv = CStr(d("typeName"))
+        rec("typeName") = tnv
+        Set rec("inspect") = Wh2Inspect(expr, frameIndex, diag, tnv)
+    Else
+        If d Is Nothing Then
+            rec("error") = "immediate_eval returned nothing"
+        Else
+            Dim em As String
+            em = ""
+            If d.Exists("outputTrimmed") Then em = CStr(d("outputTrimmed"))
+            If Len(em) = 0 Then em = "no value parsed (ret=" & CStr(d("ret")) & ")"
+            rec("error") = Left$(em, 400)
+        End If
+    End If
+    Err.Clear
+    Set Wh2ValueShape = rec
+End Function
+
+ ' Shallow inspection with EXPLICIT limits (depth 2 / width 20) and ObjPtr cycle detection.
+ ' knownType is the TypeName the caller ALREADY has from the immediate_eval wrapper, so a scalar
+ ' value costs ZERO extra IDE evaluations (the first live run was slow because it did 3 per var).
+Private Function Wh2Inspect(ByVal expr As String, ByVal frameIndex As Long, ByRef diag As Object, _
+                            ByVal knownType As String) As Object
+    Dim seen As Object
+    Set seen = New Collection
+    Set Wh2Inspect = Wh2InspectNode(expr, frameIndex, diag, 1, seen, knownType)
+End Function
+
+' The VB6 scalar type names: none of these needs object probing.
+Private Function Wh2IsScalarType(ByVal tn As String) As Boolean
+    Dim t As String
+    t = LCase$(Trim$(tn))
+    Wh2IsScalarType = False
+    If Len(t) = 0 Then Exit Function
+    If InStr(1, t, "()", vbTextCompare) > 0 Then Exit Function
+    Select Case t
+        Case "byte", "boolean", "integer", "long", "single", "double", "currency", "date", "string", "variant", "empty", "null"
+            Wh2IsScalarType = True
+    End Select
+End Function
+
+ ' (wrapper above) - knownType avoids a redundant TypeName evaluation at the top level
+Private Function Wh2InspectNode(ByVal expr As String, ByVal frameIndex As Long, ByRef diag As Object, _
+                                ByVal level As Long, ByRef seen As Object, ByVal knownType As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("depthLimit") = 2
+    d("widthLimit") = 20
+    d("truncatedDepth") = False
+    d("truncatedWidth") = False
+    d("cycleDetected") = False
+    Dim seedItems As Object
+    Set seedItems = New Collection
+    Set d("items") = seedItems
+    On Error Resume Next
+    Dim tn As String
+    tn = ""
+    If Len(knownType) > 0 Then tn = knownType
+    If Len(tn) = 0 Then tn = Wh2EvalStr("TypeName(" & expr & ")", frameIndex)
+    d("typeName") = tn
+    If Wh2IsScalarType(tn) Then
+        d("kind") = "scalar"
+        d("isObject") = False
+        d("note") = "scalar: no object probing, no extra evaluation"
+        Set Wh2InspectNode = d
+        Exit Function
+    End If
+    If InStr(1, tn, "()", vbTextCompare) > 0 Then
+        d("kind") = "array"
+        Dim lb As Long
+        Dim ub As Long
+        lb = CLng(Val(Wh2EvalStr("LBound(" & expr & ")", frameIndex)))
+        ub = CLng(Val(Wh2EvalStr("UBound(" & expr & ")", frameIndex)))
+        d("lowerBound") = lb
+        d("upperBound") = ub
+        Dim cnt As Long
+        cnt = 0
+        If ub >= lb Then cnt = ub - lb + 1
+        d("count") = cnt
+        Dim n As Long
+        n = cnt
+        If n > 20 Then
+            n = 20
+            d("truncatedWidth") = True
+        End If
+        Dim items As Object
+        Set items = New Collection
+        Dim i As Long
+        For i = lb To lb + n - 1
+            If level >= 2 Then
+                Dim leaf As Object
+                Set leaf = Wh2InspectNode(expr & "(" & CStr(i) & ")", frameIndex, diag, level + 1, seen, "")
+                leaf("index") = i
+                items.Add leaf
+            Else
+                Dim s As String
+                s = Wh2EvalStr("CStr(" & expr & "(" & CStr(i) & "))", frameIndex)
+                Dim it As Object
+                Set it = CreateObject("Scripting.Dictionary")
+                it("index") = i
+                it("value") = s
+                items.Add it
+            End If
+        Next
+        Set d("items") = items
+    ElseIf StrComp(tn, "Dictionary", vbTextCompare) = 0 Then
+        d("kind") = "dictionary"
+        Dim dcnt As Long
+        dcnt = CLng(Val(Wh2EvalStr(expr & ".Count", frameIndex)))
+        d("count") = dcnt
+        Dim dn As Long
+        dn = dcnt
+        If dn > 20 Then
+            dn = 20
+            d("truncatedWidth") = True
+        End If
+        Dim ditems As Object
+        Set ditems = New Collection
+        Dim j As Long
+        For j = 0 To dn - 1
+            Dim pair As Object
+            Set pair = CreateObject("Scripting.Dictionary")
+            pair("key") = Wh2EvalStr("CStr(" & expr & ".Keys()(" & CStr(j) & "))", frameIndex)
+            If level >= 2 Then
+                pair("value") = Wh2EvalStr("TypeName(" & expr & ".Items()(" & CStr(j) & "))", frameIndex)
+                pair("valueKind") = "typeOnly (depth limit reached)"
+                d("truncatedDepth") = True
+            Else
+                pair("value") = Wh2EvalStr("CStr(" & expr & ".Items()(" & CStr(j) & "))", frameIndex)
+            End If
+            ditems.Add pair
+        Next
+        Set d("items") = ditems
+    ElseIf Not Wh2IsScalarType(tn) Then
+        d("kind") = "customObject"
+        d("fieldsUnavailable") = True
+        ' identity for cycle detection; VB6 has NO reflection, so fields cannot be enumerated
+        Dim ptr As String
+        ptr = Wh2EvalStr("ObjPtr(" & expr & ")", frameIndex)
+        d("objPtr") = ptr
+        If Len(ptr) > 0 Then
+            Dim k As Variant
+            For Each k In seen
+                If StrComp(CStr(k), ptr, vbTextCompare) = 0 Then d("cycleDetected") = True
+            Next
+            If Not CBool(d("cycleDetected")) Then seen.Add ptr
+        End If
+        d("note") = "VB6 has no reflection: a custom class exposes only its TypeName and ObjPtr; fields are NOT guessed"
+    Else
+        d("kind") = "scalar"
+        Dim sv As String
+        sv = Wh2EvalStr("CStr(" & expr & ")", frameIndex)
+        d("value") = sv
+    End If
+    Err.Clear
+    Set Wh2InspectNode = d
+End Function
+
+' ---- source-side variable names (never invented) ----
+Private Function Wh2SourceVars(ByVal moduleName As String, ByVal procName As String, ByRef root As Object) As Object
+    Dim out As Object
+    Set out = New Collection
+    On Error Resume Next
+    Dim scan As Object
+    Set scan = CreateObject("Scripting.Dictionary")
+    scan("module") = moduleName
+    scan("proc") = procName
+    Set root("sourceScan") = scan
+    If Len(moduleName) = 0 Then
+        scan("reason") = "module_name_empty"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    If Len(procName) = 0 Then
+        scan("reason") = "proc_name_empty"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    Dim vbp As VBIDE.VBProject
+    Set vbp = GetProject()
+    If vbp Is Nothing Then
+        scan("reason") = "no_project"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    Dim comp As VBIDE.VBComponent
+    Err.Clear
+    Set comp = vbp.VBComponents.Item(moduleName)
+    If Err.Number <> 0 Then
+        scan("reason") = "component_not_found: " & Err.Description
+        Err.Clear
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    If comp Is Nothing Then
+        scan("reason") = "component_not_found: VBComponents.Item returned Nothing"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    scan("component") = comp.Name
+    Dim cm As VBIDE.CodeModule
+    Err.Clear
+    Set cm = comp.CodeModule
+    If Err.Number <> 0 Then
+        scan("reason") = "code_module_error: " & Err.Description
+        Err.Clear
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    If cm Is Nothing Then
+        scan("reason") = "code_module_missing"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    Dim sl As Long
+    Dim nl As Long
+    sl = 0
+    nl = 0
+    sl = cm.ProcStartLine(procName, 0)
+    scan("procStartLine") = sl
+    nl = cm.ProcCountLines(procName, 0)
+    scan("procCountLines") = nl
+    If sl < 1 Or nl < 1 Then
+        scan("reason") = "proc_range_unavailable"
+        Set Wh2SourceVars = out
+        Exit Function
+    End If
+    Dim txt As String
+    txt = ""
+    txt = cm.Lines(sl, nl)
+    scan("textLen") = Len(txt)
+    scan("codeModuleFound") = True
+    Dim lines() As String
+    lines = Split(Replace(Replace(txt, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    Dim seenNames As Object
+    Set seenNames = CreateObject("Scripting.Dictionary")
+    ' 1) the parameter list (the signature may continue over several lines)
+    Dim sig As String
+    Dim k As Long
+    Dim sigLine As Long
+    sigLine = 0
+    sig = ""
+    For k = 0 To UBound(lines)
+        If InStr(lines(k), "(") > 0 Then
+            sigLine = k
+            sig = lines(k)
+            Do While InStr(sig, ")") = 0 And k < UBound(lines)
+                k = k + 1
+                sig = sig & " " & lines(k)
+            Loop
+            Exit For
+        End If
+    Next
+    If InStr(sig, "(") > 0 Then
+        Dim a As Long
+        Dim b As Long
+        a = InStr(sig, "(")
+        b = InStrRev(sig, ")")
+        If b > a Then
+            Dim inner As String
+            inner = Mid$(sig, a + 1, b - a - 1)
+            If Len(Trim$(inner)) > 0 Then
+                Dim parts() As String
+                parts = Split(inner, ",")
+                Dim pi As Long
+                For pi = 0 To UBound(parts)
+                    Wh2AddVar out, seenNames, parts(pi), "parameter", sl + sigLine
+                Next
+            End If
+        End If
+    End If
+    ' 2) Dim / Static declarations in the body (comma-separated declarators supported)
+    scan("parsedParams") = out.Count
+    Dim li As Long
+    For li = 0 To UBound(lines)
+        Dim t As String
+        t = Trim$(lines(li))
+        If Len(t) > 4 Then
+            If StrComp(Left$(t, 4), "Dim ", vbTextCompare) = 0 Or StrComp(Left$(t, 7), "Static ", vbTextCompare) = 0 Then
+                Dim body As String
+                If StrComp(Left$(t, 4), "Dim ", vbTextCompare) = 0 Then
+                    body = Mid$(t, 5)
+                Else
+                    body = Mid$(t, 8)
+                End If
+                Dim decls() As String
+                decls = Split(body, ",")
+                Dim di As Long
+                For di = 0 To UBound(decls)
+                    Wh2AddVar out, seenNames, decls(di), "local", sl + li
+                Next
+            End If
+        End If
+    Next
+    scan("parsedTotal") = out.Count
+    If Len(CStr(scan("reason"))) = 0 Then scan("reason") = ""
+    Err.Clear
+    Set Wh2SourceVars = out
+End Function
+
+Private Sub Wh2AddVar(ByRef out As Object, ByRef seenNames As Object, ByVal decl As String, _
+                      ByVal kind As String, ByVal srcLine As Long)
+    On Error Resume Next
+    Dim s As String
+    s = Trim$(decl)
+    ' strip modifiers and an optional "As <type>"
+    Dim stripped As Boolean
+    Do
+        stripped = False
+        If Len(s) >= 9 Then
+            If StrComp(Left$(s, 8), "Optional ", vbTextCompare) = 0 Then
+                s = Trim$(Mid$(s, 9))
+                stripped = True
+            End If
+        End If
+        If Not stripped Then
+            If Len(s) >= 6 Then
+                If StrComp(Left$(s, 5), "ByVal ", vbTextCompare) = 0 Then
+                    s = Trim$(Mid$(s, 6))
+                    stripped = True
+                End If
+            End If
+        End If
+        If Not stripped Then
+            If Len(s) >= 6 Then
+                If StrComp(Left$(s, 5), "ByRef ", vbTextCompare) = 0 Then
+                    s = Trim$(Mid$(s, 6))
+                    stripped = True
+                End If
+            End If
+        End If
+        If Not stripped Then
+            If Len(s) >= 11 Then
+                If StrComp(Left$(s, 10), "ParamArray ", vbTextCompare) = 0 Then
+                    s = Trim$(Mid$(s, 11))
+                    stripped = True
+                End If
+            End If
+        End If
+        If Not stripped Then Exit Do
+    Loop
+    Dim declaredType As String
+    declaredType = ""
+    Dim i As Long
+    i = InStr(1, s, " As ", vbTextCompare)
+    If i > 0 Then
+        declaredType = Trim$(Mid$(s, i + 4))
+        s = Trim$(Left$(s, i - 1))
+    End If
+    ' drop array parentheses and any default value
+    Dim p As Long
+    p = InStr(s, "(")
+    If p > 0 Then s = Trim$(Left$(s, p - 1))
+    p = InStr(s, "=")
+    If p > 0 Then s = Trim$(Left$(s, p - 1))
+    If Len(s) = 0 Then Exit Sub
+    If seenNames.Exists(s) Then Exit Sub
+    seenNames.Add s, True
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("name") = s
+    d("kind") = kind
+    d("declaredType") = declaredType
+    d("paneLine") = srcLine
+    d("paneLineSpace") = "ide"
+    d("nameSource") = "source declaration (" & kind & ")"
+    out.Add d
+    Err.Clear
+End Sub
+
+' ---- watch: the SAME per-value shape, merged into every transcript break/step ----
+Private Function Wh2NameAllowed(ByVal name As String) As Boolean
+    Wh2NameAllowed = False
+    If m_lastLocalNames Is Nothing Then Exit Function
+    Dim i As Long
+    For i = 1 To m_lastLocalNames.Count
+        If StrComp(CStr(m_lastLocalNames(i)), name, vbTextCompare) = 0 Then
+            Wh2NameAllowed = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function DbWatchArray() As Object
+    Dim out As Object
+    Set out = New Collection
+    On Error Resume Next
+    If m_watchExprs Is Nothing Then Set DbWatchArray = out : Exit Function
+    If m_watchExprs.Count = 0 Then Set DbWatchArray = out : Exit Function
+    Dim diag As Object
+    Set diag = CreateObject("Scripting.Dictionary")
+    Dim ctxErr3 As String
+    ctxErr3 = Wh2FrameContext(m_watchFrame, diag)
+    If Len(ctxErr3) > 0 Then Set DbWatchArray = out : Exit Function
+    Dim i As Long
+    For i = 1 To m_watchExprs.Count
+        Dim ex As String
+        ex = CStr(m_watchExprs(i))
+        If Wh2NameAllowed(ex) Then
+            ArmGateRelease "watch", 6000
+            out.Add Wh2ValueShape(ex, m_watchFrame, diag)
+            DisarmGateRelease
+        Else
+            Dim refused As Object
+            Set refused = CreateObject("Scripting.Dictionary")
+            refused("expr") = ex
+            refused("error") = "unknown_identifier_refused"
+            refused("note") = "transcript[].watch evaluates ONLY identifiers enumerated by get_locals in this IDE session; an unknown identifier is NOT evaluated because it can hang the in-flight call (measured)"
+            out.Add refused
+        End If
+    Next
+    Err.Clear
+    Set DbWatchArray = out
+End Function
+' =====================================================================
+' W-H3: run_project (two-phase + env) and last_error (dialog body)
+' =====================================================================
+
+Private Function ToolRunProject(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "run_project"
+    root("ok") = False
+    root("startedPending") = False
+    root("startedPid") = 0
+    root("runningState") = ""
+    root("firstBreakpointHit") = Null
+    root("err") = ""
+    Set root("envApplied") = EmptyJsonArray()
+    root("envRestored") = False
+    root("commandLineArgsSupported") = True
+    Dim cmdArgs As String
+    cmdArgs = JsonGetStr(args, "commandLineArgs")
+    root("commandLineArgs") = cmdArgs
+    Dim startMode As String
+    startMode = JsonGetStr(args, "startMode")
+    If Len(startMode) = 0 Then startMode = "Standalone"
+    root("startModeRequested") = startMode
+    Dim observe As Boolean
+    observe = JsonGetBool(args, "observe", False)
+    root("observe") = observe
+    Dim timeoutMs As Long
+    timeoutMs = JsonGetLong(args, "timeout_ms", 15000)
+    If timeoutMs <= 0 Then timeoutMs = 15000
+    If timeoutMs > 120000 Then timeoutMs = 120000
+    root("timeoutMs") = timeoutMs
+    On Error GoTo RP_ERR
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    root("projectStartMode") = ProjectStartModeText(p)
+    root("startModeApplied") = (StrComp(CStr(root("projectStartMode")), startMode, vbTextCompare) = 0)
+    If Not CBool(root("startModeApplied")) Then
+        root("startModeNote") = "the start mode is a PROJECT property (Project Properties -> Debugging) and cannot be switched at run time; the project currently reports '" & CStr(root("projectStartMode")) & "'"
+    End If
+    If Len(cmdArgs) > 0 Then
+        root("reason") = "commandLineArgsUnsupported"
+        root("commandLineArgsSupported") = False
+        root("error") = "a Standard EXE started from the VB6 IDE does not receive Command$; Debugging-tab command-line arguments belong to the ActiveX Component start mode"
+        root("howToGetArgs") = "build the EXE (make_project) and run it with the arguments, or open an ActiveX project and use its Debugging-tab arguments"
+        ToolRunProject = JsonStringify(root)
+        Exit Function
+    End If
+    If observe Then
+        ToolRunProject = RpObserve(root, timeoutMs)
+        Exit Function
+    End If
+    Dim st As String
+    st = GetIdeState()
+    root("ideStateBefore") = st
+    If st <> "design" Then
+        root("reason") = "not_in_design"
+        root("error") = "run_project phase 1 STARTS the project, so the IDE must be in design (state=" & st & ")"
+        ToolRunProject = JsonStringify(root)
+        Exit Function
+    End If
+    Dim applied As Object
+    Set applied = New Collection
+    Dim envObj As Object
+    Set envObj = DbObjOf(args, "env")
+    If Not envObj Is Nothing Then
+        Dim k As Variant
+        For Each k In envObj.Keys
+            Dim nm As String
+            nm = CStr(k)
+            Dim oldVal As String
+            oldVal = Environ$(nm)
+            Dim rc As Long
+            rc = SetEnvironmentVariableW(StrPtr(nm), StrPtr(CStr(envObj(k))))
+            Dim rec As Object
+            Set rec = CreateObject("Scripting.Dictionary")
+            rec("name") = nm
+            rec("value") = CStr(envObj(k))
+            rec("set") = (rc <> 0)
+            rec("previousValueWasPresent") = (Len(oldVal) > 0)
+            rec("previousValue") = oldVal
+            applied.Add rec
+        Next
+    End If
+    Set root("envApplied") = applied
+    Set m_envRestore = New Collection
+    Dim ai As Long
+    For ai = 1 To applied.Count
+        m_envRestore.Add applied(ai)
+    Next
+    Dim why As String
+    Dim started As Boolean
+    why = ""
+    started = DbClickStart(why)
+    root("executedStart") = started
+    root("startWhy") = why
+    If started Then
+        root("startedPending") = True
+        root("stopReason") = "started"
+        root("runningState") = "pending"
+        Dim hc As Object
+        Set hc = CreateObject("Scripting.Dictionary")
+        hc("tool") = "run_project"
+        Dim ha As Object
+        Set ha = CreateObject("Scripting.Dictionary")
+        ha("observe") = True
+        ha("timeout_ms") = timeoutMs
+        Set hc("arguments") = ha
+        Set root("howToContinue") = hc
+        root("ok") = True
+    Else
+        root("reason") = "start_command_not_found"
+        RpRestoreEnv root
+    End If
+    ToolRunProject = JsonStringify(root)
+    Exit Function
+RP_ERR:
+    On Error Resume Next
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    RpRestoreEnv root
+    ToolRunProject = JsonStringify(root)
+End Function
+
+Private Function ProjectStartModeText(ByVal p As VBIDE.VBProject) As String
+    ProjectStartModeText = ""
+    On Error Resume Next
+    Dim v As Variant
+    v = p.Properties("StartMode")
+    If Err.Number = 0 Then
+        ProjectStartModeText = CStr(v)
+    Else
+        Err.Clear
+    End If
+End Function
+
+Private Function RpObserve(ByRef root As Object, ByVal timeoutMs As Long) As String
+    On Error Resume Next
+    Dim t0 As Long
+    t0 = Util.TickMs()
+    Dim st As String
+    Dim dlgTitle As String
+    Dim seenBreak As Boolean
+    seenBreak = False
+    Do While (Util.TickMs() - t0) < timeoutMs
+        If DbBreakNow() Then
+            seenBreak = True
+            root("runningState") = "break"
+            Set root("firstBreakpointHit") = H3PositionObject()
+            Exit Do
+        End If
+        st = GetIdeState()
+        If st = "design" Then
+            root("runningState") = "exited"
+            Exit Do
+        End If
+        dlgTitle = ""
+        If WinOps.HasVisibleHostDialog(dlgTitle) Then
+            root("runningState") = "error"
+            root("err") = dlgTitle
+            Set root("errorDialog") = H3DialogBlock(dlgTitle)
+            Exit Do
+        End If
+        If Util.CanPump() Then DoEvents
+        DbBriefWait 40
+    Loop
+    If Len(CStr(root("runningState"))) = 0 Then root("runningState") = "timeout"
+    root("startedPid") = CLng(DbGetCurrentProcessId())
+    root("startedPidNote") = "an IDE-run program executes INSIDE the VB6 process, so this is the IDE pid; a separate EXE pid exists only for an out-of-process component"
+    If Not seenBreak Then root("firstBreakpointHit") = Null
+    If CStr(root("runningState")) <> "run" Then RpRestoreEnv root
+    root("runningStateNow") = GetIdeState()
+    root("ok") = CBool(CStr(root("runningState")) = "exited" Or CStr(root("runningState")) = "break" Or CStr(root("runningState")) = "error")
+    RpObserve = JsonStringify(root)
+End Function
+
+Private Sub RpRestoreEnv(ByRef root As Object)
+    On Error Resume Next
+    root("envRestored") = False
+    If m_envRestore Is Nothing Then
+        root("envRestored") = True
+        Exit Sub
+    End If
+    Dim i As Long
+    For i = 1 To m_envRestore.Count
+        Dim rec As Object
+        Set rec = m_envRestore(i)
+        Dim nm As String
+        nm = CStr(rec("name"))
+        If CBool(rec("previousValueWasPresent")) Then
+            SetEnvironmentVariableW StrPtr(nm), StrPtr(CStr(rec("previousValue")))
+        Else
+            SetEnvironmentVariableW StrPtr(nm), 0
+        End If
+    Next
+    Set m_envRestore = Nothing
+    root("envRestored") = True
+    root("envRestoreNote") = "each variable was restored to its previous value (or DELETED when it did not exist before)"
+End Sub
+
+Private Function H3PositionObject() As Object
+    On Error Resume Next
+    Set H3PositionObject = Nothing
+    Dim rj As String
+    rj = ToolCurrentPosition()
+    Dim v As Variant
+    If JsonParse(rj, v) Then
+        Set H3PositionObject = v
+    End If
+    Err.Clear
+End Function
+
+Private Function H3DialogBlock(ByVal title As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("present") = True
+    d("title") = title
+    d("body") = WinOps.DialogBodiesText("#32770")
+    Set d("buttons") = H3DialogButtons()
+    Set H3DialogBlock = d
+End Function
+
+Private Function H3DialogButtons() As Object
+    Dim out As Object
+    Set out = New Collection
+    On Error Resume Next
+    Dim rj As String
+    rj = WinOps.ReadActiveDialogsJson("#32770", True, 3)
+    Dim v As Variant
+    If Not JsonParse(rj, v) Then Set H3DialogButtons = out : Exit Function
+    Dim top As Object
+    Set top = v
+    If top Is Nothing Then Set H3DialogButtons = out : Exit Function
+    If Not top.Exists("dialogs") Then Set H3DialogButtons = out : Exit Function
+    Dim arr As Object
+    Set arr = Nothing
+    Set arr = top("dialogs")
+    If arr Is Nothing Then Set H3DialogButtons = out : Exit Function
+    Dim dlg As Variant
+    For Each dlg In arr
+        If IsObject(dlg) Then
+            Dim ctrls As Object
+            Set ctrls = Nothing
+            If dlg.Exists("controls") Then Set ctrls = dlg("controls")
+            If Not ctrls Is Nothing Then
+                Dim c As Variant
+                For Each c In ctrls
+                    If IsObject(c) Then
+                        Dim b As Object
+                        Set b = CreateObject("Scripting.Dictionary")
+                        b("hwnd") = JsonGetLong(c, "hwnd", 0)
+                        b("text") = JsonGetStr(c, "text", "")
+                        b("cls") = JsonGetStr(c, "cls", "")
+                        out.Add b
+                    End If
+                Next
+            End If
+        End If
+    Next
+    Set H3DialogButtons = out
+End Function
+
+Private Function ToolLastError(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "last_error"
+    root("ok") = False
+    root("stopped_at") = ""
+    root("errNumber") = Null
+    root("errDescription") = Null
+    root("errSource") = Null
+    Dim parsed As Object
+    Set parsed = CreateObject("Scripting.Dictionary")
+    parsed("number") = False
+    parsed("description") = False
+    parsed("source") = False
+    Set root("errParsed") = parsed
+    Set root("localsNames") = EmptyJsonArray()
+    root("localsNamesSource") = "the identifier names enumerated by the LAST get_locals in this IDE session (source-declaration scan); empty when get_locals was never called"
+    root("howToRecover") = "the runtime-error box is MODAL: dismiss it with dismiss:true (send_window_message click on its End button) or the IDE stays blocked; close_active_dialogs refuses these buttons by the safe whitelist (measured)"
+    On Error GoTo LE_ERR
+    Dim st As String
+    st = GetIdeState()
+    root("ideState") = st
+    Dim dlgTitle As String
+    Dim present As Boolean
+    dlgTitle = ""
+    present = WinOps.HasVisibleHostDialog(dlgTitle)
+    Dim blk As Object
+    If present Then
+        Set blk = H3DialogBlock(dlgTitle)
+    Else
+        Set blk = CreateObject("Scripting.Dictionary")
+        blk("present") = False
+        blk("title") = ""
+        blk("body") = ""
+        Set blk("buttons") = EmptyJsonArray()
+    End If
+    Set root("errorDialog") = blk
+    root("stopped_at") = IIf(present, "error_dialog", "no_error_dialog")
+    Dim body As String
+    body = ""
+    If present Then body = CStr(blk("body"))
+    root("bodyBytes") = Len(body)
+    If Len(body) > 0 Then
+        Dim numText As String
+        numText = H3ParseErrNumber(body)
+        If Len(numText) > 0 Then
+            root("errNumber") = CLng(Val(numText))
+            parsed("number") = True
+        End If
+        Dim desc As String
+        desc = H3ParseErrDescription(body)
+        If Len(desc) > 0 Then
+            root("errDescription") = desc
+            parsed("description") = True
+        End If
+        Dim src As String
+        src = H3ParseErrSource(body)
+        If Len(src) > 0 Then
+            root("errSource") = src
+            parsed("source") = True
+        End If
+    End If
+    root("callstack") = Vba6Probe.CallstackJson(32)
+    If st = "break" Then
+        root("position") = ToolCurrentPosition()
+        root("positionSource") = "paneSelection"
+    Else
+        root("position") = Null
+        root("positionSource") = "none"
+    End If
+    Dim names As Object
+    Set names = New Collection
+    If Not m_lastLocalNames Is Nothing Then
+        Dim ni As Long
+        For ni = 1 To m_lastLocalNames.Count
+            names.Add CStr(m_lastLocalNames(ni))
+        Next
+    End If
+    Set root("localsNames") = names
+    root("ok") = present
+    If JsonGetBool(args, "dismiss", False) Then
+        If present Then
+            Dim btnHwnd As Long
+            btnHwnd = H3FindEndButton(blk)
+            root("dismissButtonHwnd") = btnHwnd
+            If btnHwnd <> 0 Then
+                Dim drj As String
+                drj = WinOps.SendWindowMessageJson(btnHwnd, "click", "", "", "", "", 1, False, False)
+                root("dismissReceipt") = Left$(drj, 800)
+                root("dismissed") = True
+            Else
+                root("dismissed") = False
+                root("dismissError") = "no End button found in the dialog"
+            End If
+        Else
+            root("dismissed") = False
+            root("dismissError") = "no runtime-error dialog is up"
+        End If
+    End If
+    ToolLastError = JsonStringify(root)
+    Exit Function
+LE_ERR:
+    root("ok") = False
+    root("reason") = "unexpected_error"
+    root("errorMessage") = Err.Description
+    ToolLastError = JsonStringify(root)
+End Function
+
+Private Function H3ParseErrNumber(ByVal body As String) As String
+    H3ParseErrNumber = ""
+    On Error Resume Next
+    Dim i As Long
+    i = InStr(1, body, ChrW$(&H9519) & ChrW$(&H8BEF), vbTextCompare)
+    If i = 0 Then i = InStr(1, body, "error", vbTextCompare)
+    If i = 0 Then Exit Function
+    Dim j As Long
+    Dim ch As String
+    Dim digits As String
+    j = i
+    digits = ""
+    Do While j <= Len(body)
+        ch = Mid$(body, j, 1)
+        If ch >= "0" And ch <= "9" Then
+            digits = digits & ch
+        ElseIf Len(digits) > 0 Then
+            Exit Do
+        End If
+        j = j + 1
+    Loop
+    H3ParseErrNumber = digits
+End Function
+
+Private Function H3ParseErrDescription(ByVal body As String) As String
+    H3ParseErrDescription = ""
+    On Error Resume Next
+    Dim lines() As String
+    lines = Split(Replace(Replace(body, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    Dim i As Long
+    Dim seenHeader As Boolean
+    seenHeader = False
+    For i = 0 To UBound(lines)
+        Dim t As String
+        t = Trim$(lines(i))
+        If Len(t) = 0 Then
+            ' skip
+        ElseIf InStr(1, t, ChrW$(&H9519) & ChrW$(&H8BEF), vbTextCompare) > 0 Or InStr(1, t, "error", vbTextCompare) > 0 Then
+            If InStr(1, t, ":", vbTextCompare) > 0 Then seenHeader = True
+        ElseIf seenHeader Then
+            H3ParseErrDescription = t
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function H3ParseErrSource(ByVal body As String) As String
+    H3ParseErrSource = ""
+    On Error Resume Next
+    Dim i As Long
+    i = InStr(1, body, "Source:", vbTextCompare)
+    If i = 0 Then Exit Function
+    Dim rest As String
+    rest = Mid$(body, i + 7)
+    Dim nl As Long
+    nl = InStr(rest, vbLf)
+    If nl > 0 Then rest = Left$(rest, nl - 1)
+    H3ParseErrSource = Trim$(rest)
+End Function
+
+Private Function H3FindEndButton(ByRef blk As Object) As Long
+    H3FindEndButton = 0
+    On Error Resume Next
+    Dim btns As Object
+    Set btns = Nothing
+    If blk.Exists("buttons") Then Set btns = blk("buttons")
+    If btns Is Nothing Then Exit Function
+    Dim i As Long
+    For i = 1 To btns.Count
+        Dim b As Object
+        Set b = btns(i)
+        Dim t As String
+        t = CStr(b("text"))
+        If InStr(1, t, ChrW$(&H7ED3) & ChrW$(&H675F), vbTextCompare) > 0 Or StrComp(t, "End", vbTextCompare) = 0 Then
+            H3FindEndButton = JsonGetLong(b, "hwnd", 0)
+            Exit Function
+        End If
+    Next
+End Function
+' =====================================================================
+' W-C (P5): source freshness - disk file vs the IDE code pane, per component.
+' COMPARISON CONTRACT (published in the receipt):
+'   * fresh is decided by the NORMALIZED CODE TEXT comparison (disk file head /
+'     Attribute lines stripped) - the same rule DiskMatchesPane uses;
+'   * diskSha256 / ideSha256 are published for INFORMATION with hashSpace naming
+'     the space each was taken in ("disk" = raw file bytes, "pane" = CodeModule text);
+'   * diskFileMtime is INFORMATIONAL ONLY and is never a decision input.
+' =====================================================================
+Private Function SourceFreshnessJson(ByVal haveIde As Boolean) As Object
+    Dim out As Object
+    Set out = CreateObject("Scripting.Dictionary")
+    Dim comps As Object
+    Dim staleNames As Object
+    Set comps = New Collection
+    Set staleNames = New Collection
+    out("applicable") = False
+    out("freshnessSource") = "disk"
+    out("hashSpaceDisk") = "disk (raw file bytes)"
+    out("hashSpaceIde") = "pane (CodeModule text, same space as get_component_code coords=ide)"
+    out("decision") = "normalized code-text compare (disk head/Attribute lines stripped) per component"
+    out("diskFileMtimeIsInformational") = True
+    Set out("components") = comps
+    Set out("staleComponents") = staleNames
+    out("staleCount") = 0
+    out("allFresh") = False
+    out("projectFresh") = False
+    out("warning") = ""
+    If Not haveIde Then
+        out("reason") = "no IDE surface for this build: the CLI route compiles DISK, so there is no in-memory pane to compare"
+        Set SourceFreshnessJson = out
+        Exit Function
+    End If
+    On Error Resume Next
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    If p Is Nothing Then
+        out("reason") = "no open project"
+        Set SourceFreshnessJson = out
+        Exit Function
+    End If
+    Dim i As Long
+    Dim c As VBIDE.VBComponent
+    Dim staleText As String
+    staleText = ""
+    For i = 1 To p.VBComponents.Count
+        Set c = Nothing
+        Set c = p.VBComponents.Item(i)
+        If Not c Is Nothing Then
+            Dim rec As Object
+            Set rec = CreateObject("Scripting.Dictionary")
+            rec("component") = c.Name
+            Dim fn As String
+            fn = ""
+            fn = c.FileNames(1)
+            rec("diskFile") = fn
+            Dim diskSha As String
+            diskSha = ""
+            If Len(fn) > 0 Then
+                If Len(Dir$(fn)) > 0 Then diskSha = Build.FileSha256(fn)
+            End If
+            rec("diskSha256") = diskSha
+            Dim mt As String
+            mt = ""
+            If Len(fn) > 0 Then
+                mt = Format$(FileDateTime(fn), "yyyy-mm-dd hh:nn:ss")
+            End If
+            rec("diskFileMtime") = mt
+            Dim paneText As String
+            paneText = ""
+            Dim lineCount As Long
+            lineCount = 0
+            Dim cm As VBIDE.CodeModule
+            Set cm = Nothing
+            Set cm = c.CodeModule
+            If Not cm Is Nothing Then
+                lineCount = cm.CountOfLines
+                If lineCount > 0 Then paneText = cm.Lines(1, lineCount)
+            End If
+            rec("ideSha256") = Sha256.Sha256HexTextUtf8(paneText)
+            rec("paneLineCount") = lineCount
+            Dim fresh As Boolean
+            fresh = False
+            If Len(diskSha) > 0 Then fresh = DiskMatchesPane(c.Name, paneText)
+            rec("fresh") = fresh
+            comps.Add rec
+            If Not fresh Then
+                staleNames.Add c.Name
+                If Len(staleText) > 0 Then staleText = staleText & ", "
+                staleText = staleText & c.Name
+            End If
+        End If
+    Next
+    out("applicable") = True
+    out("freshnessSource") = "ide"
+    out("staleCount") = staleNames.Count
+    out("allFresh") = (staleNames.Count = 0)
+    out("projectFresh") = (staleNames.Count = 0)
+    If staleNames.Count > 0 Then
+        out("warning") = "sourceFreshness: " & CStr(staleNames.Count) & " component(s) differ between the IDE code pane and the file on disk: " & staleText & ". route=ide compiles the IDE MEMORY (so those edits ARE compiled); call reload_component when the IDE memory must be replaced by the disk text."
+    End If
+    Err.Clear
+    Set SourceFreshnessJson = out
+End Function
+' =====================================================================
+' W-C: CLSID InprocServer32 guard (32-bit registry view; VB6 runs as a 32-bit process).
+' =====================================================================
+Private Function WcClsidKeyPath() As String
+    WcClsidKeyPath = "HKLM\Software\Classes\CLSID\{4CB64903-3CBA-4AF6-852B-D534862A893D}\InprocServer32\"
+End Function
+
+Private Function WcInprocRead() As String
+    WcInprocRead = ""
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    Dim v As String
+    v = ""
+    v = CStr(sh.RegRead(WcClsidKeyPath()))
+    If Err.Number = 0 Then WcInprocRead = v
+    Err.Clear
+End Function
+
+Private Function WcInprocWrite(ByVal val As String) As Boolean
+    WcInprocWrite = False
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    sh.RegWrite WcClsidKeyPath(), val, "REG_SZ"
+    If Err.Number = 0 Then WcInprocWrite = True
+    Err.Clear
+End Function
+' =====================================================================
+' W-C (P6): final artifact identity - sampled AFTER post-processing (the LAA
+' PE-header patch) and verified by a SECOND read of the same file.
+' =====================================================================
+Private Function WcVbpRevisionText(ByVal vbpPath As String) As String
+    WcVbpRevisionText = ""
+    On Error Resume Next
+    If Len(vbpPath) = 0 Then Exit Function
+    If Len(Dir$(vbpPath)) = 0 Then Exit Function
+    Dim fnum As Integer
+    Dim ln As String
+    fnum = FreeFile
+    Open vbpPath For Input As #fnum
+    Do While Not EOF(fnum)
+        Line Input #fnum, ln
+        If InStr(1, ln, "RevisionVer=", vbTextCompare) = 1 Then
+            WcVbpRevisionText = Trim$(Mid$(ln, Len("RevisionVer=") + 1))
+            Exit Do
+        End If
+    Loop
+    Close #fnum
+    Err.Clear
+End Function
+
+Private Function WcFinalArtifactJson(ByVal artifactPath As String, ByVal sampleDetail As String, ByVal vbpRevision As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("sampledAfterPostProcessing") = True
+    d("samplePoint") = "post_laa"
+    d("samplePointDetail") = sampleDetail
+    d("verifiedOnDisk") = False
+    d("sha256") = ""
+    d("size") = 0
+    d("mtime") = ""
+    d("peFlags") = Null
+    d("laaFlag") = Null
+    d("fileVersion") = ""
+    d("revisionVer") = vbpRevision
+    d("revisionVerSource") = "disk"
+    d("revisionMismatch") = False
+    If Len(artifactPath) = 0 Then
+        d("reason") = "no artifact path for this project"
+        Set WcFinalArtifactJson = d
+        Exit Function
+    End If
+    On Error Resume Next
+    If Len(Dir$(artifactPath)) = 0 Then
+        d("reason") = "the artifact is not on disk at " & artifactPath
+        Set WcFinalArtifactJson = d
+        Err.Clear
+    Else
+        d("path") = artifactPath
+        d("sha256") = Build.FileSha256(artifactPath)
+        d("size") = FileLen(artifactPath)
+        d("mtime") = Format$(FileDateTime(artifactPath), "yyyy-mm-dd hh:nn:ss")
+        Dim chars As Long
+        Dim charsOff As Long
+        Dim peErr As String
+        If PeLaaRead(artifactPath, chars, charsOff, peErr) Then
+            d("peFlags") = chars
+            d("laaFlag") = ((chars And &H20) <> 0)
+            d("peFlagsOffset") = charsOff
+        Else
+            d("peError") = peErr
+        End If
+        Dim fso As Object
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        Dim fv As String
+        fv = ""
+        fv = fso.GetFileVersion(artifactPath)
+        If Err.Number = 0 Then d("fileVersion") = fv
+        Err.Clear
+        Dim sha2 As String
+        sha2 = Build.FileSha256(artifactPath)
+        d("verifiedOnDisk") = (Len(CStr(d("sha256"))) > 0 And StrComp(sha2, CStr(d("sha256")), vbTextCompare) = 0)
+        If Not CBool(d("verifiedOnDisk")) Then d("verifyNote") = "the second read produced " & sha2 & " - the digest is NOT stable, verifiedOnDisk=false"
+        Dim ideRev As String
+        ideRev = ""
+        Dim pp As VBIDE.VBProject
+        Set pp = Nothing
+        Set pp = GetProject()
+        If Not pp Is Nothing Then
+            Dim v As Variant
+            v = pp.Properties("RevisionVer")
+            If Err.Number = 0 Then ideRev = Trim$(CStr(v))
+            Err.Clear
+        End If
+        If Len(ideRev) > 0 Then
+            d("revisionVerIde") = ideRev
+            d("revisionVerSource") = "ide"
+            d("revisionMismatch") = (StrComp(ideRev, vbpRevision, vbTextCompare) <> 0)
+        End If
+        Err.Clear
+    End If
+    Set WcFinalArtifactJson = d
+End Function
+' =====================================================================
+' W-C guard: an EMPTY content must never silently truncate an existing file,
+' and a VB source file must never be written as 0 bytes at all.
+' =====================================================================
+
+Private Function WcIsVbSourcePath(ByVal p As String) As Boolean
+    WcIsVbSourcePath = False
+    On Error Resume Next
+    Dim e As String
+    e = LCase$(Mid$(p, InStrRev(p, ".") + 1))
+    If e = "bas" Or e = "cls" Or e = "frm" Or e = "ctl" Or e = "pag" Or e = "dsr" Or e = "vbp" Then WcIsVbSourcePath = True
+    Err.Clear
+End Function
+
+Private Function WcEmptyContentGuard(ByVal pathRaw As String, ByVal content As String, ByVal confirmTruncate As Boolean) As Object
+    Set WcEmptyContentGuard = Nothing
+    m_wcTruncateAllowed = False
+    On Error Resume Next
+    If Len(Trim$(content)) > 0 Then Exit Function
+    Dim pth As String
+    pth = ResolvePath(pathRaw)
+    If Len(pth) = 0 Then Exit Function
+    Dim ex As Boolean
+    ex = False
+    ex = (Len(Dir$(pth)) > 0)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not ex Then Exit Function
+    Dim sz As Double
+    sz = 0
+    sz = FileLen(pth)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If sz <= 0 Then Exit Function
+    Dim isVb As Boolean
+    isVb = WcIsVbSourcePath(pth)
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = "empty_content_would_truncate"
+    d("path") = pth
+    d("existingSize") = sz
+    d("vbSourceFile") = isVb
+    d("confirmTruncateGiven") = confirmTruncate
+    If isVb Then
+        d("vbSourceNeverEmpty") = True
+        d("howToProceed") = "VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are never written as 0 bytes - an empty VB source cannot compile and this tool refuses even with confirm_truncate:true. Pass the real text, or delete the file explicitly with file_delete if that is genuinely intended."
+        Set WcEmptyContentGuard = d
+        Exit Function
+    End If
+    If Not confirmTruncate Then
+        d("howToProceed") = "pass confirm_truncate:true to intentionally empty this non-VB file"
+        Set WcEmptyContentGuard = d
+        Exit Function
+    End If
+    m_wcTruncateAllowed = True
+    Set WcEmptyContentGuard = Nothing
+    Err.Clear
+End Function
+
+Private Function WcTruncateReceipt(ByVal jsonText As String) As String
+    WcTruncateReceipt = jsonText
+    If Not m_wcTruncateAllowed Then Exit Function
+    If Len(jsonText) > 0 Then
+        If Left$(jsonText, 1) = "{" Then
+        WcTruncateReceipt = "{" & chr(34) & "truncated" & chr(34) & ":true," & chr(34) & "truncatedByConfirm" & chr(34) & ":true," & Mid$(jsonText, 2)
+        End If
+    End If
+End Function
+
+Private Function WcGuardedWriteFile(ByVal args As Object) As String
+    Dim g As Object
+    Set g = WcEmptyContentGuard(JsonGetStr(args, "path"), JsonGetStr(args, "content"), JsonGetBool(args, "confirm_truncate", False))
+    If Not g Is Nothing Then
+        WcGuardedWriteFile = JsonStringify(g)
+        Exit Function
+    End If
+    WcGuardedWriteFile = WcTruncateReceipt(ToolWriteFile(JsonGetStr(args, "path"), JsonGetStr(args, "content"), JsonGetStr(args, "encoding", "auto"), JsonGetBool(args, "create_dirs", True), JsonGetBool(args, "backup", True), JsonGetStr(args, "validate")))
+End Function
+
+Private Function WcGuardedWriteSource(ByVal args As Object) As String
+    Dim g As Object
+    Set g = WcEmptyContentGuard(JsonGetStr(args, "path"), JsonGetStr(args, "text"), JsonGetBool(args, "confirm_truncate", False))
+    If Not g Is Nothing Then
+        WcGuardedWriteSource = JsonStringify(g)
+        Exit Function
+    End If
+    WcGuardedWriteSource = WcTruncateReceipt(ToolWriteSource(JsonGetStr(args, "path"), JsonGetStr(args, "text"), JsonGetStr(args, "encoding"), JsonGetStr(args, "validate")))
+End Function
+' =====================================================================
+' W-D (P11): one place for the "artifactChanged is false, so how do I get a
+' compiler log?" answer. Called from BOTH make_project's false branch and the
+' build tool's cache-hit / unchanged branches, so the wording cannot drift.
+' =====================================================================
+Private Sub WcAttachCompileLogHint(ByRef root As Object)
+    On Error Resume Next
+    If root Is Nothing Then Exit Sub
+    If root.Exists("compileLogHint") Then Exit Sub
+    root("compileLogHint") = "artifactChanged is false: nothing was compiled by this call. This is NOT a failure. The in-IDE Make route produces NO compiler log; for a real log re-run with diagnose:true (isolated compile of a COPY, returns log + firstError) or use route:""cli"" / the build tool."
+    root("diagnoseRecommended") = True
+    root("compileLogHintSemantics") = "artifactChanged:false means the artifact bytes did not change - it is neither a pass nor a failure by itself; read verdict/buildState for that."
+    Err.Clear
+End Sub
+' =====================================================================
+' W-E (P8): atomic .vbp component line maintenance for add_component /
+' remove_component. ONLY the target component line changes; Reference= lines
+' and the relative order of every other component line are preserved.
+' Write strategy: TEMP FILE + REPLACE with a .bak backup; any failure puts the
+' original bytes back and reports rolledBack=true.
+' =====================================================================
+Private Function WcAddComponentVbp(ByVal args As Object) As String
+    Dim fpathSafe As String
+    fpathSafe = ""
+    Dim fileCreatedOk As Boolean
+    fileCreatedOk = False
+    On Error GoTo eh
+    Dim res As String
+    res = ToolAddComponent(JsonGetStr(args, "type"), JsonGetStr(args, "name"), JsonGetStr(args, "code"))
+    WcAddComponentVbp = res
+    Dim nm As String
+    nm = JsonGetStr(args, "name")
+    If Len(nm) = 0 Then Exit Function
+    If Len(res) = 0 Then Exit Function
+    If Left$(res, 1) <> "{" Then Exit Function
+    If InStr(1, res, "error", vbTextCompare) > 0 Then Exit Function
+    Dim kind As String
+    kind = JsonGetStr(args, "type")
+    Dim lk As String
+    lk = LCase$(kind)
+    If lk = "form" Or lk = "mdiform" Or lk = "usercontrol" Then
+        Dim rj As String
+        rj = "{" & WcJS("pairedBinaryUnsupported") & ":true,"
+        rj = rj & WcJS("pairedBinaryReason") & ":" & WcJS("type " & kind & " needs a paired binary that this atomic path does not manage; nothing was changed") & ","
+        rj = rj & WcJS("howToProceed") & ":" & WcJS("call add_component directly for designer components") & ","
+        WcAddComponentVbp = rj & Mid$(res, 2)
+        Exit Function
+    End If
+    Dim comp As VBIDE.VBComponent
+    Set comp = Nothing
+    Dim ci As Long
+    For ci = 1 To GetProject().VBComponents.Count
+        If StrComp(GetProject().VBComponents.Item(ci).Name, nm, vbTextCompare) = 0 Then
+            Set comp = GetProject().VBComponents.Item(ci)
+            Exit For
+        End If
+    Next
+    If comp Is Nothing Then
+        Set comp = GetProject().VBComponents.Item(GetProject().VBComponents.Count)
+        On Error Resume Next
+        comp.Name = nm
+        Err.Clear
+        On Error GoTo 0
+    End If
+    Dim foundName As String
+    foundName = ""
+    If Not comp Is Nothing Then foundName = comp.Name
+    Dim pdir As String
+    pdir = Left$(GetProject().FileName, InStrRev(GetProject().FileName, Chr$(92)))
+    Dim fpath As String
+    fpath = pdir & nm & WcCompExt(kind)
+    Dim writeErr As String
+    Dim matOk As Boolean
+    matOk = WcWriteComponentFile(comp, fpath, writeErr)
+    Dim d As Object
+    Set d = WcVbpAtomicSync(nm, kind, True)
+    WcAddComponentVbp = WcSpliceVbpFields(res, d)
+    Dim rollbackFileRemoved As Boolean
+    rollbackFileRemoved = False
+    If CBool(d("rolledBack")) Then
+        If Len(Dir$(fpath)) > 0 Then
+            On Error Resume Next
+            Kill fpath
+            Err.Clear
+            On Error GoTo 0
+            If Len(Dir$(fpath)) = 0 Then rollbackFileRemoved = True
+        End If
+    End If
+    fileCreatedOk = (Len(Dir$(fpath)) > 0)
+    fpathSafe = fpath
+    Dim extra As String
+    extra = ""
+    extra = extra & WcJS("matOk") & ":" & WcJB(matOk) & ","
+    extra = extra & WcJS("foundName") & ":" & WcJS(foundName) & ","
+    extra = extra & WcJS("filePath") & ":" & WcJS(fpath) & ","
+    extra = extra & WcJS("fileMaterialized") & ":" & WcJB(Len(Dir$(fpath)) > 0) & ","
+    extra = extra & WcJS("fileSizeAfterWrite") & ":" & CStr(WcFileSize(fpath)) & ","
+    extra = extra & WcJS("writeErr") & ":" & WcJS(writeErr) & ","
+    Dim dirOk As String
+    dirOk = "false"
+    If Len(Dir$(pdir, vbDirectory)) > 0 Then dirOk = "true"
+    extra = extra & WcJS("dirExists") & ":" & dirOk & ","
+    extra = extra & WcJS("vbpTrailingEolPolicy") & ":" & WcJS("exactly_one_crlf") & ","
+    extra = extra & WcJS("rollbackFileRemoved") & ":" & WcJB(rollbackFileRemoved) & ","
+    WcAddComponentVbp = "{" & extra & Mid$(WcAddComponentVbp, 2)
+    Exit Function
+eh:
+    Dim rbRemoved As Boolean
+    rbRemoved = False
+    On Error Resume Next
+    If fileCreatedOk Then
+        If Len(fpathSafe) > 0 Then
+            If Len(Dir$(fpathSafe)) > 0 Then Kill fpathSafe
+            If Len(Dir$(fpathSafe)) = 0 Then rbRemoved = True
+        End If
+    End If
+    Err.Clear
+    On Error GoTo 0
+    Dim bad As String
+    bad = "{" & WcJS("ok") & ":false,"
+    bad = bad & WcJS("reason") & ":" & WcJS("add_component_vbp_failed") & ","
+    bad = bad & WcJS("vbError") & ":" & WcJS(CStr(Err.Number) & ":" & Err.Description) & ","
+    bad = bad & WcJS("rolledBack") & ":true,"
+    bad = bad & WcJS("vbpChanged") & ":false,"
+    bad = bad & WcJS("rollbackFileRemoved") & ":" & WcJB(rbRemoved) & ","
+    bad = bad & WcJS("howToRecover") & ":" & WcJS("the .vbp was NOT modified; remove the partially added component with remove_component and retry after fixing the write permission on the project directory") & "}"
+    WcAddComponentVbp = bad
+End Function
+
+Private Function WcRemoveComponentVbp(ByVal args As Object) As String
+    Dim nm As String
+    nm = JsonGetStr(args, "name")
+    Dim res As String
+    res = ToolRemoveComponent(nm)
+    WcRemoveComponentVbp = res
+    If Len(nm) = 0 Then Exit Function
+    If Len(res) = 0 Then Exit Function
+    If Left$(res, 1) <> "{" Then Exit Function
+    Dim d As Object
+    Set d = WcVbpAtomicSync(nm, "", False)
+    WcRemoveComponentVbp = WcSpliceVbpFields(res, d)
+End Function
+
+Private Function WcSpliceVbpFields(ByVal jsonText As String, ByVal d As Object) As String
+    Dim frag As String
+    frag = WcJS("vbpChanged") & ":" & WcJB(CBool(d("vbpChanged"))) & ","
+    frag = frag & WcJS("vbpSha256Before") & ":" & WcJS(CStr(d("vbpSha256Before"))) & ","
+    frag = frag & WcJS("vbpSha256After") & ":" & WcJS(CStr(d("vbpSha256After"))) & ","
+    frag = frag & WcJS("vbpBackupPath") & ":" & WcJS(CStr(d("vbpBackupPath"))) & ","
+    frag = frag & WcJS("vbpWritePasses") & ":" & CStr(CLng(d("vbpWritePasses"))) & ","
+    frag = frag & WcJS("rolledBack") & ":" & WcJB(CBool(d("rolledBack"))) & ","
+    frag = frag & WcJS("vbpOrderPolicy") & ":" & WcJS(CStr(d("vbpOrderPolicy"))) & ","
+    frag = frag & WcJS("addedVbpLine") & ":" & WcJS(CStr(d("addedVbpLine"))) & ","
+    frag = frag & WcJS("removedVbpLines") & ":" & CStr(d("removedVbpLinesJson")) & ","
+    If Len(CStr(d("vbpNote"))) > 0 Then frag = frag & WcJS("vbpNote") & ":" & WcJS(CStr(d("vbpNote"))) & ","
+    If Len(CStr(d("vbpReason"))) > 0 Then frag = frag & WcJS("vbpReason") & ":" & WcJS(CStr(d("vbpReason"))) & ","
+    WcSpliceVbpFields = "{" & frag & Mid$(jsonText, 2)
+End Function
+
+Private Function WcJB(ByVal v As Boolean) As String
+    WcJB = "false"
+    If v Then WcJB = "true"
+End Function
+
+Private Function WcJS(ByVal v As String) As String
+    Dim t As String
+    t = Replace(v, Chr$(92), Chr$(92) & Chr$(92))
+    t = Replace(t, Chr$(34), Chr$(92) & Chr$(34))
+    t = Replace(t, vbCrLf, " ")
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    WcJS = Chr$(34) & t & Chr$(34)
+End Function
+
+Private Function WcCompExt(ByVal kind As String) As String
+    Dim k As String
+    k = LCase$(kind)
+    WcCompExt = ".bas"
+    If k = "class" Then WcCompExt = ".cls"
+    If k = "form" Then WcCompExt = ".frm"
+    If k = "mdiform" Then WcCompExt = ".frm"
+    If k = "usercontrol" Then WcCompExt = ".ctl"
+    If k = "proppage" Then WcCompExt = ".pag"
+    If k = "userdoc" Then WcCompExt = ".dob"
+    If k = "designer" Then WcCompExt = ".dsr"
+    If k = "resource" Then WcCompExt = ".res"
+End Function
+
+Private Function WcCompToken(ByVal kind As String) As String
+    Dim k As String
+    k = LCase$(kind)
+    WcCompToken = "Module"
+    If k = "class" Then WcCompToken = "Class"
+    If k = "form" Then WcCompToken = "Form"
+    If k = "mdiform" Then WcCompToken = "MDIForm"
+    If k = "usercontrol" Then WcCompToken = "UserControl"
+    If k = "proppage" Then WcCompToken = "PropertyPage"
+    If k = "userdoc" Then WcCompToken = "UserDocument"
+    If k = "designer" Then WcCompToken = "Designer"
+    If k = "resource" Then WcCompToken = "ResFile"
+End Function
+
+Private Function WcVbpCompName(ByVal ln As String) As String
+    WcVbpCompName = ""
+    Dim t As String
+    t = Trim$(ln)
+    Dim eq As Long
+    eq = InStr(1, t, "=")
+    If eq <= 1 Then Exit Function
+    Dim key As String
+    key = LCase$(Left$(t, eq - 1))
+    If key <> "module" And key <> "class" And key <> "form" And key <> "mdiform" And key <> "usercontrol" And key <> "propertypage" And key <> "userdocument" And key <> "designer" And key <> "resfile" Then Exit Function
+    Dim rest As String
+    rest = Mid$(t, eq + 1)
+    Dim semi As Long
+    semi = InStr(1, rest, ";")
+    If semi > 0 Then rest = Left$(rest, semi - 1)
+    WcVbpCompName = Trim$(rest)
+End Function
+
+Private Function WcVbpAtomicSync(ByVal compName As String, ByVal compKind As String, ByVal isAdd As Boolean) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("vbpChanged") = False
+    d("vbpSha256Before") = ""
+    d("vbpSha256After") = ""
+    d("vbpBackupPath") = ""
+    d("vbpWritePasses") = 0
+    d("rolledBack") = False
+    d("vbpOrderPolicy") = "vb6_section"
+    d("addedVbpLine") = ""
+    d("removedVbpLinesJson") = "[]"
+    d("vbpNote") = ""
+    d("vbpReason") = ""
+    On Error Resume Next
+    Dim p As VBIDE.VBProject
+    Set p = GetProject()
+    Dim vbp As String
+    vbp = ""
+    vbp = p.FileName
+    If Len(vbp) = 0 Then
+        d("vbpReason") = "the project has no file name (unsaved); .vbp was not touched"
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    If Len(Dir$(vbp)) = 0 Then
+        d("vbpReason") = "the .vbp is not on disk: " & vbp
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        d("vbpReason") = "the .vbp path could not be read from the IDE"
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    d("vbpSha256Before") = Build.FileSha256(vbp)
+    Dim text As String
+    Dim encUsed As String
+    Dim whyRead As String
+    text = ""
+    If Not Build.ReadSourceText(vbp, text, encUsed, whyRead) Then
+        d("vbpReason") = "the .vbp could not be read as text: " & whyRead
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    Dim norm As String
+    norm = Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf)
+    Dim lines() As String
+    lines = Split(norm, vbLf)
+    Dim n As Long
+    n = UBound(lines)
+    Dim i As Long
+    Dim lastComp As Long
+    Dim found As Long
+    lastComp = -1
+    found = -1
+    For i = 0 To n
+        If Len(WcVbpCompName(lines(i))) > 0 Then
+            lastComp = i
+            If StrComp(WcVbpCompName(lines(i)), compName, vbTextCompare) = 0 Then found = i
+        End If
+    Next
+    Dim cnt As Long
+    Dim newLine As String
+    If isAdd Then
+        If found >= 0 Then
+            d("vbpNote") = "the component line already exists; .vbp was NOT touched"
+            Set WcVbpAtomicSync = d
+            Exit Function
+        End If
+        newLine = WcCompToken(compKind) & "=" & compName & "; " & compName & WcCompExt(compKind)
+        Dim outLines() As String
+        ReDim outLines(0 To n + 1)
+        If lastComp < 0 Then lastComp = 0
+        cnt = 0
+        For i = 0 To n
+            outLines(cnt) = lines(i)
+            cnt = cnt + 1
+            If i = lastComp Then
+                outLines(cnt) = newLine
+                cnt = cnt + 1
+            End If
+        Next
+        lines = outLines
+        n = cnt - 1
+        d("addedVbpLine") = newLine
+    Else
+        If found < 0 Then
+            d("vbpNote") = "no .vbp component line matches this name; nothing to remove"
+            Set WcVbpAtomicSync = d
+            Exit Function
+        End If
+        Dim remJson As String
+        remJson = ""
+        cnt = 0
+        For i = 0 To n
+            If StrComp(WcVbpCompName(lines(i)), compName, vbTextCompare) = 0 Then
+                If Len(remJson) > 0 Then remJson = remJson & ","
+                remJson = remJson & WcJS(lines(i))
+                cnt = cnt + 1
+            End If
+        Next
+        d("removedVbpLinesJson") = "[" & remJson & "]"
+        Dim kept() As String
+        ReDim kept(0 To n - cnt)
+        Dim m As Long
+        m = 0
+        For i = 0 To n
+            If StrComp(WcVbpCompName(lines(i)), compName, vbTextCompare) <> 0 Then
+                kept(m) = lines(i)
+                m = m + 1
+            End If
+        Next
+        lines = kept
+        n = m - 1
+    End If
+    Dim newText As String
+    newText = Join(lines, vbCrLf)
+    ' only re-add the final EOL when the split did NOT already leave an empty tail element
+    If Right$(text, 2) = vbCrLf Then
+        If n < 0 Then
+            newText = newText & vbCrLf
+        ElseIf Len(lines(n)) > 0 Then
+            newText = newText & vbCrLf
+        End If
+    End If
+    Dim tmp As String
+    Dim bak As String
+    tmp = vbp & ".wc_tmp"
+    bak = vbp & ".wc_bak"
+    d("vbpBackupPath") = bak
+    Err.Clear
+    WcWriteTextFile tmp, newText
+    If Err.Number <> 0 Then
+        d("vbpReason") = "could not write the temp .vbp: " & Err.Description
+        Err.Clear
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    If Len(Dir$(bak)) > 0 Then Kill bak
+    FileCopy vbp, bak
+    If Err.Number <> 0 Then
+        d("vbpReason") = "could not back up the .vbp: " & Err.Description
+        d("rolledBack") = True
+        Err.Clear
+        If Len(Dir$(tmp)) > 0 Then Kill tmp
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    Dim oldName As String
+    oldName = vbp & ".wc_old"
+    If Len(Dir$(oldName)) > 0 Then Kill oldName
+    Name vbp As oldName
+    If Err.Number <> 0 Then
+        d("vbpReason") = "could not move the original .vbp aside: " & Err.Description
+        Err.Clear
+        WcRestoreVbp vbp, bak, tmp
+        d("rolledBack") = True
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    Name tmp As vbp
+    If Err.Number <> 0 Then
+        d("vbpReason") = "could not put the new .vbp in place: " & Err.Description
+        Err.Clear
+        WcRestoreVbp vbp, bak, tmp
+        d("rolledBack") = True
+        Set WcVbpAtomicSync = d
+        Exit Function
+    End If
+    If Len(Dir$(oldName)) > 0 Then Kill oldName
+    d("vbpWritePasses") = 1
+    d("vbpChanged") = True
+    d("vbpSha256After") = Build.FileSha256(vbp)
+    Dim back As String
+    Dim enc2 As String
+    Dim why2 As String
+    back = ""
+    If Build.ReadSourceText(vbp, back, enc2, why2) Then
+        If back <> newText Then
+            d("vbpReason") = "READ-BACK MISMATCH: restoring the original .vbp"
+            WcRestoreVbp vbp, bak, ""
+            d("vbpChanged") = False
+            d("rolledBack") = True
+            d("vbpSha256After") = Build.FileSha256(vbp)
+        End If
+    End If
+    Err.Clear
+    Set WcVbpAtomicSync = d
+End Function
+
+Private Sub WcWriteTextFile(ByVal path As String, ByVal text As String)
+    Dim b() As Byte
+    b = StrConv(text, vbFromUnicode)
+    Dim f As Integer
+    f = FreeFile
+    Open path For Binary As #f
+    Put #f, , b
+    Close #f
+End Sub
+
+Private Sub WcRestoreVbp(ByVal vbp As String, ByVal bak As String, ByVal tmp As String)
+    On Error Resume Next
+    If Len(tmp) > 0 Then
+        If Len(Dir$(tmp)) > 0 Then Kill tmp
+    End If
+    If Len(Dir$(bak)) > 0 Then
+        If Len(Dir$(vbp)) > 0 Then Kill vbp
+        FileCopy bak, vbp
+    End If
+    Err.Clear
+End Sub
+
+Private Sub WcNoopProbe()
+End Sub
+
+Private Function WcWriteComponentFile(ByVal comp As Object, ByVal fpath As String, ByRef writeErr As String) As Boolean
+    WcWriteComponentFile = False
+    writeErr = ""
+    On Error GoTo eh
+    If comp Is Nothing Then
+        writeErr = "no component object"
+        Exit Function
+    End If
+    Dim cl As Long
+    Dim txt As String
+    cl = 0
+    txt = ""
+    If Not comp.CodeModule Is Nothing Then
+        cl = comp.CodeModule.CountOfLines
+        If cl > 0 Then txt = comp.CodeModule.Lines(1, cl)
+    End If
+    Dim body As String
+    body = "Attribute VB_Name = " & Chr$(34) & comp.Name & Chr$(34) & vbCrLf & txt & vbCrLf
+    WcWriteTextFile fpath, body
+    If Len(Dir$(fpath)) > 0 Then WcWriteComponentFile = True
+    Exit Function
+eh:
+    writeErr = CStr(Err.Number) & ":" & Err.Description
+End Function
+
+Private Function WcFileSize(ByVal path As String) As Long
+    WcFileSize = 0
+    On Error Resume Next
+    If Len(Dir$(path)) > 0 Then WcFileSize = FileLen(path)
+    Err.Clear
+End Function
+' =====================================================================
+' W-F (P3): transactional procedure move/delete. Panes are captured first;
+' ANY failure restores BOTH sides. .vbp is never touched.
+' =====================================================================
+Private Function WfPaneLines(ByVal compName As String) As String()
+    Dim t As String
+    t = SafeCompText(compName)
+    WfPaneLines = Split(Replace(Replace(t, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+End Function
+
+Private Function WfProcSpan(ByVal compName As String, ByVal proc As String, ByRef sLine As Long, ByRef eLine As Long) As Boolean
+    WfProcSpan = False
+    sLine = 0
+    eLine = 0
+    Dim comp As VBIDE.VBComponent
+    Set comp = FindComponent(compName)
+    If comp Is Nothing Then Exit Function
+    If comp.CodeModule Is Nothing Then Exit Function
+    WfProcSpan = ProcRangeOf(comp.CodeModule, proc, sLine, eLine)
+End Function
+
+Private Function WfNorm(ByVal t As String) As String
+    Dim s As String
+    s = Replace(t, vbCrLf, vbLf)
+    s = Replace(s, vbCr, vbLf)
+    Do While Len(s) > 0
+        If Right$(s, 1) = Chr$(10) Or Right$(s, 1) = Chr$(32) Then
+            s = Left$(s, Len(s) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+    WfNorm = s
+End Function
+
+Private Function WfSetPane(ByVal compName As String, ByVal text As String) As Boolean
+    WfSetPane = False
+    On Error Resume Next
+    Dim r As String
+    r = ToolReplaceCode(compName, "set", 0, 0, text, "", "off", True)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    ' CodeModule may normalise the trailing newline, so compare the NORMALISED text
+    If WfNorm(CompText(compName)) = WfNorm(text) Then WfSetPane = True
+End Function
+
+Private Function WfSha(ByVal t As String) As String
+    WfSha = Sha256HexTextUtf8(t)
+End Function
+
+Private Function WfJoinRange(ByRef lines() As String, ByVal sLine As Long, ByVal eLine As Long) As String
+    Dim i As Long
+    Dim out As String
+    out = ""
+    For i = sLine - 1 To eLine - 1
+        If i > sLine - 1 Then out = out & vbCrLf
+        out = out & lines(i)
+    Next
+    WfJoinRange = out
+End Function
+
+Private Function WfRemoveRange(ByRef lines() As String, ByVal sLine As Long, ByVal eLine As Long) As String
+    Dim out As String
+    Dim i As Long
+    Dim n As Long
+    n = UBound(lines)
+    out = ""
+    For i = 0 To n
+        If i < sLine - 1 Or i > eLine - 1 Then
+            If Len(out) > 0 Then out = out & vbCrLf
+            out = out & lines(i)
+        End If
+    Next
+    WfRemoveRange = out
+End Function
+
+Private Function WfRemoveRanges(ByRef lines() As String, ByRef starts() As Long, ByRef ends() As Long, ByVal cnt As Long) As String
+    Dim keep() As Boolean
+    Dim i As Long
+    Dim n As Long
+    n = UBound(lines)
+    ReDim keep(0 To n)
+    For i = 0 To n
+        keep(i) = True
+    Next
+    Dim k As Long
+    For k = 0 To cnt - 1
+        For i = starts(k) - 1 To ends(k) - 1
+            If i >= 0 And i <= n Then keep(i) = False
+        Next
+    Next
+    Dim out As String
+    out = ""
+    For i = 0 To n
+        If keep(i) Then
+            If Len(out) > 0 Then out = out & vbCrLf
+            out = out & lines(i)
+        End If
+    Next
+    WfRemoveRanges = out
+End Function
+
+Private Function ToolMoveProcedure(ByVal fromComp As String, ByVal proc As String, ByVal toComp As String, ByVal anchor As String) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "move_procedure"
+    root("ok") = False
+    root("rolledBack") = False
+    root("restoreVerified") = False
+    root("vbpTouched") = False
+    root("encoding") = "pane-text"
+    root("bom") = "n/a (pane text, no file write)"
+    Dim snaps As Object
+    Set snaps = New Collection
+    On Error GoTo eh
+    Dim srcBefore As String
+    Dim tgtBefore As String
+    srcBefore = SafeCompText(fromComp)
+    tgtBefore = SafeCompText(toComp)
+    root("sourceSha256Before") = WfSha(srcBefore)
+    root("targetSha256Before") = WfSha(tgtBefore)
+    Dim sLine As Long
+    Dim eLine As Long
+    If Not WfProcSpan(fromComp, proc, sLine, eLine) Then
+        root("reason") = "proc_not_found"
+        ToolMoveProcedure = JsonStringify(root)
+        Exit Function
+    End If
+    Dim srcLines() As String
+    srcLines = WfPaneLines(fromComp)
+    If eLine > UBound(srcLines) + 1 Then
+        root("reason") = "proc_range_out_of_bounds"
+        ToolMoveProcedure = JsonStringify(root)
+        Exit Function
+    End If
+    Dim block As String
+    block = WfJoinRange(srcLines, sLine, eLine)
+    Dim tgtLines() As String
+    tgtLines = WfPaneLines(toComp)
+    Dim tn As Long
+    tn = UBound(tgtLines)
+    Dim atLine As Long
+    atLine = tn + 1
+    If Len(Trim$(anchor)) > 0 Then
+        atLine = -1
+        Dim ai As Long
+        For ai = 0 To tn
+            If Trim$(tgtLines(ai)) = Trim$(anchor) Then
+                atLine = ai + 1
+                Exit For
+            End If
+        Next
+        If atLine < 0 Then
+            root("reason") = "insert_anchor_not_found"
+            ToolMoveProcedure = JsonStringify(root)
+            Exit Function
+        End If
+    End If
+    Dim outTgt As String
+    outTgt = WfInsertBlock(tgtLines, atLine, block)
+    UndoSnapshot fromComp, srcBefore
+    UndoSnapshot toComp, tgtBefore
+    snaps.Add "undo_snapshot:" & fromComp
+    snaps.Add "undo_snapshot:" & toComp
+    Set root("snapshots") = snaps
+    If Not WfSetPane(toComp, outTgt) Then
+        root("reason") = "target_insert_failed"
+        If WfSetPane(toComp, tgtBefore) Then root("restoreVerified") = True
+        root("rolledBack") = True
+        ToolMoveProcedure = JsonStringify(root)
+        Exit Function
+    End If
+    Dim outSrc As String
+    outSrc = WfRemoveRange(srcLines, sLine, eLine)
+    If Not WfSetPane(fromComp, outSrc) Then
+        root("reason") = "source_delete_failed"
+        Dim okA As Boolean
+        okA = True
+        If Not WfSetPane(fromComp, srcBefore) Then okA = False
+        If Not WfSetPane(toComp, tgtBefore) Then okA = False
+        root("restoreVerified") = okA
+        root("rolledBack") = True
+        ToolMoveProcedure = JsonStringify(root)
+        Exit Function
+    End If
+    Dim moved As Object
+    Set moved = CreateObject("Scripting.Dictionary")
+    moved("from") = fromComp
+    moved("to") = toComp
+    moved("proc") = proc
+    moved("lineCount") = eLine - sLine + 1
+    moved("insertAfterLine") = atLine
+    Set root("moved") = moved
+    root("sourceSha256After") = WfSha(SafeCompText(fromComp))
+    root("targetSha256After") = WfSha(SafeCompText(toComp))
+    root("roundtrip_ok") = (Len(CompText(toComp)) > 0)
+    root("ok") = True
+    ToolMoveProcedure = JsonStringify(root)
+    Exit Function
+eh:
+    root("reason") = "unexpected_error"
+    root("errorMessage") = CStr(Err.Number) & ":" & Err.Description
+    On Error Resume Next
+    Err.Clear
+    ToolMoveProcedure = JsonStringify(root)
+End Function
+
+Private Function WfInsertBlock(ByRef lines() As String, ByVal atLine As Long, ByVal block As String) As String
+    Dim out As String
+    Dim i As Long
+    Dim n As Long
+    n = UBound(lines)
+    out = ""
+    For i = 0 To n
+        out = out & lines(i) & vbCrLf
+        If i = atLine - 1 Then out = out & block & vbCrLf & vbCrLf
+    Next
+    WfInsertBlock = out
+End Function
+
+Private Function ToolDeleteProcedures(ByVal procs As Object, ByVal defaultComp As String) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "delete_procedures"
+    root("ok") = False
+    root("rolledBack") = False
+    root("restoreVerified") = False
+    root("snapshotId") = "undo_snapshot_written_per_component"
+    root("encoding") = "pane-text"
+    root("bom") = "n/a (pane text)"
+    Dim deleted As Object
+    Set deleted = New Collection
+    Dim shas As Object
+    Set shas = New Collection
+    Dim before As Object
+    Set before = CreateObject("Scripting.Dictionary")
+    On Error GoTo eh
+    Dim comps As Object
+    Set comps = CreateObject("Scripting.Dictionary")
+    Dim i As Long
+    For i = 1 To procs.Count
+        Dim ent As Object
+        Set ent = procs(i)
+        Dim cn As String
+        Dim pn As String
+        If IsObject(ent) Then
+            cn = JsonGetStr(ent, "component")
+            pn = JsonGetStr(ent, "proc")
+        Else
+            cn = defaultComp
+            pn = CStr(ent)
+        End If
+        If Len(cn) = 0 Or Len(pn) = 0 Then
+            root("reason") = "bad_entry"
+            ToolDeleteProcedures = JsonStringify(root)
+            Exit Function
+        End If
+        If Not comps.Exists(cn) Then comps.Add cn, cn
+    Next
+    Dim k As Variant
+    For Each k In comps.Keys
+        before.Add CStr(k), SafeCompText(CStr(k))
+        shas.Add WfSha(CStr(k))
+        UndoSnapshot CStr(k), SafeCompText(CStr(k))
+    Next
+    Dim compName As Variant
+    For Each compName In comps.Keys
+        Dim starts() As Long
+        Dim ends() As Long
+        Dim prname() As String
+        Dim cnt As Long
+        cnt = 0
+        ReDim starts(0 To procs.Count)
+        ReDim ends(0 To procs.Count)
+        ReDim prname(0 To procs.Count)
+        Dim j As Long
+        For j = 1 To procs.Count
+            Dim e2 As Object
+            Set e2 = procs(j)
+            Dim cn2 As String
+            Dim pn2 As String
+            If IsObject(e2) Then
+                cn2 = JsonGetStr(e2, "component")
+                pn2 = JsonGetStr(e2, "proc")
+            Else
+                cn2 = defaultComp
+                pn2 = CStr(e2)
+            End If
+            If StrComp(cn2, CStr(compName), vbTextCompare) = 0 Then
+                Dim sL As Long
+                Dim eL As Long
+                If Not WfProcSpan(cn2, pn2, sL, eL) Then
+                    root("reason") = "proc_not_found"
+                    root("missingProc") = pn2
+                    WfRestoreAll before
+                    root("rolledBack") = True
+                    ToolDeleteProcedures = JsonStringify(root)
+                    Exit Function
+                End If
+                starts(cnt) = sL
+                ends(cnt) = eL
+                prname(cnt) = pn2
+                cnt = cnt + 1
+            End If
+        Next
+        Dim nl() As String
+        nl = WfPaneLines(CStr(compName))
+        Dim outTxt As String
+        outTxt = WfRemoveRanges(nl, starts, ends, cnt)
+        If Not WfSetPane(CStr(compName), outTxt) Then
+            root("reason") = "delete_failed"
+            WfRestoreAll before
+            root("rolledBack") = True
+            root("restoreVerified") = True
+            ToolDeleteProcedures = JsonStringify(root)
+            Exit Function
+        End If
+        Dim x As Long
+        For x = 0 To cnt - 1
+            Dim drec As Object
+            Set drec = CreateObject("Scripting.Dictionary")
+            drec("component") = CStr(compName)
+            drec("proc") = prname(x)
+            drec("fromLine") = starts(x)
+            drec("toLine") = ends(x)
+            drec("lineCount") = ends(x) - starts(x) + 1
+            deleted.Add drec
+        Next
+    Next
+    Set root("deleted") = deleted
+    Set root("shas") = shas
+    root("ok") = True
+    ToolDeleteProcedures = JsonStringify(root)
+    Exit Function
+eh:
+    root("reason") = "unexpected_error"
+    root("errorMessage") = CStr(Err.Number) & ":" & Err.Description
+    On Error Resume Next
+    WfRestoreAll before
+    root("rolledBack") = True
+    Err.Clear
+    ToolDeleteProcedures = JsonStringify(root)
+End Function
+
+Private Sub WfRestoreAll(ByRef before As Object)
+    On Error Resume Next
+    Dim k As Variant
+    For Each k In before.Keys
+        WfSetPane CStr(k), CStr(before(k))
+    Next
+    Err.Clear
+End Sub
+' =====================================================================
+' W-F (P7): byte-anchor edit. Works on the RAW file bytes (GBK/ANSI), so a
+' Chinese comment can be replaced without any text-encoding round trip.
+' =====================================================================
+Private Function WbB64Alphabet() As String
+    WbB64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+End Function
+
+Private Function WbB64Decode(ByVal s As String, ByRef ok As Boolean) As Byte()
+    ok = False
+    Dim alpha As String
+    alpha = WbB64Alphabet()
+    Dim clean As String
+    clean = ""
+    Dim i As Long
+    Dim ch As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If InStr(1, alpha, ch) > 0 Then clean = clean & ch
+    Next
+    Dim n As Long
+    n = Len(clean)
+    If n = 0 Then
+        ok = True
+        WbB64Decode = WbEmptyBytes()
+        Exit Function
+    End If
+    Dim pad As Long
+    pad = 0
+    If n Mod 4 = 2 Then pad = 2
+    If n Mod 4 = 3 Then pad = 1
+    Dim outN As Long
+    outN = (n * 6) \ 8
+    If outN < 1 Then outN = 1
+    Dim out() As Byte
+    ReDim out(0 To outN - 1)
+    Dim acc As Long
+    Dim bits As Long
+    Dim j As Long
+    j = 0
+    bits = 0
+    acc = 0
+    For i = 1 To n
+        acc = acc * 64 + (InStr(1, alpha, Mid$(clean, i, 1)) - 1)
+        bits = bits + 6
+        If bits >= 8 Then
+            bits = bits - 8
+            Dim byteVal As Long
+            byteVal = Int(acc / (2 ^ bits))
+            byteVal = byteVal Mod 256
+            If j <= UBound(out) Then out(j) = byteVal
+            j = j + 1
+            acc = acc Mod (2 ^ bits)
+        End If
+    Next
+    ok = True
+    WbB64Decode = out
+End Function
+
+Private Function WbEmptyBytes() As Byte()
+    Dim e() As Byte
+    ReDim e(0 To 0)
+    WbEmptyBytes = e
+End Function
+
+Private Function WbFindBytes(ByRef hay() As Byte, ByRef needle() As Byte, ByVal fromIdx As Long) As Long
+    WbFindBytes = -1
+    Dim hn As Long
+    Dim nn As Long
+    hn = UBound(hay)
+    nn = UBound(needle)
+    Dim i As Long
+    Dim j As Long
+    Dim ok As Boolean
+    For i = fromIdx To hn - nn
+        ok = True
+        For j = 0 To nn
+            If hay(i + j) <> needle(j) Then
+                ok = False
+                Exit For
+            End If
+        Next
+        If ok Then
+            WbFindBytes = i
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function WbIsGbkSplit(ByRef b() As Byte, ByVal idx As Long) As Boolean
+    WbIsGbkSplit = False
+    If idx <= 0 Then Exit Function
+    If idx > UBound(b) Then Exit Function
+    Dim prev As Long
+    Dim cur As Long
+    prev = b(idx - 1)
+    cur = b(idx)
+    If prev >= &H81 And prev <= &HFE Then
+        If cur >= &H40 And cur <= &HFE Then WbIsGbkSplit = True
+    End If
+End Function
+
+Private Function WbBytesEqual(ByRef a() As Byte, ByRef b() As Byte) As Boolean
+    WbBytesEqual = False
+    If UBound(a) <> UBound(b) Then Exit Function
+    Dim i As Long
+    For i = 0 To UBound(a)
+        If a(i) <> b(i) Then Exit Function
+    Next
+    WbBytesEqual = True
+End Function
+
+Private Function WbBomJson(ByRef b() As Byte) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("bom") = False
+    d("kind") = "none"
+    If UBound(b) >= 2 Then
+        If b(0) = &HEF And b(1) = &HBB And b(2) = &HBF Then
+            d("bom") = True
+            d("kind") = "utf-8"
+        End If
+    End If
+    If UBound(b) >= 1 Then
+        If b(0) = &HFF And b(1) = &HFE Then
+            d("bom") = True
+            d("kind") = "utf-16le"
+        End If
+    End If
+    Set WbBomJson = d
+End Function
+
+Private Function WbByteCount(ByRef b() As Byte) As Long
+    WbByteCount = 0
+    On Error Resume Next
+    WbByteCount = UBound(b) - LBound(b) + 1
+    If Err.Number <> 0 Then
+        WbByteCount = 0
+        Err.Clear
+    End If
+End Function
+
+Private Function WbPathKind(ByVal p As String) As String
+    WbPathKind = "relative"
+    If Len(p) >= 2 Then
+        If Mid$(p, 2, 1) = ":" Then WbPathKind = "absolute"
+    End If
+    If Left$(p, 2) = "\\" Then WbPathKind = "unc"
+    If Left$(p, 2) = "//" Then WbPathKind = "unc"
+End Function
+
+Private Function WbArrayFromBytes(ByRef b() As Byte, ByVal sIdx As Long, ByVal n As Long) As Byte()
+    Dim out() As Byte
+    ReDim out(0 To n - 1)
+    Dim i As Long
+    For i = 0 To n - 1
+        out(i) = b(sIdx + i)
+    Next
+    WbArrayFromBytes = out
+End Function
+
+Private Function ToolEditByByteAnchor(ByVal args As Object) As String
+    Dim root As Object
+    Set root = CreateObject("Scripting.Dictionary")
+    root("tool") = "edit_by_byte_anchor"
+    root("ok") = False
+    root("fileUntouched") = True
+    root("encoding") = "ansi/gbk (raw bytes)"
+    root("gbkBoundarySafe") = False
+    root("roundtrip_ok") = False
+    On Error GoTo eh
+    Dim rawPath As String
+    rawPath = JsonGetStr(args, "path")
+    root("rawPath") = rawPath
+    Dim path As String
+    path = ResolvePath(rawPath)
+    root("resolvedPath") = path
+    root("pathKind") = WbPathKind(rawPath)
+    If Len(path) = 0 Then
+        root("reason") = "path_required"
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If Len(Dir$(path)) = 0 Then
+        root("reason") = "file_not_found"
+        root("dirFound") = (Len(Dir$(Left$(path, InStrRev(path, Chr$(92))), vbDirectory)) > 0)
+        root("fileUntouched") = True
+        root("sha256Before") = ""
+        root("sha256After") = ""
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    Dim okOld As Boolean
+    Dim okNew As Boolean
+    Dim oldB() As Byte
+    Dim newB() As Byte
+    oldB = WbB64Decode(JsonGetStr(args, "old_bytes_b64"), okOld)
+    newB = WbB64Decode(JsonGetStr(args, "new_bytes_b64"), okNew)
+    If Not okOld Or Not okNew Then
+        root("reason") = "bad_base64"
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If UBound(oldB) < 0 Then
+        root("reason") = "old_bytes_empty"
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    Dim b() As Byte
+    ReadAllBytesTo path, b
+    If WbByteCount(b) <= 0 Then
+        root("reason") = "read_failed_or_empty"
+        root("fileUntouched") = True
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    root("sha256Before") = Encoding.Sha256HexFile(path)
+    ' on ANY failure path the digest must stay equal to the pre-call one (fileUntouched:true)
+    root("sha256After") = root("sha256Before")
+    root("bytesBefore") = UBound(b) + 1
+    Set root("bom") = WbBomJson(b)
+    ' locate
+    Dim hits() As Long
+    Dim cnt As Long
+    cnt = 0
+    ReDim hits(0 To 64)
+    Dim start As Long
+    start = 0
+    Do
+        Dim pos As Long
+        pos = WbFindBytes(b, oldB, start)
+        If pos < 0 Then Exit Do
+        If cnt <= UBound(hits) Then hits(cnt) = pos
+        cnt = cnt + 1
+        start = pos + 1
+    Loop While cnt < 65
+    If cnt = 0 Then
+        root("reason") = "anchor_not_found"
+        root("encoding_mismatch") = True
+        root("encodingDetected") = Encoding.DetectEncoding(b)
+        root("note") = "the base64 bytes do not occur in the file. If the anchor text LOOKS right in a text editor, the file is probably not in the encoding those bytes were produced from - check encodingDetected."
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If cnt > 1 And Not JsonGetBool(args, "all_matches", False) Then
+        root("reason") = "anchor_ambiguous"
+        root("matches") = cnt
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    ' GBK boundary: the match may not START or END inside a double-byte character
+    Dim i As Long
+    Dim nn As Long
+    nn = UBound(oldB) + 1
+    For i = 0 To cnt - 1
+        If hits(i) > 0 Then
+            If WbIsGbkSplit(b, hits(i)) Then
+                root("reason") = "anchor_splits_gbk_char"
+                root("gbkBoundarySafe") = False
+                root("anchorByteOffset") = hits(i)
+                root("note") = "the anchor starts in the middle of a double-byte GBK character (lead 0x81..0xFE / trail 0x40..0xFE)"
+                ToolEditByByteAnchor = JsonStringify(root)
+                Exit Function
+            End If
+        End If
+        Dim endIdx As Long
+        endIdx = hits(i) + nn
+        If endIdx <= UBound(b) Then
+            If WbIsGbkSplit(b, endIdx) Then
+                root("reason") = "anchor_splits_gbk_char"
+                root("gbkBoundarySafe") = False
+                root("anchorByteOffset") = hits(i)
+                root("note") = "the anchor ENDS in the middle of a double-byte GBK character (the replacement would start inside one)"
+                ToolEditByByteAnchor = JsonStringify(root)
+                Exit Function
+            End If
+        End If
+    Next
+    root("gbkBoundarySafe") = True
+    root("anchorByteOffset") = hits(0)
+    root("matches") = cnt
+    ' build the new byte array
+    Dim newLen As Long
+    newLen = UBound(newB) + 1
+    If Len(Trim$(JsonGetStr(args, "new_bytes_b64"))) = 0 Then newLen = 0
+    Dim grow As Long
+    grow = newLen - nn
+    Dim outN As Long
+    outN = (UBound(b) + 1) + grow * cnt
+    Dim out() As Byte
+    ReDim out(0 To outN - 1)
+    Dim src As Long
+    Dim dst As Long
+    src = 0
+    dst = 0
+    Dim used As Long
+    used = 0
+    Dim hitIdx As Long
+    hitIdx = 0
+    Do While src <= UBound(b)
+        If hitIdx < cnt Then
+            If src = hits(hitIdx) Then
+                Dim k As Long
+                For k = 0 To newLen - 1
+                    out(dst) = newB(k)
+                    dst = dst + 1
+                Next
+                src = src + nn
+                hitIdx = hitIdx + 1
+                used = used + 1
+            Else
+                out(dst) = b(src)
+                dst = dst + 1
+                src = src + 1
+            End If
+        Else
+            out(dst) = b(src)
+            dst = dst + 1
+            src = src + 1
+        End If
+    Loop
+    ' round-trip self check (GBK decode then re-encode) BEFORE any write
+    Dim txt As String
+    Dim back() As Byte
+    txt = StrConv(out, vbUnicode)
+    back = StrConv(txt, vbFromUnicode)
+    root("roundtrip_ok") = WbBytesEqual(back, out)
+    If Not CBool(root("roundtrip_ok")) Then
+        root("reason") = "roundtrip_failed"
+        root("note") = "the new bytes do not survive an ANSI decode/encode round trip; NOTHING was written"
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If UBound(out) < 0 Then
+        root("reason") = "empty_result_refused"
+        root("fileUntouched") = True
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If UBound(out) = 0 And WbByteCount(out) = 0 Then
+        root("reason") = "empty_result_refused"
+        root("fileUntouched") = True
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    If Not Encoding.WriteAllBytesChecked(path, out) Then
+        root("reason") = "write_failed"
+        root("fileUntouched") = True
+        ToolEditByByteAnchor = JsonStringify(root)
+        Exit Function
+    End If
+    root("sha256After") = Encoding.Sha256HexFile(path)
+    root("fileUntouched") = False
+    root("bytesAfter") = outN
+    root("bytesChanged") = CDbl(root("bytesAfter")) - CDbl(root("bytesBefore"))
+    root("ok") = True
+    ToolEditByByteAnchor = JsonStringify(root)
+    Exit Function
+eh:
+    root("reason") = "unexpected_error"
+    root("errorMessage") = CStr(Err.Number) & ":" & Err.Description
+    On Error Resume Next
+    Err.Clear
+    ToolEditByByteAnchor = JsonStringify(root)
 End Function

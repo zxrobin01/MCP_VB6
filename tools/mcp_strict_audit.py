@@ -32,6 +32,7 @@ Exit codes: 0 all checks passed | 1 strict check(s) failed | 2 usage error |
             3 refused target | 4 connection failure
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -84,6 +85,25 @@ def target_port(url):
     return (parts.port or (443 if parts.scheme == "https" else 80)), ""
 
 
+def _auth_token():
+    """Optional bearer token for a TOKEN-PROTECTED endpoint (never echoed).
+
+    Env only, deliberately: VB6MCP_TOKEN, else VB6MCP_TOKEN_FILE.  Without a token
+    every request is byte-for-byte what it was before this helper existed.
+    """
+    tok = (os.environ.get("VB6MCP_TOKEN") or "").strip()
+    if tok:
+        return tok
+    path = (os.environ.get("VB6MCP_TOKEN_FILE") or "").strip()
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
 def post(url, method, params=None, rid=1, proto=None):
     body = {"jsonrpc": "2.0", "id": rid, "method": method}
     if params is not None:
@@ -92,6 +112,9 @@ def post(url, method, params=None, rid=1, proto=None):
                "Accept": "application/json, text/event-stream"}
     if proto:
         headers["MCP-Protocol-Version"] = proto
+    tok = _auth_token()
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r:
         raw = r.read().decode("utf-8-sig")
@@ -173,6 +196,15 @@ def _audit(url):
     check("3c. tools present", n > 0, "count=%d" % n)
     check("3d. every tool has inputSchema",
           all(t.get("inputSchema") for t in (tres.get("tools") or [])), "")
+    _tools = tres.get("tools") or []
+    _bad_req = [t.get("name") for t in _tools
+                if not isinstance((t.get("inputSchema") or {}).get("required"), list)]
+    check("3e. every inputSchema.required is an ARRAY", not _bad_req,
+          "bad=" + ",".join(str(x) for x in _bad_req[:6]))
+    _bad_props = [t.get("name") for t in _tools
+                  if not isinstance((t.get("inputSchema") or {}).get("properties"), dict)]
+    check("3f. every inputSchema.properties is an OBJECT", not _bad_props,
+          "bad=" + ",".join(str(x) for x in _bad_props[:6]))
 
     name = (tres.get("tools") or [{}])[0].get("name")
     tc = post(url, "tools/call", {"name": name, "arguments": {}}, 3, proto=sv)
