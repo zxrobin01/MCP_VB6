@@ -89,20 +89,20 @@ End Property
 
 Public Function ProjectName() As String
     If m_tools Is Nothing Then Exit Function
-    ProjectName = m_tools.ProjectNameSafe()
+    ProjectName = McpProjTools.ProjectNameSafe(m_tools)
 End Function
 
 ' the instance registry needs the project file and the DLL hash.
 Public Function ProjectFileName() As String
     On Error Resume Next
     If m_tools Is Nothing Then Exit Function
-    ProjectFileName = m_tools.ProjectFileNameSafe()
+    ProjectFileName = McpCls.ProjectFileNameSafe(m_tools)
 End Function
 
 Public Function ProductBuildSha256() As String
     On Error Resume Next
     If m_tools Is Nothing Then Exit Function
-    ProductBuildSha256 = m_tools.BuildSha256()
+    ProductBuildSha256 = McpBuildTools.BuildSha256(m_tools)
 End Function
 
 ' the settings form shows the tool count; forward it from the tool table so it
@@ -148,7 +148,7 @@ Public Function HandleJsonRpc(ByVal requestText As String) As String
             Set emptyDict = CreateObject("Scripting.Dictionary")
             HandleJsonRpc = JsonRpcResult(id, emptyDict)
         Case "tools/list"
-            HandleJsonRpc = JsonRpcResult(id, m_tools.BuildToolsListResult())
+            HandleJsonRpc = JsonRpcResultRaw(id, m_tools.ToolsListResultJson())
         Case "tools/call"
             HandleJsonRpc = HandleToolCall(obj, id)
         Case "resources/list"
@@ -241,7 +241,7 @@ Private Function HandleResourceRead(ByVal obj As Object, ByVal id As Variant) As
     compPrefix = "vb6://component/"
     If uri = "vb6://project" Then
         On Error Resume Next
-        text = m_tools.ProjectVbpText()
+        text = McpProjTools.ProjectVbpText(m_tools)
         On Error GoTo 0
     ElseIf Left$(LCase$(uri), Len(compPrefix)) = compPrefix Then
         On Error Resume Next
@@ -367,7 +367,9 @@ Private Function HandleToolCall(ByVal obj As Object, ByVal id As Variant) As Str
         HandleToolCall = JsonRpcResult(id, ToolErrorResult("params.name is required"))
         Exit Function
     End If
+    WinOps.WheelRequestAttach "rpc_begin"
     HandleToolCall = JsonRpcResult(id, m_tools.CallTool(name, args))
+    WinOps.WheelRequestAttach "rpc_end"
 End Function
 
 ' ---------- HTTP routing ----------
@@ -537,7 +539,7 @@ Private Function BuildInitializeResult(ByVal clientVersion As String) As Object
     ' The instructions banner is published through initialize.instructions so the
     ' agent reads it before calling anything.
     On Error Resume Next
-    d("instructions") = m_tools.BuildInstructions()
+    d("instructions") = McpBuildTools.BuildInstructions(m_tools)
     On Error GoTo 0
     Set BuildInitializeResult = d
 End Function
@@ -565,6 +567,12 @@ Private Function JsonRpcResult(ByVal id As Variant, ByVal result As Object) As S
         Set d("result") = result
     End If
     JsonRpcResult = JsonStringify(d)
+End Function
+
+' patch O: same envelope as JsonRpcResult, but the RESULT is already serialized.
+' Used only by tools/list, whose result string is cached (see CodeTools).
+Private Function JsonRpcResultRaw(ByVal id As Variant, ByVal resultJson As String) As String
+    JsonRpcResultRaw = "{""jsonrpc"":""2.0"",""id"":" & JsonStringify(id) & ",""result"":" & resultJson & "}"
 End Function
 
 Private Function JsonRpcError(ByVal id As Variant, ByVal code As Long, ByVal message As String, ByVal data As String) As String
@@ -611,4 +619,75 @@ Private Function CorsHeaders() As String
     CorsHeaders = "Access-Control-Allow-Origin: *" & vbCrLf & _
                   "Access-Control-Allow-Methods: POST, GET, OPTIONS, DELETE" & vbCrLf & _
                   "Access-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, MCP-Session-Id"
+End Function
+
+
+' R-1021-03 A4: ctl lane dispatch surface (PipeTransport owns the wire/auth).
+Public Function CtlGateObj() As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlGateObj = m_tools.CtlGateObj()
+End Function
+Public Function CtlStateObj() As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlStateObj = m_tools.CtlStateObj()
+End Function
+Public Function CtlReleaseObj(ByVal minHeldMs As Long) As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlReleaseObj = m_tools.CtlReleaseObj(minHeldMs)
+End Function
+Public Function CtlCancelObj(ByVal target As String) As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlCancelObj = m_tools.CtlCancelObj(target)
+End Function
+Public Function CtlAbandonObj(ByVal confirm As Boolean, ByVal minHeldMs As Long) As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlAbandonObj = m_tools.CtlAbandonObj(confirm, minHeldMs)
+End Function
+Public Function CtlToolsJson() As String
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    CtlToolsJson = m_tools.CtlToolsJson()
+End Function
+Public Function CtlToolAllowed(ByVal name As String) As Boolean
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    CtlToolAllowed = m_tools.CtlToolFastAllowed(name)
+End Function
+Public Function CtlToolIsReadOnly(ByVal name As String) As Boolean
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    CtlToolIsReadOnly = m_tools.CtlToolIsReadOnly(name)
+End Function
+Public Function CtlToolRefusedObj() As Object
+    Dim d As Object
+    On Error Resume Next
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = "readonly_lane_refused"
+    d("detail") = "slow_tool_not_on_ctl_lane"
+    d("allowed") = m_tools.CtlToolsJson()
+    d("failureKind") = "toolError"
+    Set CtlToolRefusedObj = d
+End Function
+Public Function CtlReadOnlyText(ByVal name As String, ByVal argsJson As String) As String
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    CtlReadOnlyText = m_tools.CtlReadOnlyText(name, argsJson)
+End Function
+
+Public Function CtlToolsColl() As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlToolsColl = m_tools.CtlToolCollection()
+End Function
+
+Public Function CtlInflightObj() As Object
+    On Error Resume Next
+    If m_tools Is Nothing Then Exit Function
+    Set CtlInflightObj = m_tools.CtlInflightObj()
 End Function

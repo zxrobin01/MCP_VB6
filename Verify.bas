@@ -4,6 +4,21 @@ Option Explicit
 ' millisecond clock for the per-segment timing this module now reports.
 Private Declare Function GetTickCount Lib "kernel32" () As Long
 
+' ===================== WP-22-04: semantic classification state =====================
+' SemanticDiffJson is the only comparison that knows WHICH KIND of difference it found.
+' Its answer is published twice: as JSON in the receipt, and in these module variables,
+' so VerifyComponent makes its DECISION from the classification itself instead of
+' re-parsing the JSON it just built. The add-in is single-threaded and a verify call
+' never re-enters itself, so run state here is safe in exactly the way Vb6Lint.bas's
+' per-run state already is.
+Private m_semAvail As Boolean
+Private m_semReal As Long
+Private m_semCase As Long
+Private m_semWs As Long
+Private m_semAttr As Long
+Private m_semHeader As Long
+Private m_semKind As String
+
 Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As String, ByVal diskPath As String, ByVal headerOffset As Long, ByVal baselineLines As String, ByVal buildLogPath As String, Optional ByVal compName As String = "", Optional ByVal buildState As Long = -1, Optional ByVal buildSource As String = "", Optional ByVal buildNote As String = "", Optional ByVal extraJson As String = "", Optional ByRef tmLint As Long = 0, Optional ByRef tmDiag As Long = 0, Optional ByRef tmDisk As Long = 0) As String
     ' report where the time of a verify actually goes. The caller
     ' (CodeTools.ToolVerify) splices these into the receipt; 0 means "not measured".
@@ -51,6 +66,17 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     ' normalised away, and classifies every differing line.
     Dim semJson As String
     semJson = SemanticDiffJson(ideText, diskPath, usedOffset)
+
+    ' ---- WP-22-04: fold the SEMANTIC answer into the DECISION --------------------
+    ' ideEqualsDisk stays the BYTE answer and is NOT redefined below. The question a
+    ' VB6 caller actually asks is case-insensitive (the compiler compares identifiers
+    ' that way), so it gets its own answer - ideEqualsDiskFolded - and only a REAL
+    ' difference may fail. foldableOnly means: the disk text could be read AND every
+    ' difference folds away (case / trailing whitespace / hidden Attribute lines).
+    Dim foldableOnly As Boolean
+    foldableOnly = (m_semAvail And (m_semReal = 0))
+    Dim diffKind As String
+    diffKind = m_semKind
     Dim bres As TBuildResult, buildOk As Long
     buildOk = buildState
     If Len(buildLogPath) > 0 Then
@@ -60,7 +86,14 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     End If
     Dim overall As String
     overall = "PASS"
-    If verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL" Then overall = "FAIL"
+    ' WP-22-04: a FOLDABLE difference is NOT a proven inconsistency. The measured
+    ' defect (MCP-1022-49): ten components reloaded cleanly, verify_scope answered
+    ' pass:0 fail:8 with failBasis=ide_disk_diff_proven, and every differing line was
+    ' the SAME identifier spelled with different case (m_id / m_Id, Value.Keys /
+    ' Value.keys, App.Path / App.path, Mid$ / mid$) - semantically identical to VB6.
+    If verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL" Then
+        If Not foldableOnly Then overall = "FAIL"
+    End If
     ' item 10 (F-c): MISMATCH-FORMATTING is deliberately NOT added to the FAIL
     ' list above (a formatting-only difference is UNPROVEN, not proven bad) and it is NOT
     ' allowed to inherit PASS either: with a fresh build artifact the ladder below would
@@ -102,11 +135,30 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     ' because the two texts are NOT equal - only their paren-less Call spelling differs.
     sb = sb & Jq("formattingDiffs") & ":{" & Jq("count") & ":" & CStr(fmtCount) & "," & Jq("first") & ":" & Js(fmtFirst) & "," & Jq("kind") & ":" & Js("paren-less Call <name>() empty argument parentheses") & "},"
     sb = sb & Jq("semanticDiff") & ":" & semJson & ","
+    ' WP-22-04: the classification as TOP-LEVEL fields, so a caller never parses
+    ' semanticDiff to branch on it. caseInsensitive is a statement of fact, not a mode:
+    ' VB6 identifiers are case-insensitive, so this comparison folds case on BOTH sides.
+    sb = sb & Jq("caseInsensitive") & ":true,"
+    sb = sb & Jq("diffKind") & ":" & Js(diffKind) & ","
+    sb = sb & Jq("caseOnlyLines") & ":" & CStr(m_semCase) & ","
+    sb = sb & Jq("whitespaceOnlyLines") & ":" & CStr(m_semWs) & ","
+    sb = sb & Jq("attributeOnlyLines") & ":" & CStr(m_semAttr) & ","
+    sb = sb & Jq("headerOnlyLines") & ":" & CStr(m_semHeader) & ","
+    sb = sb & Jq("realDiffLines") & ":" & CStr(m_semReal) & ","
+    sb = sb & Jq("foldableOnly") & ":" & LayB(foldableOnly) & ","
+    sb = sb & Jq("ideEqualsDiskFolded") & ":" & LayB(foldableOnly) & ","
+    sb = sb & Jq("foldNote") & ":" & Js("foldableOnly=true means every IDE-vs-disk difference is one VB6 itself ignores (identifier case, trailing whitespace, the hidden Attribute lines a pane never shows); it is NOT byte equality - see ideEqualsDisk") & ","
     ' W-D: LAYERED failure facts. Each layer answers on its own; overall/FAIL is derived
     ' from them but a caller can see WHICH layer failed instead of one opaque ok:false.
     Dim lay As String
     lay = "{"
-    lay = lay & Jq("ideDiskDiff") & ":{" & Jq("failed") & ":" & LayB(verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") & "," & Jq("ideDisk") & ":" & Js(verdict) & "," & Jq("ideEqualsDisk") & ":" & eqFlag & "," & Jq("detail") & ":" & Js(detail) & "},"
+    ' WP-22-04: the layer's failed flag follows the SAME decision as overall, so a
+    ' foldable-only difference cannot read as a failed layer while overall says PASS.
+    lay = lay & Jq("ideDiskDiff") & ":{" & Jq("failed") & ":" & _
+        LayB((verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") And (Not foldableOnly)) & "," & _
+        Jq("ideDisk") & ":" & Js(verdict) & "," & Jq("ideEqualsDisk") & ":" & eqFlag & "," & _
+        Jq("foldableOnly") & ":" & LayB(foldableOnly) & "," & Jq("diffKind") & ":" & Js(diffKind) & "," & _
+        Jq("detail") & ":" & Js(detail) & "},"
     lay = lay & Jq("lint") & ":{" & Jq("failed") & ":" & LayB(errN > 0) & "," & Jq("lintErrors") & ":" & CStr(errN) & "," & Jq("lintWarnings") & ":" & CStr(warnN) & "," & Jq("baselineHits") & ":" & CStr(BaselineHits()) & "},"
     Dim buildFailed As String
     buildFailed = "false"
@@ -117,7 +169,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("failureLayers") & ":" & lay & ","
     Dim basis As String
     basis = "none"
-    If verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL" Then
+    If (verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") And (Not foldableOnly) Then
         basis = "ideDiskDiff"
     ElseIf errN > 0 Then
         basis = "lint"
@@ -131,6 +183,14 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("buildOk") & ":" & CStr(buildOk) & ","
     sb = sb & Jq("buildSource") & ":" & Js(buildSource) & ","
     sb = sb & Jq("lintNote") & ":" & Js("lintErrors counts this project's own lint rules, NOT the VB6 compiler: a module with a hard syntax error can still report 0 lint errors") & ","
+    ' WP-22-04: what a lint verdict IS, spliced from the lint engine (ONE source:
+    ' Vb6Lint.GateDict). A lint error is a suspicion; the compiler is the authority,
+    ' and on a large module a STRUCTURAL error is downgraded there to a warning +
+    ' needsHumanReview so it cannot turn this verdict red on its own.
+    Dim gateLvl As String
+    gateLvl = Vb6Lint.GateLevel
+    sb = sb & Jq("gateLevel") & ":" & Js(gateLvl) & ","
+    sb = sb & Jq("lintGate") & ":" & Vb6Lint.GateJson() & ","
     If Len(buildNote) > 0 Then sb = sb & Jq("buildNote") & ":" & Js(buildNote) & ","
     sb = sb & Jq("diagnostics") & ":" & lintJson
     ' alpha: coords / ideSha256 / artifact fields arrive as raw JSON from
@@ -172,6 +232,16 @@ End Function
 ' =====================================================================
 Public Function SemanticDiffJson(ByVal ideText As String, ByVal diskPath As String, ByVal usedOffset As Long) As String
     On Error Resume Next
+    ' WP-22-04: reset the published classification FIRST, so a run that exits early
+    ' (the disk text could not be read) never leaves the PREVIOUS module's answer
+    ' behind for a caller to read.
+    m_semAvail = False
+    m_semReal = 0
+    m_semCase = 0
+    m_semWs = 0
+    m_semAttr = 0
+    m_semHeader = 0
+    m_semKind = "unavailable"
     Dim js As String
     Dim disk As String
     Dim encUsed As String
@@ -202,11 +272,15 @@ Public Function SemanticDiffJson(ByVal ideText As String, ByVal diskPath As Stri
         doff = SemFindOffset(dl, il, ideN)
     End If
     Dim caseOnly As Long
+    Dim wsOnly As Long
+    Dim headerOnly As Long
     Dim attrOnly As Long
     Dim realN As Long
     Dim diffCount As Long
     Dim extra As Long
     caseOnly = 0
+    wsOnly = 0
+    headerOnly = 0
     attrOnly = 0
     realN = 0
     diffCount = 0
@@ -221,9 +295,22 @@ Public Function SemanticDiffJson(ByVal ideText As String, ByVal diskPath As Stri
     For i = 0 To ideN - 1
         Do While k <= UBound(dl)
             If SemIsAttr(dl(k)) Then
-                attrOnly = attrOnly + 1
+                ' WP-22-04: an Attribute line skipped on the FIRST row sits in the FILE
+                ' HEADER (headerOnly); one skipped later is an inline attribute
+                ' (attributeOnly). Both fold, but the contract names both categories.
+                If i = 0 Then
+                    headerOnly = headerOnly + 1
+                Else
+                    attrOnly = attrOnly + 1
+                End If
                 diffCount = diffCount + 1
-                If diffCount <= 200 Then linesJson = SemAppend(linesJson, i + 1, k + 1, "attribute-only")
+                If diffCount <= 200 Then
+                    If i = 0 Then
+                        linesJson = SemAppend(linesJson, i + 1, k + 1, "header-only")
+                    Else
+                        linesJson = SemAppend(linesJson, i + 1, k + 1, "attribute-only")
+                    End If
+                End If
                 k = k + 1
             Else
                 Exit Do
@@ -237,7 +324,16 @@ Public Function SemanticDiffJson(ByVal ideText As String, ByVal diskPath As Stri
             ideLine = il(i)
             diskLine = dl(k)
             If SemNorm(ideLine) = SemNorm(diskLine) Then
-                If ideLine <> diskLine Then
+                ' SemNorm = LCase$(trailing-whitespace-trimmed). Equal here means the
+                ' lines differ at most by CASE and/or TRAILING whitespace; the two are
+                ' split because they answer different questions for a caller.
+                If SemTrimR(ideLine) = SemTrimR(diskLine) Then
+                    If ideLine <> diskLine Then
+                        wsOnly = wsOnly + 1
+                        diffCount = diffCount + 1
+                        If diffCount <= 200 Then linesJson = SemAppend(linesJson, i + 1, k + 1, "whitespace-only")
+                    End If
+                Else
                     caseOnly = caseOnly + 1
                     diffCount = diffCount + 1
                     If diffCount <= 200 Then linesJson = SemAppend(linesJson, i + 1, k + 1, "case-only")
@@ -263,12 +359,25 @@ Public Function SemanticDiffJson(ByVal ideText As String, ByVal diskPath As Stri
     Dim semEq As Boolean
     semEq = False
     If realN = 0 Then semEq = True
+    ' WP-22-04: publish the classification (module state + the FOUR named categories).
+    m_semAvail = True
+    m_semReal = realN
+    m_semCase = caseOnly
+    m_semWs = wsOnly
+    m_semAttr = attrOnly
+    m_semHeader = headerOnly
+    m_semKind = SemKindOf(diffCount, realN, caseOnly, wsOnly, attrOnly, headerOnly)
     js = "{"
     js = js & SemQ("available") & ":true,"
     js = js & SemQ("semanticEquals") & ":" & SemB(semEq) & ","
+    js = js & SemQ("foldableEquals") & ":" & SemB(semEq) & ","
+    js = js & SemQ("caseInsensitive") & ":true,"
+    js = js & SemQ("diffKind") & ":" & SemS(m_semKind) & ","
     js = js & SemQ("diffCount") & ":" & CStr(diffCount) & ","
     js = js & SemQ("caseOnly") & ":" & CStr(caseOnly) & ","
     js = js & SemQ("attributeOnly") & ":" & CStr(attrOnly) & ","
+    js = js & SemQ("whitespaceOnly") & ":" & CStr(wsOnly) & ","
+    js = js & SemQ("headerOnly") & ":" & CStr(headerOnly) & ","
     js = js & SemQ("real") & ":" & CStr(realN) & ","
     js = js & SemQ("lines") & ":[" & linesJson & "],"
     js = js & SemQ("normalisation") & ":" & SemS("case + hidden Attribute lines + trailing whitespace ONLY")
@@ -294,6 +403,12 @@ Private Function SemB(ByVal v As Boolean) As String
 End Function
 
 Private Function SemNorm(ByVal ln As String) As String
+    SemNorm = LCase$(SemTrimR(ln))
+End Function
+
+' Trailing SPACE/TAB only. Leading whitespace and indentation are NOT folded: an
+' indentation change is a REAL difference (see the comment above SemanticDiffJson).
+Private Function SemTrimR(ByVal ln As String) As String
     Dim t As String
     t = ln
     Do While Len(t) > 0
@@ -303,7 +418,29 @@ Private Function SemNorm(ByVal ln As String) As String
             Exit Do
         End If
     Loop
-    SemNorm = LCase$(t)
+    SemTrimR = t
+End Function
+
+' The ONE place the classification NAME is decided from the counts.
+Private Function SemKindOf(ByVal diffCount As Long, ByVal realN As Long, ByVal caseN As Long, _
+        ByVal wsN As Long, ByVal attrN As Long, ByVal headN As Long) As String
+    SemKindOf = "none"
+    If diffCount <= 0 Then Exit Function
+    If realN > 0 Then
+        SemKindOf = "real"
+        Exit Function
+    End If
+    If caseN > 0 And wsN = 0 And attrN = 0 And headN = 0 Then
+        SemKindOf = "caseOnly"
+    ElseIf wsN > 0 And caseN = 0 And attrN = 0 And headN = 0 Then
+        SemKindOf = "whitespaceOnly"
+    ElseIf attrN > 0 And caseN = 0 And wsN = 0 And headN = 0 Then
+        SemKindOf = "attributeOnly"
+    ElseIf headN > 0 And caseN = 0 And wsN = 0 And attrN = 0 Then
+        SemKindOf = "headerOnly"
+    Else
+        SemKindOf = "foldableMixed"
+    End If
 End Function
 
 Private Function SemIsAttr(ByVal ln As String) As Boolean

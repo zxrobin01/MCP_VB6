@@ -50,6 +50,47 @@ Private m_regR1 As Long
 ' every procedure); adding a rule moves exactly this number.
 Private Const RULE_COUNT As Long = 20
 
+' ===================== WP-22-04: the LINT CONFIDENCE GATE =====================
+' A lint verdict is a SUSPICION, never a compile verdict. That used to be prose in a
+' tool description; here it becomes a decision the engine itself makes:
+'
+'   * LEXICAL finding - decided from the raw text of ONE logical line (an unclosed
+'     quote, an unbalanced parenthesis, a C-style operator, an 'EndIf' spelling, a
+'     reserved word the compiler was measured to reject in that position). No
+'     whole-module model is involved, so it is a HARD error and is NEVER downgraded.
+'   * STRUCTURAL finding - comes from a whole-module model this scanner builds itself
+'     (block stack, procedure extents, duplicate names, keyword/token heuristics). The
+'     VB6 compiler is the only authority for those, and on a LARGE module the model can
+'     be wrong for reasons the scanner cannot see. Measured (MCP-1021-41): a 238 KB
+'     module returned 49 severity=error diagnostics - three of them VB6-E102
+'     'unclosed block: for' - while VB6.EXE /make compiled the SAME project with 0
+'     errors.
+'
+' So on a module at or above LINT_DOWNGRADE_BYTES a STRUCTURAL error is downgraded to
+' warning, counted, and listed in needsHumanReview[] with a reason. Nothing is dropped
+' or reworded: rule id, line, message and diagnostic ORDER are unchanged, and the
+' totals stay exact (errors + warnings == diagnostics). A genuinely unbalanced block in
+' a SMALL module is still a hard error, so the downgrade can never hide one where the
+' model is trustworthy.
+'
+' WHY 102400 (100 KB) and not a 'does this look generated' heuristic: the requirement
+' names 'large module (e.g. >100 KB)' and the measured failure was 238 KB. Size is the
+' one property measurable on EVERY input, and it is exactly what makes a whole-module
+' model unreliable: the block stack spans every logical line, so one construct the
+' scanner does not model poisons every later line of the module.
+Public Const LINT_DOWNGRADE_BYTES As Long = 102400
+Private Const LINT_REVIEW_MAX As Long = 50
+Private Const LINT_DOWNGRADE_REASON As String = "lint_only_no_compile_corroboration"
+' size of the module being linted, in ANSI bytes (what an external Get-Item reports)
+Private m_modBytes As Long
+' how many severity=error diagnostics the gate downgraded in this run
+Private m_ndg As Long
+' the first LINT_REVIEW_MAX downgraded findings, so a receipt can name them
+Private m_dgRule() As String
+Private m_dgLine() As Long
+Private m_dgMsg() As String
+Private m_dgN As Long
+
 Public Sub Lint(ByVal text As String, ByVal compKind As String)
     m_regR0 = 0
     m_regR1 = 0
@@ -70,6 +111,12 @@ Private Sub ResetRun()
     ReDim m_diag(0 To 63)
     m_silent = False
     m_baseHits = 0
+    ' WP-22-04: the confidence-gate counters are per-run state (like the counters above)
+    m_ndg = 0
+    m_dgN = 0
+    ReDim m_dgRule(0 To LINT_REVIEW_MAX - 1)
+    ReDim m_dgLine(0 To LINT_REVIEW_MAX - 1)
+    ReDim m_dgMsg(0 To LINT_REVIEW_MAX - 1)
     ' m_nstoreMax is deliberately NOT reset here: it is a CALLER setting (SetStoreCap).
 End Sub
 
@@ -169,7 +216,7 @@ Public Function LintRegionAt(ByVal text As String, ByVal compKind As String, ByV
     ' scan. The output is identical to running ComputeProcs with the region active.
     For i = 0 To m_nproc - 1
         MaybePump
-        If IsReserved(m_procName(i)) Then
+        If IsReservedAt(m_procName(i), m_procKind(i)) Then
             AddDiag "VB6-E112", "error", m_procStart(i) + 1, "reserved word as procedure name: " & m_procName(i)
         End If
     Next i
@@ -242,6 +289,21 @@ Private Sub AddDiag(ByVal rid As String, ByVal sev As String, ByVal ln As Long, 
             Exit Sub
         End If
     End If
+    ' ---- WP-22-04: the CONFIDENCE GATE -----------------------------------------
+    ' A STRUCTURAL error is the linter's opinion about a whole-module model it built
+    ' itself; on a large module that opinion is not strong enough to be a red gate (the
+    ' measured MCP-1021-41 receipt: 49 errors where /make answered 0). The diagnostic
+    ' is KEPT - same rule, line, message and order - and only its severity moves, so a
+    ' caller still sees it in diagnostics[] and additionally in needsHumanReview[].
+    If sev = "error" Then
+        If m_modBytes >= LINT_DOWNGRADE_BYTES Then
+            If RuleClass(rid) = "structural" Then
+                sev = "warning"
+                m_ndg = m_ndg + 1
+                NoteReview rid, ln, msg
+            End If
+        End If
+    End If
     ' (F2): COUNT every diagnostic, MATERIALISE at most m_nstoreMax of them.
     ' The receipt cap (CodeTools.LintMaxDiag, default 300) is handed in by the caller via
     ' SetStoreCap, so a 27,005-diagnostic module no longer pays 27,005 UDT+BSTR writes for
@@ -294,6 +356,10 @@ Private Sub LoadLines(ByVal text As String)
         m_raw(0) = ""
     End If
     m_n = UBound(m_raw) + 1
+    ' WP-22-04: the module SIZE decides whether a structural rule may be an error (see
+    ' the gate block in the declarations section). ANSI bytes, i.e. the number an
+    ' external Get-Item reports for the same .bas/.cls file.
+    m_modBytes = TextBytes(text)
     ReDim m_code(0 To m_n - 1)
     ReDim m_endCont(0 To m_n - 1)
     Dim i As Long
@@ -432,7 +498,7 @@ Private Sub ComputeProcs()
                 st = m_ls(k)
                 kindCur = ProcKindOf(m_lc(k))
                 If m_firstProcLine < 0 Then m_firstProcLine = m_ls(k)
-                If IsReserved(nm) Then AddDiag "VB6-E112", "error", m_ls(k) + 1, "reserved word as procedure name: " & nm
+                If IsReservedAt(nm, kindCur) Then AddDiag "VB6-E112", "error", m_ls(k) + 1, "reserved word as procedure name: " & nm
             End If
         Else
             If IsProcEnd(m_lc(k)) Then
@@ -822,16 +888,17 @@ Private Function IsModuleDecl(ByVal L As String) As Boolean
 End Function
 
 Private Sub CollectDecl(ByVal L As String, ByVal ln As Long, ByVal decl As Object)
-    Dim s As String, parts() As String, i As Long, nm As String
+    Dim s As String, parts() As String, i As Long, nm As String, pos As String
     s = L
+    pos = "dim"
     If Left$(s, 4) = "dim " Then s = Mid$(s, 5)
     If Left$(s, 7) = "static " Then s = Mid$(s, 8)
-    If Left$(s, 6) = "const " Then s = Mid$(s, 7)
+    If Left$(s, 6) = "const " Then s = Mid$(s, 7) : pos = "const"
     parts = Split(s, ",")
     For i = 0 To UBound(parts)
         MaybePump
         nm = LeadingIdent(Trim$(parts(i)))
-        Register nm, ln, decl
+        Register nm, ln, decl, pos
     Next
 End Sub
 
@@ -846,18 +913,18 @@ Private Sub CollectParams(ByVal L As String, ByVal ln As Long, ByVal decl As Obj
     parts = Split(s, ",")
     For i = 0 To UBound(parts)
         t = StripParamMods(Trim$(parts(i)))
-        Register LeadingIdent(t), ln, decl
+        Register LeadingIdent(t), ln, decl, "param"
     Next
 End Sub
 
-Private Sub Register(ByVal nm As String, ByVal ln As Long, ByVal decl As Object)
+Private Sub Register(ByVal nm As String, ByVal ln As Long, ByVal decl As Object, ByVal pos As String)
     If Len(nm) = 0 Then Exit Sub
     If decl.Exists(LCase$(nm)) Then
         AddDiag "VB6-E109", "error", ln, "duplicate declaration in procedure: " & nm
     Else
         decl(LCase$(nm)) = True
     End If
-    If IsReserved(nm) Then AddDiag "VB6-E112", "error", ln, "reserved word used as identifier: " & nm
+    If IsReservedAt(nm, pos) Then AddDiag "VB6-E112", "error", ln, "reserved word used as identifier: " & nm
 End Sub
 
 Private Function LeadingIdent(ByVal s As String) As String
@@ -887,13 +954,82 @@ Private Function StripParamMods(ByVal s As String) As String
     StripParamMods = t
 End Function
 
-Private Function ReservedList() As String
-    ReservedList = " name len time date string object left right mid error print loop line input output append base text currency type set get let str val call close open write read stop end sub function property dim const static private public friend option if then else elseif for next do while wend with select case on goto resume exit rem new nothing empty null me true false and or not xor mod is like to step each in as byval byref optional paramarray redim erase lbound ubound variant boolean byte integer long single double "
+' ---------------- identifier legality: measured, not assumed ----------------
+'
+' HISTORY (defect fixed here): this module used ONE flat list of ~110 words and reported
+' every occurrence of any of them as E112. That list mixed real reserved words with
+' intrinsic function names and type names, so legal code such as
+'     Dim name As String   /   Dim left As Long   /   Dim mid As Long
+'     Dim time As Long     /   Sub Property()
+' was reported as an error. The compiler accepts those names; the report was the defect.
+'
+' The tables below are MEASURED DATA, not a guess: every candidate word was compiled once
+' per syntactic position, in its own minimal project, with VB6.EXE /make, and a word is
+' reported only where the compiler actually rejected it. Evidence and the full
+' word x position table (verdict + the verbatim compiler log line) for 264 words x 11
+' positions:
+'     evidence/kw/matrix.tsv
+'     evidence/kw/summary.md
+' One project per case is mandatory: VB6 reports only the FIRST error per build, so a
+' shared project would attribute an error to the wrong word and hide later verdicts.
+'
+' Measured classes:
+'   * HARD_FORBIDDEN - rejected in every position this module can check (local variable,
+'     parameter, Sub name, Function name, Property name). Reported wherever the name is
+'     declared. The three Enum-only exceptions (cdec, date, doevents) belong here: they are
+'     rejected in every checked position and accepted only as an Enum member, a position
+'     this module never checks.
+'   * POSITION_RULES - rejected in SOME positions only. Exactly one word was measured in
+'     this class: "property" is rejected as a module variable and as a public class field,
+'     but is accepted as a local variable, as a parameter and as a procedure name. This
+'     module does not check module variables or class fields, so it never reports it; if a
+'     later rule adds those positions, PositionOnly() already carries the measured answer.
+'   * INTRINSIC_OK - intrinsic function / type / statement names the compiler ACCEPTS as
+'     identifiers (name, left, mid, right, time, str, val, read, append, base, text, line,
+'     output, object, step, ...). They are in neither table below, so they are never
+'     reported.
+'
+' The position argument does not change today's answer - the measurement found no word
+' that is accepted in one checked position and rejected in another - but the call sites
+' pass it so a per-position correction can be encoded here without touching them.
+Private Function HardForbidden() As String
+    HardForbidden = _
+        " abs addressof and any array as attribute boolean byref" & _
+        " byte byval call case cbool cbyte ccur cdate cdbl" & _
+        " cdec cint clng close const csng cstr currency cvar" & _
+        " cverr date debug decimal declare dim do doevents double" & _
+        " each else elseif empty end endif enum eqv erase" & _
+        " event exit false fix for friend function get gosub" & _
+        " goto if imp implements in input inputb int integer" & _
+        " is lbound len lenb let like lock long loop" & _
+        " lset me mod new next not nothing null on" & _
+        " open option optional or paramarray preserve print private public" & _
+        " put raiseevent redim rem resume return rset seek select" & _
+        " set sgn single spc static stop string sub tab" & _
+        " then to true type typeof ubound unlock until variant" & _
+        " wend while with withevents write xor "
 End Function
 
-Private Function IsReserved(ByVal nm As String) As Boolean
+Private Function PositionOnly() As String
+    PositionOnly = " property "
+End Function
+
+Private Function IsReservedAt(ByVal nm As String, ByVal pos As String) As Boolean
+    Dim w As String
     If Len(nm) = 0 Then Exit Function
-    If InStr(1, ReservedList(), " " & LCase$(nm) & " ", vbBinaryCompare) > 0 Then IsReserved = True
+    w = " " & LCase$(nm) & " "
+    Select Case pos
+        Case "modulevar", "classfield"
+            ' Not checked by this module today; kept so the measured exception cannot be lost.
+            If InStr(1, HardForbidden(), w, vbBinaryCompare) > 0 Then
+                IsReservedAt = True
+            ElseIf InStr(1, PositionOnly(), w, vbBinaryCompare) > 0 Then
+                IsReservedAt = True
+            End If
+        Case Else
+            ' sub / function / property (a procedure name), dim / param / const (a declaration)
+            IsReservedAt = (InStr(1, HardForbidden(), w, vbBinaryCompare) > 0)
+    End Select
 End Function
 
 ' ---------------- rules: option / lexical / agent ----------------
@@ -1752,4 +1888,171 @@ Public Function BlockPairingProblem(ByVal blockText As String, ByRef headers As 
         ReDim Preserve keep(0 To k - 1)
         suggestedText = Join(keep, vbCrLf)
     End If
+End Function
+
+
+
+' ===================== WP-22-04: gate helpers =====================
+' Which AUTHORITY class does a rule id belong to? See the gate block in the declarations
+' section. Everything not listed as lexical is STRUCTURAL ON PURPOSE: a rule added later
+' must earn its way into the hard set by being decidable from ONE line's own text.
+Private Function RuleClass(ByVal rid As String) As String
+    RuleClass = "structural"
+    Select Case rid
+        Case "VB6-E112"
+            ' reserved word where the compiler was MEASURED to reject one (HardForbidden)
+            RuleClass = "lexical"
+        Case "VB6-E113"
+            ' unterminated string / unbalanced parentheses on one logical line
+            RuleClass = "lexical"
+        Case "VB6-E114"
+            ' a second Option Explicit: an exact, module-level count of one line's text
+            RuleClass = "lexical"
+        Case "VB6-E115"
+            ' EndIf / EndSub / Else If / If-without-Then: spelling decided by the line
+            RuleClass = "lexical"
+        Case "VB6-X201"
+            ' ==, !=, &&, ||, ++, ->, => : never valid VB6, decided by the line
+            RuleClass = "lexical"
+        Case "VB6-X202"
+            ' //, /*, */, {, }, a trailing semicolon, a non-VB6 # comment: line-local
+            RuleClass = "lexical"
+        Case "VB6-X206"
+            ' a declaration that ends in "As" with no type: line-local
+            RuleClass = "lexical"
+    End Select
+End Function
+
+' ANSI byte length of the source text - the same number an external Get-Item reports. A
+' character the code page cannot represent becomes '?' (1 byte), so this can only ever be
+' SMALLER than the true size: the gate can never downgrade a module it did not measure as
+' large.
+Private Function TextBytes(ByVal s As String) As Long
+    TextBytes = Len(s)
+    On Error Resume Next
+    Dim b() As Byte
+    b = StrConv(s, vbFromUnicode)
+    If Err.Number = 0 Then
+        If Encoding.ByteCount(b) > 0 Then TextBytes = Encoding.ByteCount(b)
+    End If
+    Err.Clear
+End Function
+
+' remember one downgraded finding (bounded by LINT_REVIEW_MAX; the COUNT is never bounded)
+Private Sub NoteReview(ByVal rid As String, ByVal ln As Long, ByVal msg As String)
+    If m_dgN >= LINT_REVIEW_MAX Then Exit Sub
+    If m_dgN > UBound(m_dgRule) Then Exit Sub
+    m_dgRule(m_dgN) = rid
+    m_dgLine(m_dgN) = ln
+    m_dgMsg(m_dgN) = msg
+    m_dgN = m_dgN + 1
+End Sub
+
+' The gate as ONE dictionary - the single source for every receipt shape this project
+' emits (a dictionary for CodeTools, a JSON string for Verify.bas).
+Public Function GateDict() As Object
+    Dim o As Object
+    Set o = CreateObject("Scripting.Dictionary")
+    o("gateLevel") = "lexical"
+    o("gateLevelMeaning") = "this is a LEXICAL lint verdict, NOT a compile verdict"
+    o("lintIsNotCompile") = True
+    o("moduleBytes") = m_modBytes
+    o("downgradeThresholdBytes") = LINT_DOWNGRADE_BYTES
+    o("structuralChecksDowngraded") = m_ndg
+    o("needsHumanReviewCount") = m_dgN
+    o("reviewNote") = "a downgraded finding is still REPORTED (as severity=warning) and still names its rule and line; review it with a compiler, not with the linter"
+    Dim lex As Object
+    Set lex = New Collection
+    lex.Add "VB6-E112"
+    lex.Add "VB6-E113"
+    lex.Add "VB6-E114"
+    lex.Add "VB6-E115"
+    lex.Add "VB6-X201"
+    lex.Add "VB6-X202"
+    lex.Add "VB6-X206"
+    Set o("lexicalRules") = lex
+    Dim st As Object
+    Set st = New Collection
+    st.Add "VB6-E101"
+    st.Add "VB6-E102"
+    st.Add "VB6-E103"
+    st.Add "VB6-E104"
+    st.Add "VB6-E105"
+    st.Add "VB6-E106"
+    st.Add "VB6-E107"
+    st.Add "VB6-E108"
+    st.Add "VB6-E109"
+    st.Add "VB6-E116"
+    st.Add "VB6-E117"
+    st.Add "VB6-X203"
+    st.Add "VB6-X204"
+    st.Add "VB6-X205"
+    st.Add "W301/W304/W305 (already warnings)"
+    Set o("structuralRules") = st
+    o("downgradeRule") = "a STRUCTURAL error becomes a warning when moduleBytes >= downgradeThresholdBytes"
+    o("downgradeReason") = LINT_DOWNGRADE_REASON
+    o("downgradeReasonText") = "a structural finding comes from the linter's own whole-module model and the VB6 compiler is the only authority for it; on a module this large the model has no compile corroboration"
+    o("authority") = "compile: build / make_project. errorCount=0 together with artifactChanged (and the artifact sha256) is the authoritative answer for structural questions"
+    Set o("needsHumanReview") = ReviewCollection()
+    Set GateDict = o
+End Function
+
+' Splice the gate keys into a caller's receipt dictionary at TOP level (check_component /
+' validate_code), so a caller can branch on gateLevel without a shape check.
+Public Sub GateInto(ByRef d As Object)
+    If d Is Nothing Then Exit Sub
+    Dim g As Object
+    Set g = GateDict()
+    d("gateLevel") = g("gateLevel")
+    d("gateLevelMeaning") = g("gateLevelMeaning")
+    d("lintIsNotCompile") = g("lintIsNotCompile")
+    d("moduleBytes") = g("moduleBytes")
+    d("downgradeThresholdBytes") = g("downgradeThresholdBytes")
+    d("structuralChecksDowngraded") = g("structuralChecksDowngraded")
+    d("needsHumanReviewCount") = g("needsHumanReviewCount")
+    Set d("lintGate") = g
+End Sub
+
+' The gate as JSON, for the receipts this project assembles as text (verify).
+Public Function GateJson() As String
+    On Error Resume Next
+    GateJson = JsonLib.JsonStringify(GateDict())
+    If Len(GateJson) = 0 Then GateJson = "{" & Chr$(34) & "gateLevel" & Chr$(34) & ":" & Jr("lexical") & "}"
+    Err.Clear
+End Function
+
+Private Function ReviewCollection() As Object
+    Dim c As Object
+    Dim it As Object
+    Dim i As Long
+    Set c = New Collection
+    For i = 0 To m_dgN - 1
+        MaybePump
+        Set it = CreateObject("Scripting.Dictionary")
+        it("ruleId") = m_dgRule(i)
+        it("line") = m_dgLine(i)
+        it("message") = m_dgMsg(i)
+        it("severity") = "warning"
+        it("downgradedFrom") = "error"
+        it("reason") = LINT_DOWNGRADE_REASON
+        it("review") = "compile the project (build / make_project) and compare errorCount before acting on this finding"
+        c.Add it
+    Next
+    Set ReviewCollection = c
+End Function
+
+Public Property Get GateLevel() As String
+    GateLevel = "lexical"
+End Property
+
+Public Function ModuleBytes() As Long
+    ModuleBytes = m_modBytes
+End Function
+
+Public Function StructuralDowngrades() As Long
+    StructuralDowngrades = m_ndg
+End Function
+
+Public Function ReviewItems() As Long
+    ReviewItems = m_dgN
 End Function

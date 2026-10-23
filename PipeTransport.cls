@@ -198,6 +198,23 @@ Private m_curTool As String
 Private m_serveStart As Long
 Private m_progSeq As Long
 Private m_lastProgAt As Long
+Private m_bootAt As Long
+Private m_ctlTokenBroken As Boolean
+Private m_role As String
+Private m_owner As PipeTransport
+Private m_ctl As PipeTransport
+Private m_ctlNonce As String
+Private m_ctlPipeName As String
+Private m_ctlToken As String
+Private m_ctlSid As String
+Private m_ctlSeq As Long
+Private m_ctlAuthed As Boolean
+Private m_ctlDenied As Long
+Private m_ctlAuthFails As Long
+Private m_ctlAuthFailAt As Long
+Private m_ctlLockUntil As Long
+Private m_ctlServes As Long
+Private m_ctlHelloChecked As Boolean
 ' diagnostic (Lead-authorized narrow round): count every nested re-entry so
 ' "was the pipe ever ticked while a tool call was running?" is a FACT in the log,
 ' not a guess.
@@ -211,6 +228,17 @@ Private m_lastPublishErr As String
 Private m_progFrames As Long
 Private m_nestedLogged As Long
 Private m_useAcl As Boolean
+' Server half of the hello.auth handshake (threat model M-5). No credential
+' source => m_authOn stays False and the handshake keeps today's behaviour
+' EXACTLY (the welcome frame does not gain an auth member either), so the
+' additive contract is measurable rather than asserted. When a credential IS
+' configured the nonce (pairing) is followed by an AUTHORIZATION check.
+' Only sha256(token) is retained; neither the token nor its fingerprint is ever
+' logged, echoed or put into a receipt - a published fingerprint is a
+' guess-confirmation oracle, so the fingerprint is not used at all here.
+Private m_authOn As Boolean
+Private m_authSha As String
+Private m_authSource As String
 
 ' --- knobs -----------------------------------------------------------------
 
@@ -315,12 +343,16 @@ Public Sub StartServer(ByVal mcp As McpServer, ByVal mode As String, ByVal tcpEn
     m_progressMs = Util.EnvLongOr("VB6MCP_PIPE_PROGRESS_MS", NP_DEFAULT_PROGRESS_MS)
     m_progressOn = EnvFlag("VB6MCP_PIPE_PROGRESS", True)
     m_useAcl = EnvFlag("VB6MCP_PIPE_ACL", True)
+    LoadAuthConfig
     ReDim m_acc(0 To NP_ACC_CAP - 1)
     ReDim m_out(0 To 3)
     Set m_outQ = New Collection
     m_state = 0
     m_active = True
-    NpLog "transport=pipe event=start mode=" & m_mode & " tcpEnabled=" & BoolText(m_tcpEnabled) & " pipe=" & PipeNameRedacted() & " nonce=" & NoncePrefix() & "... pid=" & CStr(m_pid) & " session=" & CStr(m_sid) & " tickMs=" & CStr(m_tickMs) & " acl=" & CStr(m_useAcl)
+    m_bootAt = NpGetTickCount()
+    m_role = "business"
+    StartCtlLane
+    NpLog "transport=pipe event=start mode=" & m_mode & " tcpEnabled=" & BoolText(m_tcpEnabled) & " pipe=" & PipeNameRedacted() & " nonce=" & NoncePrefix() & "... pid=" & CStr(m_pid) & " session=" & CStr(m_sid) & " tickMs=" & CStr(m_tickMs) & " acl=" & CStr(m_useAcl) & " auth=" & AuthStateText()
     Exit Sub
 Fail:
     m_active = False
@@ -330,6 +362,10 @@ End Sub
 Public Sub StopServer()
     On Error Resume Next
     m_active = False
+    If Not m_ctl Is Nothing Then
+        m_ctl.StopServer
+        Set m_ctl = Nothing
+    End If
     If m_hPipe <> 0 Then Teardown "stop"
     If m_ov.hEvent <> 0 Then
         NpCloseHandle m_ov.hEvent
@@ -342,8 +378,27 @@ End Sub
 
 ' One bounded servicing pass. The host (ServerForm's tmrWatch / the Winsock
 ' transport's Win32 timer) calls this from the UI thread only.
+' R-1021-03 v6: role-aware auth. The ctl lane has its OWN flag (m_ctlAuthed); 
+' reading m_authed on a ctl connection made a HEALTHY connection look unauthenticated.
+Private Function ConnAuthed() As Boolean
+    If m_role = "ctl" Then
+        ConnAuthed = m_ctlAuthed
+    Else
+        ConnAuthed = m_authed
+    End If
+End Function
+
 Public Sub Tick()
+    Dim ctlT As Double
+    Dim pfOn As Boolean
     If Not m_active Then Exit Sub
+    ' R2 PERF GATE: ONE cross-module probe per tick instead of one per probe (see
+    ' WinOps.WoProfOn). Diag-on segments and their order are unchanged.
+    pfOn = WinOps.WoProfOn()
+    ' R-1021-03 v9: the ctl hello deadline is evaluated ONLY in ServiceConnected, on
+    ' one path. Two earlier attempts failed in opposite directions (v7 queued 35
+    ' denies and never wrote one; v8 set the flag here first so nothing was queued at
+    ' all). One place, one decision.
     If m_inTick Then
         ' NESTED RE-ENTRY. This is reached only through the existing pump model:
         ' a long tool call runs Util.MaybePump -> DoEvents, which dispatches the
@@ -352,32 +407,64 @@ Public Sub Tick()
         ' only emit the ADR section 7.4 progress frame.
         m_nestedTicks = m_nestedTicks + 1
         MaybeProgress
+        If Not m_ctl Is Nothing Then
+            If pfOn Then ctlT = WinOps.WoProfNow()
+            m_ctl.Tick
+            If pfOn Then WinOps.WoProfAdd 1, WinOps.WoProfNow() - ctlT
+        End If
         Exit Sub
     End If
     m_inTick = True
     On Error GoTo Done
-    Dim guard As Long
+    Dim guard As Long, stBefore As Long, okStep As Boolean
+    Dim stepT0 As Double
     guard = 0
     Do
         guard = guard + 1
         If guard > 128 Then Exit Do
+        stBefore = m_state
+        If pfOn Then stepT0 = WinOps.WoProfNow()
+        okStep = True
         Select Case m_state
             Case 0
-                If Not EnsurePipe() Then Exit Do
+                okStep = EnsurePipe()
             Case 1
-                If Not PollConnect() Then Exit Do
+                okStep = PollConnect()
             Case 2
-                If Not ServiceConnected() Then Exit Do
+                okStep = ServiceConnected()
             Case 3
-                If Not PollRead() Then Exit Do
+                okStep = PollRead()
             Case 4
-                If Not PollWrite() Then Exit Do
+                okStep = PollWrite()
             Case Else
                 Exit Do
         End Select
+        ' The segment index is the state the step RAN FROM (7 EnsurePipe, 8 PollConnect,
+        ' 9 ServiceConnected, 10 PollRead, 11 PollWrite, 12 = no state step at all), so a
+        ' multi-millisecond tick becomes a NAMED state instead of one opaque pipe number.
+        Select Case stBefore
+            Case 0
+                If pfOn Then WinOps.WoProfAdd 7, WinOps.WoProfNow() - stepT0
+            Case 1
+                If pfOn Then WinOps.WoProfAdd 8, WinOps.WoProfNow() - stepT0
+            Case 2
+                If pfOn Then WinOps.WoProfAdd 9, WinOps.WoProfNow() - stepT0
+            Case 3
+                If pfOn Then WinOps.WoProfAdd 10, WinOps.WoProfNow() - stepT0
+            Case 4
+                If pfOn Then WinOps.WoProfAdd 11, WinOps.WoProfNow() - stepT0
+            Case Else
+                If pfOn Then WinOps.WoProfAdd 12, WinOps.WoProfNow() - stepT0
+        End Select
+        If Not okStep Then Exit Do
     Loop
 Done:
     m_inTick = False
+    If Not m_ctl Is Nothing Then
+        If pfOn Then ctlT = WinOps.WoProfNow()
+        m_ctl.Tick
+        If pfOn Then WinOps.WoProfAdd 1, WinOps.WoProfNow() - ctlT
+    End If
 End Sub
 
 Public Function StatsJson() As String
@@ -423,6 +510,15 @@ Public Sub PublishInstance(ByVal port As Long, ByVal tcpEnabled As Boolean, ByVa
     d("nonce") = m_nonce
     d("instanceId") = m_instanceId
     d("tcpEnabled") = tcpEnabled
+    If Not m_ctl Is Nothing Then
+        If m_ctl.Active() Then
+            d("ctlPipe") = m_ctl.CtlPipeName()
+            d("ctlNonce") = m_ctl.CtlNonceValue()
+            d("ctlProto") = "ctl/1"
+            d("ctlAvailable") = True
+            Set d("ctlAuth") = m_ctl.CtlAuthBasis()
+        End If
+    End If
     d("pipeProto") = "np/1"
     d("project") = project
     d("projectPath") = projectPath
@@ -507,7 +603,7 @@ Private Function EnsurePipe() As Boolean
     Dim h As Long
     h = NpCreateNamedPipe(m_pipeName, NP_PIPE_ACCESS_DUPLEX Or NP_FILE_FLAG_OVERLAPPED, _
         NP_PIPE_TYPE_BYTE Or NP_PIPE_READMODE_BYTE Or NP_PIPE_WAIT, _
-        1, NP_PIPE_BUF, NP_PIPE_BUF, 0, pSA)
+        IIf(m_role = "ctl", 2, 1), NP_PIPE_BUF, NP_PIPE_BUF, 0, pSA)
     Dim e As Long
     e = Err.LastDllError
     If pSD <> 0 Then NpLocalFree pSD
@@ -564,12 +660,17 @@ Private Function PollConnect() As Boolean
 End Function
 
 Private Sub OnConnected()
+    m_ctlHelloChecked = False
     m_state = 2
     m_conns = m_conns + 1
     m_connAt = NpGetTickCount()
     m_idleAt = m_connAt
     m_accLen = 0
     m_authed = False
+    ' per-CONNECTION ctl auth state: the contract gives every connection a fresh sid,
+    ' so a new connection must not inherit the previous handshake (measured: the second
+    ' connection's hello was parsed as a request -> ctl_unauthorized/bad_session).
+    CtlResetConn
     m_outLen = 0
     m_outSent = 0
     m_closeAfterFlush = False
@@ -577,6 +678,15 @@ Private Sub OnConnected()
     ' (step 3): a new authenticated connection means a new doorbell seq space.
     Ingress.SessionReset
     NpLog "transport=pipe event=connect conns=" & CStr(m_conns) & " (handshake deadline " & CStr(m_helloMs) & " ms)"
+End Sub
+
+' Reset the per-connection control-lane handshake. m_ctlAuthed/m_ctlSid/m_ctlSeq belong to
+' ONE connection (contract: a fresh sid per connection); the lockout counter deliberately
+' survives, because it guards the PROCESS, not the connection.
+Private Sub CtlResetConn()
+    m_ctlAuthed = False
+    m_ctlSid = ""
+    m_ctlSeq = -1
 End Sub
 
 ' --- state 2: connected ---------------------------------------------------
@@ -624,11 +734,26 @@ Private Function ServiceConnected() As Boolean
 
     ' (a) handshake deadline: a squatter may not hold the single instance
     '     (nMaxInstances = 1) without presenting hello.
-    If Not m_authed Then
+    If Not ConnAuthed() Then
         If (now - m_connAt) > m_helloMs Then
-            NpLog "transport=pipe result=teardown reason=hello_timeout"
-            Teardown "hello_timeout"
-            Exit Function
+            ' R-1021-03 C5: a ctl client must be able to tell "the server says hello
+            ' timed out" from "the socket was cut". Queue the deny frame and let the
+            ' existing flush / close-after-flush path close the handle (the business lane
+            ' uses m_closeAfterFlush for exactly the same reason). NEVER Teardown first.
+            If m_role = "ctl" Then
+                ' Queue the deny ONCE per connection, then FALL THROUGH to (b): that is
+                ' what actually starts the write and lets close-after-flush close the
+                ' handle. Returning here was the v7 bug (35 queued denies, zero bytes).
+                If Not m_ctlHelloChecked Then
+                    m_ctlHelloChecked = True
+                    NpLog "transport=ctl event=deny reason=hello_timeout"
+                    CtlDeny "hello_timeout", ""
+                End If
+            Else
+                NpLog "transport=pipe result=teardown reason=hello_timeout"
+                Teardown "hello_timeout"
+                Exit Function
+            End If
         End If
     End If
 
@@ -666,7 +791,10 @@ Private Function ServiceConnected() As Boolean
     ' (d) non-blocking availability probe, then a read of EXACTLY the bytes the
     '     kernel reports. Never a blocking ReadFile.
     Dim pr As Long, avail As Long, lft As Long, ok As Long
+    Dim pkT0 As Double
+    pkT0 = WinOps.WoProfNow()
     ok = NpPeekNamedPipe(m_hPipe, 0, 0, pr, avail, lft)
+    WinOps.WoProfAdd 16, WinOps.WoProfNow() - pkT0
     If ok = 0 Then
         Dim pe As Long
         pe = Err.LastDllError
@@ -758,6 +886,7 @@ Private Function PollWrite() As Boolean
     e = Err.LastDllError
     If ok <> 0 Then
         m_outSent = m_outSent + br
+        WinOps.WoProfOutReap br
         If m_outSent >= m_outLen Then
             m_outLen = 0
             m_outSent = 0
@@ -825,6 +954,10 @@ Private Function TakeFrame(ByVal n As Long) As String
 End Function
 
 Private Sub HandleFrame(ByVal txt As String)
+    If m_role = "ctl" Then
+        HandleCtlFrame txt
+        Exit Sub
+    End If
     If Not m_authed Then
         HandleHello txt
         Exit Sub
@@ -864,6 +997,19 @@ Private Sub HandleHello(ByVal txt As String)
         SendDenyFrame "nonce_mismatch", ""
         Exit Sub
     End If
+    ' The nonce proves PAIRING (the client read our registry entry); auth proves
+    ' AUTHORIZATION (the client holds the operator's credential). Order is
+    ' deliberate: the existing nonce verdict is unchanged, and only a client that
+    ' already knows the nonce can even reach the auth verdict. Two STABLE reasons
+    ' are used - never collapsed into a generic error - and nothing secret is
+    ' logged (see HelloAuthResult).
+    Dim authRes As String
+    authRes = HelloAuthResult(txt)
+    If authRes <> "ok" Then
+        NpLog "transport=pipe event=deny reason=" & authRes & " authSource=" & m_authSource
+        SendDenyFrame authRes, ""
+        Exit Sub
+    End If
     m_authed = True
     QueueOut WelcomeJson()
     NpLog "transport=pipe event=welcome instanceId=" & m_instanceId & " tcpEnabled=" & BoolText(m_tcpEnabled)
@@ -887,6 +1033,188 @@ Private Function HelloNonceMatches(ByVal txt As String) As Boolean
     End If
 End Function
 
+' --- hello.auth (HANDSHAKE AUTH) --------------------------------------------------
+
+' Credential source, resolved ONCE at start. Precedence follows the threat
+' model (M-5): VB6MCP_TOKEN (environment - never touches disk) then
+' VB6MCP_TOKEN_FILE (owner-only file). An explicit configuration that cannot be
+' read or is empty must NOT silently disable authorization, so it FAILS CLOSED
+' (an unusable expected value => every hello is refused) and the source field
+' says which case it was - without ever containing the value.
+Private Sub LoadAuthConfig()
+    m_authOn = False
+    m_authSha = ""
+    m_authSource = ""
+    Dim t As String
+    t = Environ$("VB6MCP_TOKEN")
+    If Len(t) > 0 Then
+        m_authSource = "env"
+        m_authSha = Sha256HexTextUtf8(t)
+        m_authOn = True
+        Exit Sub
+    End If
+    Dim f As String
+    f = Environ$("VB6MCP_TOKEN_FILE")
+    If Len(f) = 0 Then Exit Sub
+    ' MEASURED (HANDSHAKE AUTH D1): VB6 Open(For Binary Access Read) CREATES a zero-byte
+    ' file at a MISSING path instead of raising, so a configured-but-nonexistent
+    ' credential file became "file_empty" AND left an empty file behind. Existence
+    ' is decided BEFORE opening, and a missing file is its own source label (still
+    ' fail-closed: an unusable expected value refuses every hello).
+    If Len(Dir$(f)) = 0 Then
+        m_authSource = "file_missing"
+        m_authSha = ""
+        m_authOn = True
+        Exit Sub
+    End If
+    Dim v As String
+    If Not ReadTokenFile(f, v) Then
+        m_authSource = "file_error"
+        m_authSha = ""
+        m_authOn = True
+        Exit Sub
+    End If
+    If Len(v) = 0 Then
+        m_authSource = "file_empty"
+        m_authSha = ""
+        m_authOn = True
+        Exit Sub
+    End If
+    m_authSource = "file"
+    m_authSha = Sha256HexTextUtf8(v)
+    m_authOn = True
+End Sub
+
+' Reads at most 4096 bytes, decodes as UTF-8 (BOM tolerant) and trims the line
+' terminator, matching the bridge's own VB6MCP_TOKEN_FILE reader (utf-8-sig +
+' strip). Returns False only when the file cannot be read at all.
+Private Function ReadTokenFile(ByVal path As String, ByRef outText As String) As Boolean
+    ReadTokenFile = False
+    outText = ""
+    Dim f As Integer
+    Dim n As Long
+    Dim b() As Byte
+    On Error GoTo Fail
+    ' Defensive twin of the caller's check: the read must never CREATE the file it
+    ' is supposed to read (see the D1 note in LoadAuthConfig).
+    If Len(Dir$(path)) = 0 Then Exit Function
+    f = FreeFile
+    Open path For Binary Access Read As #f
+    n = LOF(f)
+    If n <= 0 Then
+        Close #f
+        ReadTokenFile = True
+        Exit Function
+    End If
+    If n > 4096 Then n = 4096
+    ReDim b(0 To n - 1)
+    Get #f, 1, b
+    Close #f
+    Dim s As String
+    s = Utf8DecodeBytes(b)
+    If Left$(s, 1) = ChrW$(&HFEFF) Then s = Mid$(s, 2)
+    Do While Len(s) > 0
+        Select Case AscW(Right$(s, 1))
+            Case 13, 10, 9, 32
+                s = Left$(s, Len(s) - 1)
+            Case Else
+                Exit Do
+        End Select
+    Loop
+    Do While Len(s) > 0
+        Select Case AscW(Left$(s, 1))
+            Case 13, 10, 9, 32
+                s = Mid$(s, 2)
+            Case Else
+                Exit Do
+        End Select
+    Loop
+    outText = s
+    ReadTokenFile = True
+    Exit Function
+Fail:
+    On Error Resume Next
+    Close #f
+    outText = ""
+    ReadTokenFile = False
+End Function
+
+Private Function AuthStateText() As String
+    If m_authOn Then
+        AuthStateText = "on:" & m_authSource
+    Else
+        AuthStateText = "off"
+    End If
+End Function
+
+' "ok" | "token_missing" | "token_mismatch". The caller logs ONLY this verdict
+' string: the token and its sha256 are never logged or echoed (the sha256 of a
+' secret is a guess-confirmation oracle, and the wire's tokenFp is not used here
+' at all).
+Private Function HelloAuthResult(ByVal txt As String) As String
+    HelloAuthResult = "ok"
+    If Not m_authOn Then Exit Function
+    Dim v As Variant
+    Dim root As Object
+    Dim authVal As Variant
+    Dim authObj As Object
+    Dim isObj As Boolean
+    Dim gotToken As String
+    Dim gotScheme As String
+    On Error Resume Next
+    If JsonParse(txt, v) Then
+        If IsObject(v) Then
+            Set root = v
+            If JsonGet(root, "auth", authVal, isObj) Then
+                If isObj Then
+                    Set authObj = authVal
+                    gotToken = JsonGetStr(authObj, "token", "")
+                    gotScheme = LCase$(JsonGetStr(authObj, "scheme", ""))
+                End If
+            End If
+        End If
+    End If
+    On Error GoTo 0
+    If Len(gotScheme) > 0 Then
+        If gotScheme <> "bearer" Then
+            ' The wire pins scheme=bearer. A credential presented under another
+            ' scheme cannot be the configured bearer token.
+            HelloAuthResult = "token_mismatch"
+            Exit Function
+        End If
+    End If
+    If Len(gotToken) = 0 Then
+        ' Absent auth object, absent token key and an empty token are ONE case:
+        ' the credential was not presented.
+        HelloAuthResult = "token_missing"
+        Exit Function
+    End If
+    If Len(m_authSha) <> 64 Then
+        ' Configured but unusable (file_error / file_empty): fail closed and do
+        ' not tell the client which of the two it was.
+        HelloAuthResult = "token_mismatch"
+        Exit Function
+    End If
+    If Not AuthHexEqual(Sha256HexTextUtf8(gotToken), m_authSha) Then HelloAuthResult = "token_mismatch"
+End Function
+
+' Constant-time comparison of two 64-hex sha256 strings: EVERY character is
+' folded into the accumulator with no early exit, so the running time does not
+' depend on where the first difference is - the property hmac.compare_digest
+' gives the bridge. Length is public (always 64); unequal lengths are refused
+' before the loop, so no length information is derived from timing either.
+Private Function AuthHexEqual(ByVal a As String, ByVal b As String) As Boolean
+    AuthHexEqual = False
+    If Len(a) <> 64 Then Exit Function
+    If Len(b) <> 64 Then Exit Function
+    Dim i As Long
+    Dim diff As Long
+    For i = 1 To 64
+        diff = diff Or (CLng(AscW(Mid$(a, i, 1))) Xor CLng(AscW(Mid$(b, i, 1))))
+    Next i
+    If diff = 0 Then AuthHexEqual = True
+End Function
+
 Private Function WelcomeJson() As String
     Dim proj As String, sha As String
     proj = ""
@@ -900,7 +1228,14 @@ Private Function WelcomeJson() As String
     ' of this instance is live (the visible-transport requirement, section 0.2
     ' rule 3 / section 2.5). instanceId echoes pid + nonce, which is the pairing
     ' check the client performs.
-    WelcomeJson = "{""vb6mcp"":""welcome"",""proto"":""np/1"",""instanceId"":""" & JsonEsc(m_instanceId) & """,""pid"":" & CStr(m_pid) & ",""session"":" & CStr(m_sid) & ",""project"":""" & JsonEsc(proj) & """,""dllSha256"":""" & JsonEsc(sha) & """,""transport"":""pipe"",""tcpEnabled"":" & BoolText(m_tcpEnabled) & "}"
+    ' The auth member is ADDITIVE and CONDITIONAL: with no configured credential
+    ' the frame below is byte-for-byte the pre-HANDSHAKE AUTH frame (measured by
+    ' comparing the raw welcome frame / key set against the previously deployed
+    ' build), so "unconfigured == today" is a measurement, not an argument.
+    Dim authPart As String
+    authPart = ""
+    If m_authOn Then authPart = ",""auth"":{""state"":""ok""}"
+    WelcomeJson = "{""vb6mcp"":""welcome"",""proto"":""np/1"",""instanceId"":""" & JsonEsc(m_instanceId) & """,""pid"":" & CStr(m_pid) & ",""session"":" & CStr(m_sid) & ",""project"":""" & JsonEsc(proj) & """,""dllSha256"":""" & JsonEsc(sha) & """,""transport"":""pipe"",""tcpEnabled"":" & BoolText(m_tcpEnabled) & authPart & "}"
 End Function
 
 ' --- request servicing ----------------------------------------------------
@@ -913,7 +1248,15 @@ Private Sub ServeRpc(ByVal txt As String)
     m_progSeq = 0
     m_lastProgAt = m_serveStart
     On Error Resume Next
+    Dim rpcT0 As Double
+    rpcT0 = WinOps.WoProfNow()
+    WinOps.WoProfMethod m_curTool
     resp = m_mcp.HandleJsonRpc(txt)
+    Dim rpcUs As Double
+    rpcUs = WinOps.WoProfNow() - rpcT0
+    WinOps.WoProfAdd 14, rpcUs
+    WinOps.WoProfMethodDone rpcUs
+    WinOps.WoProfReqResp Len(txt), Len(resp)
     If Err.Number <> 0 Then
         ' The TCP path answers a 500 here; a pipe must answer SOMETHING or the
         ' client waits for its whole forward budget.
@@ -998,19 +1341,29 @@ Private Function ExtractToolName(ByVal txt As String) As String
     On Error Resume Next
     Dim v As Variant
     If Len(txt) = 0 Then Exit Function
-    If InStr(1, txt, """tools/call""", vbBinaryCompare) = 0 Then Exit Function
+    If InStr(1, txt, """method""", vbBinaryCompare) = 0 Then Exit Function
     If Not JsonParse(txt, v) Then Exit Function
     If Not IsObject(v) Then Exit Function
     Dim o As Object
     Set o = v
-    Dim pv As Variant
-    Dim pIsObj As Boolean
-    pIsObj = False
-    If Not JsonGet(o, "params", pv, pIsObj) Then Exit Function
-    If Not pIsObj Then Exit Function
-    Dim po As Object
-    Set po = pv
-    ExtractToolName = JsonGetStr(po, "name", "")
+    Dim mm As String
+    mm = JsonGetStr(o, "method", "")
+    If Len(mm) = 0 Then Exit Function
+    If mm = "tools/call" Then
+        Dim pv As Variant
+        Dim pIsObj As Boolean
+        pIsObj = False
+        If JsonGet(o, "params", pv, pIsObj) Then
+            If pIsObj Then
+                Dim po As Object
+                Set po = pv
+                Dim tn As String
+                tn = JsonGetStr(po, "name", "")
+                If Len(tn) > 0 Then mm = mm & ":" & tn
+            End If
+        End If
+    End If
+    ExtractToolName = mm
 End Function
 
 Private Function InternalErrorJson(ByVal requestText As String, ByVal errNo As Long) As String
@@ -1086,6 +1439,7 @@ Private Function BeginNextOut() As Boolean
     If n > 0 Then NpCopyMemory m_out(4), b(0), n
     m_outLen = 4 + n
     m_outSent = 0
+    WinOps.WoProfOutFrame m_outLen
     BeginNextOut = True
 End Function
 
@@ -1105,6 +1459,7 @@ Private Function NpStartWrite() As Boolean
     e = Err.LastDllError
     If ok <> 0 Then
         m_outSent = m_outSent + bw
+        WinOps.WoProfWriteSync bw
         If m_outSent >= m_outLen Then
             m_outLen = 0
             m_outSent = 0
@@ -1148,11 +1503,17 @@ Private Sub Teardown(ByVal reason As String)
     m_outLen = 0
     m_outSent = 0
     m_authed = False
+    CtlResetConn
     m_closeAfterFlush = False
     m_closeAfterFlushAt = 0
     m_serving = False
     m_tears = m_tears + 1
     m_lastReason = reason
+    If m_role = "ctl" Then
+        ' R-1021-03 v6: ctl relisten - one zombie connection must not block every later Connect
+        m_lastCreateAt = 0
+        EnsurePipe
+    End If
     Set m_outQ = New Collection
     If m_ov.hEvent <> 0 Then
         NpCloseHandle m_ov.hEvent
@@ -1372,3 +1733,460 @@ Private Sub EnsureFolder(ByVal fso As Object, ByVal path As String)
     End If
     fso.CreateFolder path
 End Sub
+
+
+' ===========================================================================
+' R-1021-03 A4: ctl/1 lane. A second PipeTransport instance, same UI-thread Tick.
+' Responses are Dictionaries serialized by JsonStringify (no hand-built JSON).
+' ===========================================================================
+Private Sub MergeInto(ByVal dst As Object, ByVal src As Object)
+    If src Is Nothing Then Exit Sub
+    Dim k As Variant
+    For Each k In src.Keys
+        If IsObject(src(k)) Then
+            Set dst(CStr(k)) = src(k)
+        Else
+            dst(CStr(k)) = src(k)
+        End If
+    Next
+End Sub
+
+Private Function CtlLimitsObj() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("servedFromSamePump") = True
+    d("statementInterrupted") = False
+    d("nonPumpingCallServiceable") = False
+    Set CtlLimitsObj = d
+End Function
+
+Private Sub StartCtlLane()
+    On Error Resume Next
+    Dim tok As String, broken As Boolean
+    tok = ""
+    broken = False
+    ResolveCtlToken tok, broken
+    If broken Then
+        NpLog "transport=ctl event=unavailable reason=token_configured_unreadable"
+        Exit Sub
+    End If
+    m_ctlNonce = MakeNonce16()
+    If Len(m_ctlNonce) <> 16 Then Exit Sub
+    m_ctlPipeName = "\\.\pipe\vb6mcp-ctl-" & CStr(m_sid) & "-" & CStr(m_pid) & "-" & m_slug & "-" & m_ctlNonce
+    Set m_ctl = New PipeTransport
+    m_ctl.StartCtl m_mcp, m_ctlPipeName, m_ctlNonce, tok, Me
+    If m_ctl.Active() Then
+        NpLog "transport=ctl event=start nonce=" & Left$(m_ctlNonce, 4) & "..."
+    Else
+        Set m_ctl = Nothing
+        NpLog "transport=ctl event=start_failed"
+    End If
+End Sub
+
+Private Sub ResolveCtlToken(ByRef tok As String, ByRef broken As Boolean)
+    On Error Resume Next
+    tok = ""
+    broken = False
+    Dim t As String
+    t = Environ$("VB6MCP_TOKEN")
+    If Len(t) > 0 Then
+        tok = Trim$(t)
+        Exit Sub
+    End If
+    Dim f As String
+    f = Environ$("VB6MCP_TOKEN_FILE")
+    If Len(f) = 0 Then Exit Sub
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then
+        broken = True
+        Exit Sub
+    End If
+    Set ts = fso.OpenTextFile(f, 1, False)
+    If ts Is Nothing Then
+        broken = True
+        Exit Sub
+    End If
+    tok = Trim$(ts.ReadAll)
+    ts.Close
+    If Len(tok) = 0 Then broken = True
+    Err.Clear
+End Sub
+
+Public Sub StartCtl(ByVal mcp As McpServer, ByVal pipeName As String, ByVal nonce As String, ByVal token As String, ByVal owner As PipeTransport)
+    On Error GoTo Fail
+    Set m_mcp = mcp
+    Set m_owner = owner
+    m_role = "ctl"
+    m_mode = "ctl"
+    m_tcpEnabled = False
+    m_pid = NpGetCurrentProcessId()
+    m_sid = SessionOfProcess(m_pid)
+    m_pipeName = pipeName
+    ' the ctl child must publish ITS pipe name: PublishInstance reads CtlPipeName() from
+    ' this object, and an unset backing field silently published an empty ctlPipe
+    ' (bridge then reported ctl_pipe_absent and refused the lane).
+    m_ctlPipeName = pipeName
+    m_ctlNonce = nonce
+    m_ctlToken = token
+    m_startedAt = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    m_instanceId = CStr(m_pid) & "-" & m_ctlNonce
+    m_tickMs = Util.EnvLongOr("VB6MCP_PIPE_TICK_MS", NP_DEFAULT_TICK_MS)
+    m_idleMs = Util.EnvLongOr("VB6MCP_PIPE_IDLE_MS", NP_DEFAULT_IDLE_MS)
+    m_readDeadlineMs = Util.EnvLongOr("VB6MCP_PIPE_READ_DEADLINE_MS", NP_DEFAULT_READ_DEADLINE_MS)
+    m_helloMs = Util.EnvLongOr("VB6MCP_PIPE_HELLO_MS", NP_DEFAULT_HELLO_MS)
+    m_progressMs = Util.EnvLongOr("VB6MCP_PIPE_PROGRESS_MS", NP_DEFAULT_PROGRESS_MS)
+    m_progressOn = EnvFlag("VB6MCP_PIPE_PROGRESS", True)
+    m_useAcl = EnvFlag("VB6MCP_PIPE_ACL", True)
+    ReDim m_acc(0 To NP_ACC_CAP - 1)
+    ReDim m_out(0 To 3)
+    Set m_outQ = New Collection
+    m_state = 0
+    m_active = True
+    m_bootAt = NpGetTickCount()
+    Exit Sub
+Fail:
+    m_active = False
+End Sub
+
+Public Function CtlPipeName() As String
+    CtlPipeName = m_ctlPipeName
+End Function
+Public Function CtlNonceValue() As String
+    CtlNonceValue = m_ctlNonce
+End Function
+Public Function CtlAuthBasis() As Object
+    Dim c As Object
+    Set c = New Collection
+    c.Add "nonce"
+    c.Add "acl"
+    If Len(m_ctlToken) > 0 Then c.Add "bearer"
+    Set CtlAuthBasis = c
+End Function
+
+Private Sub HandleCtlFrame(ByVal txt As String)
+    On Error Resume Next
+    If Not m_ctlAuthed Then
+        HandleCtlHello txt
+        Exit Sub
+    End If
+    If Len(txt) > 65536 Then
+        CtlDeny "ctl_bad_frame", "too_large"
+        Exit Sub
+    End If
+    Dim v As Variant, o As Object
+    If Not JsonParse(txt, v) Then
+        CtlDeny "ctl_bad_frame", "bad_json"
+        Exit Sub
+    End If
+    If Not IsObject(v) Then
+        CtlDeny "ctl_bad_frame", "bad_json"
+        Exit Sub
+    End If
+    Set o = v
+    Dim gotSid As String, seq As Long
+    gotSid = JsonGetStr(o, "sid", "")
+    seq = JsonGetLong(o, "seq", -1)
+    If Len(gotSid) = 0 Then
+        CtlDeny "ctl_unauthorized", "bad_session"
+        Exit Sub
+    End If
+    If StrComp(gotSid, m_ctlSid, vbBinaryCompare) <> 0 Then
+        CtlDeny "ctl_unauthorized", "bad_session"
+        Exit Sub
+    End If
+    If seq <> (m_ctlSeq + 1) Then
+        CtlDeny "ctl_unauthorized", "bad_seq"
+        Exit Sub
+    End If
+    m_ctlSeq = seq
+    Dim op As String, args As Object, av As Variant, isObj As Boolean
+    op = LCase$(JsonGetStr(o, "op", ""))
+    Set args = Nothing
+    If JsonGet(o, "args", av, isObj) Then
+        If IsObject(av) Then Set args = av
+    End If
+    m_ctlServes = m_ctlServes + 1
+    Dim res As Object, payload As Object
+    Set res = CreateObject("Scripting.Dictionary")
+    res("vb6mcp") = "ctlresult"
+    res("sid") = m_ctlSid
+    res("seq") = seq
+    Set res("limits") = CtlLimitsObj()
+    Select Case op
+        Case "ping"
+            res("ok") = True
+            res("pid") = m_pid
+            res("uptimeMs") = NpGetTickCount() - m_bootAt
+            res("ackedAt") = NpGetTickCount()
+            Set res("gate") = m_mcp.CtlGateObj()
+            Set res("businessPipe") = BusinessPipeObj()
+            Dim pmp As Object
+            Set pmp = CreateObject("Scripting.Dictionary")
+            pmp("calls") = Util.PumpCount()
+            pmp("gateSkips") = Util.PumpGateSkipped()
+            Set res("pump") = pmp
+        Case "state"
+            res("ok") = True
+            res("pid") = m_pid
+            Set payload = m_mcp.CtlStateObj()
+            Call MergeInto(res, payload)
+            Set payload = Nothing
+            Set res("inflight") = m_mcp.CtlInflightObj()
+            If m_owner Is Nothing Then
+                Set res("inflight") = New Collection
+            End If
+            Dim ctl As Object
+            Set ctl = CreateObject("Scripting.Dictionary")
+            ctl("conns") = m_conns
+            ctl("denied") = m_ctlDenied
+            ctl("served") = m_ctlServes
+            ctl("queued") = 0
+            Set res("ctl") = ctl
+        Case "release_gate"
+            res("ok") = True
+            Set payload = m_mcp.CtlReleaseObj(JsonGetLong(args, "minHeldMs", 0))
+            Call MergeInto(res, payload)
+        Case "cancel"
+            res("ok") = True
+            Set payload = m_mcp.CtlCancelObj(JsonGetStr(args, "target", ""))
+            Call MergeInto(res, payload)
+        Case "abandon"
+            Set payload = m_mcp.CtlAbandonObj(JsonGetBool(args, "confirm", False), JsonGetLong(args, "minHeldMs", 0))
+            Call MergeInto(res, payload)
+            If payload.Exists("abandoned") Then
+                Dim relMs As Long
+                If Not m_owner Is Nothing Then m_owner.AbandonBusiness relMs
+                Dim bp As Object
+                Set bp = CreateObject("Scripting.Dictionary")
+                bp("closed") = True
+                bp("state") = "idle"
+                bp("relistenMs") = relMs
+                Set res("businessPipe") = bp
+            End If
+        Case "tool"
+            Dim nm As String, aj As String
+            nm = JsonGetStr(args, "name", "")
+            aj = ""
+            If Not args Is Nothing Then
+                Dim av2 As Variant, isObj2 As Boolean
+                If JsonGet(args, "arguments", av2, isObj2) Then
+                    If IsObject(av2) Then aj = JsonStringify(av2)
+                End If
+            End If
+            If Len(nm) = 0 Then
+                res("ok") = False
+                res("reason") = "readonly_lane_refused"
+                res("detail") = "missing_name"
+                res("allowed") = m_mcp.CtlToolsJson()
+            ElseIf Not m_mcp.CtlToolIsReadOnly(nm) Then
+                ' ORDER MATTERS: ask "is it read-only?" BEFORE "is it fast enough?"; the other
+                ' order reported every state-changing tool as "slow_tool_not_on_ctl_lane"
+                ' (measured regression C16).
+                res("ok") = False
+                res("reason") = "readonly_lane_refused"
+                res("detail") = "not_read_only"
+                res("allowed") = m_mcp.CtlToolsJson()
+                res("failureKind") = "toolError"
+            ElseIf Not m_mcp.CtlToolAllowed(nm) Then
+                res("ok") = False
+                res("reason") = "readonly_lane_refused"
+                res("detail") = "slow_tool_not_on_ctl_lane"
+                res("allowed") = m_mcp.CtlToolsJson()
+                res("failureKind") = "toolError"
+            Else
+                Dim receipt As String, rv As Variant, ro As Object
+                receipt = m_mcp.CtlReadOnlyText(nm, aj)
+                res("ok") = True
+                res("source") = "ctl_lane"
+                If JsonParse(receipt, rv) Then
+                    If IsObject(rv) Then
+                        Set ro = rv
+                        Set res("receipt") = ro
+                    Else
+                        res("receipt") = receipt
+                    End If
+                Else
+                    res("receipt") = receipt
+                End If
+            End If
+        Case Else
+            res("ok") = False
+            res("reason") = "ctl_unknown_op"
+            Dim sup As Object
+            Set sup = New Collection
+            sup.Add "ping"
+            sup.Add "state"
+            sup.Add "release_gate"
+            sup.Add "cancel"
+            sup.Add "abandon"
+            sup.Add "tool"
+            Set res("supported") = sup
+    End Select
+    QueueOut JsonStringify(res)
+    Err.Clear
+End Sub
+
+Private Sub HandleCtlHello(ByVal txt As String)
+    On Error Resume Next
+    If m_ctlLockUntil <> 0 Then
+        If NpGetTickCount() < m_ctlLockUntil Then
+            CtlDeny "ctl_lockout", "", 60000
+            Exit Sub
+        End If
+    End If
+    If Len(txt) > 65536 Then
+        CtlDeny "ctl_bad_frame", "too_large"
+        Exit Sub
+    End If
+    Dim v As Variant, o As Object
+    If Not JsonParse(txt, v) Then
+        CtlDeny "ctl_bad_frame", "bad_json"
+        Exit Sub
+    End If
+    If Not IsObject(v) Then
+        CtlDeny "ctl_bad_frame", "bad_json"
+        Exit Sub
+    End If
+    Set o = v
+    If LCase$(JsonGetStr(o, "vb6mcp", "")) <> "ctlhello" Then
+        CtlDeny "bad_hello", "kind"
+        Exit Sub
+    End If
+    If LCase$(JsonGetStr(o, "proto", "")) <> "ctl/1" Then
+        CtlDeny "ctl_unauthorized", "bad_proto"
+        Exit Sub
+    End If
+    Dim nonce As String
+    nonce = JsonGetStr(o, "nonce", "")
+    If Len(nonce) <> Len(m_ctlNonce) Then
+        CtlDeny "ctl_unauthorized", "nonce_mismatch"
+        Exit Sub
+    End If
+    If StrComp(nonce, m_ctlNonce, vbBinaryCompare) <> 0 Then
+        CtlDeny "ctl_unauthorized", "nonce_mismatch"
+        Exit Sub
+    End If
+    Dim iid As String
+    iid = JsonGetStr(o, "instanceId", "")
+    If Len(iid) > 0 Then
+        If StrComp(iid, m_instanceId, vbBinaryCompare) <> 0 Then
+            CtlDeny "ctl_unauthorized", "nonce_mismatch"
+            Exit Sub
+        End If
+    End If
+    If Len(m_ctlToken) > 0 Then
+        Dim av As Variant, isObj As Boolean, gt As String
+        gt = ""
+        If JsonGet(o, "auth", av, isObj) Then
+            If IsObject(av) Then gt = JsonGetStr(av, "token", "")
+        End If
+        If Len(gt) = 0 Then
+            CtlDeny "ctl_unauthorized", "token_mismatch"
+            Exit Sub
+        End If
+        If StrComp(Sha256.Sha256HexTextUtf8(gt), Sha256.Sha256HexTextUtf8(m_ctlToken), vbBinaryCompare) <> 0 Then
+            CtlDeny "ctl_unauthorized", "token_mismatch"
+            Exit Sub
+        End If
+    End If
+    m_ctlAuthed = True
+    m_ctlSid = MakeNonce16()
+    m_ctlSeq = -1
+    m_ctlAuthFails = 0
+    Dim w As Object
+    Set w = CreateObject("Scripting.Dictionary")
+    w("vb6mcp") = "ctlwelcome"
+    w("proto") = "ctl/1"
+    w("instanceId") = m_instanceId
+    w("pid") = m_pid
+    w("sid") = m_ctlSid
+    w("seqBase") = 0
+    Dim ops As Object
+    Set ops = New Collection
+    ops.Add "ping"
+    ops.Add "state"
+    ops.Add "release_gate"
+    ops.Add "cancel"
+    ops.Add "abandon"
+    ops.Add "tool"
+    Set w("ops") = ops
+    Set w("authBasis") = CtlAuthBasis()
+    w("maxFrame") = 65536
+    w("ackedAt") = NpGetTickCount()
+    Set w("gate") = m_mcp.CtlGateObj()
+    Set w("limits") = CtlLimitsObj()
+    Dim ctl As Object
+    Set ctl = CreateObject("Scripting.Dictionary")
+    ctl("conns") = m_conns
+    ctl("denied") = m_ctlDenied
+    ctl("served") = m_ctlServes
+    Set w("ctl") = ctl
+    Set w("ctlTools") = m_mcp.CtlToolsColl()
+    Set w("limits") = CtlLimitsObj()
+    QueueOut JsonStringify(w)
+    NpLog "transport=ctl event=welcome instanceId=" & m_instanceId
+    Err.Clear
+End Sub
+
+Private Sub CtlDeny(ByVal reason As String, ByVal detail As String, Optional ByVal retryAfterMs As Long = 0)
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("vb6mcp") = "deny"
+    d("proto") = "ctl/1"
+    d("reason") = reason
+    d("detail") = detail
+    If retryAfterMs > 0 Then d("retryAfterMs") = retryAfterMs
+    QueueOut JsonStringify(d)
+    m_ctlDenied = m_ctlDenied + 1
+    If reason = "ctl_unauthorized" Or reason = "ctl_bad_frame" Then
+        m_ctlAuthFails = m_ctlAuthFails + 1
+        If m_ctlAuthFails = 1 Then m_ctlAuthFailAt = NpGetTickCount()
+        If (NpGetTickCount() - m_ctlAuthFailAt) > 60000 Then
+            m_ctlAuthFails = 1
+            m_ctlAuthFailAt = NpGetTickCount()
+        End If
+        If m_ctlAuthFails >= 3 Then m_ctlLockUntil = NpGetTickCount() + 60000
+    End If
+    m_closeAfterFlush = True
+End Sub
+
+Private Function BusinessPipeObj() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("state") = m_owner.BusinessPipeState()
+    d("heldMs") = m_owner.BusinessPipeHeldMs()
+    Set BusinessPipeObj = d
+End Function
+
+Public Function BusinessPipeState() As String
+    Select Case m_state
+        Case 0: BusinessPipeState = "idle"
+        Case 1: BusinessPipeState = "connect_pending"
+        Case 2: BusinessPipeState = "connected"
+        Case 3: BusinessPipeState = "read_pending"
+        Case 4: BusinessPipeState = "write_pending"
+        Case Else: BusinessPipeState = "unknown"
+    End Select
+End Function
+
+Public Function BusinessPipeHeldMs() As Long
+    If m_connAt = 0 Then Exit Function
+    BusinessPipeHeldMs = NpGetTickCount() - m_connAt
+End Function
+
+Public Sub AbandonBusiness(ByRef relistenMs As Long)
+    On Error Resume Next
+    Dim t0 As Long
+    relistenMs = 0
+    If m_hPipe <> 0 Then Teardown "ctl_abandon"
+    m_state = 0
+    t0 = NpGetTickCount()
+    If EnsurePipe() Then relistenMs = NpGetTickCount() - t0
+    NpLog "transport=pipe event=abandon reason=ctl_lane relistenMs=" & CStr(relistenMs)
+    Err.Clear
+End Sub
+
+Public Function IsServicing() As Boolean
+    IsServicing = m_serving
+End Function

@@ -146,6 +146,7 @@ import hmac
 import http.server
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -165,6 +166,11 @@ FRAME_MAX = 8 * 1024 * 1024          # sec 7.3 single-frame ceiling
 HTTP_BODY_MAX = 8 * 1024 * 1024      # request body ceiling of this listener
 DEFAULT_PORT = 8767                  # >= tools/mcp_strict_audit.py MIN_SELF_OWNED_PORT
 RESERVED_PORT = 8766                 # never bound by this repository's tooling
+
+#: WHEN this process started.  ide_list/ide_status publish uptimeMs from it - a pure fact
+#: about THIS middle service (never persisted, never a schema).
+_BOOT_AT = time.time()
+_BOOT_ISO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_BOOT_AT))
 
 #: the directory THIS FILE lives in, in SOURCE form.
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -260,6 +266,30 @@ class Config(object):
         self.host = _env_str("VB6MCP_BRIDGE_HOST", "127.0.0.1")
         self.pipe_connect_ms = _env_int("VB6MCP_PIPE_CONNECT_MS", 300)
         self.forward_timeout_ms = _env_int("VB6MCP_FORWARD_TIMEOUT_MS", 120000)
+        # R-1021-03 A4: TWO independent layers (mirror of CodeTools.ToolBudgetMs).
+        #   max_call_ms      generic ceiling: tools WITHOUT a budget of their own only.
+        #   max_call_hard_ms absolute cap: every derived budget, including build /
+        #                    make_project and an explicit caller timeout_ms.
+        self.max_call_ms = _env_int("VB6MCP_MAX_CALL_MS", 120000)
+        self.max_call_hard_ms = _env_int("VB6MCP_MAX_CALL_HARD_MS", 600000)
+        if self.max_call_hard_ms < self.max_call_ms:
+            self.max_call_hard_ms = self.max_call_ms
+        # one immediate retry when the pipe reports ERROR_PIPE_BUSY (a just-started or
+        # just-abandoned instance is a TRANSIENT busy, not "no IDE")
+        self.pipe_busy_retry_ms = _env_int("VB6MCP_PIPE_BUSY_RETRY_MS", 300)
+        # R-1021-03 A4 client half: the ctl/1 CONTROL LANE (bridge/CTL_WIRE_CONTRACT.md).
+        # Feature-detected from the instance record; this switch only exists so an operator can
+        # prove a business-only path still works after a rollback.  Disabling it can never make
+        # the bridge fall back to an UNAUTHENTICATED control channel - it simply does not use
+        # the lane (the business lane is the only other route, and it is nonce-paired).
+        self.ctl_enabled = _env_bool("VB6MCP_CTL", True)
+        # the hello deadline is the SERVER's VB6MCP_PIPE_HELLO_MS window; the ack deadline bounds
+        # ONE op on the lane (4.7: every ctl op must be fast - a slow op delays release_gate).
+        self.ctl_hello_ms = _env_int("VB6MCP_CTL_HELLO_MS", _env_int("VB6MCP_PIPE_HELLO_MS", 5000))
+        self.ctl_ack_ms = _env_int("VB6MCP_CTL_ACK_MS", 1500)
+        # the out-of-process read-only fallback (section B).  Only used when the ctl lane is
+        # UNAVAILABLE and the peer was classified peer_unresponsive.
+        self.oop_enabled = _env_bool("VB6MCP_OOP_FALLBACK", True)
         self.progress_ms = _env_int("VB6MCP_PIPE_PROGRESS_MS", 2000)
         # NB: deliberately NOT "VB6MCP_PIPE_IDLE_MS" - the VB side uses that name for the
         # SERVER's 120 s idle close.  Sharing the name would turn a client stall threshold of
@@ -898,6 +928,1030 @@ class PipeClient(object):
             self.rbuf.feed(data)
 
 
+# ---------------------------------------------------------------- ctl lane (ctl/1) ----
+# bridge/CTL_WIRE_CONTRACT.md.  The CONTROL LANE is a SECOND named pipe with exactly three
+# jobs, all of which must work while a long call holds the single-flight BUSINESS gate:
+#   1. liveness/state questions (ping, state),
+#   2. recovery of a stuck gate (release_gate, cancel, abandon),
+#   3. a SMALL read-only, FAST tool subset (tool, 4.7).
+# It is NOT a second business lane.  This block is the CLIENT half only.  Three client rules
+# are load bearing and are enforced here rather than by convention:
+#   * feature-detect from the instance record; NEVER fall back to an unauthenticated channel;
+#   * every frame carries sid + a strictly increasing seq; a mismatch kills the connection;
+#   * an effect is claimed ONLY when the server acknowledged it (oob.acked) - a wedged peer
+#     produces delivered:"queued_unacknowledged" + applied:false, never a success.
+
+CTL_PROTO = "ctl/1"
+CTL_OPS = ("ping", "state", "release_gate", "cancel", "abandon", "tool")
+
+# 4.7 CTL read-only subset = (the add-in's ToolReadOnly table) INTERSECTED WITH (fast: well
+# under one second, never opens a dialog or a modal host loop).  A WHITELIST on purpose: a new
+# read-only-but-slow tool must not leak onto the recovery lane, where a slow call would sit in
+# front of release_gate/cancel (the lane serves ONE connection at a time, sec 1).
+CTL_FAST_TOOLS = (
+    "ide_state", "execution_state", "desktop_probe", "read_active_dialogs", "find_gui",
+    "ui_text", "last_error", "list_windows", "current_position", "mcp_info",
+    "get_codepane", "get_project_info",
+)
+
+# 4 preamble: the server's static honesty block.  The client REPORTS a block a server actually
+# sent (under limits) and never invents one: fabricating it would present the server's own
+# stated limits as if the server had spoken them.
+CTL_RESULT_PASS = (
+    "released", "releasedTool", "heldMs", "depthAfter", "gateReleaseCount", "statementInterrupted",
+    "requested", "honoredAtNextPump", "abandoned", "abandonedTool", "responseLost", "businessPipe",
+    "inFlightTool", "howToProceed", "note", "cancel", "release", "inflight", "gate",
+    "mode", "project", "pid", "uptimeMs", "ackedAt", "pump", "ctl", "source",
+)
+
+#: oob.why - SIX distinct failure grades.  Collapsing them into one "ctl unavailable" would hide
+#: exactly the distinction an operator needs: a lane that was never published, one that could
+#: not be opened, one that rejected us, one that locked us out, and one that accepted the bytes
+#: but never answered.
+CTL_WHY = ("ctl_pipe_absent", "ctl_connect_failed", "ctl_hello_timeout",
+           "ctl_unauthorized", "ctl_lockout", "ctl_no_ack")
+
+#: Lead ruling 3: a fix_params verdict must NAME the fix, not just classify the failure.
+CTL_HOWTOFIX_UNAUTHORIZED = (
+    "the instance record and the add-in disagree (or a bearer is required): check "
+    "ctlPipe/ctlNonce/ctlProto in the instance record, and the VB6MCP_TOKEN / VB6MCP_TOKEN_FILE "
+    "the ADD-IN process was started with")
+
+
+class CtlError(Exception):
+    """One ctl exchange failure.  why is always one of CTL_WHY (never a bare string)."""
+
+    def __init__(self, why, detail="", stage="", retry_after_ms=None, response=None):
+        Exception.__init__(self, "%s%s" % (why, ((": " + str(detail)) if detail else "")))
+        self.why = why if why in CTL_WHY else "ctl_connect_failed"
+        self.detail = str(detail or "")
+        self.stage = stage
+        self.retry_after_ms = retry_after_ms
+        self.response = response or {}
+        self.hello_ms = 0
+        self.rtt_ms = 0
+        self.sid = None
+
+
+def ctl_problem(inst):
+    """(why, detail) when the lane is NOT usable, else None.  FEATURE DETECT ONLY (sec 6)."""
+    if inst is None:
+        return "ctl_pipe_absent", "no_instance"
+    if not CFG.ctl_enabled:
+        return "ctl_pipe_absent", "disabled_by_env"
+    if not getattr(inst, "ctlPipe", None):
+        return "ctl_pipe_absent", "no_ctl_pipe_field"
+    if not getattr(inst, "ctlNonce", None):
+        return "ctl_pipe_absent", "no_ctl_nonce_field"
+    if getattr(inst, "ctlAvailable", None) is False:
+        return "ctl_pipe_absent", "ctl_available_false"
+    proto = getattr(inst, "ctlProto", None)
+    if proto and str(proto) != CTL_PROTO:
+        # an unsupported proto is NOT usable and is never coerced into ctl/1
+        return "ctl_pipe_absent", "ctl_proto_unsupported:%s" % proto
+    return None
+
+
+def ctl_available(inst):
+    return ctl_problem(inst) is None
+
+
+def _ctl_tag(value):
+    """A nonce/secret-safe log tag: first 4 chars + ... (sec 2 factor 1: never log it in full)."""
+    s = "" if value is None else str(value)
+    return (s[:4] + "...") if len(s) > 4 else "..."
+
+
+def ctl_sid4(sid):
+    return _ctl_tag(sid)
+
+
+class CtlClient(object):
+    """One ctl/1 connection: hello -> welcome -> monotonic seq -> one response per frame.
+
+    Reuses PipeClient (same np/1 framing, fully overlapped, every wait bounded), so the control
+    lane cannot introduce a second, differently-behaved transport implementation.
+    """
+
+    def __init__(self, inst):
+        self.inst = inst
+        self.pc = None
+        self.sid = None
+        self.seq = None
+        self.seq_base = 0
+        self.ops = []
+        self.auth_basis = []
+        self.max_frame = 65536
+        self.welcome = {}
+        self.hello_ms = 0
+        self.last_rtt_ms = 0
+        self.ctl_tools = []
+
+    # -- lifecycle ---------------------------------------------------------------
+    def open(self, hello_ms=None):
+        why, detail = ctl_problem(self.inst) or (None, None)
+        if why:
+            raise CtlError(why, detail, "detect")
+        budget = max(200, int(hello_ms or CFG.ctl_hello_ms))
+        t_hello = time.monotonic()
+        pc = None
+        for attempt in (0, 1):
+            pc = PipeClient(self.inst.ctlPipe)
+            try:
+                pc.connect(min(CFG.pipe_connect_ms, budget))
+                break
+            except PipeError as exc:
+                code = getattr(exc, "code", 0)
+                if code in (ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT) and attempt == 0:
+                    # sec 6: ONE retry after VB6MCP_PIPE_BUSY_RETRY_MS before reporting busy
+                    bridge_log("ctl_connect_busy", pid=self.inst.pid,
+                               retryMs=CFG.pipe_busy_retry_ms)
+                    time.sleep(max(0, CFG.pipe_busy_retry_ms) / 1000.0)
+                    continue
+                if _pipe_reason(code) == "absent":
+                    raise CtlError("ctl_pipe_absent", "connect_absent", "connect")
+                raise CtlError("ctl_connect_failed",
+                               "connect_%s_%d" % (_pipe_reason(code), code), "connect")
+        self.pc = pc
+        hello = {
+            "vb6mcp": "ctlhello", "proto": CTL_PROTO,
+            "nonce": self.inst.ctlNonce,
+            "instanceId": "%s-%s" % (self.inst.pid, self.inst.ctlNonce),
+            "client": {"pid": os.getpid(), "session": _session_id(),
+                       "user": _user_name(), "version": VERSION},
+        }
+        if CFG.auth_enabled():
+            # sec 2 optional fourth factor.  The token VALUE never reaches a log or a receipt;
+            # tokenFp is an in-memory compare aid for the server and is never printed here.
+            hello["auth"] = {"scheme": "bearer", "token": CFG.token,
+                             "tokenFp": hashlib.sha256(
+                                 CFG.token.encode("utf-8")).hexdigest()[:8]}
+        bridge_log("ctl_hello", pid=self.inst.pid, nonce=_ctl_tag(self.inst.ctlNonce),
+                   bearer=bool(CFG.auth_enabled()), proto=CTL_PROTO)
+        deadline = t_hello + budget / 1000.0
+        sent, _n = self.pc.send_frame(hello, deadline)
+        if not sent:
+            self.close()
+            raise CtlError("ctl_connect_failed", "hello_write_failed", "hello")
+        frame, err = self.pc.recv_frame(deadline)
+        if err == "timeout":
+            self.close()
+            e = CtlError("ctl_hello_timeout", "no_welcome_in_%dms" % budget, "hello")
+            e.hello_ms = _msf(t_hello)
+            raise e
+        if err is not None:
+            self.close()
+            raise CtlError("ctl_connect_failed",
+                           "hello_read_%s" % getattr(err, "code", err), "hello")
+        self.hello_ms = _msf(t_hello)
+        self._validate_welcome(frame)
+        return self
+
+    def close(self):
+        if self.pc is not None:
+            try:
+                self.pc.close()
+            except Exception:
+                pass
+        self.pc = None
+
+    # -- handshake validation ----------------------------------------------------
+    def _validate_welcome(self, frame):
+        kind = str(frame.get("vb6mcp") or "")
+        if kind == "deny":
+            self.close()
+            raise _ctl_deny_error(frame, "hello")
+        if kind != "ctlwelcome":
+            self.close()
+            raise CtlError("ctl_connect_failed",
+                           "unexpected_first_frame:%s" % (kind or "<empty>"), "hello",
+                           response=frame)
+        proto = str(frame.get("proto") or "")
+        if proto != CTL_PROTO:
+            self.close()
+            raise CtlError("ctl_connect_failed", "welcome_proto:%s" % (proto or "<empty>"),
+                           "hello", response=frame)
+        want = "%s-%s" % (self.inst.pid, self.inst.ctlNonce)
+        if str(frame.get("instanceId") or "") != want:
+            self.close()
+            raise CtlError("ctl_unauthorized", "welcome_instance_mismatch", "hello",
+                           response=frame)
+        try:
+            wpid = int(frame.get("pid"))
+        except (TypeError, ValueError):
+            wpid = -1
+        if wpid != int(self.inst.pid or 0):
+            self.close()
+            raise CtlError("ctl_unauthorized", "welcome_pid_mismatch", "hello", response=frame)
+        sid = frame.get("sid")
+        if not isinstance(sid, str) or not sid:
+            self.close()
+            raise CtlError("ctl_connect_failed", "welcome_without_sid", "hello", response=frame)
+        try:
+            base = int(frame.get("seqBase") or 0)
+        except (TypeError, ValueError):
+            base = 0
+        self.sid = sid
+        self.seq_base = base
+        # "a strictly increasing seq (starting at seqBase)": the FIRST frame is seqBase itself.
+        self.seq = base - 1
+        self.welcome = frame
+        ops = frame.get("ops")
+        self.ops = [str(o) for o in ops] if isinstance(ops, list) else []
+        basis = frame.get("authBasis")
+        self.auth_basis = [str(b) for b in basis] if isinstance(basis, list) else []
+        tools = frame.get("ctlTools")
+        self.ctl_tools = [str(t) for t in tools] if isinstance(tools, list) else []
+        try:
+            self.max_frame = int(frame.get("maxFrame") or 65536)
+        except (TypeError, ValueError):
+            self.max_frame = 65536
+        bridge_log("ctl_welcome", pid=wpid, sid=_ctl_tag(sid), ops=",".join(self.ops) or "-",
+                   authBasis=",".join(self.auth_basis) or "-", helloMs=self.hello_ms)
+
+    # -- one op ------------------------------------------------------------------
+    def call(self, op, args=None, ack_ms=None):
+        """Send one op and return the ctlresult dict (ok:false refusals are RETURNED, not raised).
+
+        Raised: every transport/auth failure (CtlError).  An op-level refusal such as
+        nothing_in_flight / readonly_lane_refused is an ANSWER and is returned to the caller.
+        """
+        if self.pc is None:
+            raise CtlError("ctl_connect_failed", "not_open", "op")
+        if op not in CTL_OPS:
+            raise CtlError("ctl_connect_failed", "op_not_in_protocol:%s" % op, "op")
+        if self.ops and op not in self.ops:
+            raise CtlError("ctl_connect_failed", "op_not_published:%s" % op, "op")
+        self.seq += 1
+        frame = {"vb6mcp": "ctl", "sid": self.sid, "seq": self.seq, "op": op}
+        if args:
+            frame["args"] = args
+        budget = max(100, int(ack_ms or CFG.ctl_ack_ms))
+        t0 = time.monotonic()
+        deadline = t0 + budget / 1000.0
+        try:
+            encoded = encode_frame(frame)
+        except FrameError:
+            raise CtlError("ctl_connect_failed", "frame_over_maxFrame_op", "op")
+        if len(encoded) - 4 > self.max_frame:
+            raise CtlError("ctl_connect_failed", "frame_over_maxFrame:%d>%d"
+                           % (len(encoded) - 4, self.max_frame), "op")
+        sent, _n = self.pc.write_all(encoded, deadline)
+        if not sent:
+            raise CtlError("ctl_connect_failed", "op_write_failed:%s" % op, "op")
+        frame, err = self.pc.recv_frame(deadline)
+        if err == "timeout":
+            e = CtlError("ctl_no_ack", "no_result:%s" % op, "op")
+            e.hello_ms = self.hello_ms
+            e.rtt_ms = _msf(t0)
+            e.sid = self.sid
+            raise e
+        if err is not None:
+            raise CtlError("ctl_connect_failed",
+                           "op_read_failed:%s" % getattr(err, "code", err), "op")
+        self.last_rtt_ms = _msf(t0)
+        kind = str(frame.get("vb6mcp") or "")
+        if kind == "deny":
+            raise _ctl_deny_error(frame, "op")
+        if kind != "ctlresult":
+            raise CtlError("ctl_connect_failed",
+                           "unexpected_op_frame:%s" % (kind or "<empty>"), "op", response=frame)
+        try:
+            seq = int(frame.get("seq"))
+        except (TypeError, ValueError):
+            seq = -1
+        if str(frame.get("sid") or "") != str(self.sid):
+            raise CtlError("ctl_unauthorized", "result_sid_mismatch", "op", response=frame)
+        if seq != self.seq:
+            raise CtlError("ctl_unauthorized", "result_seq_mismatch:%s!=%s" % (seq, self.seq),
+                           "op", response=frame)
+        if frame.get("ok") is False:
+            reason = str(frame.get("reason") or "")
+            if reason in ("ctl_unauthorized", "not_authed", "ctl_lockout"):
+                raise _ctl_deny_error(frame, "op")
+            # an op-level refusal (nothing_in_flight / readonly_lane_refused / unknown op)
+            return frame
+        return frame
+
+
+def _msf(t0):
+    return int((time.monotonic() - t0) * 1000)
+
+
+def _ctl_deny_error(frame, stage):
+    """Map a structured ctl rejection to one of the six reasons (sec 5).  No secret is echoed."""
+    reason = str(frame.get("reason") or "")
+    detail = str(frame.get("detail") or "")
+    if reason == "ctl_lockout":
+        try:
+            retry = int(frame.get("retryAfterMs") or 60000)
+        except (TypeError, ValueError):
+            retry = 60000
+        return CtlError("ctl_lockout", detail or "lockout", stage, retry_after_ms=retry,
+                        response=frame)
+    if reason in ("ctl_unauthorized", "not_authed"):
+        return CtlError("ctl_unauthorized", detail or reason, stage, response=frame)
+    if reason == "hello_timeout":
+        return CtlError("ctl_hello_timeout", detail or reason, stage, response=frame)
+    if reason in ("bad_hello", "ctl_bad_frame"):
+        return CtlError("ctl_unauthorized", "%s:%s" % (reason, detail or "-"), stage,
+                        response=frame)
+    return CtlError("ctl_connect_failed", "%s:%s" % (reason or "deny", detail or "-"), stage,
+                    response=frame)
+
+
+def ctl_request(inst, op, args=None, ack_ms=None):
+    """One complete ctl exchange.  Returns (result_dict, info).  Raises CtlError.
+
+    info is the client-side evidence an oob report is built from: helloMs (connect+hello+welcome),
+    rttMs (one op round trip), sid (for the log only), authBasis and the published op set.
+    """
+    ctl = CtlClient(inst)
+    try:
+        ctl.open()
+        res = ctl.call(op, args, ack_ms)
+        info = {"helloMs": ctl.hello_ms, "rttMs": ctl.last_rtt_ms, "sid": ctl.sid,
+                "authBasis": list(ctl.auth_basis), "ops": list(ctl.ops),
+                "ctlTools": list(ctl.ctl_tools), "seq": ctl.seq}
+        return res, info
+    finally:
+        ctl.close()
+
+
+# -- oob: the client-side delivery report (sec 6 + sec 7) ---------------------------------
+# The server never emits these four fields (it cannot observe a frame it never received);
+# THEY BELONG TO THE CLIENT.  A receipt claims an effect only when oob.acked is true.
+
+def ctl_oob_ok(op, info, applied):
+    # The SHAPE is uniform with the failure case (peerState/suggestedAction present but null):
+    # a consumer can read oob["peerState"] without branching on acked first.
+    return {"lane": "ctl", "attempted": True, "acked": True, "why": None, "ackOp": op,
+            "helloMs": int(info.get("helloMs") or 0), "rttMs": int(info.get("rttMs") or 0),
+            "sid": ctl_sid4(info.get("sid")), "authBasis": list(info.get("authBasis") or []),
+            "delivered": "acked", "applied": bool(applied),
+            "peerState": None, "suggestedAction": None}
+
+
+def ctl_oob_error(exc, inst):
+    """The client-side verdict for an attempt that was NOT acknowledged.  Six grades, kept apart."""
+    oob = {"lane": "ctl", "attempted": True, "acked": False, "why": exc.why, "ackOp": None,
+           "helloMs": int(getattr(exc, "hello_ms", 0) or 0),
+           "rttMs": int(getattr(exc, "rtt_ms", 0) or 0),
+           "sid": ctl_sid4(getattr(exc, "sid", None)),
+           "detail": exc.detail or None,
+           "delivered": "queued_unacknowledged", "applied": False,
+           "peerState": "peer_unresponsive", "suggestedAction": "kill_and_restart"}
+    alive = bool(getattr(inst, "pidAlive", False))
+    if exc.why in ("ctl_lockout", "ctl_unauthorized"):
+        # The peer ANSWERED.  It is not unresponsive: it is refusing us for a stated reason, so
+        # "kill_and_restart" would be the wrong remedy and would hide a registry/auth mismatch.
+        oob["delivered"] = "rejected_by_server"
+        oob["peerState"] = "peer_busy"
+        if exc.why == "ctl_lockout":
+            oob["suggestedAction"] = "retry_once"
+            oob["retryAfterMs"] = int(exc.retry_after_ms or 60000)
+        else:
+            oob["suggestedAction"] = "fix_params"
+            oob["howToFix"] = CTL_HOWTOFIX_UNAUTHORIZED
+    elif exc.why == "ctl_pipe_absent":
+        oob["delivered"] = "not_attempted"
+        oob["peerState"] = "noIde"
+        oob["suggestedAction"] = "ide_start"
+    elif not alive:
+        oob["peerState"] = "noIde"
+        oob["suggestedAction"] = "ide_start"
+    return oob
+
+
+# -- inflight registry: what this bridge currently has on the wire -------------------------
+# A ctl cancel is COOPERATIVE (sec 4.4).  When it is acknowledged, the bridge records the request
+# against the call still on the wire, so that call's eventual failure receipt keeps
+# cancelled_by_request (with timeoutAlsoDue when the budget expired first) instead of being
+# flattened into a plain timeout - the caller must be able to tell "I cancelled" from "it died".
+_INFLIGHT = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_SEQ = [0]
+
+
+def inflight_begin(tool, rid):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_SEQ[0] += 1
+        token = _INFLIGHT_SEQ[0]
+        _INFLIGHT[token] = {"tool": tool, "rid": rid, "t0": time.monotonic(),
+                            "cancelRequested": False, "cancelledAt": None, "pid": None}
+        return token
+
+
+def inflight_end(token):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.pop(token, None)
+
+
+def inflight_cancelled(token):
+    with _INFLIGHT_LOCK:
+        rec = _INFLIGHT.get(token)
+        return bool(rec and rec.get("cancelRequested"))
+
+
+def inflight_mark_cancel(target):
+    """Record an ACKED cancel against every matching inflight call.  Returns the tools matched."""
+    hit = []
+    tgt = str(target if target not in (None, "") else "*").strip()
+    with _INFLIGHT_LOCK:
+        for rec in _INFLIGHT.values():
+            if tgt == "*" or tgt == str(rec.get("tool") or ""):
+                rec["cancelRequested"] = True
+                rec["cancelledAt"] = time.monotonic()
+                if rec.get("tool") not in hit:
+                    hit.append(rec.get("tool"))
+    return hit
+
+
+def inflight_snapshot():
+    with _INFLIGHT_LOCK:
+        return [{"tool": r.get("tool"), "rid": r.get("rid"),
+                 "forMs": int((time.monotonic() - r.get("t0")) * 1000),
+                 "cancelRequested": bool(r.get("cancelRequested"))} for r in _INFLIGHT.values()]
+
+
+# -- routing the two EXISTING ide_state intents onto the lane ------------------------------
+def ctl_intent_of(req_obj):
+    """(op, args, intentName) for an existing tool parameter, else None.
+
+    SEC 6: the lane adds NO new tool parameters.  Exactly two existing intents are routed:
+      ide_state{release_inflight:true}      -> release_gate
+      ide_state{cancel_inflight:true}       -> cancel
+    """
+    if not isinstance(req_obj, dict) or req_obj.get("method") != "tools/call":
+        return None
+    params = req_obj.get("params") if isinstance(req_obj.get("params"), dict) else {}
+    if params.get("name") != "ide_state":
+        return None
+    args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+    if args.get("cancel_inflight") is True:
+        target = args.get("cancel_target")
+        return ("cancel", {"target": (str(target) if target else "*")}, "cancel_inflight")
+    if args.get("release_inflight") is True:
+        try:
+            min_held = int(args.get("release_min_held_ms") or 0)
+        except (TypeError, ValueError):
+            min_held = 0
+        return ("release_gate", {"minHeldMs": max(0, min_held)}, "release_inflight")
+    return None
+
+
+def ctl_intent_receipt(rid, inst, tool, intent):
+    """Route one intent through the lane and build the receipt.  Returns (text, isError, meta).
+
+    An UNAVAILABLE lane is NOT handled here: the caller falls back to the pre-existing business
+    path unchanged (sec 6: only fall back to the business lane when the lane is not available).
+    """
+    op, op_args, intent_name = intent
+    base = {"tool": tool, "intent": intent_name, "lane": "ctl", "source": "ctl_lane",
+            "ctlOp": op, "proto": CTL_PROTO}
+    try:
+        res, info = ctl_request(inst, op, op_args)
+    except CtlError as exc:
+        oob = ctl_oob_error(exc, inst)
+        body = dict(base)
+        body.update({
+            "ok": False,
+            "reason": exc.why,
+            "message": str(exc),
+            "ctlDetail": exc.detail or None,
+            "oob": oob,
+            "ctlAvailable": True,
+            "failureKind": oob["peerState"],
+            "failureKindRule": FAILURE_KIND_RULE,
+            "peerState": oob["peerState"],
+            "suggestedAction": oob["suggestedAction"],
+            "delivered": oob["delivered"],
+            "applied": False,
+        })
+        if oob.get("retryAfterMs"):
+            body["retryAfterMs"] = oob["retryAfterMs"]
+        if exc.why == "ctl_unauthorized":
+            # the SAME text as oob.howToFix (one source, two places a caller may look)
+            body["howToFix"] = oob.get("howToFix") or CTL_HOWTOFIX_UNAUTHORIZED
+        body["note"] = ("the control lane did not acknowledge this intent; nothing here is a "
+                        "claimed effect (oob.acked=false).  A VB6 statement is never preempted, and "
+                        "a call that never returns to the add-in's pump can neither be cancelled nor "
+                        "served (ctl/1 sec 7).")
+        bridge_log("ctl_intent_unacked", tool=tool, intent=intent_name, why=exc.why,
+                   detail=exc.detail, pid=getattr(inst, "pid", None))
+        return _jsonrpc_result(rid, error_result(body, True)), True, {
+            "ctl": True, "lane": "ctl", "why": exc.why, "acked": False, "tool": tool}
+    ok = res.get("ok") is not False
+    if op == "release_gate":
+        applied = bool(res.get("released"))
+    elif op == "cancel":
+        applied = bool(res.get("requested"))
+    else:
+        applied = ok
+    if applied and op == "cancel":
+        inflight_mark_cancel(op_args.get("target"))
+    oob = ctl_oob_ok(op, info, applied)
+    body = dict(base)
+    body["ok"] = ok
+    body["oob"] = oob
+    for key in CTL_RESULT_PASS:
+        if key in res:
+            body[key] = res[key]
+    if "limits" in res:
+        # sec 4 preamble: relayed VERBATIM from the server, never synthesised here.
+        body["limits"] = res["limits"]
+    if not ok:
+        body["reason"] = res.get("reason")
+        body["ctlReason"] = res.get("reason")
+        body["ctlDetail"] = res.get("detail")
+        if "inFlightTool" in res:
+            body["inFlightTool"] = res["inFlightTool"]
+    bridge_log("ctl_intent", tool=tool, intent=intent_name, op=op, ok=ok, applied=applied,
+               ackOp=op, helloMs=info.get("helloMs"), rttMs=info.get("rttMs"))
+    return _jsonrpc_result(rid, error_result(body, not ok)), (not ok), {
+        "ctl": True, "lane": "ctl", "why": None, "acked": True, "tool": tool,
+        "applied": applied}
+
+
+def ctl_cancel_override(body, token, inst=None):
+    """A receipt for a call whose cancel was ACKED but not honoured before its budget expired.
+
+    Keeps cancelled_by_request visible (the caller asked for it) AND states that the wire budget
+    also expired (timeoutAlsoDue) - so it is never a silent timeout and never a false "stopped".
+    """
+    if not inflight_cancelled(token):
+        return body
+    b = dict(body)
+    prev = b.get("reason")
+    b["cancelRequested"] = True
+    b["cancelHonored"] = False
+    # Only a WEDGE-shaped failure is relabelled: the caller asked to cancel a call that never
+    # came back, so cancelled_by_request is the more informative verdict - but the budget facts
+    # are KEPT under timeoutAlsoDue/timeoutReason, never overwritten.
+    # Any other failure (deny, refused, ambiguous) already says what happened; the cancel is
+    # attached as an additional fact and its reason is NOT replaced.
+    if prev in ("timeout", "pipe_stalled"):
+        b["timeoutAlsoDue"] = (prev == "timeout")
+        b["timeoutReason"] = prev
+        b["reasonLegacy"] = b.get("reasonLegacy") or (
+            "forward_timeout" if prev == "timeout" else prev)
+        b["reason"] = "cancelled_by_request"
+        b["cancelNote"] = ("cancel was acknowledged on the control lane but a VB6 statement is "
+                           "never preempted (ctl/1 sec 7): the call never reached a pump point, so "
+                           "the original budget failure also stands")
+    else:
+        b["timeoutAlsoDue"] = False
+        b["cancelNote"] = ("cancel was acknowledged on the control lane; the failure below has a "
+                           "different cause and its reason is preserved")
+    return b
+
+
+# ---------------------------------------------------------------- out-of-process ----
+# Section B of the R-1021-03 client half: the LAST-resort read-only fallback.
+#
+# It is used ONLY when (a) the ctl lane is UNAVAILABLE for this instance and (b) the business
+# forward was classified peer_unresponsive (there is a pid, but nothing answers).  In that state
+# six read-only tools can still be answered from PROCESS-LEVEL facts that need no cooperation
+# from the add-in at all: EnumWindows/EnumChildWindows + IsHungAppWindow.  This measures; it
+# never drives, never sends input, and never fabricates an add-in receipt: every receipt says
+# source:"out_of_process" + degraded:true, and a fact that could not be read is listed in
+# missing[] with the reason instead of being guessed.
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+GW_OWNER = 4
+
+user32.EnumWindows.argtypes = [ENUM_PROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.EnumChildWindows.argtypes = [wintypes.HWND, ENUM_PROC, wintypes.LPARAM]
+user32.EnumChildWindows.restype = wintypes.BOOL
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+user32.IsWindowEnabled.restype = wintypes.BOOL
+user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+user32.IsHungAppWindow.restype = wintypes.BOOL
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.GetWindow.restype = wintypes.HWND
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+
+OOP_TOOLS = ("ide_state", "execution_state", "read_active_dialogs", "find_gui", "ui_text",
+             "last_error")
+DIALOG_CLASS = "#32770"
+
+
+def _hwnd_i(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _win_text(hwnd):
+    n = int(user32.GetWindowTextLengthW(hwnd) or 0)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    got = int(user32.GetWindowTextW(hwnd, buf, n + 1) or 0)
+    return buf.value[:got] if got > 0 else ""
+
+
+def _win_class(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    got = int(user32.GetClassNameW(hwnd, buf, 256) or 0)
+    return buf.value[:got] if got > 0 else ""
+
+
+def _win_node(hwnd, fg=0):
+    h = _hwnd_i(hwnd)
+    owner = _hwnd_i(user32.GetWindow(h, GW_OWNER))
+    node = {"hwnd": h, "class": _win_class(hwnd), "title": _win_text(hwnd),
+            "visible": bool(user32.IsWindowVisible(hwnd)),
+            "enabled": bool(user32.IsWindowEnabled(hwnd)),
+            "hung": bool(user32.IsHungAppWindow(hwnd)),
+            "foreground": bool(fg and h == fg),
+            "owner": owner or None,
+            "ownerEnabled": (bool(user32.IsWindowEnabled(owner)) if owner else None)}
+    return node
+
+
+def _enum_top_windows(pid):
+    """Top-level windows owned by pid.  Read-only; no message is ever sent to the target."""
+    found = []
+
+    @ENUM_PROC
+    def _cb(hwnd, _lp):
+        try:
+            wpid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if int(wpid.value) == int(pid):
+                found.append(_hwnd_i(hwnd))
+        except Exception:
+            pass
+        return True
+
+    ok = bool(user32.EnumWindows(_cb, 0))
+    return found, ok
+
+
+def _enum_children(hwnd):
+    found = []
+
+    @ENUM_PROC
+    def _cb(child, _lp):
+        try:
+            found.append(_hwnd_i(child))
+        except Exception:
+            pass
+        return True
+
+    ok = bool(user32.EnumChildWindows(hwnd, _cb, 0))
+    return found, ok
+
+
+def _proc_session(pid):
+    try:
+        kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+        kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD,
+                                                  ctypes.POINTER(wintypes.DWORD)]
+        sid = wintypes.DWORD()
+        if kernel32.ProcessIdToSessionId(int(pid), ctypes.byref(sid)):
+            return sid.value
+    except Exception:
+        pass
+    return None
+
+
+def oop_measure(pid):
+    """(facts, missing[]) measured for ONE pid.  Every unreadable fact is NAMED, never guessed."""
+    facts = {"pid": pid, "pidAlive": pid_alive(pid), "session": _proc_session(pid),
+             "ourSession": _session_id(), "windows": [], "dialogs": [],
+             "hung": None, "foregroundHwnd": _hwnd_i(user32.GetForegroundWindow()),
+             "enumOk": False}
+    missing = []
+    if not facts["pidAlive"]:
+        missing.append({"what": "process", "why": "pid_not_alive"})
+        return facts, missing
+    if (facts["session"] is not None and facts["ourSession"]
+            and facts["session"] != facts["ourSession"]):
+        # EnumWindows only sees the CALLING desktop; a window station/session boundary is a
+        # hard limit of out-of-process observation, not an error.
+        missing.append({"what": "windows", "why": "cross_session_windows_invisible",
+                        "targetSession": facts["session"], "ourSession": facts["ourSession"]})
+        return facts, missing
+    hwnds, ok = _enum_top_windows(pid)
+    facts["enumOk"] = ok
+    if not hwnds:
+        missing.append({"what": "windows", "why": "no_top_level_windows"})
+        return facts, missing
+    fg = facts["foregroundHwnd"]
+    nodes = [_win_node(h, fg) for h in hwnds]
+    facts["windows"] = nodes
+    hung = [n["hung"] for n in nodes]
+    if hung:
+        facts["hung"] = bool(all(hung)) if len(hung) > 1 else bool(hung[0])
+    for node in nodes:
+        if node["class"] != DIALOG_CLASS:
+            continue
+        kids, kok = _enum_children(node["hwnd"])
+        buttons = []
+        texts = []
+        for k in kids:
+            kn = _win_node(k)
+            if kn["class"].lower() == "button":
+                buttons.append({"hwnd": kn["hwnd"], "text": kn["title"],
+                                "enabled": kn["enabled"], "visible": kn["visible"]})
+            elif kn["class"].lower() in ("static", "edit"):
+                texts.append({"hwnd": kn["hwnd"], "class": kn["class"], "text": kn["title"]})
+        readable = [b for b in buttons if b["text"]] + [t for t in texts if t["text"]]
+        if kids and not readable:
+            # a control exists but no text came back: UIPI (elevated target) or a themed owner
+            # draw.  Say so explicitly instead of reporting an empty dialog body.
+            missing.append({"what": "dialog_text", "hwnd": node["hwnd"],
+                            "why": "child_text_unavailable"})
+        node = dict(node)
+        node["childrenOk"] = kok
+        node["buttons"] = buttons
+        node["texts"] = texts
+        facts["dialogs"].append(node)
+    return facts, missing
+
+
+def _oop_base(tool, why, facts, missing):
+    return {
+        "ok": bool(facts.get("pidAlive")),
+        "tool": tool,
+        "source": "out_of_process",
+        "degraded": True,
+        "addInReceipt": False,
+        "oob": {"lane": "oop", "attempted": True, "acked": False, "why": why,
+                "delivered": "not_delivered", "applied": False,
+                "peerState": "peer_unresponsive", "suggestedAction": "kill_and_restart"},
+        "measured": facts,
+        "missing": missing,
+        "note": ("the add-in did not answer, so this receipt is built ONLY from process-level "
+                 "measurements (EnumWindows/IsHungAppWindow).  No add-in receipt was produced and "
+                 "none is claimed; a fact that could not be read is listed in missing[]."),
+    }
+
+
+def oop_body(tool, args, why, body):
+    """The tool-shaped body for one of OOP_TOOLS (or None when tool is not served here)."""
+    args = args or {}
+    pid = _as_int(args.pop("__pid", None))
+    if not pid:
+        return None
+    facts, missing = oop_measure(pid)
+    out = _oop_base(tool, why, facts, missing)
+    under = body or {}
+    out["failureUnderneath"] = {"reason": under.get("reason"),
+                                "reasonLegacy": under.get("reasonLegacy"),
+                                "elapsedMs": under.get("elapsedMs"),
+                                "maxMs": under.get("maxMs"),
+                                "maxMsSource": under.get("maxMsSource"),
+                                "failureKind": under.get("failureKind"),
+                                "peerState": under.get("peerState")}
+    wins = facts.get("windows") or []
+    if tool in ("ide_state", "execution_state"):
+        main = None
+        for w in wins:
+            if w["visible"] and w["title"]:
+                main = w
+                break
+        out["pid"] = pid
+        out["hung"] = facts.get("hung")
+        out["mode"] = None
+        out["modeNote"] = "the IDE mode lives inside the add-in/engine and is NOT observable from outside"
+        out["mainWindow"] = main
+        out["windowCount"] = len(wins)
+        out["dialogCount"] = len(facts.get("dialogs") or [])
+        if tool == "execution_state":
+            out["topLevelWindows"] = wins
+            out["modalDialogs"] = [{"hwnd": d["hwnd"], "title": d["title"],
+                                    "buttons": [b["text"] for b in d["buttons"]]}
+                                   for d in (facts.get("dialogs") or [])]
+            out["runningState"] = ("hung" if facts.get("hung") else
+                                   ("unknown" if not wins else "responsive_windows"))
+            out["runningStateBasis"] = "IsHungAppWindow on the pid's top-level windows"
+    elif tool == "read_active_dialogs":
+        out["dialogs"] = facts.get("dialogs") or []
+        out["count"] = len(out["dialogs"])
+    elif tool == "find_gui":
+        kw = str(args.get("keyword") or "").lower()
+        cls = str(args.get("cls") or "")
+        showing = args.get("showing")
+        hits = []
+        for w in wins:
+            if kw and kw not in (w["title"] or "").lower() and kw not in (w["class"] or "").lower():
+                continue
+            if cls and w["class"] != cls:
+                continue
+            if showing is True and not w["visible"]:
+                continue
+            if showing is False and w["visible"]:
+                continue
+            hits.append(w)
+        for d in (facts.get("dialogs") or []):
+            for k in (d.get("buttons") or []) + (d.get("texts") or []):
+                if kw and kw not in (k.get("text") or "").lower():
+                    continue
+                hits.append({"hwnd": k["hwnd"], "class": k.get("class") or "Button",
+                             "title": k.get("text") or "", "visible": k.get("visible", True),
+                             "enabled": k.get("enabled", True), "hung": False,
+                             "child": True, "dialog": d["hwnd"]})
+        out["keyword"] = args.get("keyword") or ""
+        out["cls"] = cls or ""
+        out["showing"] = showing
+        out["count"] = len(hits)
+        out["hits"] = hits
+        out["ok"] = bool(facts.get("pidAlive"))
+    elif tool == "ui_text":
+        want = _as_int(args.get("hwnd"))
+        cls = str(args.get("cls") or "")
+        target = None
+        if want:
+            target = _win_node(want)
+        else:
+            for w in wins:
+                if cls and w["class"] == cls:
+                    target = w
+                    break
+            if target is None and wins:
+                target = wins[0]
+        if target is None:
+            out["ok"] = False
+            out["reason"] = "window_not_found"
+            out["text"] = ""
+        else:
+            kids, _kok = _enum_children(target["hwnd"])
+            child_nodes = [_win_node(k) for k in kids]
+            pieces = [target["title"]] + [c["title"] for c in child_nodes if c["title"]]
+            out["hwnd"] = target["hwnd"]
+            out["class"] = target["class"]
+            out["text"] = "\n".join([p for p in pieces if p])
+            out["source"] = "wm_gettext"
+            out["children"] = child_nodes
+            if not any(c["title"] for c in child_nodes) and child_nodes:
+                missing.append({"what": "child_text", "why": "child_text_unavailable"})
+    elif tool == "last_error":
+        dlg = None
+        for d in (facts.get("dialogs") or []):
+            alltext = " ".join([d["title"]] + [t.get("text") or "" for t in
+                                               (d.get("texts") or [])])
+            if "run-time error" in alltext.lower() or "runtime error" in alltext.lower():
+                dlg = d
+                break
+        if dlg is None:
+            out["ok"] = bool(facts.get("pidAlive"))
+            out["errorDialog"] = {"present": False}
+            out["errNumber"] = None
+            out["errDescription"] = None
+        else:
+            alltext = "\n".join([dlg["title"]] + [t.get("text") or ""
+                                                  for t in (dlg.get("texts") or [])])
+            out["errorDialog"] = {"present": True, "hwnd": dlg["hwnd"], "title": dlg["title"],
+                                  "body": alltext,
+                                  "buttons": [b["text"] for b in dlg["buttons"]],
+                                  "bodySource": "wm_gettext"}
+            out["errNumber"] = None
+            out["errDescription"] = None
+            m = re.search(r"run-?time error '?(-?\d+)'?", alltext, re.IGNORECASE)
+            if m:
+                out["errNumber"] = int(m.group(1))
+            dm = re.search(r"run-?time error '?-?\d+'?\s*:\s*(.+)", alltext, re.IGNORECASE)
+            if dm:
+                out["errDescription"] = dm.group(1).strip().split("\n")[0][:400]
+            out["parsed"] = bool(out["errNumber"] is not None)
+            out["parseBasis"] = "regex over the measured dialog text (not an add-in field)"
+            if not alltext.strip():
+                missing.append({"what": "error_text", "why": "child_text_unavailable"})
+    return out
+
+
+def oop_fallback_body(tool, args, sel, body):
+    """Build the out-of-process receipt, or None when the fallback does not apply.
+
+    Gate (Lead ruling): ONLY when the ctl lane is unavailable AND the peer was classified
+    peer_unresponsive.  A live ctl lane is never bypassed by this path.
+    """
+    if not CFG.oop_enabled or tool not in OOP_TOOLS:
+        return None
+    body = body or {}
+    if body.get("peerState") != "peer_unresponsive":
+        return None
+    # WEDGE-SHAPED failures only.  A DENY / handshake failure also classifies as
+    # peer_unresponsive (a peer was found and did not answer the call), but there the add-in
+    # actually SPOKE - the denial itself is the diagnosis - so measuring windows would bury the
+    # real reason (and would have silently changed the S23 receipt).  Only a call that was
+    # written and never answered is eligible.
+    if str(body.get("reason") or "") not in ("timeout", "pipe_stalled"):
+        return None
+    if body.get("ctlAvailable"):
+        return None
+    inst, _ref = select_target(sel)
+    pid = getattr(inst, "pid", None) or _as_int((body.get("heldBy") or {}).get("pid"))
+    if not pid:
+        return None
+    why = "ctl_no_ack" if _has_ctl(inst) else "ctl_unavailable"
+    a = dict(args or {})
+    a["__pid"] = pid
+    out = oop_body(tool, a, why, body)
+    if out is None:
+        return None
+    out["pid"] = pid
+    return out
+
+
+# -- the ADDITIVE second trigger (Lead ruling 2) -------------------------------------------
+# A wedged host is one case; a host-modal box (VB6's own Make dialog, a runtime-error box, a
+# host-modal loop) is another: business AND ctl both stop answering, yet the process is alive
+# and the window tree shows exactly what is stuck.  So there is a SECOND trigger that only
+# APPENDS a measured segment - it never replaces the failure fields, and it is never used to
+# re-diagnose a peer that SPOKE (a deny/ctl_unauthorized keeps its own reason verbatim).
+OOP_ADDENDUM_STATES = ("peer_busy", "peer_unresponsive")
+OOP_ADDENDUM_WHY = ("ctl_unavailable", "ctl_unauthorized")
+
+
+def oop_addendum_eligible(body, inst):
+    """("ctl_unavailable"|"ctl_unauthorized"|None) - whether the additive segment may be built.
+
+    Pure decision (no measurement), so tools/check_failure_envelope.py can assert every branch.
+    """
+    if not CFG.oop_enabled:
+        return None
+    body = body or {}
+    if body.get("outOfProcess"):
+        return None
+    if body.get("peerState") not in OOP_ADDENDUM_STATES:
+        return None
+    # The PRIMARY replacement path owns the wedge shape (timeout / pipe_stalled); the additive
+    # segment must not duplicate it.
+    if str(body.get("reason") or "") in ("timeout", "pipe_stalled"):
+        return None
+    # A peer that ANSWERED (deny / handshake refusal) is NEVER re-diagnosed: its reason is the
+    # diagnosis and the receipt stays verbatim.  This is the S23 lesson as a rule.
+    if body.get("serverReason") or body.get("serverDetail"):
+        return None
+    ctl_why = ((body.get("oob") or {}).get("why"))
+    if ctl_why in ("ctl_unauthorized", "ctl_lockout"):
+        return "ctl_unauthorized"
+    if ctl_why == "ctl_pipe_absent":
+        return "ctl_unavailable"
+    if _has_ctl(inst):
+        # the lane is published and usable: an operator can ask it directly, so measuring the
+        # window tree is not needed (and would be a second opinion on a live control lane).
+        return None
+    return "ctl_unavailable"
+
+
+def oop_addendum(tool, args, sel, body):
+    """The additive outOfProcess segment, or None.  NEVER touches body's own fields.
+
+    Evidence is REQUIRED: a #32770 dialog is visible, or IsHungAppWindow says the pid is not
+    responding.  Without evidence nothing is appended - an unobserved claim is worse than none.
+    """
+    inst, _ref = select_target(sel)
+    why = oop_addendum_eligible(body, inst)
+    if why is None:
+        return None
+    pid = getattr(inst, "pid", None) or _as_int((body or {}).get("heldBy", {}).get("pid"))
+    if not pid or not pid_alive(pid):
+        return None
+    facts, missing = oop_measure(pid)
+    dialogs = [d for d in (facts.get("dialogs") or []) if d.get("class") == DIALOG_CLASS]
+    hung = facts.get("hung") is True
+    if not dialogs and not hung:
+        return None
+    return {
+        "source": "out_of_process",
+        "degraded": True,
+        "addInReceipt": False,
+        "additive": True,
+        "why": why,
+        "tool": tool,
+        "evidence": {"modalDialogs": len(dialogs), "hung": hung,
+                     "dialogTitles": [d.get("title") for d in dialogs][:4],
+                     "basis": ("a #32770 modal dialog is visible" if dialogs else
+                               "IsHungAppWindow reports the pid is not responding")},
+        "measured": facts,
+        "missing": missing,
+        "note": ("ADDITIVE process-level observation only (source=out_of_process, degraded): "
+                 "the failure fields above are the middle service's own verdict and were NOT "
+                 "rewritten - a peer that spoke is never re-diagnosed, and a wedged host is "
+                 "reported HERE, not instead of the real reason"),
+    }
+
+
 # ---------------------------------------------------------------- registry --------
 
 def read_json(path, default):
@@ -943,6 +1997,13 @@ class Instance(object):
         self.sessionId = entry.get("sessionId")
         self.instanceId = entry.get("instanceId")
         self.tcpEnabled = entry.get("tcpEnabled")
+        # R-1021-03 A4: out-of-band control lane identity (absent on older add-ins).
+        self.ctlPipe = entry.get("ctlPipe")
+        self.ctlNonce = entry.get("ctlNonce")
+        self.ctlProto = entry.get("ctlProto")
+        self.ctlAuth = entry.get("ctlAuth")
+        self.ctlAvailable = entry.get("ctlAvailable")
+        self.ctlTools = entry.get("ctlTools")
         # fields the pass-through surfaces that the OLD whitelist dropped.  The
         # self-registration record (hwnd/tid/epoch) and the wire-protocol stamp (pipeProto)
         # are published by PipeTransport.PublishInstance and were invisible to this reader.
@@ -1050,6 +2111,8 @@ REGISTRY_ACKNOWLEDGED_FIELDS = frozenset((
     "pipeProto", "hwnd", "tid", "epoch",
 # textbox doorbell identity
     "ingressMode", "ingressHwnd", "ingressBoxHwnd", "ingressCaption",
+    # R-1021-03: the ctl/1 control lane (additive; absent => lane unavailable)
+    "ctlPipe", "ctlNonce", "ctlProto", "ctlAuth", "ctlAvailable", "ctlTools",
 ))
 
 
@@ -1114,6 +2177,10 @@ def read_registry():
         entry["sessionId"] = _as_int(j.get("sessionId"))
         entry["instanceId"] = j.get("instanceId")
         entry["tcpEnabled"] = j.get("tcpEnabled")
+        entry["ctlPipe"] = j.get("ctlPipe")
+        entry["ctlNonce"] = j.get("ctlNonce")
+        entry["ctlProto"] = j.get("ctlProto")
+        entry["ctlAuth"] = j.get("ctlAuth")
 # step 3 - the textbox doorbell identity. Now a pass-through like every
         # other writer field; kept explicit so the normalisation stays readable.
         entry["ingressMode"] = j.get("ingressMode")
@@ -1326,7 +2393,14 @@ def _refusal(reason, message, d):
 FAILURE_KIND_RULE = (
     "failureKind = noIde (there is nothing to talk to) | wedged (a peer WAS found and did "
     "not answer: probe failed / forward timed out / the connection died mid-call) | toolError "
-    "(the add-in ANSWERED with a structured error).  Additive; legacy reason values are unchanged.")
+    "(the add-in ANSWERED with a structured error).  Additive; legacy reason values are unchanged.  "
+    "The R-1021-03 failure envelope adds peerState (noIde | peer_busy | peer_unresponsive | peer_dead), "
+    "suggestedAction (retry_once | release_gate | kill_and_restart | ide_start | fix_params), "
+    "maxMs/maxMsSource/heldBy/retryAfterMs, ctlAvailable, and - on every control-lane attempt - "
+    "oob{attempted,acked,why,ackOp,helloMs,rttMs,delivered,applied}.  The four delivery fields "
+    "(delivered/applied/peerState/suggestedAction) are written by the CLIENT and are NEVER emitted "
+    "by an add-in: a server states limits{servedFromSamePump,statementInterrupted,"
+    "nonPumpingCallServiceable} instead, because it cannot observe a frame it never received.")
 
 
 class TransportError(Exception):
@@ -1775,15 +2849,39 @@ def pipe_roundtrip(inst, req_text, req_id, budget_ms, ingress_flags=None):
                 # A server deny carries the ONLY diagnosis the add-in offers, so its raw
 # reason/detail are lifted onto the receipt here as well (item 2 of :
                 # a deny must never collapse into an anonymous failure).
+                deny_reason = ""
                 try:
                     deny = json.loads((exc.partial or b"").decode("utf-8"))
                     if isinstance(deny, dict) and deny.get("vb6mcp") == "deny":
                         flags["serverReason"] = deny.get("reason") or "unspecified"
+                        deny_reason = str(deny.get("reason") or "")
                         if deny.get("detail"):
                             flags["serverDetail"] = deny.get("detail")
                         flags["serverDenyRaw"] = json.dumps(deny, ensure_ascii=False)
                 except Exception:
                     pass
+                # auth-deny mapping: a HANDSHAKE AUTH deny must not stay "pipe_connect_failed" with the
+                # real cause buried in the message text.  ONLY the two auth reasons are remapped;
+                # every other deny (nonce_mismatch / bad_hello / frame_too_large / identity) and
+                # every non-deny failure keeps the pre-change reason + flags byte-for-byte.
+                if deny_reason in ("token_missing", "token_mismatch"):
+                    flags["authReason"] = deny_reason
+                    flags["authRequired"] = True
+                    flags["authBasis"] = ("np/1 handshake deny frame (server said reason=%s)"
+                                          % deny_reason)
+                    flags["failureKind"] = "toolError"
+                    flags["suggestedAction"] = "fix_params"
+                    flags["retrySafe"] = False
+                    flags["nothingForwarded"] = True
+                    flags["howToProceed"] = [
+                        "the add-in ANSWERED the pipe handshake and REFUSED the credential: this is an auth mismatch, not a missing IDE",
+                        ("configure VB6MCP_TOKEN / VB6MCP_TOKEN_FILE on the bridge with the token that IDE expects"
+                         if deny_reason == "token_missing" else
+                         "the supplied token does not match: set VB6MCP_TOKEN / VB6MCP_TOKEN_FILE to the token that IDE expects"),
+                        "the token is compared per IDE instance; a bridge serving several IDEs must carry the one they all accept",
+                    ]
+                    raise TransportError("pipe_auth_failed", str(exc), exc.code,
+                                         exc.stage or "handshake", wrote=False, flags=flags)
                 raise TransportError("pipe_connect_failed", str(exc), exc.code,
                                      exc.stage or "connect", wrote=False, flags=flags)
         client = sess.client
@@ -1911,9 +3009,29 @@ def tcp_roundtrip(inst, req_text, budget_ms):
         raise TransportError("forward_timeout", "tcp read timeout", 0, "tcp")
 
 
-def forward_raw(req_text, req_obj, selector):
+def pipe_roundtrip_busy_retry(inst, req_text, req_id, budget_ms, igf):
+    """One immediate retry on ERROR_PIPE_BUSY (A4: transient busy, not no-IDE)."""
+    try:
+        return pipe_roundtrip(inst, req_text, req_id, budget_ms, igf)
+    except TransportError as exc:
+        if _peer_state(exc.reason, exc.flags, inst) == "peer_busy" and not exc.wrote:
+            time.sleep(max(0, CFG.pipe_busy_retry_ms) / 1000.0)
+            return pipe_roundtrip(inst, req_text, req_id, budget_ms, igf)
+        raise
+
+
+def forward_raw(req_text, req_obj, selector, timeout_ms=None):
     """Forward one JSON-RPC message.  Returns a dict:
        {text|None, transport, transportReason, flags{}, elapsedMs, ide{}, failure{}}"""
+    # PER-MESSAGE budget: None keeps the configured value, so the default forward path is
+    # unchanged.  The only caller that passes it is the bounded ide_status live probe.
+    tool_for_budget = _tool_of(req_obj) if isinstance(req_obj, dict) else None
+    if timeout_ms:
+        budget, budget_src = timeout_ms, "explicit"
+    elif tool_for_budget and isinstance(req_obj, dict) and req_obj.get("method") == "tools/call":
+        budget, budget_src = tool_budget(tool_for_budget, _args_of(req_obj))
+    else:
+        budget, budget_src = CFG.forward_timeout_ms, "env_forward"
     inst, refusal = select_target(selector)
     _mark("select_target")
     if inst is None:
@@ -1923,9 +3041,9 @@ def forward_raw(req_text, req_obj, selector):
     try:
         track, reason, flags = choose_track(inst)
     except TransportError as exc:
-        body = _transport_failure_body(exc.reason, exc.message, t0, CFG.forward_timeout_ms)
+        body = _transport_failure_body(exc.reason, exc.message, t0, budget,
+                                       tool_for_budget, budget_src, inst, exc.flags)
         body.update(exc.flags)
-        body["failureKind"] = "noIde" if exc.reason == "pipe_unavailable" else "wedged"
         return {"text": None, "failure": body, "elapsedMs": _ms(t0), "ide": ide}
     _mark("track_chosen")
     req_id = req_obj.get("id") if isinstance(req_obj, dict) else None
@@ -1936,7 +3054,7 @@ def forward_raw(req_text, req_obj, selector):
         try:
             igf = {}
             text, saw_progress = pipe_roundtrip(inst, req_text, req_id,
-                                               CFG.forward_timeout_ms, igf)
+                                               budget, igf)
             _mark("roundtrip_done")
             flags = dict(flags)
             flags.update(igf)
@@ -1953,24 +3071,24 @@ def forward_raw(req_text, req_obj, selector):
                 flags["transportFallback"] = True
                 dbg("pipe failed (%s) -> tcp fallback (wrote=%s)" % (exc.reason, exc.wrote))
                 try:
-                    text = tcp_roundtrip(inst, req_text, CFG.forward_timeout_ms)
+                    text = tcp_roundtrip(inst, req_text, budget)
                     return {"text": text, "transport": "tcp", "transportReason": reason,
                             "flags": flags, "elapsedMs": _ms(t0), "ide": ide,
                             "fellBackFrom": exc.reason}
                 except TransportError as exc2:
-                    body = _transport_failure_body(exc2.reason, exc2.message, t0,
-                                                   CFG.forward_timeout_ms)
+                    body = _transport_failure_body(exc2.reason, exc2.message, t0, budget,
+                                                   tool_for_budget, budget_src, inst, flags)
                     body.update(flags)
                     body["transport"] = "tcp"
                     body["transportReason"] = reason
                     return {"text": None, "failure": body, "elapsedMs": _ms(t0), "ide": ide}
             reason2 = "auto_pipe_busy" if flags.get("pipeBusy") else (
                 "auto_pipe_error" if flags.get("pipeIdentityMismatch") else "auto_pipe_error")
-            body = _transport_failure_body(exc.reason, exc.message, t0, CFG.forward_timeout_ms)
+            body = _transport_failure_body(exc.reason, exc.message, t0, budget,
+                                           tool_for_budget, budget_src, inst, flags)
             body.update(flags)
             body["transport"] = "pipe"
             body["transportReason"] = reason2
-            body["failureKind"] = "wedged"
             if exc.wrote and not CFG.pipe_replay:
                 body["noReplay"] = True
                 body["hint"] = ("the request WAS fully written to the pipe, so it is never "
@@ -1978,14 +3096,14 @@ def forward_raw(req_text, req_obj, selector):
                                 "set VB6MCP_PIPE_REPLAY=1 to opt in")
             return {"text": None, "failure": body, "elapsedMs": _ms(t0), "ide": ide}
     try:
-        text = tcp_roundtrip(inst, req_text, CFG.forward_timeout_ms)
+        text = tcp_roundtrip(inst, req_text, budget)
         return {"text": text, "transport": "tcp", "transportReason": reason,
                 "flags": dict(flags), "elapsedMs": _ms(t0), "ide": ide}
     except TransportError as exc:
-        body = _transport_failure_body(exc.reason, exc.message, t0, CFG.forward_timeout_ms)
+        body = _transport_failure_body(exc.reason, exc.message, t0, budget,
+                                       tool_for_budget, budget_src, inst, flags)
         body["transport"] = "tcp"
         body["transportReason"] = reason
-        body["failureKind"] = "wedged" if exc.reason == "forward_timeout" else "noIde"
         body.update(flags)
         return {"text": None, "failure": body, "elapsedMs": _ms(t0), "ide": ide}
 
@@ -2001,18 +3119,191 @@ def _ms(t0):
     return int((time.monotonic() - t0) * 1000)
 
 
-def _transport_failure_body(reason, message, t0, budget_ms):
+def _args_of(req_obj):
+    try:
+        return (req_obj.get("params") or {}).get("arguments") or {}
+    except Exception:
+        return {}
+
+
+def tool_budget(tool, params=None):
+    """(maxMs, source) - the bridge-side mirror of CodeTools.ToolBudgetMs."""
+    p = params or {}
+    g = CFG.max_call_ms
+    hard = CFG.max_call_hard_ms
+    t = (tool or "").lower()
+    def _i(k, d):
+        try:
+            return int(p.get(k, d))
+        except Exception:
+            return d
+    if t in ("immediate_eval", "immediate_run"):
+        v = _i("timeout_ms", 5000)
+        src = "param" if "timeout_ms" in p else "tool_default"
+    elif t == "make_project":
+        v, src = 140000, "tool_default"
+    elif t == "build":
+        v, src = _i("timeout_ms", 180000) + 15000, "param_slack"
+    elif t in ("debug_session", "run_until_break"):
+        v, src = _i("timeout_ms", 30000) + 8000, "param_slack"
+    elif t == "dependency_graph":
+        b = max(_i("budget_ms", 0), 25000)
+        v, src = max(b + 8000, 33000), "param_slack"
+    elif t == "eval_at_frame":
+        v, src = _i("timeoutMs", 5000) + 2000, "param_slack"
+    elif t == "get_locals":
+        v, src = 8000, "tool_default"
+    else:
+        v, src = g, "env_ceiling"
+    v = max(v, 1000)
+    if v > hard:
+        v, src = hard, src + "+hard_cap"
+    return v, src
+
+
+def _peer_state(reason, flags=None, inst=None):
+    """peer_busy (wait) | peer_unresponsive (do not wait) | noIde (nothing there)."""
+    flags = flags or {}
+    r = (reason or "").lower()
+    if flags.get("pipeBusy") or "busy" in r:
+        return "peer_busy"
+    if r in ("pipe_unavailable", "absent", "not_found", "denied", "no_ide"):
+        return "noIde"
+    return "peer_unresponsive"
+
+
+def _pid_alive(pid):
+    """True / False when the liveness of `pid` can be PROVED, None when it cannot.
+
+    A DEAD peer is the one fact that changes the remedy: "peer_unresponsive" says wait or
+    release the gate, but a process that is GONE can never answer and its debug context is
+    lost.  Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess ==
+    STILL_ACTIVE (no signal is ever sent).  POSIX: kill(pid, 0).  ERROR_ACCESS_DENIED and
+    EPERM mean UNKNOWN, never "dead" - a live process owned by someone else must not be
+    reported as gone.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                # 5 = ERROR_ACCESS_DENIED: the process may be alive and unqueryable -> UNKNOWN.
+                return None if ctypes.get_last_error() == 5 else False
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return None
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return None
+
+
+def _inst_pid(inst):
+    """The pid of a registry record whether it is an object or a dict (None when absent)."""
+    if inst is None:
+        return None
+    if isinstance(inst, dict):
+        return inst.get("pid")
+    return getattr(inst, "pid", None)
+
+
+def _has_ctl(inst):
+    """Feature-detect the ctl/1 lane from the instance record (sec 6): no fields => unavailable.
+
+    This is the SAME predicate the client uses, so a receipt that says ctlAvailable:true and a
+    client that refuses to use the lane can never disagree.
+    """
+    return ctl_available(inst)
+
+
+def _transport_failure_body(reason, message, t0, budget_ms, tool=None, budget_src=None,
+                            inst=None, flags=None):
+    """R-1021-03 A4: one structured envelope for every transport failure.
+    reason is kept for compatibility; reasonClass/timeout say what a caller must branch on."""
     m = message or ""
-    kind = "wedged" if reason in ("forward_timeout", "pipe_stalled", "pipe_read_failed") else "noIde"
-    return {
+    elapsed = _ms(t0)
+    peer = _peer_state(reason, flags, inst)
+    # MCP-1021-43 (WP-22-02): a WEDGE-shaped failure is only "unresponsive" while the process
+    # still EXISTS.  Re-check liveness ONCE here, so a pipe_stalled/timeout whose IDE has
+    # actually exited answers peer_dead (+ the lost debug context + a recovery path) instead of
+    # sending the caller to release_flight on a process that is gone.
+    peer_dead = False
+    dead_pid = None
+    if peer == "peer_unresponsive":
+        dead_pid = _inst_pid(inst)
+        if _pid_alive(dead_pid) is False:
+            peer = "peer_dead"
+            peer_dead = True
+    ctl = _has_ctl(inst)
+    body = {
         "ok": False,
-        "reason": reason,
+        "reason": "timeout" if reason == "forward_timeout" else reason,
+        "reasonLegacy": reason,
         "message": m,
-        "elapsedMs": _ms(t0),
+        "elapsedMs": elapsed,
+        "maxMs": budget_ms,
+        "maxMsSource": budget_src or "env_forward",
         "budgetMs": budget_ms,
-        "failureKind": kind,
+        "failureKind": peer,
         "failureKindRule": FAILURE_KIND_RULE,
+        "peerState": peer,
     }
+    if peer_dead:
+        # A dead peer is a DIFFERENT fact from a wedged one: there is nothing left to release.
+        debug_tools = ("run_project", "run_until_break", "debug_session", "get_locals",
+                       "eval_at_frame", "last_error", "current_position", "get_callstack")
+        body["peerDead"] = True
+        body["suggestedAction"] = "kill_and_restart"
+        body["lostContext"] = {
+            "peerDead": True,
+            "pid": dead_pid,
+            "debugger": bool(tool in debug_tools),
+            "note": ("the IDE process is GONE (proved dead): its add-in pipe, the running program, "
+                     "the break state and the locals died with it; nothing can be read from it any more"),
+        }
+        body["howToRecover"] = [
+            "the peer is provably DEAD, so release_inflight cannot help - there is nothing left to release",
+            "recover out-of-band with the hub tool ide_kill_and_relaunch{pid, project?} (or ide_start on the same .vbp); taskkill from the caller is NOT the standard path",
+            "the debug context (break position, locals, callstack) is LOST - re-run to reproduce it",
+        ]
+    elif peer == "peer_busy":
+        body["suggestedAction"] = "retry_once"
+        body["retryAfterMs"] = CFG.pipe_busy_retry_ms
+    elif peer == "peer_unresponsive":
+        body["suggestedAction"] = "release_gate" if ctl else "kill_and_restart"
+    # A published lane is a FACT about this instance, not a property of the failure class: report
+    # it on every envelope (a caller that hits peer_busy or noIde still needs to know whether a
+    # recovery lane exists).  Absent means "no lane"; false is only stated for the unresponsive
+    # case, which is the one where the absence changes the remedy.
+    if ctl:
+        body["ctlAvailable"] = True
+    elif peer == "peer_unresponsive":
+        body["ctlAvailable"] = False
+    if tool:
+        body["heldBy"] = {"tool": tool, "pid": getattr(inst, "pid", None),
+                          "sinceMs": elapsed}
+    return body
 
 
 # ---------------------------------------------------------------- receipts --------
@@ -2026,7 +3317,13 @@ def contract_version():
 
 def stamp_body(result, ide, contract, note):
     """The hub's stamping contract, restated: the JSON-RPC result keys stay EXACTLY
-    {content,isError}; mcp/ide/transport markers live in the BODY TEXT only (ADR sec 2.5)."""
+    {content,isError}; mcp/ide/transport markers live in the BODY TEXT only (ADR sec 2.5).
+
+    content[0].text is ONE JSON document (v1.14.0): an ARRAY/scalar body becomes
+    {singleDocument:true, data, receipt} (an EMPTY result is data:[] - distinguishable from
+    an unparsable body), a non-JSON body becomes a structured content_not_json document and
+    an OBJECT body keeps its FLAT shape.  VB6MCP_LEGACY_TEXTBODY=1 restores the OLD
+    two-document form for ONE version (migration switch, byte-for-byte unchanged)."""
     content = []
     for c in (result.get("content") or []):
         content.append(dict(c))
@@ -2036,17 +3333,48 @@ def stamp_body(result, ide, contract, note):
             text_item = c
             break
     if text_item is not None:
-        obj = None
-        try:
-            parsed = json.loads(text_item["text"])
-            if isinstance(parsed, dict):
-                obj = parsed
-        except Exception:
+        raw = text_item["text"]
+        if (os.environ.get("VB6MCP_LEGACY_TEXTBODY") or "") == "1":
+            # ONE VERSION ONLY: the pre-v1.14.0 two-document form, kept byte-for-byte unchanged.
             obj = None
-        if obj is not None:
-            text_item["text"] = _body_of(obj, ide, contract, note)
+            try:
+                legacy_parsed = json.loads(raw)
+                if isinstance(legacy_parsed, dict):
+                    obj = legacy_parsed
+            except Exception:
+                obj = None
+            if obj is not None:
+                text_item["text"] = _body_of(obj, ide, contract, note)
+            else:
+                text_item["text"] = raw + "\n" + _body_of({}, ide, contract, note)
         else:
-            text_item["text"] = text_item["text"] + "\n" + _body_of({}, ide, contract, note)
+            parsed = None
+            parse_ok = False
+            try:
+                parsed = json.loads(raw)
+                parse_ok = True
+            except Exception:
+                parse_ok = False
+            already_single = (parse_ok and isinstance(parsed, dict)
+                              and parsed.get("singleDocument") is True
+                              and "data" in parsed and isinstance(parsed.get("receipt"), dict))
+            if parse_ok and isinstance(parsed, dict) and not already_single:
+                text_item["text"] = _body_of(parsed, ide, contract, note)
+            elif already_single:
+                text_item["text"] = json.dumps(
+                    {"singleDocument": True, "data": parsed["data"],
+                     "receipt": json.loads(_body_of(parsed["receipt"], ide, contract, note))},
+                    ensure_ascii=False, indent=2)
+            elif parse_ok:
+                text_item["text"] = json.dumps(
+                    {"singleDocument": True, "data": parsed,
+                     "receipt": json.loads(_body_of({}, ide, contract, note))},
+                    ensure_ascii=False, indent=2)
+            else:
+                text_item["text"] = json.dumps(
+                    {"ok": False, "reason": "content_not_json", "nonJsonText": True,
+                     "rawText": raw, "receipt": json.loads(_body_of({}, ide, contract, note))},
+                    ensure_ascii=False, indent=2)
     else:
         content.append({"type": "text", "text": _body_of({"ok": True}, ide, contract, note)})
     return {"content": content, "isError": result.get("isError") is True}
@@ -2214,8 +3542,334 @@ def _timing_emit(extra=None):
     _TL.t = None
 
 
-def handle_jsonrpc(req_text, selector=None):
+# ---------------------------------------------------------------- local facts RPC -----
+# Three-layer ownership (ADR sec 0.1): the mjs side keeps the MCP wire protocol; this Python
+# middle service is the FACTS OWNER for the IDE set on THIS machine.
+#
+# Two READ-ONLY methods are served LOCALLY, in the JSON-RPC METHOD namespace:
+#
+#     POST /rpc {"jsonrpc":"2.0","id":1,"method":"ide_list"}
+#     POST /rpc {"jsonrpc":"2.0","id":2,"method":"ide_status","params":{"target":"<pid|project>","probe":true}}
+#
+# They can never shadow an add-in tool: the add-in's names live in tools/list + tools/call, a
+# DIFFERENT namespace entirely.  Every OTHER method is forwarded exactly as before, so an older
+# middle service answers -32601 "Method not found" for these two names - which is the capability
+# signal the hub uses to fall back to GET /health (one probe, then cached for the process).
+#
+# Invariants (why this lives here): READ-ONLY.  Registry read only, no spawn, no lock write, no
+# registration pruning, and ide_list NEVER touches the add-in (no pipe session, no contention
+# with a running tool).  ide_status{probe:true} is the ONE opt-in live check and it is bounded
+# by probeTimeoutMs (hard-capped at 3000 ms).
+LOCAL_RPC_METHODS = ("ide_list", "ide_status")
+LOCAL_METHOD_PRIORITY = (
+    "a bridge-local JSON-RPC METHOD wins over forwarding for exactly these names; the add-in "
+    "TOOL face (tools/list + tools/call) is a separate namespace and is never shadowed or "
+    "rewritten by this interception. Unknown methods keep the pre-existing forward behaviour.")
+ADDIN_REACHABLE_RULE = (
+    "addInReachable = the registered pid is ALIVE and the instance has a route (a consistent np/1 "
+    "pipe registration or a TCP port). It is a ROUTE-level verdict derived from the registry and "
+    "the OS - ide_list never touches the add-in (no pipe session, no contention). "
+    "ide_status{probe:true} performs ONE bounded live mcp_info over the same route a forwarded "
+    "call uses and reports it in liveProbe{attempted,ok,reason,elapsedMs}.")
+REDACTION_RULE = (
+    "a non-loopback caller gets the SAME redacted view /health gives it: no instance path, pipe "
+    "name, pid, registration file or registry directory. Loopback callers (and the stdio owner) "
+    "get the full facts. Redaction is decided by the PEER ADDRESS only, never by a parameter.")
+
+
+def _iso_utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _is_remote_peer(peer):
+    """True only for a caller that is NOT loopback; None (= the stdio owner) is local."""
+    if peer is None:
+        return False
+    try:
+        return not peer_is_loopback(str(peer))
+    except Exception:
+        return True                     # fail closed: an address we cannot judge is remote
+
+
+def _bridge_facts():
+    auth = auth_state()
+    snap = snapshot() or {}
+    return {
+        "product": PRODUCT,
+        "version": VERSION,
+        "pid": os.getpid(),
+        "host": CFG.host,
+        "port": CFG.port,
+        "startedAt": _BOOT_ISO,
+        "uptimeMs": int(max(0.0, time.time() - _BOOT_AT) * 1000.0),
+        "transport": CFG.transport or "auto(pipe-first)",
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "auth": {"enabled": bool(auth.get("enabled")),
+                 "required": bool(auth.get("required")),
+                 "scheme": auth.get("scheme"),
+                 "source": auth.get("source"),
+                 "tokenLen": auth.get("tokenLen")},
+        "contractVersion": contract_version(),
+        "snapshotTools": len(snap.get("tools") or []),
+        "localMethods": list(LOCAL_RPC_METHODS),
+        "readOnly": True,
+    }
+
+
+def _reach_basis(inst):
+    if not inst.pidAlive:
+        return "pid_not_alive"
+    if inst.pipeAvailable:
+        return "pid_alive_and_pipe_registration_consistent(route=pipe)"
+    if inst.port:
+        return "pid_alive_and_tcp_port_present(route=tcp)"
+    return "pid_alive_but_no_route_pipe_or_tcp"
+
+
+def _redact_instance_facts(facts):
+    keep = ("project", "port", "transport", "alive", "addInReachable", "addInReachableBasis")
+    out = {k: facts.get(k) for k in keep}
+    # the ctl pipe name embeds the ctlNonce, so a non-loopback caller gets the VERDICT only
+    # (available + why) and never the name or the credential.
+    ctl = facts.get("ctl") or {}
+    out["ctl"] = {"available": ctl.get("available"), "reason": ctl.get("reason"),
+                  "detail": ctl.get("detail"), "redacted": True}
+    out["redacted"] = True
+    return out
+
+
+def _instance_facts(inst, redact):
+    facts = {
+        "pid": inst.pid,
+        "project": inst.project,
+        "projectPath": inst.projectPath,
+        "port": inst.port,
+        "pipe": inst.pipe,
+        "tcpEnabled": inst.tcpEnabled,
+        "epoch": inst.epoch,
+        "sessionId": inst.sessionId,
+        "startedAt": inst.startedAt,
+        "alive": bool(inst.pidAlive),
+        "addInReachable": bool(inst.pidAlive and inst.has_route),
+        "registrationFile": inst.file,
+        # additive transport detail (the SAME vocabulary /health already publishes)
+        "transport": "pipe" if inst.pipeAvailable else "tcp",
+        "pipeAvailable": bool(inst.pipeAvailable),
+        "pipeState": inst.pipeState,
+        "instanceId": inst.instanceId,
+        "version": inst.version,
+        "dllSha256": inst.dllSha256,
+        "registryRoot": inst.registryRoot,
+        "hwnd": inst.hwnd,
+        "tid": inst.tid,
+        "addInReachableBasis": _reach_basis(inst),
+        "addInReachableRule": ADDIN_REACHABLE_RULE,
+    }
+    # R-1021-03: the control lane is FEATURE-DETECTED evidence, never a promise: a lane that is
+    # unpublished is reported with the reason instead of being silently absent.
+    _ctl_why = ctl_problem(inst)
+    facts["ctl"] = {
+        "available": _ctl_why is None,
+        "reason": _ctl_why[0] if _ctl_why else None,
+        "detail": _ctl_why[1] if _ctl_why else None,
+        "proto": inst.ctlProto or None,
+        "authBasis": inst.ctlAuth or None,
+        "tools": inst.ctlTools if isinstance(inst.ctlTools, list) else None,
+        "pipe": inst.ctlPipe,
+        "nonce": inst.ctlNonce,
+        "pipeTag": _ctl_tag(inst.ctlNonce),
+    }
+    return _redact_instance_facts(facts) if redact else facts
+
+
+def _stale_facts(d, redact):
+    if redact:
+        return []
+    out = []
+    for s in (d.get("stale") or []):
+        f = s.get("file")
+        pid = s.get("pid")
+        try:
+            age = int((time.time() - os.path.getmtime(f)) * 1000.0) if f else None
+        except OSError:
+            age = None
+        pid_dead = None
+        if pid is not None:
+            try:
+                pid_dead = not pid_alive(pid)
+            except Exception:
+                pid_dead = None
+        row = {"pid": pid, "file": f, "pidDead": pid_dead,
+               "reason": s.get("reason"), "ageMs": age}
+        if s.get("detail"):
+            row["detail"] = s.get("detail")
+        out.append(row)
+    return out
+
+
+def _selection_facts(d, target, redact):
+    live = d.get("live") or []
+    cands = [{"pid": i.pid, "port": i.port, "project": i.project} for i in live]
+    if redact:
+        cands = [{"project": c.get("project"), "port": c.get("port"), "redacted": True}
+                 for c in cands]
+    return {
+        "requested": target,
+        "rule": ("explicit target > live default > the ONLY live instance; ambiguity is "
+                 "refused, never guessed"),
+        "liveCount": len(live),
+        "candidates": cands,
+    }
+
+
+def _redact_refusal(ref):
+    out = dict(ref or {})
+    for k in ("registryDir", "registryRoots", "candidates", "staleRegistry"):
+        out.pop(k, None)
+    out["instances"] = [{"project": (c or {}).get("project"),
+                         "port": (c or {}).get("port"), "redacted": True}
+                        for c in (out.get("instances") or [])]
+    out["remoteRedacted"] = True
+    return out
+
+
+def _probe_addin_bounded(inst, selector, timeout_ms):
+    """ONE bounded live mcp_info over the SAME route a forwarded call uses.  Never raises."""
+    probe = {"attempted": True, "ok": False, "reason": None, "elapsedMs": None,
+             "timeoutMs": timeout_ms,
+             "route": "pipe" if inst.pipeAvailable else ("tcp" if inst.port else "none")}
+    req = {"jsonrpc": "2.0", "id": 991001, "method": "tools/call",
+           "params": {"name": "mcp_info", "arguments": {}}}
+    try:
+        out = forward_raw(json.dumps(req), req, selector, timeout_ms=timeout_ms)
+    except Exception as exc:
+        probe["reason"] = "probe_error"
+        probe["message"] = str(exc)[:300]
+        return probe
+    probe["elapsedMs"] = out.get("elapsedMs")
+    probe["transport"] = out.get("transport")
+    probe["transportReason"] = out.get("transportReason")
+    text = out.get("text")
+    if not text:
+        failure = out.get("failure") or {}
+        probe["reason"] = failure.get("reason") or "no_answer"
+        probe["failureKind"] = failure.get("failureKind")
+        return probe
+    try:
+        env = json.loads(text)
+        res = (env or {}).get("result") or {}
+        content = res.get("content") or []
+        body = {}
+        if content and isinstance(content[0], dict) and isinstance(content[0].get("text"), str):
+            body = json.loads(content[0]["text"])
+        probe["ok"] = bool(body.get("ok", True))
+        probe["reason"] = "answered" if probe["ok"] else "answered_error"
+        probe["liveToolCount"] = body.get("toolCount")
+        probe["contractVersion"] = ((body.get("mcp") or {}).get("contract")
+                                    or body.get("contract"))
+        probe["ide"] = body.get("ide")
+    except Exception as exc:
+        probe["reason"] = "unparseable_answer"
+        probe["message"] = str(exc)[:200]
+    return probe
+
+
+def local_ide_list(peer=None):
+    """The instance set + stale registrations + this bridge's identity.  READ-ONLY."""
+    d = discover()
+    redact = _is_remote_peer(peer)
+    body = {
+        "ok": True,
+        "readOnly": True,
+        "generatedAt": _iso_utc_now(),
+        "instances": [_instance_facts(i, redact) for i in (d.get("instances") or [])],
+        "stale": _stale_facts(d, redact),
+        "registry": {"dir": d.get("dir"),
+                     "count": len(d.get("instances") or []),
+                     "roots": d.get("roots") or [],
+                     "unreadable": bool(d.get("unreadable"))},
+        "bridge": _bridge_facts(),
+        "counts": {"instances": len(d.get("instances") or []),
+                   "live": len(d.get("live") or []),
+                   "stale": len(d.get("stale") or [])},
+        "addInReachableRule": ADDIN_REACHABLE_RULE,
+        "registryPolicy": ("ide_list is READ-ONLY: it never writes, prunes or deletes a "
+                           "registration and it never opens a pipe session."),
+    }
+    if redact:
+        body["registry"] = {"redacted": True}
+        body["remoteRedacted"] = True
+        body["redactionRule"] = REDACTION_RULE
+    return body
+
+
+def local_ide_status(params=None, peer=None):
+    """ONE instance's full facts; probe=true adds ONE bounded live add-in check.  READ-ONLY."""
+    params = params if isinstance(params, dict) else {}
+    target = params.get("target")
+    redact = _is_remote_peer(peer)
+    probe_wanted = bool(params.get("probe"))
+    try:
+        probe_timeout = int(params.get("probeTimeoutMs") or 3000)
+    except (TypeError, ValueError):
+        probe_timeout = 3000
+    probe_timeout = max(250, min(probe_timeout, 3000))    # HARD cap: a facts call never hangs
+    d = discover()
+    inst, refusal = select_target(target)
+    body = {
+        "ok": True,
+        "readOnly": True,
+        "generatedAt": _iso_utc_now(),
+        "instance": None,
+        "selection": _selection_facts(d, target, redact),
+        "bridge": _bridge_facts(),
+        "counts": {"instances": len(d.get("instances") or []),
+                   "live": len(d.get("live") or []),
+                   "stale": len(d.get("stale") or [])},
+        "stale": _stale_facts(d, redact),
+        "probeRequested": probe_wanted,
+        "liveProbe": {"attempted": False, "ok": None, "reason": "not_requested",
+                      "timeoutMs": probe_timeout,
+                      "addInReachableRule": ADDIN_REACHABLE_RULE},
+        "addInReachableRule": ADDIN_REACHABLE_RULE,
+    }
+    if redact:
+        body["remoteRedacted"] = True
+        body["redactionRule"] = REDACTION_RULE
+    if inst is None:
+        body["ok"] = False
+        facts = _redact_refusal(refusal) if redact else dict(refusal or {})
+        for k, v in facts.items():
+            body.setdefault(k, v)
+        return body
+    body["instance"] = _instance_facts(inst, redact)
+    if probe_wanted:
+        selector = str(inst.pid) if inst.pid else (target or "")
+        body["liveProbe"] = _probe_addin_bounded(inst, selector, probe_timeout)
+        body["liveProbe"]["addInReachableRule"] = ADDIN_REACHABLE_RULE
+    return body
+
+
+LOCAL_METHODS = {
+    "ide_list": lambda params, peer: local_ide_list(peer),
+    "ide_status": lambda params, peer: local_ide_status(params, peer),
+}
+
+
+def serve_local_method(method, params, peer):
+    body = LOCAL_METHODS[method](params or {}, peer)
+    body["localMethod"] = method
+    body["localMethods"] = list(LOCAL_RPC_METHODS)
+    body["localMethodPriority"] = LOCAL_METHOD_PRIORITY
+    return body
+
+
+def handle_jsonrpc(req_text, selector=None, peer=None):
     """Serve ONE JSON-RPC message.  Returns (response_text|None, is_error, meta).
+
+    peer is the CALLER address (the HTTP handler passes client_address[0]); None means the
+    local stdio owner.  It decides ONLY the redaction of the two local facts methods - never
+    dispatch, never a target - so a non-loopback caller cannot get facts /health hides.
 
     Contract face rules that must not drift:
       * tools/list result keys are EXACTLY {tools}   (mcp_strict_audit check 3b)
@@ -2237,6 +3891,18 @@ def handle_jsonrpc(req_text, selector=None):
         if rid is None:
             return None, False, {"notification": True}
         return _jsonrpc_error(rid, -32600, "Invalid Request"), True, {"reason": "no_method"}
+
+    # LOCAL FACTS METHODS (JSON-RPC method namespace, NOT the add-in tool namespace).
+    # Exactly the two reserved names are intercepted; every other method keeps the pre-existing
+    # forward path byte-for-byte, which is what lets an older middle service answer -32601 for
+    # these names (the hub's capability signal) without changing anything else.
+    if method in LOCAL_METHODS:
+        try:
+            body = serve_local_method(method, req.get("params"), peer)
+        except Exception as exc:
+            dbg("local method %s failed: %r" % (method, exc))
+            return _jsonrpc_error(rid, -32603, "local method failed: %s" % exc), True, {"local": True, "method": method}
+        return _jsonrpc_result(rid, body), False, {"local": True, "method": method}
 
     if method.startswith("notifications/"):
         sel, req2 = _extract_target(req, sel0)
@@ -2272,39 +3938,76 @@ def handle_jsonrpc(req_text, selector=None):
 
     if method == "tools/call":
         sel, req2 = _extract_target(req, sel0)
+        tool_name = _tool_of(req2)
+        args2 = _args_of(req2)
+        # R-1021-03 A4 / ctl/1 sec 6: the TWO existing ide_state intents go to the control lane
+        # FIRST when it is published; the business lane is the fallback and ONLY the fallback.
+        # No new tool parameter exists - these are the pre-existing release_inflight /
+        # cancel_inflight knobs, exactly as the add-in already defines them.
+        intent = ctl_intent_of(req2)
+        if intent is not None:
+            inst_ctl, _ctl_refusal = select_target(sel)
+            if inst_ctl is not None and ctl_available(inst_ctl):
+                return ctl_intent_receipt(rid, inst_ctl, tool_name, intent)
+            _mark("ctl_intent_business_fallback")
         req2_text = json.dumps(req2, ensure_ascii=False)
-        out = forward_raw(req2_text, req2, sel)
-        if out.get("text") is None:
-            body = dict(out.get("failure") or {"ok": False, "reason": "forward_failed"})
-            note = _transport_note(out)
-            for k, v in note.items():
-                if k not in body:
-                    body[k] = v
-            if out.get("ide"):
-                body["ide"] = out["ide"]
-            return _jsonrpc_result(rid, error_result(body, True)), True, out
+        # An in-flight call is REGISTERED here, before the wire, so an acknowledged ctl cancel can
+        # land on it from another thread and survive into this receipt (ctl/1 sec 4.4).
+        tok = inflight_begin(tool_name, rid)
         try:
-            resp_obj = json.loads(out["text"])
-        except Exception:
-            return out["text"], True, out
-        res = resp_obj.get("result") if isinstance(resp_obj, dict) else None
-        if isinstance(res, dict):
-            note = _transport_note(out)
-            parsed = None
-            for c in (res.get("content") or []):
-                if c.get("type") == "text" and isinstance(c.get("text"), str):
-                    try:
-                        p = json.loads(c["text"])
-                        if isinstance(p, dict):
-                            parsed = p
-                    except Exception:
-                        parsed = None
-                    break
-            if parsed is not None and parsed.get("ok") is False:
-                note.setdefault("failureKind", "toolError")
-                note.setdefault("failureKindRule", FAILURE_KIND_RULE)
-            resp_obj["result"] = stamp_body(res, out.get("ide"), contract_version(), note)
-        return json.dumps(resp_obj, ensure_ascii=False), False, out
+            out = forward_raw(req2_text, req2, sel)
+            if out.get("text") is None:
+                body = dict(out.get("failure") or {"ok": False, "reason": "forward_failed"})
+                note = _transport_note(out)
+                for k, v in note.items():
+                    if k not in body:
+                        body[k] = v
+                if out.get("ide"):
+                    body["ide"] = out["ide"]
+                body = ctl_cancel_override(body, tok)
+                oop = oop_fallback_body(tool_name, args2, sel, body)
+                if oop is not None:
+                    meta = dict(out)
+                    meta.update({"oop": True, "source": "out_of_process", "degraded": True,
+                                 "why": (oop.get("oob") or {}).get("why")})
+                    return _jsonrpc_result(rid, error_result(oop, True)), True, meta
+                # Lead ruling 2: a SECOND, purely ADDITIVE trigger.  A host-modal box wedges the
+                # business AND the ctl lane while the process stays alive; that state is worth
+                # reporting, but it must never rewrite the failure that caused it.  So the
+                # measured segment is APPENDED as outOfProcess and every field above stays as-is.
+                add = oop_addendum(tool_name, args2, sel, body)
+                if add is not None:
+                    body["outOfProcess"] = add
+                meta = out
+                if body.get("cancelRequested"):
+                    meta = dict(out)
+                    meta["cancelRequested"] = True
+                    meta["timeoutAlsoDue"] = body.get("timeoutAlsoDue")
+                return _jsonrpc_result(rid, error_result(body, True)), True, meta
+            try:
+                resp_obj = json.loads(out["text"])
+            except Exception:
+                return out["text"], True, out
+            res = resp_obj.get("result") if isinstance(resp_obj, dict) else None
+            if isinstance(res, dict):
+                note = _transport_note(out)
+                parsed = None
+                for c in (res.get("content") or []):
+                    if c.get("type") == "text" and isinstance(c.get("text"), str):
+                        try:
+                            p = json.loads(c["text"])
+                            if isinstance(p, dict):
+                                parsed = p
+                        except Exception:
+                            parsed = None
+                        break
+                if parsed is not None and parsed.get("ok") is False:
+                    note.setdefault("failureKind", "toolError")
+                    note.setdefault("failureKindRule", FAILURE_KIND_RULE)
+                resp_obj["result"] = stamp_body(res, out.get("ide"), contract_version(), note)
+            return json.dumps(resp_obj, ensure_ascii=False), False, out
+        finally:
+            inflight_end(tok)
 
     out = forward_raw(req_text, req, sel0)
     if out.get("text") is not None:
@@ -2340,6 +4043,13 @@ def health_body():
         "forwardTimeoutMs": CFG.forward_timeout_ms,
         "progressMs": CFG.progress_ms,
         "pipeIdleMs": CFG.pipe_idle_ms,
+        # R-1021-03: the control lane is a CLIENT capability here; whether an individual
+        # instance publishes it is per-instance facts (ide_status.ctl).
+        "ctlLane": {"proto": CTL_PROTO, "enabled": bool(CFG.ctl_enabled),
+                    "helloMs": CFG.ctl_hello_ms, "ackMs": CFG.ctl_ack_ms,
+                    "fastTools": list(CTL_FAST_TOOLS),
+                    "outOfProcessFallback": bool(CFG.oop_enabled),
+                    "maxMs": CFG.max_call_ms, "maxCallHardMs": CFG.max_call_hard_ms},
         "contractVersion": contract_version(),
         "faceTools": face,
         "snapshotTools": len(snapshot()["tools"]),
@@ -2658,7 +4368,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     return
         target = self.headers.get("X-VB6MCP-Target") or CFG.target
         try:
-            resp_text, _is_error, _meta = handle_jsonrpc(req_text, target)
+            _peer_addr = self.client_address[0] if self.client_address else None
+            resp_text, _is_error, _meta = handle_jsonrpc(req_text, target, _peer_addr)
         except Exception as exc:
             dbg("dispatch failed:", repr(exc))
             resp_text = _jsonrpc_error(None, -32603, "Internal error: %s" % exc)
@@ -3191,7 +4902,16 @@ def _blocking_read_frame(h, deadline):
     buf = FrameBuffer()
     while True:
         avail = wintypes.DWORD()
-        if kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None) and avail.value:
+        peek_ok = kernel32.PeekNamedPipe(h, None, 0, None, ctypes.byref(avail), None)
+        if not peek_ok:
+            # A CLOSED peer must be noticed IMMEDIATELY, not at the idle deadline: a stub that
+            # holds a dead handle keeps its single pipe instance "connected" and the next
+            # client's WaitNamedPipe legitimately reports busy (measured: ctl reconnect got
+            # 121 for the full connect budget before this check existed).
+            code = ctypes.get_last_error()
+            if code in (ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED):
+                return None
+        if peek_ok and avail.value:
             n = avail.value
             chunk = ctypes.create_string_buffer(n)
             got = wintypes.DWORD()
@@ -3224,6 +4944,44 @@ def _blocking_write_frame(h, obj):
             return False
         sent += got.value
     return True
+
+
+WS_CHILD = 0x40000000
+WS_VISIBLE = 0x10000000
+WS_POPUP = 0x80000000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+
+
+def _make_oop_window_fixture():
+    """A #32770 dialog + Button/Static children owned by THIS process.
+
+    Section B measures an EXTERNAL pid.  This fixture makes that measurable deterministically
+    WITHOUT starting VB6 (red line) and without touching any other live application: the pid
+    being measured is just this test process.  The dialog is a 1x1 off-screen toolwindow with
+    WS_EX_NOACTIVATE, so it never steals focus and never appears on screen.
+    """
+    try:
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p]
+    except Exception:
+        return {"dialog": 0, "button": 0, "debug": 0, "static": 0}
+
+    def _mk(parent, cls, text, style, x, y, w, h):
+        return _hwnd_i(user32.CreateWindowExW(
+            0, cls, text, style, x, y, w, h, parent or None, None, None, None))
+
+    dlg = _mk(None, "#32770", "Microsoft Visual Basic",
+              WS_POPUP | WS_VISIBLE, 3000, 3000, 320, 120)
+    btn = _mk(dlg, "Button", "End", WS_CHILD | WS_VISIBLE, 4, 4, 80, 24)
+    dbg = _mk(dlg, "Button", "Debug", WS_CHILD | WS_VISIBLE, 90, 4, 80, 24)
+    st = _mk(dlg, "Static",
+             "Run-time error '91': Object variable or With block variable not set",
+             WS_CHILD | WS_VISIBLE, 4, 40, 300, 60)
+    return {"dialog": dlg, "button": btn, "debug": dbg, "static": st}
 
 
 class StubPipeAddIn(object):
@@ -3399,6 +5157,313 @@ class StubPipeAddIn(object):
                                "isError": False}}
         return {"jsonrpc": "2.0", "id": rid, "result": {"ok": True, "stub": True,
                                                         "method": method}}
+
+
+class StubCtlAddIn(object):
+    """A fake add-in CONTROL lane (ctl/1) - STRICT server semantics, never a permissive pass.
+
+    It implements the parts of bridge/CTL_WIRE_CONTRACT.md the client half must be proven
+    against: hello/welcome with authBasis, sid + strictly increasing seq, the six ops, the two
+    readonly-lane refusal details, the 3-attempts-per-60s lockout, the nested tool receipt
+    (outer ok = transport verdict, receipt.ok = the tool's own verdict), the static limits block,
+    and an abandon that must be preceded by a release (or confirmed).
+    """
+
+    IDLE_CLOSE_S = 20.0
+    HELLO_DEADLINE_S = 5.0
+    LOCKOUT_S = 60.0
+    LOCKOUT_AFTER = 3
+    LIMITS = {"servedFromSamePump": True, "statementInterrupted": False,
+              "nonPumpingCallServiceable": False}
+    WRITE_TOOLS = frozenset(("build", "make_project", "write_file", "replace_code",
+                             "control_execution", "add_control", "add_component"))
+
+    def __init__(self, pipe_name, nonce, pid, token="", gate_tool="immediate_eval",
+                 gate_held_ms=4210, ops=None):
+        self.pipe_name = pipe_name
+        self.nonce = nonce
+        self.pid = pid
+        self.token = token
+        self.ops = list(ops or CTL_OPS)
+        self.gate = {"depth": 1, "mutBusy": True, "tool": gate_tool, "heldMs": gate_held_ms}
+        self.gate_release_count = 0
+        self.cancel = {"requested": False, "applied": False}
+        self.business_pipe_closed = False
+        self.stop_evt = threading.Event()
+        self.thread = None
+        self.conns = 0
+        self.denied = 0
+        self.served = 0
+        self.helloTimeouts = 0
+        self.lockouts = 0
+        self.denials = []
+        self.last_hello = None
+        self.sids = []
+        self.pings = 0
+        self.states = 0
+        self.release_calls = []
+        self.cancel_calls = []
+        self.abandon_calls = []
+        self.tool_calls = []
+        self.last_error = None
+        self._auth_window = []
+        self._lock_until = 0.0
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="stub-ctl", daemon=True)
+        self.thread.start()
+        for _ in range(200):
+            if wait_named_pipe(self.pipe_name, 1)[0] != "absent":
+                break
+            time.sleep(0.01)
+        return self
+
+    def stop(self):
+        self.stop_evt.set()
+        try:
+            wait_named_pipe(self.pipe_name, 50)
+        except Exception:
+            pass
+
+    # -- plumbing ----------------------------------------------------------------
+    def _send(self, h, obj):
+        try:
+            return _blocking_write_frame(h, obj)
+        except Exception:
+            return False
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            h = kernel32.CreateNamedPipeW(
+                ctypes.c_wchar_p(self.pipe_name), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 2, 65536, 65536, 0, None)
+            if not h or h == INVALID_HANDLE_VALUE:
+                time.sleep(0.05)
+                continue
+            try:
+                if not kernel32.ConnectNamedPipe(h, None):
+                    if ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+                        continue
+                self._serve(h)
+            except Exception as exc:
+                self.last_error = repr(exc)
+            finally:
+                kernel32.DisconnectNamedPipe(h)
+                kernel32.CloseHandle(h)
+
+    def _deny_unauth(self, h, detail):
+        """Count ONE unauthenticated attempt; the 3rd inside the window locks the lane for 60 s."""
+        self.denied += 1
+        now = time.monotonic()
+        self._auth_window = [t for t in self._auth_window if now - t <= self.LOCKOUT_S]
+        self._auth_window.append(now)
+        self.denials.append({"detail": detail, "attempt": len(self._auth_window)})
+        if len(self._auth_window) >= self.LOCKOUT_AFTER:
+            self._lock_until = now + self.LOCKOUT_S
+            self.lockouts += 1
+            self._send(h, {"vb6mcp": "deny", "proto": CTL_PROTO, "reason": "ctl_lockout",
+                           "retryAfterMs": int(self.LOCKOUT_S * 1000)})
+        else:
+            self._send(h, {"vb6mcp": "deny", "proto": CTL_PROTO, "reason": "ctl_unauthorized",
+                           "detail": detail})
+        try:
+            kernel32.FlushFileBuffers(h)
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+    def _serve(self, h):
+        first = _blocking_read_frame(h, time.monotonic() + self.HELLO_DEADLINE_S)
+        if first is None:
+            self.helloTimeouts += 1
+            return
+        self.last_hello = first
+        try:
+            hello = json.loads(first.decode("utf-8"))
+        except Exception:
+            hello = {}
+        self.conns += 1
+        if time.monotonic() < self._lock_until:
+            self._send(h, {"vb6mcp": "deny", "proto": CTL_PROTO, "reason": "ctl_lockout",
+                           "retryAfterMs": int(self.LOCKOUT_S * 1000)})
+            try:
+                kernel32.FlushFileBuffers(h)
+            except Exception:
+                pass
+            time.sleep(0.05)
+            return
+        if not isinstance(hello, dict) or str(hello.get("vb6mcp")) != "ctlhello":
+            self._send(h, {"vb6mcp": "deny", "proto": CTL_PROTO, "reason": "bad_hello",
+                           "detail": "first_frame_not_ctlhello"})
+            try:
+                kernel32.FlushFileBuffers(h)
+            except Exception:
+                pass
+            time.sleep(0.05)
+            return
+        if str(hello.get("proto")) != CTL_PROTO:
+            return self._deny_unauth(h, "bad_proto")
+        if (str(hello.get("nonce")) != str(self.nonce)
+                or str(hello.get("instanceId")) != "%s-%s" % (self.pid, self.nonce)):
+            return self._deny_unauth(h, "nonce_mismatch")
+        if self.token:
+            auth = hello.get("auth") if isinstance(hello.get("auth"), dict) else {}
+            supplied = str(auth.get("token") or "")
+            same = hmac.compare_digest(hashlib.sha256(supplied.encode("utf-8")).digest(),
+                                       hashlib.sha256(self.token.encode("utf-8")).digest())
+            if not supplied or not same:
+                return self._deny_unauth(h, "token_mismatch")
+        sid = uuid.uuid4().hex[:16]
+        self.sids.append(sid)
+        basis = ["nonce", "acl"] + (["token"] if self.token else [])
+        self._send(h, {"vb6mcp": "ctlwelcome", "proto": CTL_PROTO,
+                       "instanceId": "%s-%s" % (self.pid, self.nonce), "pid": self.pid,
+                       "sid": sid, "seqBase": 0, "ops": list(self.ops), "authBasis": basis,
+                       "maxFrame": 65536, "ackedAt": int(time.time() * 1000),
+                       "gate": dict(self.gate),
+                       "ctl": {"conns": self.conns, "denied": self.denied, "served": self.served},
+                       "ctlTools": list(CTL_FAST_TOOLS), "limits": dict(self.LIMITS)})
+        # Lead ruling 1 (pinned in the contract): the FIRST frame must be EXACTLY seqBase and
+        # every later frame exactly +1.  A first frame of seqBase+1 is a REJECTION - S29g asserts
+        # that direction (the client's own first frame is seqBase, S29e covers the accept side).
+        expected_seq = 0
+        while not self.stop_evt.is_set():
+            payload = _blocking_read_frame(h, time.monotonic() + self.IDLE_CLOSE_S)
+            if payload is None:
+                return
+            try:
+                frame = json.loads(payload.decode("utf-8"))
+            except Exception:
+                return
+            if not isinstance(frame, dict) or str(frame.get("vb6mcp")) != "ctl":
+                self._send(h, {"vb6mcp": "deny", "proto": CTL_PROTO, "reason": "bad_hello",
+                               "detail": "not_a_ctl_frame"})
+                return
+            if str(frame.get("sid") or "") != sid:
+                self._send(h, {"vb6mcp": "ctlresult", "sid": frame.get("sid"),
+                               "seq": frame.get("seq"), "ok": False,
+                               "reason": "ctl_unauthorized", "detail": "bad_session"})
+                return
+            try:
+                seq = int(frame.get("seq"))
+            except (TypeError, ValueError):
+                seq = -1
+            if seq != expected_seq:
+                self._send(h, {"vb6mcp": "ctlresult", "sid": sid, "seq": seq if seq >= 0 else 0,
+                               "ok": False, "reason": "ctl_unauthorized", "detail": "bad_seq"})
+                return
+            expected_seq = seq + 1
+            self.served += 1
+            self._dispatch(h, sid, seq, str(frame.get("op") or ""),
+                           frame.get("args") if isinstance(frame.get("args"), dict) else {})
+
+    # -- ops ---------------------------------------------------------------------
+    def _result(self, sid, seq):
+        return {"vb6mcp": "ctlresult", "sid": sid, "seq": seq, "limits": dict(self.LIMITS)}
+
+    def _dispatch(self, h, sid, seq, op, args):
+        d = self._result(sid, seq)
+        if op == "ping":
+            self.pings += 1
+            d.update({"ok": True, "pid": self.pid, "uptimeMs": 12345,
+                      "ackedAt": int(time.time() * 1000), "gate": dict(self.gate),
+                      "businessPipe": {"state": "busy" if self.gate["mutBusy"] else "idle",
+                                       "heldMs": self.gate["heldMs"]},
+                      "pump": {"calls": self.served, "gateSkips": 0}})
+            return self._send(h, d)
+        if op == "state":
+            self.states += 1
+            d.update({"ok": True, "pid": self.pid, "mode": "run", "project": "StubCtl",
+                      "gate": dict(self.gate),
+                      "cancel": dict(self.cancel),
+                      "release": {"attempted": self.gate_release_count > 0,
+                                  "released": self.gate_release_count > 0,
+                                  "heldMs": self.gate["heldMs"]},
+                      "ctl": {"conns": self.conns, "denied": self.denied, "served": self.served}})
+            return self._send(h, d)
+        if op == "release_gate":
+            self.release_calls.append(dict(args))
+            try:
+                min_held = int(args.get("minHeldMs") or 0)
+            except (TypeError, ValueError):
+                min_held = 0
+            if not self.gate["mutBusy"]:
+                d.update({"ok": False, "reason": "nothing_in_flight"})
+                return self._send(h, d)
+            if self.gate["heldMs"] < min_held:
+                # declined, not refused: the op ran, the gate stays held (no invented reason code)
+                d.update({"ok": True, "released": False, "releasedTool": None,
+                          "heldMs": self.gate["heldMs"], "depthAfter": self.gate["depth"],
+                          "gateReleaseCount": self.gate_release_count,
+                          "statementInterrupted": False,
+                          "note": "heldMs %d < minHeldMs %d" % (self.gate["heldMs"], min_held)})
+                return self._send(h, d)
+            tool = self.gate["tool"]
+            held = self.gate["heldMs"]
+            self.gate_release_count += 1
+            self.gate = {"depth": 0, "mutBusy": False, "tool": None, "heldMs": 0}
+            d.update({"ok": True, "released": True, "releasedTool": tool, "heldMs": held,
+                      "depthAfter": 0, "gateReleaseCount": self.gate_release_count,
+                      "statementInterrupted": False,
+                      "note": "gate accounting released; the running statement still finishes"})
+            return self._send(h, d)
+        if op == "cancel":
+            self.cancel_calls.append(dict(args))
+            tgt = str(args.get("target") or "*")
+            in_flight = self.gate["tool"] if self.gate["mutBusy"] else None
+            if not in_flight:
+                d.update({"ok": False, "reason": "nothing_in_flight"})
+                return self._send(h, d)
+            if tgt not in ("*", in_flight):
+                d.update({"ok": False, "reason": "nothing_in_flight", "inFlightTool": in_flight})
+                return self._send(h, d)
+            self.cancel = {"requested": True, "applied": False}
+            d.update({"ok": True, "requested": True, "honoredAtNextPump": True})
+            return self._send(h, d)
+        if op == "abandon":
+            self.abandon_calls.append(dict(args))
+            confirm = args.get("confirm") is True
+            try:
+                min_held = int(args.get("minHeldMs") or 0)
+            except (TypeError, ValueError):
+                min_held = 0
+            if self.gate_release_count <= 0:
+                if confirm and self.gate["mutBusy"] and self.gate["heldMs"] >= min_held:
+                    self.gate_release_count += 1
+                    self.gate = {"depth": 0, "mutBusy": False, "tool": None, "heldMs": 0}
+                else:
+                    d.update({"ok": False, "reason": "gate_not_released",
+                              "howToProceed": "call release_gate first"})
+                    return self._send(h, d)
+            abandoned_tool = "immediate_eval"
+            self.business_pipe_closed = True
+            self.gate = {"depth": 0, "mutBusy": False, "tool": None, "heldMs": 0}
+            d.update({"ok": True, "abandoned": True, "responseLost": True,
+                      "abandonedTool": abandoned_tool, "heldMs": 4210,
+                      "businessPipe": {"closed": True, "state": "idle"},
+                      "note": "the abandoned call's response will be discarded"})
+            return self._send(h, d)
+        if op == "tool":
+            name = str(args.get("name") or "")
+            self.tool_calls.append(name)
+            allowed = list(CTL_FAST_TOOLS)
+            if name in self.WRITE_TOOLS:
+                d.update({"ok": False, "reason": "readonly_lane_refused",
+                          "detail": "not_read_only", "allowed": allowed,
+                          "failureKind": "toolError"})
+                return self._send(h, d)
+            if name not in CTL_FAST_TOOLS:
+                d.update({"ok": False, "reason": "readonly_lane_refused",
+                          "detail": "slow_tool_not_on_ctl_lane", "allowed": allowed,
+                          "failureKind": "toolError"})
+                return self._send(h, d)
+            # 4.6: the tool's receipt is NESTED; the outer ok is the frame verdict only.
+            receipt = {"ok": True, "tool": name, "stub": True, "ctlLane": True,
+                       "arguments": args.get("arguments") or {}}
+            d.update({"ok": True, "source": "ctl_lane", "receipt": receipt})
+            return self._send(h, d)
+        d.update({"ok": False, "reason": "ctl_unknown_op", "supported": list(self.ops)})
+        return self._send(h, d)
 
 
 class StubHttpAddIn(object):
@@ -3883,6 +5948,36 @@ def run_selftest(with_battery=False):
         occupier.close()
         hs.stop()
         http_stubs.remove(hs)
+        # ---- S5b: pipe busy WITHOUT a tcp leg -> structured peer_busy envelope -------
+        _reset_registry(regdir)
+        n5b = uuid.uuid4().hex[:16]
+        p5b = "\\\\.\\pipe\\vb6mcp-1-%d-busy2-%s" % (mine, n5b)
+        s5b = StubPipeAddIn(p5b, n5b, mine, project="BusyTwo", tools=tools).start()
+        stubs.append(s5b)
+        _write_instance(regdir, mine, port=None, project="BusyTwo", pipe=p5b, nonce=n5b,
+                        instance_id="%d-%s" % (mine, n5b), transport="pipe")
+        discover(force=True)
+        occ2 = PipeClient(p5b).connect(600)
+        occ2.send_frame({"vb6mcp": "hello", "proto": NP_PROTO, "nonce": n5b,
+                         "client": {"pid": mine, "session": 1, "user": "selftest"}},
+                        time.monotonic() + 1.0)
+        occ2.recv_frame(time.monotonic() + 2.0)
+        _drop_pipe_probe(discover()["live"][0])
+        text5b, iserr5b, meta5b = handle_jsonrpc(_jreq("tools/call",
+                                                       {"name": "mcp_info", "arguments": {}}))
+        body5b = _resp_body(text5b)
+        check("S5b peer_busy envelope (failureKind/peerState/suggestedAction/retryAfterMs/heldBy)",
+              iserr5b is True and body5b.get("failureKind") == "peer_busy"
+              and body5b.get("peerState") == "peer_busy"
+              and body5b.get("suggestedAction") == "retry_once"
+              and body5b.get("retryAfterMs") == CFG.pipe_busy_retry_ms
+              and isinstance(body5b.get("heldBy"), dict)
+              and body5b.get("maxMsSource") == "env_ceiling",
+              "reason=%s kind=%s action=%s retry=%s" % (body5b.get("reason"),
+              body5b.get("failureKind"), body5b.get("suggestedAction"),
+              body5b.get("retryAfterMs")))
+        occ2.close()
+        s5b.stop()
 
         # ---- S6: progress then silence -> pipe_stalled, NOT a 120 s wait ---------------
         _reset_registry(regdir)
@@ -3920,7 +6015,7 @@ def run_selftest(with_battery=False):
                                                  {"name": "write_file", "arguments": {}}))
         body = _resp_body(text)
         check("S7 a fully-written request is NEVER silently replayed on another track",
-              iserr is True and body.get("noReplay") is True and body.get("failureKind") == "wedged",
+              iserr is True and body.get("noReplay") is True and body.get("failureKind") == "peer_unresponsive",
               "reason=%s noReplay=%s" % (body.get("reason"), body.get("noReplay")))
 
         # ---- S8: no answer at all -> forward_timeout at the budget, not earlier --------
@@ -3933,15 +6028,42 @@ def run_selftest(with_battery=False):
         _write_instance(regdir, mine, project="SilentOne", pipe=p8, nonce=n8,
                         instance_id="%d-%s" % (mine, n8), transport="pipe")
         discover(force=True)
-        CFG.forward_timeout_ms = 1200
+        CFG.max_call_ms = 1200
+        CFG.max_call_hard_ms = 1200
         t0 = time.monotonic()
-        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {"name": "build", "arguments": {}}))
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {"name": "mcp_info", "arguments": {}}))
         body = _resp_body(text)
         elapsed = (time.monotonic() - t0) * 1000.0
         check("S8 no frame at all -> forward_timeout at FORWARD_TIMEOUT_MS (never tighter than tcp)",
-              body.get("reason") == "forward_timeout" and 1100 <= elapsed < 4000,
-              "reason=%s elapsedMs=%.0f budgetMs=%s" % (body.get("reason"), elapsed,
-                                                        body.get("budgetMs")))
+              body.get("reason") == "timeout" and body.get("reasonLegacy") == "forward_timeout"
+              and 1100 <= elapsed < 4000 and body.get("maxMs") == 1200
+              and body.get("maxMsSource") == "env_ceiling"
+              and body.get("failureKind") == "peer_unresponsive"
+              and body.get("suggestedAction") in ("release_gate", "kill_and_restart")
+              and isinstance(body.get("heldBy"), dict),
+              "reason=%s legacy=%s elapsed=%.0f maxMs=%s src=%s kind=%s act=%s" %
+              (body.get("reason"), body.get("reasonLegacy"), elapsed, body.get("maxMs"),
+               body.get("maxMsSource"), body.get("failureKind"), body.get("suggestedAction")))
+        CFG.max_call_ms = 120000
+        CFG.max_call_hard_ms = 600000
+        # ---- S28: two-layer budget mirror (pure function) ----------------------------
+        check("S28 build budget >= 180000+15000 and <= hard cap",
+              tool_budget("build", {})[0] >= 195000 and tool_budget("build", {})[1] == "param_slack",
+              "build=%s" % (tool_budget("build", {}),))
+        check("S28 dependency_graph = max(budget_ms+8000,33000)",
+              tool_budget("dependency_graph", {})[0] == 33000,
+              "dep=%s" % (tool_budget("dependency_graph", {}),))
+        check("S28 immediate default is 5000/tool_default",
+              tool_budget("immediate_eval", {}) == (5000, "tool_default"),
+              "imm=%s" % (tool_budget("immediate_eval", {}),))
+        CFG.max_call_ms = 120000
+        CFG.max_call_hard_ms = 600000
+        check("S28 explicit timeout_ms between generic ceiling and hard cap is NOT reduced",
+              tool_budget("immediate_eval", {"timeout_ms": 150000}) == (150000, "param"),
+              "imm150=%s" % (tool_budget("immediate_eval", {"timeout_ms": 150000}),))
+        check("S28 explicit timeout_ms above the hard cap is capped and names +hard_cap",
+              tool_budget("immediate_eval", {"timeout_ms": 700000}) == (600000, "param+hard_cap"),
+              "imm700=%s" % (tool_budget("immediate_eval", {"timeout_ms": 700000}),))
         CFG.forward_timeout_ms = 120000
 
         # ---- S9: a >=3 s call is NOT cut (progress keeps the idle timer alive) --------
@@ -4505,6 +6627,645 @@ def run_selftest(with_battery=False):
         httpd28.server_close()
         CFG.token, CFG.token_source, CFG.log_path = "", "none", ""
 
+        # =================================================================================
+        # S29-S36: the ctl/1 CONTROL LANE, CLIENT HALF (R-1021-03 A4)
+        # The SERVER half below is StubCtlAddIn, which implements the contract STRICTLY (hello/
+        # welcome, sid+seq, six ops, nested tool receipt, 4.7 fast subset, 60 s lockout, limits
+        # block, abandon preconditions).  Every assertion is therefore "the client obeys the
+        # contract against a strict stub" - NOT a measurement against a live add-in.
+        # =================================================================================
+        def _ctl_pair(tag, token="", behaviour="normal", gate_tool="immediate_eval",
+                      gate_held_ms=4210):
+            nb = uuid.uuid4().hex[:16]
+            pb = "\\\\.\\pipe\\vb6mcp-1-%d-%s-%s" % (mine, tag, nb)
+            biz = StubPipeAddIn(pb, nb, mine, project="Ctl_" + tag, tools=tools,
+                                behaviour=behaviour).start()
+            stubs.append(biz)
+            nc = uuid.uuid4().hex[:16]
+            pc = "\\\\.\\pipe\\vb6mcp-ctl-1-%d-%s-%s" % (mine, tag, nc)
+            ctl = StubCtlAddIn(pc, nc, mine, token=token, gate_tool=gate_tool,
+                               gate_held_ms=gate_held_ms).start()
+            stubs.append(ctl)
+            return {"biz": biz, "pb": pb, "nb": nb, "ctl": ctl, "pc": pc, "nc": nc}
+
+        def _ctl_register(tag, pair, ctl_nonce=None, ctl_proto="ctl/1", ctl_available=True):
+            _reset_registry(regdir)
+            _write_instance(regdir, mine, project="Ctl_" + tag, pipe=pair["pb"],
+                            nonce=pair["nb"], instance_id="%d-%s" % (mine, pair["nb"]),
+                            transport="pipe", ctlPipe=pair["pc"],
+                            ctlNonce=(ctl_nonce or pair["nc"]), ctlProto=ctl_proto,
+                            ctlAvailable=ctl_available, ctlAuth=["nonce", "acl"])
+            discover(force=True)
+            live = discover()["live"]
+            return live[0] if live else None
+
+        def _raw_hello(pair, proto=None, nonce=None, sid=None, extra=None):
+            fr = {"vb6mcp": "ctlhello", "proto": (proto or CTL_PROTO),
+                  "nonce": (nonce or pair["nc"]),
+                  "instanceId": "%d-%s" % (mine, nonce or pair["nc"])}
+            fr.update(extra or {})
+            return fr
+
+        # ---- S29: ctl AUTHENTICATION - the six failure grades stay APART -----------------
+        pair = _ctl_pair("auth")
+        _ctl_register("auth", pair, ctl_nonce="0" * 16)   # registry nonce != add-in nonce
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "ide_state", "arguments": {"release_inflight": True}}))
+        body = _resp_body(text)
+        oob = body.get("oob") or {}
+        check("S29a wrong ctl nonce -> ctl_unauthorized, oob.acked/applied=false, NO business fallback",
+              iserr is True and body.get("reason") == "ctl_unauthorized"
+              and oob.get("lane") == "ctl" and oob.get("why") == "ctl_unauthorized"
+              and oob.get("acked") is False and oob.get("applied") is False
+              and oob.get("delivered") == "rejected_by_server"
+              and pair["biz"].requests == 0,
+              "reason=%s why=%s bizRequests=%d" % (body.get("reason"), oob.get("why"),
+                                                   pair["biz"].requests))
+
+        pair = _ctl_pair("proto")
+        _ctl_register("proto", pair, ctl_proto="ctl/2")
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "ide_state", "arguments": {"release_inflight": True}}))
+        body = _resp_body(text)
+        check("S29b an UNSUPPORTED ctlProto is never coerced: lane unavailable -> the "
+              "pre-existing business path (unchanged)",
+              iserr is False and body.get("stub") is True and pair["biz"].requests == 1,
+              "stub=%s bizRequests=%d" % (body.get("stub"), pair["biz"].requests))
+
+        pair = _ctl_pair("rawproto")
+        pc29 = PipeClient(pair["pc"]).connect(500)
+        pc29.send_frame(_raw_hello(pair, proto="ctl/9"), time.monotonic() + 2.0)
+        fr29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.close()
+        check("S29c bad proto -> ctl_unauthorized/bad_proto and the connection is CLOSED",
+              (fr29 or {}).get("reason") == "ctl_unauthorized"
+              and (fr29 or {}).get("detail") == "bad_proto" and pair["ctl"].denied == 1,
+              "frame=%s denied=%d" % (fr29, pair["ctl"].denied))
+
+        pair = _ctl_pair("rawsid")
+        pc29 = PipeClient(pair["pc"]).connect(500)
+        pc29.send_frame(_raw_hello(pair), time.monotonic() + 2.0)
+        wel29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.send_frame({"vb6mcp": "ctl", "sid": "deadbeefdeadbeef", "seq": 0, "op": "ping"},
+                        time.monotonic() + 2.0)
+        fr29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.close()
+        check("S29d an unknown sid -> ctl_unauthorized/bad_session (out-of-sync channel untrusted)",
+              (wel29 or {}).get("vb6mcp") == "ctlwelcome"
+              and (fr29 or {}).get("reason") == "ctl_unauthorized"
+              and (fr29 or {}).get("detail") == "bad_session",
+              "frame=%s" % (fr29,))
+
+        pair = _ctl_pair("rawseq")
+        pc29 = PipeClient(pair["pc"]).connect(500)
+        pc29.send_frame(_raw_hello(pair), time.monotonic() + 2.0)
+        wel29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        sid29 = (wel29 or {}).get("sid")
+        pc29.send_frame({"vb6mcp": "ctl", "sid": sid29, "seq": 0, "op": "ping"},
+                        time.monotonic() + 2.0)
+        ok29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.send_frame({"vb6mcp": "ctl", "sid": sid29, "seq": 0, "op": "ping"},
+                        time.monotonic() + 2.0)
+        fr29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.close()
+        check("S29e a REPLAYED seq -> ctl_unauthorized/bad_seq (the first seq=seqBase was accepted)",
+              (ok29 or {}).get("ok") is True and (fr29 or {}).get("reason") == "ctl_unauthorized"
+              and (fr29 or {}).get("detail") == "bad_seq",
+              "first=%s replay=%s" % ((ok29 or {}).get("ok"), (fr29 or {}).get("detail")))
+
+        # Lead ruling 1: the contract pins the FIRST frame to EXACTLY seqBase, so seqBase+1 as a
+        # FIRST frame is a rejection - the reverse direction of S29e, asserted on the wire.
+        pair = _ctl_pair("rawseq0")
+        pc29 = PipeClient(pair["pc"]).connect(500)
+        pc29.send_frame(_raw_hello(pair), time.monotonic() + 2.0)
+        wel29, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        sid29 = (wel29 or {}).get("sid")
+        base29 = int((wel29 or {}).get("seqBase") or 0)
+        pc29.send_frame({"vb6mcp": "ctl", "sid": sid29, "seq": base29 + 1, "op": "ping"},
+                        time.monotonic() + 2.0)
+        fr29b, _e29 = pc29.recv_frame(time.monotonic() + 2.0)
+        pc29.close()
+        check("S29g the FIRST frame must be EXACTLY seqBase: seqBase+1 -> ctl_unauthorized/bad_seq "
+              "(never silently accepted)",
+              (fr29b or {}).get("reason") == "ctl_unauthorized"
+              and (fr29b or {}).get("detail") == "bad_seq",
+              "seqBase=%s firstSent=%s frame=%s" % (base29, base29 + 1, fr29b))
+
+        pair = _ctl_pair("lockout")
+        for i in range(3):
+            pcl = PipeClient(pair["pc"]).connect(500)
+            pcl.send_frame(_raw_hello(pair, nonce="f" * 16), time.monotonic() + 2.0)
+            last = pcl.recv_frame(time.monotonic() + 2.0)[0]
+            pcl.close()
+        _ctl_register("lockout", pair)      # correct nonce this time
+        inst29 = discover()["live"][0]
+        biz_before = pair["biz"].requests
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "ide_state", "arguments": {"release_inflight": True}}))
+        body = _resp_body(text)
+        oob = body.get("oob") or {}
+        check("S29f 3 unauthenticated attempts -> ctl_lockout for the NEXT attempt, 60 s, "
+              "peer_busy (NOT unresponsive), no business fallback",
+              iserr is True and body.get("reason") == "ctl_lockout"
+              and oob.get("why") == "ctl_lockout" and oob.get("acked") is False
+              and oob.get("peerState") == "peer_busy"
+              and oob.get("suggestedAction") == "retry_once"
+              and oob.get("retryAfterMs") == 60000
+              and pair["ctl"].lockouts >= 1 and pair["biz"].requests == biz_before,
+              "lastDeny=%s why=%s state=%s retry=%s lockouts=%d" % (
+                  last, oob.get("why"), oob.get("peerState"), oob.get("retryAfterMs"),
+                  pair["ctl"].lockouts))
+
+        # ---- S30: bearer is OPTIONAL - 2 factors off, 3 factors on ----------------------
+        SECRET30 = "SELFTEST-CTL-BEARER-0123456789"
+        pair = _ctl_pair("bearer-off")
+        inst30 = _ctl_register("bearer-off", pair)
+        CFG.token, CFG.token_source = "", "none"
+        res30, info30 = ctl_request(inst30, "ping")
+        hello30 = json.loads((pair["ctl"].last_hello or b"{}").decode("utf-8"))
+        check("S30a bearer OFF: welcome.authBasis == [nonce,acl] and the hello carries NO auth block",
+              res30.get("ok") is True and info30.get("authBasis") == ["nonce", "acl"]
+              and "auth" not in hello30,
+              "basis=%s helloKeys=%s" % (info30.get("authBasis"), sorted(hello30.keys())))
+
+        pair = _ctl_pair("bearer-on", token=SECRET30)
+        inst30 = _ctl_register("bearer-on", pair)
+        CFG.token, CFG.token_source = SECRET30, "env"
+        res30, info30 = ctl_request(inst30, "ping")
+        hello30 = json.loads((pair["ctl"].last_hello or b"{}").decode("utf-8"))
+        auth30 = hello30.get("auth") or {}
+        check("S30b bearer ON (both sides): 3 factors, hello carries scheme+token+tokenFp(8 hex)",
+              res30.get("ok") is True
+              and info30.get("authBasis") == ["nonce", "acl", "token"]
+              and auth30.get("scheme") == "bearer" and auth30.get("token") == SECRET30
+              and len(str(auth30.get("tokenFp") or "")) == 8,
+              "basis=%s fpLen=%d" % (info30.get("authBasis"),
+                                     len(str(auth30.get("tokenFp") or ""))))
+
+        pair = _ctl_pair("bearer-noclient", token=SECRET30)   # add-in REQUIRES a bearer
+        inst30 = _ctl_register("bearer-noclient", pair)
+        CFG.token, CFG.token_source = "", "none"
+        try:
+            ctl_request(inst30, "ping")
+            denied30 = False
+        except CtlError as exc:
+            denied30 = (exc.why == "ctl_unauthorized" and "token_mismatch" in exc.detail)
+        check("S30c the add-in REQUIRES a bearer the bridge does not have -> ctl_unauthorized/"
+              "token_mismatch (never a silent downgrade)",
+              denied30 is True, "denied=%s" % denied30)
+
+        pair = _ctl_pair("bearer-bridgeonly")
+        inst30 = _ctl_register("bearer-bridgeonly", pair)
+        CFG.token, CFG.token_source = SECRET30, "env"
+        res30, info30 = ctl_request(inst30, "ping")
+        check("S30d bridge HAS a token, add-in needs none: accepted, and the receipt claims NO "
+              "bearer factor (authBasis stays 2)",
+              res30.get("ok") is True and info30.get("authBasis") == ["nonce", "acl"],
+              "basis=%s" % (info30.get("authBasis"),))
+        CFG.token, CFG.token_source = "", "none"
+
+        # ---- S31: ping / state / release_gate SEMANTICS ---------------------------------
+        pair = _ctl_pair("ops")
+        inst31 = _ctl_register("ops", pair)
+        res31, info31 = ctl_request(inst31, "ping")
+        check("S31a ping proves liveness and reports gate + businessPipe state",
+              res31.get("ok") is True and res31.get("pid") == mine
+              and isinstance(res31.get("gate"), dict)
+              and (res31.get("businessPipe") or {}).get("state") == "busy"
+              and res31.get("limits") == StubCtlAddIn.LIMITS,
+              "pid=%s gate=%s" % (res31.get("pid"), res31.get("gate")))
+        res31, info31 = ctl_request(inst31, "state")
+        check("S31b state reports gate.depth/mutBusy/tool + cancel/release snapshots",
+              res31.get("ok") is True and res31["gate"]["mutBusy"] is True
+              and res31["gate"]["tool"] == "immediate_eval"
+              and res31["gate"]["depth"] == 1 and isinstance(res31.get("cancel"), dict),
+              "gate=%s" % (res31.get("gate"),))
+        res31, info31 = ctl_request(inst31, "release_gate", {"minHeldMs": 5000})
+        check("S31c release_gate(minHeldMs=5000) with heldMs=4210 DECLINES (released=false) "
+              "without inventing a new reason code",
+              res31.get("ok") is True and res31.get("released") is False
+              and res31.get("heldMs") == 4210 and not res31.get("reason"),
+              "released=%s heldMs=%s" % (res31.get("released"), res31.get("heldMs")))
+        res31, info31 = ctl_request(inst31, "release_gate", {"minHeldMs": 0})
+        check("S31d release_gate(0) releases the gate; statementInterrupted is ALWAYS false",
+              res31.get("released") is True
+              and res31.get("releasedTool") == "immediate_eval"
+              and res31.get("statementInterrupted") is False
+              and res31.get("gateReleaseCount") == 1 and res31.get("depthAfter") == 0,
+              "released=%s tool=%s count=%s" % (res31.get("released"),
+                                                res31.get("releasedTool"),
+                                                res31.get("gateReleaseCount")))
+        res31, info31 = ctl_request(inst31, "release_gate", {"minHeldMs": 0})
+        check("S31e release_gate with nothing in flight -> nothing_in_flight (NOT an auth failure)",
+              res31.get("ok") is False and res31.get("reason") == "nothing_in_flight",
+              "reason=%s" % (res31.get("reason"),))
+
+        pair = _ctl_pair("intent")
+        inst31 = _ctl_register("intent", pair)
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "ide_state", "arguments": {"release_inflight": True,
+                                               "release_min_held_ms": 0}}))
+        body = _resp_body(text)
+        oob = body.get("oob") or {}
+        check("S31f ide_state{release_inflight} is served by the CTL LANE: oob acked/ackOp/applied, "
+              "limits relayed, business pipe untouched",
+              iserr is False and body.get("source") == "ctl_lane"
+              and body.get("intent") == "release_inflight"
+              and body.get("released") is True and body.get("statementInterrupted") is False
+              and oob.get("lane") == "ctl" and oob.get("acked") is True
+              and oob.get("ackOp") == "release_gate" and oob.get("applied") is True
+              and isinstance(oob.get("helloMs"), int) and isinstance(oob.get("rttMs"), int)
+              and body.get("limits") == StubCtlAddIn.LIMITS
+              and pair["biz"].requests == 0,
+              "acked=%s ackOp=%s applied=%s bizRequests=%d" % (
+                  oob.get("acked"), oob.get("ackOp"), oob.get("applied"),
+                  pair["biz"].requests))
+
+        # ---- S32: cancel SEMANTICS -----------------------------------------------------
+        pair = _ctl_pair("cancel")
+        inst32 = _ctl_register("cancel", pair)
+        res32, info32 = ctl_request(inst32, "cancel", {"target": "mcp_info"})
+        check("S32a cancel for a tool that is NOT in flight -> nothing_in_flight + inFlightTool",
+              res32.get("ok") is False and res32.get("reason") == "nothing_in_flight"
+              and res32.get("inFlightTool") == "immediate_eval",
+              "reason=%s inFlightTool=%s" % (res32.get("reason"), res32.get("inFlightTool")))
+        res32, info32 = ctl_request(inst32, "cancel", {"target": "*"})
+        check("S32b cancel '*' -> requested + honoredAtNextPump (cooperative)",
+              res32.get("ok") is True and res32.get("requested") is True
+              and res32.get("honoredAtNextPump") is True,
+              "requested=%s" % (res32.get("requested"),))
+        ctl_request(inst32, "release_gate", {"minHeldMs": 0})
+        res32, info32 = ctl_request(inst32, "cancel", {"target": "*"})
+        check("S32c cancel with nothing in flight -> nothing_in_flight",
+              res32.get("ok") is False and res32.get("reason") == "nothing_in_flight",
+              "reason=%s" % (res32.get("reason"),))
+
+        # ---- S33: abandon SEMANTICS (incl. args.minHeldMs) -----------------------------
+        pair = _ctl_pair("abandon")
+        inst33 = _ctl_register("abandon", pair)
+        res33, info33 = ctl_request(inst33, "abandon", {"confirm": False})
+        check("S33a abandon before any release -> gate_not_released + howToProceed",
+              res33.get("ok") is False and res33.get("reason") == "gate_not_released"
+              and "release_gate" in str(res33.get("howToProceed")),
+              "reason=%s how=%s" % (res33.get("reason"), res33.get("howToProceed")))
+        res33, info33 = ctl_request(inst33, "abandon", {"confirm": True, "minHeldMs": 999999})
+        check("S33b abandon confirm=true with minHeldMs above heldMs is STILL refused",
+              res33.get("ok") is False and res33.get("reason") == "gate_not_released",
+              "reason=%s" % (res33.get("reason"),))
+        res33, info33 = ctl_request(inst33, "abandon", {"confirm": True, "minHeldMs": 0})
+        check("S33c abandon confirm=true forces the release first, then abandons "
+              "(responseLost + businessPipe.closed)",
+              res33.get("ok") is True and res33.get("abandoned") is True
+              and res33.get("responseLost") is True
+              and (res33.get("businessPipe") or {}).get("closed") is True,
+              "abandoned=%s pipe=%s" % (res33.get("abandoned"), res33.get("businessPipe")))
+
+        # ---- S34: ABANDON THEN RECONNECT (the Lead asked for the measured cost + reason) --
+        pair = _ctl_pair("reconnect")
+        inst34 = _ctl_register("reconnect", pair)
+        ctl_request(inst34, "release_gate", {"minHeldMs": 0})
+        first34, info34a = ctl_request(inst34, "state")
+        t34 = time.monotonic()
+        res34, info34 = ctl_request(inst34, "abandon", {"confirm": False})
+        abandon_ms = int((time.monotonic() - t34) * 1000)
+        t34 = time.monotonic()
+        re34 = {"ok": False, "why": "not_attempted"}
+        try:
+            res34b, info34b = ctl_request(inst34, "ping")
+            re34 = {"ok": res34b.get("ok") is True, "why": "ok",
+                    "ms": int((time.monotonic() - t34) * 1000),
+                    "sid": info34b.get("sid"), "helloMs": info34b.get("helloMs")}
+        except CtlError as exc:
+            re34 = {"ok": False, "why": exc.why, "ms": int((time.monotonic() - t34) * 1000)}
+        check("S34 abandon then RECONNECT: a fresh ctl connection with a NEW sid succeeds, "
+              "cost measured (ms) and the reason code reported",
+              res34.get("abandoned") is True and re34.get("ok") is True
+              and re34.get("why") == "ok" and re34.get("sid") and re34.get("sid") != info34.get("sid")
+              and re34.get("ms", 99999) < 3000,
+              "abandonMs=%d reconnectMs=%s reason=%s sidChanged=%s" % (
+                  abandon_ms, re34.get("ms"), re34.get("why"),
+                  bool(re34.get("sid") and re34.get("sid") != info34.get("sid"))))
+        print("    S34 abandon->reconnect: abandonMs=%d reconnectMs=%s reason=%s helloMs=%s"
+              % (abandon_ms, re34.get("ms"), re34.get("why"), re34.get("helloMs")))
+
+        # ---- S35: the 4.7 READ-ONLY FAST SUBSET + the NESTED tool receipt --------------
+        pair = _ctl_pair("lane")
+        inst35 = _ctl_register("lane", pair)
+        res35, info35 = ctl_request(inst35, "tool", {"name": "ide_state", "arguments": {}})
+        check("S35a tool op returns a NESTED receipt (outer ok = frame verdict; receipt.ok = "
+              "tool verdict) and tool fields are NEVER flattened",
+              res35.get("ok") is True and res35.get("source") == "ctl_lane"
+              and isinstance(res35.get("receipt"), dict)
+              and res35["receipt"].get("ok") is True
+              and res35["receipt"].get("tool") == "ide_state"
+              and "stub" not in res35 and "tool" not in res35,
+              "outerKeys=%s receiptKeys=%s" % (sorted(res35.keys()),
+                                               sorted((res35.get("receipt") or {}).keys())))
+        res35, info35 = ctl_request(inst35, "tool", {"name": "dependency_graph", "arguments": {}})
+        check("S35b a SLOW read-only tool is refused: readonly_lane_refused/"
+              "slow_tool_not_on_ctl_lane (+ allowed list, failureKind=toolError, an ANSWER not a raise)",
+              res35.get("ok") is False and res35.get("reason") == "readonly_lane_refused"
+              and res35.get("detail") == "slow_tool_not_on_ctl_lane"
+              and res35.get("failureKind") == "toolError"
+              and CTL_FAST_TOOLS[0] in (res35.get("allowed") or []),
+              "detail=%s allowed=%d" % (res35.get("detail"),
+                                        len(res35.get("allowed") or [])))
+        res35, info35 = ctl_request(inst35, "tool", {"name": "build", "arguments": {}})
+        check("S35c a WRITE tool is refused: readonly_lane_refused/not_read_only",
+              res35.get("ok") is False and res35.get("reason") == "readonly_lane_refused"
+              and res35.get("detail") == "not_read_only",
+              "detail=%s" % (res35.get("detail"),))
+
+        # ---- S36: the SWALLOWED-RAISE fixture (max budget + cancel interaction) ---------
+        # dependency_graph's own budget is 33000 by table; the HARD cap is what decides here, so
+        # VB6MCP_MAX_CALL_MS / VB6MCP_MAX_CALL_HARD_MS = 2000 makes the whole assertion fast
+        # while exercising the REAL two-layer arithmetic (maxMsSource names +hard_cap).
+        _reset_registry(regdir)
+        n36 = uuid.uuid4().hex[:16]
+        p36 = "\\\\.\\pipe\\vb6mcp-1-%d-raise-%s" % (mine, n36)
+        s36 = StubPipeAddIn(p36, n36, mine, project="RaiseOne", tools=tools,
+                            behaviour="silent").start()
+        stubs.append(s36)
+        _write_instance(regdir, mine, project="RaiseOne", pipe=p36, nonce=n36,
+                        instance_id="%d-%s" % (mine, n36), transport="pipe")
+        discover(force=True)
+        CFG.max_call_ms = 2000
+        CFG.max_call_hard_ms = 2000
+        t36 = time.monotonic()
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "dependency_graph", "arguments": {}}))
+        body = _resp_body(text)
+        el36 = (time.monotonic() - t36) * 1000
+        check("S36a swallowed raise: dependency_graph at VB6MCP_MAX_CALL_MS=2000 -> "
+              "reason=timeout with maxMs/maxMsSource/elapsedMs",
+              body.get("reason") == "timeout" and body.get("maxMs") == 2000
+              and str(body.get("maxMsSource") or "").endswith("hard_cap")
+              and body.get("elapsedMs") is not None and 1900 <= el36 < 6000
+              and body.get("failureKind") == "peer_unresponsive"
+              and isinstance(body.get("heldBy"), dict),
+              "reason=%s maxMs=%s src=%s elapsed=%d" % (
+                  body.get("reason"), body.get("maxMs"), body.get("maxMsSource"), el36))
+
+        pair = _ctl_pair("raise", behaviour="silent", gate_tool="dependency_graph",
+                         gate_held_ms=4210)
+        _ctl_register("raise", pair)
+        cancel_out = {}
+
+        def _cancel_worker():
+            time.sleep(0.35)
+            try:
+                t_c, ie_c, _m_c = handle_jsonrpc(_jreq("tools/call", {
+                    "name": "ide_state",
+                    "arguments": {"cancel_inflight": True,
+                                  "cancel_target": "dependency_graph"}}, rid=771))
+                cancel_out["body"] = _resp_body(t_c)
+                cancel_out["isError"] = ie_c
+            except Exception as exc:
+                cancel_out["error"] = repr(exc)
+
+        th = threading.Thread(target=_cancel_worker, name="selftest-cancel", daemon=True)
+        th.start()
+        text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+            "name": "dependency_graph", "arguments": {}}))
+        th.join(15)
+        body = _resp_body(text)
+        cb = cancel_out.get("body") or {}
+        coob = cb.get("oob") or {}
+        check("S36b a ctl-ACKED cancel is NOT overwritten by the timeout: receipt keeps "
+              "cancelled_by_request + timeoutAlsoDue and the budget facts",
+              cancel_out.get("isError") is False and coob.get("acked") is True
+              and coob.get("applied") is True
+              and body.get("reason") == "cancelled_by_request"
+              and body.get("cancelRequested") is True
+              and body.get("cancelHonored") is False
+              and body.get("timeoutAlsoDue") is True
+              and body.get("timeoutReason") == "timeout"
+              and body.get("maxMs") == 2000
+              and (body.get("elapsedMs") or 0) >= 1900,
+              "cancelAcked=%s cancelApplied=%s reason=%s timeoutAlsoDue=%s maxMs=%s elapsed=%s"
+              % (coob.get("acked"), coob.get("applied"), body.get("reason"),
+                 body.get("timeoutAlsoDue"), body.get("maxMs"), body.get("elapsedMs")))
+        CFG.max_call_ms = 120000
+        CFG.max_call_hard_ms = 600000
+
+        # ---- S37: OUT-OF-PROCESS read-only fallback (client section B) -------------------
+        # A #32770 dialog + Button/Static children owned by THIS process make the measurement
+        # deterministic without starting VB6 (red line) or touching another live app.
+        fx = _make_oop_window_fixture()
+        try:
+            ok37 = _hwnd_i(fx.get("dialog")) != 0
+            facts37, miss37 = oop_measure(os.getpid())
+            check("S37a oop_measure sees the pid's top-level windows and its #32770 dialog "
+                  "with button/static text (read-only, no input sent)",
+                  ok37 and facts37.get("pidAlive") is True
+                  and any(w.get("title") == "Microsoft Visual Basic"
+                          for w in facts37.get("windows") or [])
+                  and len(facts37.get("dialogs") or []) == 1
+                  and any(b.get("text") == "End" for b in facts37["dialogs"][0]["buttons"])
+                  and isinstance(facts37.get("hung"), bool),
+                  "windows=%d dialogs=%d missing=%s" % (
+                      len(facts37.get("windows") or []), len(facts37.get("dialogs") or []),
+                      [m.get("why") for m in miss37]))
+
+            b37 = oop_body("ide_state", {"__pid": os.getpid()}, "ctl_unavailable", {})
+            check("S37b ide_state fallback: source=out_of_process + degraded=true + "
+                  "addInReceipt=false, and only measured fields",
+                  b37.get("source") == "out_of_process" and b37.get("degraded") is True
+                  and b37.get("addInReceipt") is False
+                  and b37.get("mode") is None and b37.get("windowCount") >= 1
+                  and (b37.get("oob") or {}).get("lane") == "oop",
+                  "source=%s windows=%s mode=%s" % (b37.get("source"),
+                                                    b37.get("windowCount"), b37.get("mode")))
+
+            b37 = oop_body("read_active_dialogs", {"__pid": os.getpid()}, "ctl_unavailable", {})
+            d37 = (b37.get("dialogs") or [{}])[0]
+            check("S37c read_active_dialogs fallback reports the #32770 title + buttons",
+                  b37.get("count") == 1 and d37.get("class") == "#32770"
+                  and d37.get("title") == "Microsoft Visual Basic"
+                  and sorted(str(x.get("text")) for x in d37.get("buttons") or [])
+                  == ["Debug", "End"],
+                  "buttons=%s" % ([x.get("text") for x in d37.get("buttons") or []],))
+
+            b37 = oop_body("find_gui", {"__pid": os.getpid(), "keyword": "Visual Basic"},
+                           "ctl_unavailable", {})
+            check("S37d find_gui fallback filters by keyword (title/class match only)",
+                  b37.get("count") >= 1
+                  and any(h.get("title") == "Microsoft Visual Basic"
+                          for h in b37.get("hits") or []),
+                  "hits=%d" % (b37.get("count"),))
+
+            b37 = oop_body("ui_text", {"__pid": os.getpid(), "hwnd": fx["dialog"]},
+                           "ctl_unavailable", {})
+            check("S37e ui_text fallback returns the measured window text (WM_GETTEXT), "
+                  "never an invented string",
+                  "Run-time error" in str(b37.get("text") or "")
+                  and b37.get("source") == "wm_gettext",
+                  "textLen=%d" % len(str(b37.get("text") or "")))
+
+            b37 = oop_body("last_error", {"__pid": os.getpid()}, "ctl_unavailable", {})
+            check("S37f last_error fallback finds the runtime-error dialog and PARSES the "
+                  "measured text (errNumber 91) with parseBasis stated",
+                  (b37.get("errorDialog") or {}).get("present") is True
+                  and b37.get("errNumber") == 91
+                  and "Object variable" in str(b37.get("errDescription") or "")
+                  and b37.get("parseBasis"),
+                  "errNumber=%s desc=%r" % (b37.get("errNumber"),
+                                            (b37.get("errDescription") or "")[:40]))
+
+            # A ctl-less live instance is the ONLY state in which the fallback may fire, so the
+            # gate is probed against exactly that state (and the same entry serves S37h).
+            _reset_registry(regdir)
+            n37 = uuid.uuid4().hex[:16]
+            p37 = "\\\\.\\pipe\\vb6mcp-1-%d-oop-%s" % (mine, n37)
+            s37 = StubPipeAddIn(p37, n37, mine, project="OopOne", tools=tools,
+                                behaviour="silent").start()
+            stubs.append(s37)
+            _write_instance(regdir, mine, project="OopOne", pipe=p37, nonce=n37,
+                            instance_id="%d-%s" % (mine, n37), transport="pipe")
+            discover(force=True)
+
+            gate37a = oop_fallback_body("ide_state", {}, None,
+                                        {"peerState": "peer_busy", "ctlAvailable": False})
+            gate37b = oop_fallback_body("ide_state", {}, None,
+                                        {"peerState": "peer_unresponsive", "ctlAvailable": True})
+            gate37c = oop_fallback_body("build", {}, None,
+                                        {"peerState": "peer_unresponsive", "ctlAvailable": False})
+            gate37d = oop_fallback_body("ide_state", {}, None,
+                                        {"peerState": "peer_unresponsive", "reason": "timeout",
+                                         "ctlAvailable": False})
+            # a DENY-shaped failure is peer_unresponsive too, but the add-in SPOKE: measuring
+            # windows would bury the denial itself (this is the S23 regression this gate prevents).
+            gate37e = oop_fallback_body("ide_state", {}, None,
+                                        {"peerState": "peer_unresponsive",
+                                         "reason": "pipe_connect_failed", "ctlAvailable": False})
+            check("S37g the fallback GATE: never for peer_busy, never over a LIVE ctl lane, "
+                  "never for a non-listed tool, never for a DENY-shaped failure; yes for "
+                  "ctl-unavailable + a WEDGE-shaped peer_unresponsive",
+                  gate37a is None and gate37b is None and gate37c is None and gate37e is None
+                  and gate37d is not None
+                  and (gate37d.get("oob") or {}).get("why") == "ctl_unavailable",
+                  "a=%s b=%s c=%s d=%s e=%s" % (gate37a is None, gate37b is None,
+                                                 gate37c is None, gate37d is not None,
+                                                 gate37e is None))
+
+            # end to end: the same silent business pipe + NO ctl fields on the entry -> the
+            # receipt that would have been a bare timeout becomes an out-of-process reading.
+            CFG.max_call_ms = 1200
+            CFG.max_call_hard_ms = 1200
+            text, iserr, meta = handle_jsonrpc(_jreq("tools/call", {
+                "name": "ide_state", "arguments": {}}))
+            body = _resp_body(text)
+            check("S37h END TO END: a timed-out ide_state on a ctl-less instance is answered "
+                  "OUT OF PROCESS (degraded, why=ctl_unavailable) instead of a bare timeout",
+                  iserr is True and body.get("source") == "out_of_process"
+                  and body.get("degraded") is True
+                  and (body.get("oob") or {}).get("why") == "ctl_unavailable"
+                  and (body.get("failureUnderneath") or {}).get("reason") == "timeout"
+                  and (meta or {}).get("source") == "out_of_process",
+                  "source=%s why=%s under=%s" % (
+                      body.get("source"), (body.get("oob") or {}).get("why"),
+                      (body.get("failureUnderneath") or {}).get("reason")))
+
+            # ---- S37i/S37j: the ADDITIVE second trigger + the DENY is never re-diagnosed ----
+            # The failure fields must be IDENTICAL with the process-out-of-process machinery ON
+            # and OFF.  A digest over the semantic fields is the comparison, not a human read.
+            def _biz_digest(b):
+                keys = ("reason", "reasonLegacy", "failureKind", "peerState",
+                        "suggestedAction", "serverReason", "serverDetail", "retryAfterMs",
+                        "ctlAvailable", "maxMsSource")
+                snap = dict((k, (b or {}).get(k)) for k in keys)
+                return hashlib.sha256(json.dumps(snap, sort_keys=True).encode("utf-8")).hexdigest()
+
+            # S37i: peer_busy (a HOST-MODAL-shaped stall on the business pipe) + ctl lane absent
+            # + process alive + a visible #32770 => the segment is APPENDED, nothing rewritten.
+            _reset_registry(regdir)
+            n37b = uuid.uuid4().hex[:16]
+            p37b = "\\\\.\\pipe\\vb6mcp-1-%d-oopbusy-%s" % (mine, n37b)
+            s37b = StubPipeAddIn(p37b, n37b, mine, project="OopBusy", tools=tools).start()
+            stubs.append(s37b)
+            _write_instance(regdir, mine, project="OopBusy", pipe=p37b, nonce=n37b,
+                            instance_id="%d-%s" % (mine, n37b), transport="pipe")
+            discover(force=True)
+            occ37 = PipeClient(p37b).connect(600)
+            occ37.send_frame({"vb6mcp": "hello", "proto": NP_PROTO, "nonce": n37b,
+                              "client": {"pid": mine, "session": 1, "user": "selftest"}},
+                             time.monotonic() + 1.0)
+            occ37.recv_frame(time.monotonic() + 2.0)
+            _drop_pipe_probe(discover()["live"][0])
+            CFG.oop_enabled = False
+            text, iserrA, metaA = handle_jsonrpc(_jreq("tools/call", {
+                "name": "ide_state", "arguments": {}}))
+            bodyA = _resp_body(text)
+            CFG.oop_enabled = True
+            text, iserrB, metaB = handle_jsonrpc(_jreq("tools/call", {
+                "name": "ide_state", "arguments": {}}))
+            bodyB = _resp_body(text)
+            add37 = bodyB.get("outOfProcess") or {}
+            check("S37i ADDITIVE second trigger: peer_busy + ctl lane absent + pid alive + a "
+                  "visible #32770 -> outOfProcess APPENDED, failure fields byte-identical "
+                  "(digest ON == digest OFF)",
+                  iserrB is True and bodyB.get("peerState") == "peer_busy"
+                  and bodyB.get("failureKind") == "peer_busy"
+                  and bodyB.get("suggestedAction") == "retry_once"
+                  and "outOfProcess" not in bodyA
+                  and add37.get("source") == "out_of_process"
+                  and add37.get("degraded") is True and add37.get("additive") is True
+                  and (add37.get("evidence") or {}).get("modalDialogs") >= 1
+                  and _biz_digest(bodyA) == _biz_digest(bodyB),
+                  "reason=%s kind=%s add=%s dialogs=%s digestEqual=%s" % (
+                      bodyB.get("reason"), bodyB.get("failureKind"), add37.get("source"),
+                      (add37.get("evidence") or {}).get("modalDialogs"),
+                      _biz_digest(bodyA) == _biz_digest(bodyB)))
+            occ37.close()
+
+            # S37j: a DENY (the add-in SPOKE) must keep its reason verbatim: the segment must
+            # NOT appear even though the pid is alive, the ctl lane is absent and a #32770 is
+            # visible - the exact state that fires S37i.
+            _reset_registry(regdir)
+            n37c = uuid.uuid4().hex[:16]
+            p37c = "\\\\.\\pipe\\vb6mcp-1-%d-oopdeny-%s" % (mine, n37c)
+            s37c = StubPipeAddIn(p37c, n37c, mine, project="OopDeny", tools=tools,
+                                 behaviour="deny_hello", deny_reason="nonce_mismatch").start()
+            stubs.append(s37c)
+            _write_instance(regdir, mine, project="OopDeny", pipe=p37c, nonce=n37c,
+                            instance_id="%d-%s" % (mine, n37c), transport="pipe")
+            discover(force=True)
+            CFG.oop_enabled = True
+            _drop_pipe_probe(discover()["live"][0])
+            text, iserrD, metaD = handle_jsonrpc(_jreq("tools/call", {
+                "name": "ide_state", "arguments": {}}))
+            bodyD = _resp_body(text)
+            # A deny makes the add-in REBUILD its pipe, and the bridge caches that transient
+            # busy for 2 s - so the comparison run needs a fresh probe and the rebuild window,
+            # otherwise the second call legitimately reports pipe_unavailable instead.
+            time.sleep(0.5)
+            CFG.oop_enabled = False
+            _drop_pipe_probe(discover()["live"][0])
+            text, iserrE, _metaE = handle_jsonrpc(_jreq("tools/call", {
+                "name": "ide_state", "arguments": {}}))
+            bodyE = _resp_body(text)
+            CFG.oop_enabled = True
+            _live37 = discover()["live"]
+            eligD = oop_addendum_eligible(bodyD, _live37[0] if _live37 else None)
+            check("S37j a DENY is NEVER re-diagnosed: reason/serverReason/peerState byte-identical "
+                  "(digest ON == digest OFF) and NO outOfProcess segment is appended",
+                  bodyD.get("reason") == "pipe_connect_failed"
+                  and bodyD.get("serverReason") == "nonce_mismatch"
+                  and bodyD.get("peerState") == "peer_unresponsive"
+                  and "outOfProcess" not in bodyD
+                  and eligD is None
+                  and _biz_digest(bodyD) == _biz_digest(bodyE),
+                  "reason=%s serverReason=%s outOfProcess=%s eligible=%s digestEqual=%s" % (
+                      bodyD.get("reason"), bodyD.get("serverReason"),
+                      "outOfProcess" in bodyD, eligD,
+                      _biz_digest(bodyD) == _biz_digest(bodyE)))
+            CFG.max_call_ms = 120000
+            CFG.max_call_hard_ms = 600000
+            CFG.oop_enabled = True
+        finally:
+            if fx.get("dialog"):
+                user32.DestroyWindow(fx["dialog"])
+
         # ---- S15: the DEPLOYABLE entry point, as its own OS process ----------------------
         live_dir = os.path.join(tmpdir, "instances_live")
         os.makedirs(live_dir, exist_ok=True)
@@ -4562,6 +7323,33 @@ def run_selftest(with_battery=False):
                     proc.kill()
                 except Exception:
                     pass
+
+        # ---- S16 (WP-22-02): a DEAD peer is NOT "unresponsive" ---------------------------
+        # MCP-1021-43: after pipe_stalled the IDE process was gone; the old envelope still said
+        # peer_unresponsive, so the caller was told to release a gate that no longer existed.
+        dead_inst = Instance({"pid": 4294967294, "port": 0, "transport": "pipe",
+                              "project": "DeadProbe", "startedAt": "2026-10-22 09:00:00"})
+        live_inst = Instance({"pid": os.getpid(), "port": 0, "transport": "pipe",
+                              "project": "LiveProbe", "startedAt": "2026-10-22 09:00:00"})
+        dead_body = _transport_failure_body("pipe_stalled", "pipe error 109 GetOverlappedResult (io)",
+                                            time.monotonic(), 120000, "run_project",
+                                            "param_slack", dead_inst, {})
+        live_body = _transport_failure_body("pipe_stalled", "pipe error 109 GetOverlappedResult (io)",
+                                            time.monotonic(), 120000, "run_project",
+                                            "param_slack", live_inst, {})
+        check("S16 a DEAD pid upgrades peer_unresponsive -> peer_dead (+peerDead/lostContext/howToRecover)",
+              dead_body.get("peerState") == "peer_dead"
+              and dead_body.get("peerDead") is True
+              and dead_body.get("failureKind") == "peer_dead"
+              and (dead_body.get("lostContext") or {}).get("debugger") is True
+              and any("ide_kill_and_relaunch" in x for x in (dead_body.get("howToRecover") or [])),
+              "peerState=%s debugger=%s" % (dead_body.get("peerState"),
+                                            (dead_body.get("lostContext") or {}).get("debugger")))
+        check("S16 a LIVE pid keeps the ordinary peer_unresponsive envelope (no false peer_dead)",
+              live_body.get("peerState") == "peer_unresponsive"
+              and "peerDead" not in live_body
+              and live_body.get("suggestedAction") in ("release_gate", "kill_and_restart"),
+              "peerState=%s" % live_body.get("peerState"))
 
         ok = all(r[1] for r in results)
     finally:

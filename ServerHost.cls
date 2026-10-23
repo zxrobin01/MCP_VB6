@@ -26,6 +26,7 @@ Private m_wsa As WinsockTransport
 ' default:  VB6MCP_TRANSPORT=winsock  (env)  or  HKCU\Software\VB6MCP\Transport
 ' = "winsock" (registry). See 内部分析记录
 Private m_useWsa As Boolean
+Private m_shutdownCalls As Long
 Private m_menu As Object
 Private WithEvents m_menuEvents As VBIDE.CommandBarEvents
 ' the second Add-Ins entry - the settings dialog (NON-MODAL).
@@ -65,15 +66,21 @@ Public Sub Start(ByVal vbe As Object)
     ' VB6MCP_WHEEL (env) / HKCU\Software\VB6MCP\Wheel unset, nothing at all is
     ' subclassed. No keyboard hook and no global hook is ever installed.
     WinOps.WheelInit
+    LogLine "wheel state=" & Left$(WinOps.WheelStateJson(), 500)
+    LogLine "handles start=" & WinOps.WheelGuiResourcesJson()
     LogLine "VB6MCP add-in started (requested port " & CStr(basePort) & ")"
 End Sub
 
 Public Sub Shutdown()
+    m_shutdownCalls = m_shutdownCalls + 1
+    LogLine "shutdown enter=" & CStr(m_shutdownCalls)
     ' clean uninstall - restore every code-pane window procedure we
     ' subclassed BEFORE the add-in goes away (a stale pointer would crash the IDE
     ' on exit). This is a no-op when the wheel was never enabled.
     On Error Resume Next
-    WinOps.WheelShutdownJson
+    Dim wheelReceipt As String
+    wheelReceipt = WinOps.WheelShutdownJson()
+    LogLine "wheel shutdown=" & Left$(wheelReceipt, 700)
     On Error GoTo 0
     UnhookIdeEvents
     RemoveMenuItem
@@ -88,6 +95,7 @@ Public Sub Shutdown()
     End If
     Set m_mcp = Nothing
     Set m_vbe = Nothing
+    LogLine "handles end=" & WinOps.WheelGuiResourcesJson()
     LogLine "VB6MCP add-in stopped"
 End Sub
 
@@ -231,16 +239,19 @@ End Sub
 Private Sub m_prjEvents_ItemAdded(ByVal VBProject As VBIDE.VBProject)
     Changes.Record "project_added", EvName(VBProject)
     MarkIdentityDirty
+    WinOps.WheelRequestAttach "ide_event"
 End Sub
 
 Private Sub m_prjEvents_ItemRemoved(ByVal VBProject As VBIDE.VBProject)
     Changes.Record "project_removed", EvName(VBProject)
     MarkIdentityDirty
+    WinOps.WheelRequestAttach "ide_event"
 End Sub
 
 Private Sub m_prjEvents_ItemRenamed(ByVal VBProject As VBIDE.VBProject, ByVal OldName As String)
     Changes.Record "project_renamed", OldName & " -> " & EvName(VBProject)
     MarkIdentityDirty
+    WinOps.WheelRequestAttach "ide_event"
 End Sub
 
 Private Sub m_cmpEvents_ItemAdded(ByVal VBComponent As VBIDE.VBComponent)

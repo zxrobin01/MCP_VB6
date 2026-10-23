@@ -33,3 +33,27 @@ Desktop.ini
 VB6MCP.pdb
 VB6MCP.dll.prev
 bridge/hub_remotes.json
+
+# Local evidence workspace (never shipped, never tracked)
+# fix/ holds each lane's raw verification evidence + one-off probe scripts.  It is a LOCAL working
+# area on purpose: what ships is a CURATED summary copied to docs/evidence/<task-id>/ (REPORT.md +
+# at most 3 raw files it cites, each <=512 KB).  Ignoring the whole tree keeps git status readable
+# and stops raw evidence from drifting into a release by accident.
+fix/
+
+# Runtime state / editor snapshots (never shipped)
+# .vb6mcp/  = add-in runtime configuration + its logs (written next to the project while the add-in runs)
+# _undo/    = pre-edit pane snapshots written by undo_edit/replace_code/apply_edits
+.vb6mcp/
+_undo/
+
+# Local build intermediates / artifact records (never shipped)
+build/
+dist/*.sha256.*
+dist/*.sha256
+# dist/ is BUILD STAGING (assembled export tree + per-build srcstamp records). It is rebuilt from
+# source on every release build and must never be committed: its contents are outputs, and its
+# srcstamp/ directory grows one pair of files per build (the file is kept on disk as evidence; it
+# is just not part of the tree). Tracked files that already live under dist/ stay tracked - this
+# rule only stops NEW build output from showing up as untracked noise.
+dist/

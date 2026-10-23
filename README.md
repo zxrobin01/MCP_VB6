@@ -36,7 +36,7 @@ VB6 工程，并控制编译与运行。
   必须给出**机器可读的原因**而不是悄悄降级。
 - **人工复核程度不作保证**：请不要假设每一行都被人类逐行审阅过。用于生产或二次开发前请自行
   评估；发现问题请开 issue（见 CONTRIBUTING）。
-- **已知局限**：见「七、已知限制」，尤其是**本项目在中文版 VB6（zh-CN）上开发与验证**这一点。
+- **已知局限**：见「七、已知限制」，尤其是**端到端验证只在中文版 VB6（zh-CN）上做过；英文版能力上支持但未闭环**这一点。
 ## 为什么做这个（项目背景）
 
 VB6 在 2008 年就停止演进了，但它写的系统还在跑：工厂、财务、医院、政府内部系统里有大量
@@ -199,13 +199,13 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
 
 **插件面 120 个工具：必须有活的 IDE。** 它们全部由运行在 `VB6.EXE` 进程内的插件实现（读/改代码、静态检查、编译、断点、窗体、快照……），没有可执行的实例就没有执行者。**列出**工具可以在没有 IDE 时进行（hub 会用随包快照回 `tools/list`，标 `faceSource=snapshot`），但**调用**它们需要本机有活实例，或显式寻址一个有活实例的远端端点；没有活实例时的拒绝码见下一小节。
 
-**hub 面 10 个工具：在 IDE 进程之外运行，调用它们不需要加载插件**，但依赖各不相同：
+**hub 面 11 个工具：在 IDE 进程之外运行，调用它们不需要加载插件**，但依赖各不相同：
 
 - **完全不需要 IDE**（只读本机状态，或只读写本地 JSON 存储）：
   - `ide_list` —— 读本机实例登记表 + 端口扫描 + **已配置远端端点的探测状态**；一个实例都没有也照常回执（并说明原因与过期登记项）；
   - `ide_target` —— 只改 hub 自己的默认目标（本地状态，不碰 IDE）；
   - `list_lessons` / `add_lesson` / `delete_lesson` / `export_lessons` / `import_lessons_md` —— 只读写 `mcp_lessons/` 下的 JSON（写操作带 `.bak`）。
-- **需要一个目标实例才动手**：`ide_stop`（按 pid 停掉**本 hub 自己启动的**实例，绝不动外来实例）、`ide_restart`（恢复自有实例并验证就绪）。没有任何实例时它们回结构化拒绝，而不是假装成功（`ide_restart` 在「一个实例都没有」时回 `no_ide_running`）。
+- **需要一个目标实例才动手**：`ide_stop`（按 pid 停掉**本 hub 自己启动的**实例，绝不动外来实例）、`ide_restart`（恢复自有实例并验证就绪）、`ide_kill_and_relaunch`（管道 busy/wedged 时的带外复位：停自有实例、清注册、原工程重启并轮询就绪；绝不碰 8766/远端实例）。没有任何实例时它们回结构化拒绝，而不是假装成功（`ide_restart` 在「一个实例都没有」时回 `no_ide_running`）。
 - **不需要现有 IDE，但需要能启动 IDE 的条件**：`ide_start`（显式 `project` 或 `VB6MCP_AUTOSTART_PROJECT`，加一个可解析的 `VB6.EXE`；否则回 `not_implemented` / `vb6_exe_not_found` / `project_not_found`）。
 
 > 可离线运行的是 `tools/check_*` 那一组门禁；`tests/smoke_test.py` 与 `mcp_strict_audit` **必须**先打开 IDE 并加载插件 —— 它们不是离线自检。
@@ -318,13 +318,13 @@ URL: http://127.0.0.1:8767/mcp
 
 验证链路是否打通：`python tests/smoke_test.py --port <中间服务端口>`（该脚本**不发送 token**，只在服务端未配置凭据时可用；且需要**先打开 VB6 IDE 并加载插件** —— 这不是离线自检）。
 
-## 四、工具列表（插件面 120 + hub 面 10 = 130 个）
+## 四、工具列表（插件面 120 + hub 面 11 = 131 个）
 
 > 权威清单见 **`docs/TOOL_CATALOG.md`**（由运行中的 add-in 经 `tools/list` 导出，再并入 hub 自有工具），
 > 离线基线为 `tools/schema_baseline.json`，可用 `tools/check_live_tools.py docs/tools_schema.json` 做离线交叉比对。
 >
 > 工具来自**两个面**：**插件面 120 个**（`docs/tools_schema.json`，住在 VB6 IDE 进程内）与
-> **hub 面 10 个**（`bridge/hub_tools.json`，在 IDE 进程外）。下面按功能把两个面共 **130 个**工具分组，
+> **hub 面 11 个**（`bridge/hub_tools.json`，在 IDE 进程外）。下面按功能把两个面共 **131 个**工具分组，
 > 每个工具只出现一次：插件面分 16 类，hub 面见第 17 节；`关键参数` 一列直接取自各自的
 > `inputSchema`（必填参数在前），不是凭记忆写的。hub 面的 5 个经验库工具**无需 IDE 在线即可用**。
 
@@ -532,9 +532,9 @@ URL: http://127.0.0.1:8767/mcp
 | `set_addin_state` | 加载或卸载一个 IDE 插件 | `prog_id`, `connect` |
 | `quit_ide` | 退出 IDE，响应后延迟执行，未保存会丢 | - |
 
-### 17. hub 面：IDE 实例管理与经验库（10 个，在 IDE 进程之外运行）
+### 17. hub 面：IDE 实例管理与经验库（11 个，在 IDE 进程之外运行）
 
-这 10 个工具由 MCP hub（`bridge/vb6mcp_hub.mjs`）提供，**在 IDE 进程之外**运行：客户端不必先加载插件。其中 `ide_list`、`ide_target` 与 5 个经验库工具**不依赖任何 IDE**（经验库只读写本地 JSON）；`ide_stop` / `ide_restart` 需要**一个目标实例**，`ide_start` 需要**能启动 VB6 的条件**。逐项清单与两个拒绝码的前置条件见「二、连接模型」里的「哪些工具免 IDE、哪些必须有活 IDE」。
+这 11 个工具由 MCP hub（`bridge/vb6mcp_hub.mjs`）提供，**在 IDE 进程之外**运行：客户端不必先加载插件。其中 `ide_list`、`ide_target` 与 5 个经验库工具**不依赖任何 IDE**（经验库只读写本地 JSON）；`ide_stop` / `ide_restart` 需要**一个目标实例**，`ide_start` 需要**能启动 VB6 的条件**。逐项清单与两个拒绝码的前置条件见「二、连接模型」里的「哪些工具免 IDE、哪些必须有活 IDE」。
 
 - **经验库** `mcp_lessons/`：`defaults.json`（随包发布，勿改）+ `user.json`（用户层，按 id 覆盖/禁用/新增）。
   合并结果经 `initialize.instructions` 发布给客户端，agent 调工具前即可读到；`add/delete/import` 写 `user.json` 时带 `.bak` 备份。
@@ -545,9 +545,10 @@ URL: http://127.0.0.1:8767/mcp
 |------|----------|----------|
 | `ide_list` | 列出 hub 能寻址的**全部** VB6 IDE：本机实例 + **已配置的远端端点**（只探白名单、绝不自动发现；连不上也列出并带探测状态）；回报 pid/端口/工程、唯一身份（endpoint / targetKey / pathVia）、真实路径与登记表拼写，并回显解析到同一身份的**调用者别名**；含过期登记项与「同一身份两个实例」冲突 | - |
 | `ide_target` | 设置或清除默认 IDE 目标：pid、工程名或 auto | `target` |
-| `ide_start` | 按 .vbp 启动一个 VB6 IDE 实例 | `project` |
+| `ide_start` | 按 .vbp 启动一个 VB6 IDE 实例，并轮询到插件就绪（`ready` 才是真就绪） | `project`, `ready_wait_ms` |
 | `ide_stop` | 停止本 hub 启动的 IDE 实例（需要一个目标实例） | `pid`, `force` |
-| `ide_restart` | 重启卡死的自有 IDE 实例并证明已就绪（需要一个目标实例） | `pid`, `project` |
+| `ide_restart` | 重启卡死的自有 IDE 实例并证明已就绪（需要一个目标实例）；长重启可 `wait_ms` 到点回 `pending`+`opId`，再用 `opId` 续查（只查不重启） | `pid`, `project`, `opId`, `wait_ms` |
+| `ide_kill_and_relaunch` | 管道 busy/wedged 时的带外复位：只停本 hub 自有实例、清注册项、原 .vbp 重启并轮询就绪（不依赖插件管道） | `pid`, `project`, `ready_wait_ms` |
 | `list_lessons` | 列出经验条目：场景、陷阱、做法（hub 面，无需 IDE 在线） | `includeDisabled` |
 | `add_lesson` | 新增或覆盖一条用户经验，带备份（无需 IDE 在线） | `id`, `scenario`, `trap`, `do` |
 | `delete_lesson` | 删除用户经验，或禁用随包经验（无需 IDE 在线） | `id` |
@@ -587,10 +588,12 @@ URL: http://127.0.0.1:8767/mcp
 - 服务器接受连接时强制校验对端为 127.0.0.1（MSWINSCK.OCX 的 LocalIP 只读，
   无法在监听前绑定回环地址，故用接受时过滤实现），无鉴权——只信任本机进程。
 
-- **本地化**：本项目在**中文版 VB6（zh-CN）**上开发与验证。IDE 标题的模式标记、「立即」
-  窗口名、部分对话框按钮标题按中文匹配；英文版 VB6 显示 [Design]/Immediate 等，**模式识别
-  与部分弹窗流程可能失效**。宿主 bridge/ 侧是本地化无关的（只假设 VB98 目录名，各语言版本
-  一致）。详见本文件「七、已知限制」。
+### 本地化与英文版 IDE 支持
+
+- **结论**：英文版（en-US）VB6 在**能力上支持**，但**未做端到端实测**（我们的验证机是中文版 zh-CN，见本节末尾）。
+- **与语言无关的部分**：菜单/调试命令按 caption 匹配、忽略本地化 bar 名（`Start`/`Continue`/`End`、`Toggle Breakpoint`、`Step Into/Over`、`Run To Cursor`、`Start With Full Compile`、`Clear All Breakpoints` 等）；断点开关与调试命令的中英标题都在匹配表内；IDE 模式标记中英同集且大小写不敏感（`[设计]`/`[运行]`/`[Design]`/`[Run]`）；对话框按钮**控件 ID 优先、中英文本兜底**；运行时错误框的英文措辞（`RUN-TIME ERROR` / `RUNTIME ERROR`）已识别；注释/诊断语言**界面优先**（英文 IDE 得到英文注释）；hub/bridge 侧只假设 `VB98` 目录名，与语言无关。
+- **仍需注意**：个别流程的**窗口标题**匹配与少数弹窗仍以中文为基准；英文版首次使用建议先跑 `mcp_info` / `ide_state` / `command_bars{action:"list"}` 三条只读调用，确认工具面与状态。
+- **欢迎反馈**：若你在英文版（或其它语言版本）VB6 上使用，请报告 **tool 名 + 回执 + IDE 界面语言**——即使只是「可用/不可用」也是极有价值的贡献。
 
 ## 八、FAQ / 故障排查
 
@@ -711,6 +714,44 @@ URL: http://127.0.0.1:8767/mcp
 
 ---
 
+## hub 侧恢复原语与可靠性开关（v1.13 ~ v1.16）
+
+> 这一节从**用户视角**说明这批能力解决什么故障、什么时候用、回执里该看哪些字。逐字段契约见 `docs/CONTRACTS.md` 的 v1.13.0 ~ v1.16.5 版本行。
+
+1. **`ide_kill_and_relaunch`（v1.13.0，hub 侧、不依赖插件管道）** —— 管道 busy / wedged 时**唯一**的恢复原语：结束**本 hub 自有**的实例、清掉它的注册项、在原 `.vbp` 上重启并轮询就绪；只停 hub 自有实例，**绝不碰 8766、远端实例或别人启动的 IDE**。回执看 `ready` / `threeWay{http,mcpInfo,project}` / `ownership`；`ready:false` 只表示"进程已拉起但插件还没应答"，照 `howToProceed` 轮询 `ide_list`，不要重试 kill。
+   **为什么要它**：插件是单线程的，管道 busy 时连 `ide_state{release_inflight:true}` 都送不进去；以前唯一出路是人工 `Stop-Process` 再重开 IDE，现在一次调用即可，而且不动别人的实例。
+
+2. **`ide_restart` 的 `wait_ms` + `opId`（v1.14.0）** —— 重启可能比客户端超时长：`wait_ms` 限制**单次调用**阻塞多久，到点回 `pending:true + state:"in_progress" + opId`；拿 `opId` 再调 `ide_restart{opId}` 只查询、**不启动任何东西**（操作注册表保留 30 分钟，hub 重启即忘）。同一个 hub **同一时刻只允许一个重启**，进行中再调会被 `restart_in_progress` 拒绝。
+   **为什么要它**：重启实际已完成、客户端却只收到 `Request timed out`（无回执），调用方只能去查进程；盲目重试又会二次重启。
+
+3. **`ide_restart` 的 content 单 JSON 文档（v1.14.0）** —— `content[0].text` 现在是**一个** JSON 文档：数组/标量 body 变为 `{singleDocument:true, data, receipt}`（空结果 = `data: []`，与解析失败可区分），非 JSON body 给结构化 `content_not_json`，对象 body 维持扁平；`VB6MCP_LEGACY_TEXTBODY=1` 可临时回到旧两段式（只保留一个版本）。传输失败且 peer 可证已死时给 `peerState:"peer_dead"` + `lostContext` + `howToRecover[]`。
+   **为什么要它**：旧版把"JSON 数组 + 追加回执对象"拼成两段，严格客户端 `JSON.parse` 直接失败 —— `find_gui` 在无命中（`[]`）时甚至无法区分"空结果"与"解析失败"。
+
+4. **`build` / `make_project` 的离线路由（v1.13.0）** —— 没有活 IDE 时，`build` / `make_project(route!="ide")` / `project_meta` 由 hub 自己服务：`offline:true + offlineRoute:"cli"|"file" + targetResolved:false`，走独立的 `VB6.EXE /make`；不能启动编译器时回 `reason:"cli_unavailable"` + `howToProceed`，**不再**把"没有 IDE"当成 `target_mismatch`。0 实例时 `package_app`/`verify` 明确 `offlineServed:false + no_live_ide`，不假装离线可用。
+   **为什么要它**：离线编译是唯一能拿到真编译器日志的通道；以前 IDE 一关，`build` 仍被陈旧目标挡住，只能绕过 MCP 手跑 `/make`。
+
+5. **`verify` / `verify_scope` 的 `requireCompiler`（v1.16.0）** —— 默认 false 时回执逐字节不变；true 时要么给出**编译器权威**（`authority:"compiler"` + `errorCount` + `artifactChanged` + `compiler{...}`），要么结构化拒绝 `compiler_not_configured` + `compilerProbe{...}` + `howToProceed`，**永不用 lint 顶替编译**。
+   **为什么要它**：lint 只做词法与结构，曾对大模块报 49 个 error，而同一时刻 `/make` 是 0 error；把"疑似"当"编译结论"会给出与事实相反的假红。
+
+6. **`apply_edits` / `preview_edit` 多组件批量（v1.16.0，仍是同一个工具）** —— `edits[].component` 让一批编辑跨最多 40 个组件；`expected_shas[]` 任一不符即整批拒绝、一字节不写；顺序语义 = 按 `edits[]` 顺序、每条锚点在该组件**已更新文本**上解析；失败**全或无**回滚（`rolledBack` + `restoreVerified` + `restoredComponents[]`）；`max_ops` 默认 200 / 上限 1000。`preview_edit` 用同一形状按组件分组 hunks 且**什么都不写**。
+   **为什么要它**：跨文件改名/搬迁原来要十几次单组件调用，中间失败会留下"改了一半"的状态；多组件批量把一批编辑变成一个事务，且先 preview 能看清每处落地。
+
+7. **`breakpoints{action:"probe"}` 两阶段行为验证（v1.16.0）** —— 唯一能回答"这个断点到底生效吗"的通道：`phase:"start"`（默认）检查设计态 / 无模态框 / 可断行后**启动程序**（不保存、不写源码），回 `probeId + startedPending + howToContinue`；`phase:"observe"` 用同一 `probeId` 等停、读 `position` + `callstack`、End 并用回读证明 `stateAfter=design`。`probeId` 单次使用、TTL 600000 ms；`probeResult` 是闭合枚举。同一版里 `control_execution{mode:"end"|"stop"}` 在 RUN 态**不再假拒绝**（旧的 `commandbars_unavailable_while_running` 是伪拒绝），`programEnded:true` 只在 design 回读之后出现。
+   **为什么要它**：native 断点"记录成功但从不命中"，injected 断点写盘并两次搞死 IDE；只有真的跑一次、停在目标行，才能证明它有效。
+
+8. **`run_project` 的 observe 预算与完成标记（v1.15.0）** —— `observe_max_wait_ms`（默认 `timeout_ms`，夹取 1000..120000）到点**返回**：`state` 是封闭五值 `done-by-marker | exited | break | error | timeout`；`done_marker{path,contains}` 可在 IDE 机器（允许 UNC）上等一个文件标记，只读前 65536 字节、不写文件。★`timeout` 是 `ok:true + timeout:true + retrySafe:true + suggestedAction:"observe_again"`（**不是失败**）；break 态 observe 明确拒绝（`observe_in_break_not_supported`）；IDE 自己的查找框会被分类成 `observe_blocked_by_ide_dialog`，不再误报成程序错误。
+   **为什么要它**：回放 7 秒就结束，工具却报 `Request timed out` 并把管道留在 busy；完成标记让"已经跑完"可判定，而不是靠外部轮询。
+
+9. **`get_locals{allowUnsafeInBreak}`（v1.15.0）与 `last_error` 结构化错误（v1.16.3）** —— break 态 `get_locals` 默认**拒绝**（`break_eval_requires_opt_in`）；`true` 是知情同意，**不保证**不挂，恢复走 hub 的 `ide_kill_and_relaunch`。`last_error`（以及 `ide_state.lastError`）在错误框**仍然存在**时新增只读结构化字段 `err{number,description,source,hresult,numberBasis}` / `errBasis` / `errChannel{...}` / `errCrossCheck` / `errLocation{...}`；它**不抑制、不自动关闭、不无框读取**错误框，读不到的字段是 null + 原因，绝不猜。
+   **为什么要它**：break 态读局部变量可能把单线程管道 wedged，必须让调用方显式选择并知道恢复路径；错误框的本地化文本以前是唯一来源，读不到就只能外部截图。
+
+10. **`quit_ide` 的 `exitWrites`（v1.16.4）** —— `requested:true` 的回执新增 `exitWrites{declaration,observed,condition,evidence,basis}`：它是**声明**，不是测量（进程无法观测自身退出阶段）。`condition` 只按当前可见工程数判定：0 个工程 ⇒ `no_project_observed_no_write`（实测未写）；≥2 个工程 ⇒ `project_group_context_then_clean_quit`（约 250 ms 后出现 50~53 B 的 `.vbg`）；恰好 1 个 ⇒ `undetermined`（两个实测形状相反）。`sideEffects.filesWritten` 只覆盖调用期间，**不覆盖退出阶段**。
+   **为什么要它**：IDE 退出阶段可能写 `.vbg`，而工具既不能确认也不能阻止；与其给一个"没写"的假保证，不如把能观察到的条件、证据和不确定都写出来。
+
+> 以上能力**都不改变既有默认行为**（不传新参数 / 不用 probe / 不 requireCompiler 时，回执与旧版一致）；契约与冻结面变化见 `docs/CONTRACTS.md`。
+
+---
+
 ## `modMcpTrace` 是干什么的？必须要有吗？
 
 **① 它是干什么用的**：一个很小的标准模块，里面只有 `McpTrace` / `McpTraceOn` 两个过程（外加开关变量）。它只服务于 `inject_trace` —— 被注入的追踪调用最终落在它上面，负责把一行 JSON 写进追踪文件。
@@ -822,6 +863,4 @@ docs/tools_schema.json（工具面契约）与 tools/schema_baseline.json（冻�
 
 见 CONTRIBUTING.zh-CN.md（构建、注册、门禁、编码规则）。
 
-**第一优先是本地化**：本项目在**中文版 VB6** 上开发与验证，已知耦合点可枚举（见「七、
-已知限制」）。如果你在用英文版或其它语言版本，哪怕只报告「能用/不能用」也是极有价值
-的贡献。
+**本地化**：英文版 VB6 **能力上已支持**（菜单/调试命令按 caption 匹配、模式标记中英同集、对话框按钮控件 ID 优先、运行时错误框英文措辞已识别），但**尚未做端到端实测**（验证机为中文版 zh-CN）。欢迎英文版用户报告「哪条工具可用/哪条失败（附回执与 IDE 界面语言）」——即使只是「能用/不能用」也极有价值。

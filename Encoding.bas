@@ -89,6 +89,43 @@ Public Sub DecodeBytes(ByRef b() As Byte, ByVal enc As String, ByRef out As Stri
     MultiByteToWideChar cp, 0, VarPtr(b(p + off)), n - off, StrPtr(out), cch
 End Sub
 
+' R-1021-04 (item 4): THE decode rule for build text - the compiler log read by
+' Build.ReadLogAny and the source line quoted by firstError. A buffer is decoded as
+' UTF-8 ONLY when it is VALID UTF-8 (strict MultiByteToWideChar, no replacement);
+' everything else is decoded with the system ANSI codepage (936 on a Chinese
+' Windows, ACP elsewhere). This is what stops a UTF-8 message being decoded as GBK
+' and reaching a receipt as mojibake. Returns False + why when nothing decodes, so
+' a caller can report unreadable instead of printing garbage.
+Public Function DecodeUtf8OrAnsi(ByRef b() As Byte, ByRef out As String, ByRef encUsed As String, ByRef why As String) As Boolean
+    Dim n As Long, p As Long, cch As Long
+    out = ""
+    encUsed = ""
+    why = ""
+    DecodeUtf8OrAnsi = False
+    n = ByteCount(b)
+    If n <= 0 Then
+        why = "empty"
+        Exit Function
+    End If
+    p = LBound(b)
+    encUsed = DetectEncoding(b)
+    If encUsed = "empty" Then encUsed = "ansi"
+    ' utf-16be has no decoder here; ANSI at least keeps the byte order explicit
+    If encUsed = "utf-16be" Then encUsed = "ansi"
+    If encUsed = "utf-8" Then
+        ' STRICT re-check on the WHOLE buffer: a buffer that is not valid UTF-8 must
+        ' never take this branch, whatever DetectEncoding concluded.
+        cch = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, VarPtr(b(p)), n, 0, 0)
+        If cch <= 0 Then encUsed = "ansi"
+    End If
+    DecodeBytes b, encUsed, out
+    If Len(out) = 0 Then
+        why = "decode_empty:" & encUsed
+        Exit Function
+    End If
+    DecodeUtf8OrAnsi = True
+End Function
+
 Public Function BytesEqual(ByRef a() As Byte, ByRef b() As Byte, ByVal aOff As Long, ByVal bOff As Long, ByVal n As Long) As Boolean
     ' windowed byte compare between two Byte arrays (no StrConv detour).
     Dim i As Long
@@ -140,9 +177,20 @@ Public Function DecodeVerified(ByRef b() As Byte, ByRef encUsed As String, ByRef
         End If
         sk = 2    ' EncodeText re-emits the utf-16le BOM it consumed
     End If
-    DecodeBytes b, encUsed, out
+    ' R-1021-04 (item 4): the write/read-back path decodes through the SAME rule as
+    ' the log reader, and refuses (rather than silently disagreeing) if the rule and
+    ' the encoding it pre-computed diverge.
+    Dim decEnc As String
+    Dim decWhy As String
+    If Not DecodeUtf8OrAnsi(b, out, decEnc, decWhy) Then
+        why = "decode_failed:" & decWhy
+        Exit Function
+    End If
+    If decEnc <> encUsed Then
+        why = "decode_rule_mismatch:" & encUsed & "<->" & decEnc
+        Exit Function
+    End If
     If Len(out) = 0 Then
-        why = "decode_empty:" & encUsed
         Exit Function
     End If
     EncodeText out, encUsed, back
@@ -224,6 +272,32 @@ End Sub
 
 Public Sub ReadAllBytesTo(ByVal path As String, ByRef out() As Byte)
     Dim fnum As Integer, n As Long
+    ' R-1021-01: a READER must never create anything. MEASURED on the VB6
+    ' runtime with an independent probe EXE: "Open <path> For Binary Access
+    ' Read" on a MISSING file (parent directory present) does not raise at all -
+    ' LOF is 0 and a 0-byte file is now on disk. read_source therefore left
+    ' exactly that residue behind and then reported "empty or unreadable".
+    ' Probe with GetAttr BEFORE the Open. GetAttr is used ON PURPOSE instead of
+    ' CreateObject("Scripting.FileSystemObject"): it needs no COM runtime, it is
+    ' cheap (Sha256HexFile / verify hit this often), and above all it FAILS
+    ' CLOSED - a missing file is a definite Err 53, never "probe unavailable".
+    '   Err 53 (file not found)  -> return the empty array, WITHOUT issuing any Open
+    '   any other error (76 = a missing PARENT directory, permission, ...) -> restore
+    '   default error handling and let the old path run: it reports the failure
+    '   exactly as it always did.
+    ' The signature and the "missing/empty => empty array, no error" semantics are
+    ' unchanged on purpose: only the CREATE side effect is removed.
+    Dim attrProbe As VbFileAttribute
+    On Error Resume Next
+    Err.Clear
+    attrProbe = GetAttr(path)
+    If Err.Number = 53 Then
+        Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
     fnum = FreeFile
     On Error GoTo fail
     Open path For Binary Access Read As #fnum

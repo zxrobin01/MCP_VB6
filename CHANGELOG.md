@@ -5,11 +5,62 @@
 这里记录**用户能感知到的变更**：每次改了什么、**为什么改**。
 原则只有一条：**只写能从代码或提交里核实的事**；无法确认的历史宁可不写。文中不出现任何外部未开源产品的名字、私有工程名或维护者本机路径。
 
-**当前：产品 `0.3.0` · 契约 `v1.12.0` · 工具面 `120`（插件）+ `10`（hub）= `130`（客户端可见）** —— 产品版本来自 `Util.bas`（`initialize` 与 `mcp_info` 都会回显）；插件面住在 VB6 IDE 进程内，hub 面在进程外、**不开 IDE 也能用**；同一台机器上由**中间服务**（`bridge/vb6mcp_bridge.py`）持有**唯一一个 TCP 端口**（默认 `127.0.0.1:8767`，插件改走**命名管道**），MCP 客户端经 **hub**（`bridge/vb6mcp_hub.mjs`，stdio）接入，**配了凭据时 HTTP 面一律要 token**。契约版本是**工具面与回执的兼容性契约**（工具增删/描述变更会升它，`mcp_info` 的 `breaking[]`/`migrations[]` 列出会改变调用方式的变更）。本仓库**只发布源码**，`VB6MCP.dll` 需自行运行 `build.bat` 生成。另：`.vbp` 工程文件自身还有一个 `1.0.0` 的版本资源，与上面两个无关。
+**当前：产品 `0.3.0` · 契约 `v1.16.5` · 工具面 `120`（插件）+ `11`（hub）= `131`（客户端可见）** —— 产品版本来自 `Util.bas`（`initialize` 与 `mcp_info` 都会回显）；插件面住在 VB6 IDE 进程内，hub 面在进程外、**不开 IDE 也能用**；同一台机器上由**中间服务**（`bridge/vb6mcp_bridge.py`）持有**唯一一个 TCP 端口**（默认 `127.0.0.1:8767`，插件改走**命名管道**），MCP 客户端经 **hub**（`bridge/vb6mcp_hub.mjs`，stdio）接入，**配了凭据时 HTTP 面一律要 token**。契约版本是**工具面与回执的兼容性契约**（工具增删/描述变更会升它，`mcp_info` 的 `breaking[]`/`migrations[]` 列出会改变调用方式的变更）。本仓库**只发布源码**，`VB6MCP.dll` 需自行运行 `build.bat` 生成。另：`.vbp` 工程文件自身还有一个 `1.0.0` 的版本资源，与上面两个无关。
 
 本文件只记录**源码 / 功能**方面的改动；打包、发布与其它基础设施调整不在此列。
 
 ---
+
+## 2026-10-24
+
+### 01:35 · 契约 v1.16.5 · 版本说明补正：instructions 不再写死版本与工具数 · README 补 v1.13~v1.16（工具面零变化）
+
+**改了什么**：① `initialize.instructions` 的末条由硬编码 `v1.11.4 current (110 tools)` 改为动态拼接 `VB6MCP_CONTRACT_VERSION` 与 `Owner.ToolCount()`；同段标题由 `BREAKING (read before calling):` 改为 `HISTORICAL CONTRACT NOTES (oldest first; the authoritative breaking[] is in mcp_info):`（那 4 条是 v1.6~v1.11 时代的历史条款，不是当前 breaking）。② README 中英新增「hub 侧恢复原语与可靠性开关（v1.13 ~ v1.16）」章节（10 项），并把工具面口径修正为 120 + 11 = 131，补上 `ide_kill_and_relaunch` 与 `ide_start.ready_wait_ms` / `ide_restart.opId`·`wait_ms`。③ `Util.bas` 的契约常量 v1.16.4 → v1.16.5。④ README 中英新增「本地化与英文版 IDE 支持」小节，并把原「英文版可能失效 / 第一优先是本地化」的口径更正为「能力支持、未端到端验证」（只改文档）。工具面零变化：add-in 120 → 120、hub 11 → 11、DSH 面 131 → 131；无工具/参数/描述/schema 变化 ⇒ **冻结面不变、不重冻**。
+**为什么**：客户端在 `initialize` 里看到 "v1.11.4 current (110 tools)" 与当前 v1.16.4 / 120 自相矛盾；把版本与数量写成动态值，就不会再随版本漂移而陈旧。README 缺的这批能力恰恰是"出故障时怎么自救"的说明，不写出来用户只能自己试错。
+
+## 2026-10-23
+
+### 20:59 · 契约 v1.16.4 · quit_ide 退出阶段写盘改成「声明」· 契约戳横幅校正（无工具变化）
+
+**改了什么**：① `quit_ide` 在 `requested:true` 回执新增 `exitWrites{declaration,observed,condition,evidence,basis}`：它是**声明**不是测量（进程无法观测自身退出阶段）。`condition` 仅按当前可见工程数判定：0 个 ⇒ `no_project_observed_no_write`（实测未写）；≥2 个 ⇒ `project_group_context_then_clean_quit`（约 250 ms 后出现 50~53 B 的 `.vbg`）；恰好 1 个 ⇒ `undetermined`（两个实测形状相反）。`evidence` 为固定 4 项，`basis` 标注来源；`sideEffects.filesWritten` 只覆盖调用期间、**不覆盖退出阶段**。② 修正文档→生成物里的契约戳横幅（旧 v1.16.0 → v1.16.4）。工具面 add-in 120 / hub 11 / DSH 131 不变；仅 `quit_ide` 描述变更 ⇒ 冻结面显式重冻。
+**为什么**：IDE 退出阶段可能写 `.vbg`，工具既不能确认也不能阻止；与其给一个"没写"的假保证，不如把能观察到的条件、证据和不确定写出来。
+
+### 19:43 · 契约 v1.16.3 · last_error 的结构化错误通道（错误框还在时即可读）· 无工具变化
+
+**改了什么**：① `last_error` 与 `ide_state.lastError` 新增只读结构化字段 `err{number,description,source,hresult,numberBasis}` / `errBasis` / `errChannel{...}` / `errCrossCheck` / `errLocation`；数据来自纯进程内内存读取（`GetModuleHandleW` + `CopyMemory` 读异常记录），**不调用** `EbExceptionHandled`（实测它会清错误状态）。② 本批**不抑制、不自动关闭、不无框读取**错误框；读不到的字段给 null + 原因，`errLocation` 统一 `basis:"not_attempted"`（不发明行列）。工具面 ADDITIVE：add-in 120→120、hub 11→11、DSH 面 131→131；仅 1 个 description 变更 ⇒ 冻结面显式重冻（`tools_schema.json` == `schema_baseline.json` = `D2A3EF0D…`）。
+**为什么**：错误框的本地化文本以前是唯一来源，读不到就只能外部截图；结构化记录能在框还挂着时给出 number/description/source，同时明确划出"不做什么"的边界（不关框、不无框读、不猜行列）。
+
+### 18:38 · 契约 v1.16.2 · dirty-untitled 关闭默认拒绝 + open_project 成功面归一 + 断点台账落点固定
+
+**改了什么**：① `open_project{exclusive:true}` 与 `remove_project` 在"工程无盘上 `.vbp` 且未保存"时默认拒绝且**零写盘**（`dirty_untitled_would_write` + `zeroWriteBasis` 事后二次扫描自证）；组件级 dirty 必须读 `VBComponent.IsDirty`（`VBComponent.Saved` 对本机每个组件都抛 438）；opt-in 为两个工具各新增 `allowHostWrite`（默认 false）。② `open_project` 成功即 `ok:true`，非致命 IDE API 噪音只进 `apiWarnings[]`，不再占用 `apiError`。③ 断点注入台账默认写 `%TEMP%\vb6mcp\breakpoints.json`（可用 `VB6MCP_BP_REG_FILE` 覆盖），写入路径必须出现在 `sideEffects.filesWritten[]`。工具面 ADDITIVE：+2 可选参数，无工具增删、无 required 变化，2 个工具描述与 1 个参数描述变更 ⇒ 显式重冻。
+**为什么**：VB6 关闭"脏且无标题"工程时会把未保存工程写进 IDE 当前目录并覆盖同名文件，而 `VBProject.Saved` 只读 ⇒ 只能默认拒绝、让调用方显式 opt-in；`AddFromFile` 抛错但工程实际已打开会让成功面说谎；断点台账落在工程 CWD 会污染工作区。
+
+## 2026-10-22
+
+### 23:36 · 契约 v1.16.1 · 静息 CPU 降 84% · TIMERPROC 宿主 tick · add_component 回执不再说谎（工具面零变化）
+
+**改了什么**：① `add_component` 回执新增 `fileSyncSkipped` / `fileSyncSkippedDetail` / `failedAt` / `adoptedAfterError` / `adoptedVbError` / `adoptedNote`，新增失败原因 `add_component_failed`（旧 `add_component_vbp_failed` 仅保留在 component_file/vbp_sync 阶段），并修正 `vbError` 语义（旧值恒为 `"0:"`，现为真实 `Number:Description`）。工具面 120/11/131 不变、schema 未变（不重冻）。② 功能侧：静息 CPU 0.281% 总 / 0.231% 稳态（改造前 1.797% / 1.781%）；默认宿主 tick 由 VB6 Timer 控件改为 Win32 `TIMERPROC`（长调用期间 progress 帧 3–15）；bridge 对数组/标量 body 改为单文档 `{singleDocument,data,receipt}`（修 `find_gui` / `vba6_probe_plan` / `audit_tail`）；hub 面检测改为注册表文件轮询。
+**为什么**：空闲轮询把宿主 CPU 拉到近 2%，长调用还会饿死进度帧；add_component 把"跳过文件同步"写成成功、并保留恒为 `"0:"` 的 vbError，会让调用方把失败读成成功。
+
+### 14:01 · 契约 v1.16.0 · 断点行为验证（两阶段 probe）· RUN 态 End 去伪拒绝 · verify 编译器权威 · 多组件批量编辑
+
+**改了什么**：① `breakpoints{action:"probe"}` 两阶段：`phase:"start"` 判设计态/无模态框/可断行后**启动程序**（不保存、不写源码）回 `probeId + startedPending`；`phase:"observe"` 用同一 `probeId` 等停、读 `position`+`callstack`、End 并用回读证明 `stateAfter=design`；`probeId` 单次、TTL 600000，`probeResult` 是闭合枚举，`phase:"auto"` 只是 start 别名。② `control_execution{mode:"end"|"stop"}` 在 RUN 态**不再假拒绝**（旧的 `commandbars_unavailable_while_running` 是伪拒绝），`programEnded:true` 只在 design 回读之后出现。③ `verify` / `verify_scope` 新增可选 `requireCompiler`（默认 false 逐字节不变；true 要么给编译器权威，要么结构化拒绝 `compiler_not_configured`，**绝不用 lint 顶替**）。④ `apply_edits` / `preview_edit` 多组件批量：`edits[].component`、`expected_shas[]`、40 组件 / 1000 ops 上限、全或无回滚，`preview_edit` 按组件分组 hunks 且**什么都不写**。工具数 120/11/131 不变；+7 可选参数、`breakpoints.action` 枚举 +probe、9 个描述变更、`apply_edits`/`preview_edit` 的 required 由 `["name","edits"]` 变为 `["edits"]`；本版已重冻。
+**为什么**：native 断点"记录成功但从不命中"、injected 断点写盘并两次搞死 IDE —— 只有真跑一次、停在目标行，才能证明它有效；lint 是词法/结构，曾对大模块报 49 error 而同刻 `/make` 0 error，必须让编译器做权威；跨文件改名原来要十几次单组件调用、中途失败会留下"改了一半"的状态。
+
+### 10:02 · 契约 v1.15.0 · run_project 的 observe 预算与完成标记 · get_locals 知情同意（插件面 +3 可选参数）
+
+**改了什么**：① `run_project.observe_max_wait_ms`（默认 `timeout_ms`，夹取 1000..120000）到点**返回**：`state` 是封闭五值 `done-by-marker|exited|break|error|timeout`；`timeout` 是 `ok:true + timeout:true + retrySafe:true + suggestedAction:"observe_again"`（**不是失败**），`pipeReleasedByReturn:true` 不再长期持门。② `run_project.done_marker{path,contains}`：路径在 IDE 所在机器（可 UNC），只读前 65536 字节、不写；`contains` 大小写敏感，非 ASCII 同时尝试 UTF-8 与 ANSI；`done-by-marker` 仅当 `marker.matched:true`，请求了但未命中给 `marker.unmet:true`。③ break 态 observe 拒绝（`observe_in_break_not_supported`）；`#32770` 分类：只有运行时错误框算 `program_error`，IDE 自己的查找/替换框给 `observe_blocked_by_ide_dialog`。④ `get_locals.allowUnsafeInBreak`（默认 false）：break 态默认拒绝 `break_eval_requires_opt_in`；true 是知情同意、**不保证**不挂，恢复走 hub 的 `ide_kill_and_relaunch`，失败回执带 `gateReleased`+`howToRecover`。工具名/工具数不变（120/11/131）；本版冻结面未改，v1.16.0 关闭该滞后。
+**为什么**：回放 7 秒结束却报 `Request timed out` 并把管道留在 busy；完成标记让"已经跑完"可判定；break 态读局部变量可能 wedged 单线程管道，必须让调用方显式同意并知道恢复路径。
+
+### 10:02 · 契约 v1.14.0 · ide_restart 可续查 + content 单 JSON 文档 + peer_dead
+
+**改了什么**：① `ide_restart` 新增 `wait_ms`（单次调用阻塞上限，默认 25000，夹取 1500..300000）与 `opId`（续查）；**超时不是失败**：回 `pending:true + state:"in_progress" + opId + currentStep + lastKnownState`，重启继续在后台进行；`ide_restart{opId}` 只查进程内操作注册表（保留 30 分钟）且**不启动任何东西**；同一时刻只允许一个重启，进行中再调回 `restart_in_progress + inProgress`。每条回执新增 `opId/started/state/finished/elapsedMs/currentStep/lastKnownState/opRule`。② `content[0].text` 改为**单个 JSON 文档**：数组/标量 body 变 `{singleDocument:true,data,receipt}`（空 = `data: []`），非 JSON body 给 `content_not_json`，对象 body 维持扁平；`VB6MCP_LEGACY_TEXTBODY=1` 只保留旧两段式一个版本。③ 传输失败且 peer 可证已死时给 `peer_dead` / `lostContext` / `howToRecover`。工具面仅 hub 的 `ide_restart` 变化（+2 可选参数），add-in 120 / hub 11 / DSH 131 不变。
+**为什么**：重启实际完成、客户端却只收到无回执的 30 s timeout，调用方只能外部查 pid；盲目重试会二次重启。"JSON 数组 + 追加回执对象"的两段式让严格客户端 `JSON.parse` 失败，空结果与解析失败也无法区分。
+
+### 10:02 · 契约 v1.13.0 · 目标解析与离线路由分离 + ide_start 就绪 + hub 带外复位（新增 1 个 hub 工具）
+
+**改了什么**：① 默认目标阶梯**只从活实例选**：discovery 后复核 pid/transport 丢弃已死候选，hub 陈旧记录不再能成为默认目标；显式 `_target` 指向死 pid 时 `target_mismatch` 带 `onlinePids[]` / `targetDiagnostic` / `howToProceed` / `suggestion`；0 活实例时 IDE 面工具回 `no_live_ide`（`reasonLegacy:"no_ide_running"`），不再出现 pid 级 target_mismatch。② **离线路由**：`build` / `make_project(route!="ide")` / `project_meta` 在无活 IDE 时由 hub 自服务（`offline:true + offlineRoute:"cli"|"file" + targetResolved:false`），独立 `VB6.EXE /make`，编译后补 LAA 并回读、**所有改写之后**才取 `artifact{exists,bytes,mtime,sha256}`+`artifactChanged`（`hashedAfterRewrites`+`rewriteSteps[]`）；不能启动编译器回 `cli_unavailable`；`package_app`/`verify` 明确 `offlineServed:false + no_live_ide`。③ `ide_start`：`ok:true+started:true` 只声明**进程已创建**，`ready:true` 才表示观测到 add-in 对同一 pid 应答 `mcp_info`（有上限的轮询，非固定 sleep）；超时回 `ready:false + readyWaitMs + readyChecks{...} + pollingHint`；同 `.vbp` 已打开则复用。④ 新增 hub 工具 `ide_kill_and_relaunch`：不依赖插件管道，结束**本 hub 自有**实例、清注册、原工程重启并轮询就绪；回执 `stoppedPid/newPid/ready/readyWaitMs/threeWay{...}`；非自有 / 已知端口 <8767（含 8766）/ 远端实例一律拒绝。工具面：add-in 120→120，hub 10→11，DSH 面 130→131。
+**为什么**：IDE 全关时 `build` 仍被陈旧 pid 挡住（离线编译是唯一能拿真编译器日志的通道）；`ide_start` 返回 pid 后立即调用却 `target_mismatch`（约 10~15 s 注册空窗）；管道 busy 时连 `release_inflight` 都送不进去，只能人工 Stop-Process —— 这三件事都需要 hub 侧有"只认活实例 + 带外复位"的能力。
 
 ## 2026-10-20
 

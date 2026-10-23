@@ -174,3 +174,23 @@ false statement.  What replaces it:
 in the IDE - so TLS and source restriction are the floor, not the ceiling.  A deny-first tool allowlist
 makes a forgotten entry fail CLOSED instead of quietly shipping the write face to the network, and the
 audit log is what makes an incident attributable at all.
+
+## 11. Per-bridge credentials (2026-10-21, three-tier hub) - one token per configured bridge
+
+The hub can talk to SEVERAL middle services (the local slot from `VB6MCP_BRIDGE_URL` plus every
+entry of `VB6MCP_BRIDGES`).  Each remote bridge has its OWN credential, so the rule is about
+WHERE a credential may be presented, not just whether one exists:
+
+| concern | rule |
+|---|---|
+| source of truth | the local slot keeps `VB6MCP_TOKEN`/`VB6MCP_TOKEN_FILE` (unchanged); a `VB6MCP_BRIDGES[]` entry carries `tokenFile`, read once at startup |
+| presentation | a bridge token is attached ONLY to requests whose base URL equals THAT bridge's configured `url` (normalized). It is never sent to another host, and the hub never retries a 401 with a different credential |
+| a shared URL | two bridge names pointing at ONE url are a CONFIG ERROR (`duplicate_bridge_url`) and the duplicate is ignored: one URL must not lend one bridge's credential to another |
+| failure shape | a 401 from a bridge is `endpoint_auth_failed` (failureKind `toolError`, suggestedAction `fix_params`, retrySafe false) - NEVER "unreachable", and nothing is forwarded |
+| receipt hygiene | a receipt may say `token{configured,source,length,fileConfigured,error}`; the VALUE is never logged, never echoed and never copied into a child environment |
+| discovery | which bridges exist, their probe state and whether their token file is readable are visible in `ide_list.bridges[]`; a failing bridge is kept, never silently dropped |
+| known weakness | a token file readable by another local user is still game over for THAT bridge (same T1 note as section 9); the file is the operator's responsibility, the hub only refuses to spread it |
+
+The unattended relay case (a portproxy that terminates on loopback) is deliberate: the bridge still
+sees a loopback peer and applies the loopback tier, while the HUB is the component that decides
+which bridge a call belongs to and presents that bridge's credential.

@@ -254,7 +254,115 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 '     Six new tools had emitted "required":{} (an empty Dictionary passed where a
 '     list belonged); the schema builder now coerces/refuses that shape, so a
 '     JSON-Schema validator can never be handed a non-array required again.
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.12.0"
+' v1.12.1 (identifier legality measured, not assumed; tool face unchanged, not re-frozen):
+'   * E112 used ONE flat list of ~110 words and reported every use of any of them, so legal
+'     identifiers such as Dim name / Dim left / Dim mid / Dim time / Sub Property() were
+'     flagged. The list is replaced by measured classes: HARD_FORBIDDEN (rejected in every
+'     position the lint checks - still reported), POSITION_RULES (illegal only in positions
+'     the lint does not check, e.g. "property" as a module variable or a public class
+'     field - no longer reported) and INTRINSIC_OK (intrinsic names the compiler accepts -
+'     never reported).
+'   * The data comes from a compiler-measured matrix: 264 words x 11 syntactic positions,
+'     one minimal project per case, VB6.EXE /make (evidence/kw/matrix.tsv + summary.md).
+'     E112 fires only where the word was measured rejected. 17 former false-positive words
+'     are gone; 47 genuinely reserved words the old list missed are now covered (all of them
+'     fail to compile, so no compiling code is affected).
+'   * No tool, parameter or description change: tools/list is byte-identical; FACE_DELTA none.
+' v1.12.2 (R-1021-02: run/step disk writes become observable, replayable and
+' consent-gated; ONE new optional parameter; receipts additive):
+'   * control_execution / run_project accept allowDiskMutation (boolean, default
+'     false). Starting from DIRTY memory (VBProject.Saved=False or a component
+'     IsDirty=True) is REFUSED with reason="dirty_memory_would_be_saved" unless
+'     the caller passes true; the refusal carries the dirty component list and
+'     howToProceed. dirtyUnknown (flags unreadable) never refuses.
+'   * both tools snapshot the project files (.vbp + every component file + a
+'     paired .frx/.res) BEFORE the pre-run flush and AFTER the Start, and publish
+'     diskWrites[{file,beforeBytes,afterBytes,beforeSha,afterSha,
+'     reason:"pre-run-save",attribution}] (attribution: mcp_pre_run_flush |
+'     ide_auto_save | unknown), touchedFiles[] (mtime/size moved, digest same),
+'     diskSnapshot{hashMode,budgetBytes,checkedFiles,snapshotMs,taken} and
+'     checkedFiles. Full SHA on both sides up to 32 MiB; above that the mode
+'     degrades to "gated" and an un-taken digest is "" plus a reason.
+'   * saveOnRun means "THIS CALL itself writes the IDE memory to disk" (true only
+'     for the run/full_compile pre-run flush, with
+'     saveOnRunReason="mcp_pre_run_flush"); ideAutoSaveHint="may_save_on_start" is
+'     ALWAYS present next to it, plus ideAutoSaveMode/ideAutoSaveReadFrom (a
+'     READ-ONLY registry probe, never written). saveOnRun:false is NOT a promise
+'     that the disk did not change - the IDE option can still save on Start.
+'   * restart reports saveOnRun:false + deferredStart.pending:true; the deferred
+'     Start's own disk effect is completed after the fact and emitted as
+'     deferredStart{...} on the NEXT tools/call receipt (never silently dropped).
+'   * debug_session / run_until_break also START the program, so their receipts
+'     carry saveOnRun:false + ideAutoSaveHint/ideAutoSaveMode as a HINT ONLY: no
+'     parameter and no refusal was added there.
+'   * The IDE option itself is documented (position, three values, manual steps);
+'     this add-in never changes it.
+' v1.13.0 (target resolution vs offline routing; readiness; hub-side out-of-band reset):
+'   * The hub resolves a default target from LIVE instances only (a dead or stale candidate is
+'     dropped before the ladder runs), and a target failure now names onlinePids[],
+'     howToProceed[] and targetDiagnostic{reason,...}; 0 live instances answer reason=no_live_ide
+'     (reasonLegacy=no_ide_running) instead of a pid-level target_mismatch.
+'   * build / make_project(route=cli) / project_meta are served OFFLINE by the hub when no IDE is
+'     live: an independent VB6.EXE /make subprocess, LAA applied AFTER the compile, and the
+'     artifact hash taken AFTER every rewrite.
+'   * ide_start reports ready / readyWaitMs / readyChecks / pollingHint (the add-in is POLLED; a
+'     fixed sleep is never a readiness test) and accepts an OPTIONAL ready_wait_ms.
+'   * new HUB tool ide_kill_and_relaunch (add-in independent): stop an instance THIS hub owns,
+'     clear its registration, relaunch it on the same .vbp and poll for readiness.
+'   * ADDITIVE for the add-in face: no add-in tool and no add-in parameter changed (120 tools).
+' v1.14.0 (hub face only: a CONTINUABLE restart operation + one-JSON-document content channel):
+'   * ide_restart accepts two OPTIONAL hub-side parameters: wait_ms (bound how long ONE call
+'     blocks) and opId (continue/poll an operation a previous call returned). A restart that
+'     outlives wait_ms answers pending:true + state="in_progress" + opId instead of looking like
+'     a failure, and a SECOND restart while one is in flight is refused with
+'     reason="restart_in_progress" (it could stop the process the first one just started).
+'   * every ide_restart receipt carries opId/started/state/finished/elapsedMs/currentStep/
+'     lastKnownState/opRule; ide_restart{opId} reads the in-process operation registry and starts
+'     NOTHING (30 minute TTL, not persisted across a hub restart).
+'   * content[0].text is ONE JSON document: an array/scalar body is {singleDocument:true, data,
+'     receipt:{...}} (an empty result is data:[]) and a non-JSON body is a structured
+'     content_not_json document. Object bodies keep their existing FLAT shape.
+'   * a transport-failure envelope adds peerState="peer_dead" when the peer process is PROVABLY
+'     gone (lostContext + howToRecover point at the hub-side reset, not at a taskkill).
+'   * ADDITIVE for the add-in face: no add-in tool and no add-in parameter changed (120 tools).
+' v1.15.0 (add-in face: bounded observe with a decidable state, and a get_locals break opt-in):
+'   * run_project gains two OPTIONAL parameters: observe_max_wait_ms (integer ms, default
+'     timeout_ms, clamped 1000..120000) and done_marker (object {path, contains}; path is on the
+'     machine that runs the IDE; the first 65536 bytes are read as bytes and nothing is written;
+'     contains is CASE-SENSITIVE). The budget is enforced INSIDE the wait loop: when it expires the
+'     call RETURNS with state=timeout, ok:true, timeout:true, retrySafe:true, suggestedAction=observe_again,
+'     the measured elapsedMs, and (if a marker was requested but never matched) marker.unmetReason =
+'     "budget reached before the marker appeared" - NOT a failure and NOT the goal being reached.
+'     state is a CLOSED five-value set: done-by-marker | exited | break | error | timeout; done-by-marker
+'     implies marker.matched:true. pipeReleasedByReturn:true, so the single-flight gate is not held.
+'   * observe in BREAK state is REFUSED with reason=observe_in_break_not_supported; a #32770 dialog
+'     is CLASSIFIED first (only a runtime-error box is program_error; an IDE Find/Replace dialog is
+'     ide_own_dialog and answers observe_blocked_by_ide_dialog, NEVER an error).
+'   * get_locals in BREAK state is REFUSED with reason=break_eval_requires_opt_in unless the new
+'     OPTIONAL allowUnsafeInBreak:true is passed (informed consent: it does NOT guarantee that a
+'     statement will not hang; recover with the hub-side ide_kill_and_relaunch, not taskkill). Every
+'     failure receipt carries gateReleased + howToRecover.
+'   * FROZEN FACE LAG (deliberate): the two freeze artifacts of the add-in face are NOT rewritten in
+'     this version - they are re-frozen only after the new DLL is deployed to a live IDE.
+' v1.16.0 (add-in face: behavioural breakpoint verification exposed, and an OPTIONAL compiler-authority demand):
+'   * breakpoints{action:"probe"} is now part of the tool face. The VBIDE exposes no breakpoint API, so the
+'     only honest verification of a breakpoint is behavioural: the probe REALLY STARTS the program (design
+'     state and no modal box required), waits up to timeout_ms (default 15000, capped 120000) for a stop,
+'     reads position/proc/line/callstack, and ALWAYS ends the program. probeResult is decided by the RUN
+'     (stopped_at_target | stopped_elsewhere | did_not_stop | timeout | run_failed), and the receipt adds
+'     target / stateBefore / stateAfter / elapsedMs / probeCleanup / diskWrites / touchedFiles. It never
+'     saves the project and never writes the source.
+'   * verify / verify_scope gain ONE OPTIONAL parameter, requireCompiler (boolean, default false).
+'     false = the receipt is byte-for-byte the previous one. true = DEMAND compiler authority: an isolated
+'     VB6.EXE /make over a COPY of the project's DISK files must produce a real log. When the compiler
+'     cannot be resolved, cannot be started, writes no log or is killed at the budget, the call is REFUSED
+'     with ok:false + a structured reason + compilerProbe{resolved,path,why} + howToProceed, and a lint
+'     verdict is NEVER substituted. On success the receipt adds authority="compiler" and
+'     compiler{path,logPath,errorCount,artifactChanged,compiledFrom}.
+'   * the new DLL is built from the SAME project: no tool was added or removed (add-in 120 -> 120; hub and
+'     DSH-facing tool counts are unaffected by this add-in-face change). The freeze artifacts are
+'     re-frozen only after the new DLL is deployed to a live IDE.
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.16.5"
 ' message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
@@ -269,6 +377,10 @@ Private m_pumpDepth As Long
 Private m_pumpCount As Long
 Private m_pumpMs As Long
 Private m_pumpMaxMs As Long
+' R-1021-03 A3: the in-flight call's cancel/ceiling hook (CodeTools.PumpHook).
+Private m_abortSink As Object
+Private m_abortTag As String
+Private m_abortAt As Long
 ' the ONE gate for the whole pump class. A host modal box that is UP means a
 ' DoEvents here can dispatch a POSTED host command and enter the host's modal loop -
 ' measured in: the add-in then never returns, no watchdog tick is delivered
@@ -288,6 +400,7 @@ Private m_gateTitle As String
 ' this module changed. (The other five collections live in CodeTools.cls because only
 ' CodeTools creates components / renames them / removes them / writes undo snapshots.)
 Public g_seBackups As Collection
+
 
 Public Sub LogLine(ByVal msg As String)
     On Error Resume Next
@@ -1201,6 +1314,33 @@ Public Sub PumpReset()
     m_pumpLastAt = PumpTickCount()
 End Sub
 
+Public Sub SetAbortSink(ByVal sink As Object)
+    Set m_abortSink = sink
+End Sub
+
+Public Sub ClearAbortSink()
+    Set m_abortSink = Nothing
+End Sub
+
+Public Sub RequestAbort(ByVal tag As String)
+    If Len(tag) = 0 Then Exit Sub
+    m_abortTag = tag
+    m_abortAt = PumpTickCount()
+End Sub
+
+Public Function AbortPending() As Boolean
+    AbortPending = (Len(m_abortTag) > 0)
+End Function
+
+Public Function AbortTag() As String
+    AbortTag = m_abortTag
+End Function
+
+Public Sub ClearAbort()
+    m_abortTag = ""
+    m_abortAt = 0
+End Sub
+
 Public Sub MaybePump()
     ' A pump inside a pump must never happen.
     If m_pumpDepth > 0 Then Exit Sub
@@ -1223,6 +1363,9 @@ Public Sub PumpNow()
     Dim t0 As Long
     t0 = PumpTickCount()
     m_pumpLastAt = t0
+    ' R-1021-03 A3: CHECK BEFORE THE GATE. Cooperative cancel and the call's own
+    ' ceiling are evaluated at EVERY generic pump point.
+    If Not m_abortSink Is Nothing Then m_abortSink.PumpHook
     ' ==== THE ONE GATE ====
     ' A host modal box that is UP turns DoEvents into the wedge path: the pump dispatches
     ' whatever the host has POSTED (measured VB6's File>Make command arriving that
@@ -1568,4 +1711,368 @@ Private Function UtilTrimSep(ByVal p As String) As String
         If Right$(s, 1) = "\" Then s = Left$(s, Len(s) - 1) Else Exit Do
     Loop
     UtilTrimSep = s
+End Function
+
+' =====================================================================
+' R-1021-01: the ONE structured "input file does not exist" envelope and the
+' path probes the read tools share.  Nothing in this section writes: every
+' member answers from a read-only existence probe, so a missing path can never
+' reach an Open statement (see Encoding.ReadAllBytesTo, whose Open is what used
+' to create the 0-byte residue).
+' =====================================================================
+Public Function UtilIsAbsolutePathShape(ByVal p As String) As Boolean
+    UtilIsAbsolutePathShape = False
+    If Left$(p, 4) = "\\?\" Then UtilIsAbsolutePathShape = True
+    If Left$(p, 4) = "\\.\" Then UtilIsAbsolutePathShape = True
+    If Len(p) >= 2 Then
+        If Mid$(p, 2, 1) = ":" Then UtilIsAbsolutePathShape = True
+    End If
+    If Left$(p, 2) = "\\" Then UtilIsAbsolutePathShape = True
+    If Left$(p, 2) = "//" Then UtilIsAbsolutePathShape = True
+End Function
+
+Public Function UtilFileExistsAt(ByVal p As String) As Boolean
+    UtilFileExistsAt = False
+    If Len(p) = 0 Then Exit Function
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    UtilFileExistsAt = CBool(fso.FileExists(p))
+    Err.Clear
+End Function
+
+Public Function UtilFolderExistsAt(ByVal p As String) As Boolean
+    UtilFolderExistsAt = False
+    If Len(p) = 0 Then Exit Function
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    UtilFolderExistsAt = CBool(fso.FolderExists(p))
+    Err.Clear
+End Function
+
+Public Function UtilParentFolderOf(ByVal p As String) As String
+    UtilParentFolderOf = ""
+    If Len(p) = 0 Then Exit Function
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    UtilParentFolderOf = fso.GetParentFolderName(p)
+    Err.Clear
+End Function
+
+' The structured refusal a READ tool answers when the requested file does not
+' exist.  attemptedPath is always the ABSOLUTE resolved path; pathsTried lists
+' the raw spelling first (+ the resolved one when they differ), and
+' created:false / sideEffects make the zero-write guarantee checkable by the
+' caller instead of promised in prose.
+Public Function InputFileMissingJson(ByVal toolName As String, ByVal rawPath As String, _
+        ByVal resolvedPath As String, ByVal parentExists As Boolean, ByVal pathIsDirectory As Boolean) As String
+    Dim d As Object, tried As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Set tried = New Collection
+    d("ok") = False
+    d("tool") = toolName
+    d("reason") = "file_not_found"
+    d("attemptedPath") = resolvedPath
+    d("rawPath") = rawPath
+    If Len(rawPath) > 0 Then tried.Add rawPath
+    If Len(resolvedPath) > 0 Then
+        If StrComp(rawPath, resolvedPath, vbTextCompare) <> 0 Then tried.Add resolvedPath
+    End If
+    Set d("pathsTried") = tried
+    d("fileExists") = False
+    d("pathIsDirectory") = pathIsDirectory
+    d("parentExists") = parentExists
+    d("created") = False
+    d("sideEffects") = "none: nothing was created, deleted or opened for write"
+    d("suggestedAction") = "check the path spelling; a relative path resolves against the open project's directory, so pass an absolute path when in doubt"
+    InputFileMissingJson = JsonStringify(d)
+End Function
+' =====================================================================
+' R-1021-02: READ-ONLY probe of the VB6 IDE option "When a program starts"
+' (Tools > Options > Environment). Storage measured on the live box
+' (2026-10-21): HKCU\Software\Microsoft\Visual Basic\6.0\SaveBeforeRun (REG_SZ)
+'   "0" = Don't Save Changes, "1" = Prompt, "2" = Save Changes.
+' THIS ADD-IN NEVER WRITES THAT VALUE. It only reads it so a receipt can say
+' WHICH IDE state was in force when a program was started.
+' =====================================================================
+Public Function IdeSaveBeforeRunMode(ByRef outRaw As String, ByRef outReadable As Boolean, ByRef outNote As String) As String
+    IdeSaveBeforeRunMode = "unknown"
+    outRaw = ""
+    outReadable = False
+    outNote = ""
+    On Error Resume Next
+    Dim sh As Object
+    Set sh = CreateObject("WScript.Shell")
+    If sh Is Nothing Then
+        outNote = "registry probe unavailable: WScript.Shell could not be created"
+        Exit Function
+    End If
+    outRaw = CStr(sh.RegRead("HKCU\Software\Microsoft\Visual Basic\6.0\SaveBeforeRun"))
+    If Err.Number <> 0 Then
+        Err.Clear
+        outNote = "SaveBeforeRun is not readable (missing value or no access); the IDE option state is UNKNOWN. This add-in never writes it."
+        Exit Function
+    End If
+    outReadable = True
+    Select Case Trim$(outRaw)
+        Case "0"
+            IdeSaveBeforeRunMode = "dont_save"
+        Case "1"
+            IdeSaveBeforeRunMode = "prompt"
+        Case "2"
+            IdeSaveBeforeRunMode = "save"
+        Case Else
+            IdeSaveBeforeRunMode = "unknown"
+            outNote = "SaveBeforeRun carries an unrecognised value '" & outRaw & "' (measured mapping: 0=dont_save, 1=prompt, 2=save)"
+    End Select
+    Err.Clear
+End Function
+
+Public Function PumpAbortDue() As Boolean
+    PumpAbortDue = False
+    If m_abortSink Is Nothing Then Exit Function
+    On Error Resume Next
+    Dim tag As String
+    tag = m_abortSink.PumpQuery()
+    If Len(tag) > 0 Then
+        m_abortTag = tag
+        m_abortAt = PumpTickCount()
+        PumpAbortDue = True
+    End If
+    Err.Clear
+End Function
+
+
+' ---------------------------------------------------------------------------
+' R-1021-04: BUILD ROUTING PREFLIGHT - is this .vbp held by a VB6 process?
+'
+' An isolated VB6.EXE /make against a project a VB6 IDE already holds exits 0,
+' writes no /out log and produces no artifact: a silent failure. This read-only
+' probe stops the build BEFORE the compiler is launched. Two sources:
+'   (1) the add-in instance registry (%TEMP%\vb6mcp\instances\*.json): our own
+'       live IDE publishes projectPath; an entry whose pid is provably dead is
+'       ignored (UtilPidAlive fails closed towards ALIVE);
+'   (2) a best-effort WMI scan of VB6.EXE command lines, which also covers an
+'       IDE that runs without this add-in. When WMI cannot be queried the
+'       result says so instead of guessing.
+' Returns a Dictionary: held, holderPid, holderKind, evidence, projectPath,
+' sources (registry/wmi state strings), note.
+Public Function BuildHolderInfo(ByVal vbpPath As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("held") = False
+    d("holderPid") = 0
+    d("holderIsSelf") = False
+    d("holderKind") = ""
+    d("evidence") = ""
+    d("projectPath") = vbpPath
+    d("sources") = "registry=no wmi=no"
+    d("note") = ""
+    If Len(vbpPath) = 0 Then
+        d("note") = "empty project path: nothing to probe"
+        Set BuildHolderInfo = d
+        Exit Function
+    End If
+    Dim want As String
+    want = UtilNormPathForCompare(vbpPath)
+    ' ---- (1) instance registry -------------------------------------------------
+    On Error Resume Next
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then
+        d("sources") = "registry=unavailable wmi=no"
+    Else
+        Dim dirPath As String
+        dirPath = InstancesDir()
+        If Not fso.FolderExists(dirPath) Then
+            d("sources") = "registry=missing wmi=no"
+        Else
+            Dim f As Object
+            For Each f In fso.GetFolder(dirPath).Files
+                If LCase$(Right$(f.Name, 5)) = ".json" Then
+                    Dim txt As String
+                    txt = UtilReadTextFile(f.Path)
+                    Dim pp As String
+                    pp = UtilJsonStrMember(txt, "projectPath")
+                    If Len(pp) > 0 Then
+                        If UtilPathEq(pp, want) Then
+                            Dim ipid As Long
+                            ipid = UtilJsonNumMember(txt, "pid")
+                            If ipid > 0 Then
+                                If UtilPidAlive(ipid) Then
+                                    d("held") = True
+                                    d("holderPid") = ipid
+                                    d("holderIsSelf") = (ipid = UtilProcessId())
+                                    d("holderKind") = "registry"
+                                    d("evidence") = "instance registry " & f.Name & " publishes this projectPath"
+                                    d("sources") = "registry=hit wmi=skipped"
+                                    Set BuildHolderInfo = d
+                                    Exit Function
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            Next f
+            d("sources") = "registry=no-hit wmi=no"
+        End If
+    End If
+    Err.Clear
+    On Error GoTo 0
+    ' ---- (2) VB6.EXE command lines (best effort) -------------------------------
+    Dim wmiState As String
+    wmiState = UtilVb6CommandLineHolder(want, d)
+    On Error Resume Next
+    d("sources") = Replace(CStr(d("sources")), "wmi=no", "wmi=" & wmiState)
+    Err.Clear
+    On Error GoTo 0
+    Set BuildHolderInfo = d
+End Function
+
+' R-1021-04 helper: read one string member out of the ASCII instance JSON
+' without a full JSON parser. Returns "" when absent. The writer escapes
+' backslashes, quotes and non-ASCII code units (\\uXXXX), so both are decoded.
+Private Function UtilJsonStrMember(ByVal json As String, ByVal member As String) As String
+    On Error Resume Next
+    UtilJsonStrMember = ""
+    Dim key As String
+    key = Chr$(34) & member & Chr$(34) & ":"
+    Dim p As Long
+    p = InStr(1, json, key, vbTextCompare)
+    If p = 0 Then Exit Function
+    p = p + Len(key)
+    Do While p <= Len(json)
+        If Mid$(json, p, 1) = " " Then
+            p = p + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    If Mid$(json, p, 1) <> Chr$(34) Then Exit Function
+    p = p + 1
+    Dim out As String
+    Dim cc As String
+    Do While p <= Len(json)
+        cc = Mid$(json, p, 1)
+        If cc = Chr$(34) Then Exit Do
+        If cc = Chr$(92) Then
+            Dim nx As String
+            nx = Mid$(json, p + 1, 1)
+            If nx = "u" Then
+                out = out & ChrW$(CLng("&H" & Mid$(json, p + 2, 4)))
+                p = p + 6
+            ElseIf nx = Chr$(34) Or nx = Chr$(92) Then
+                out = out & nx
+                p = p + 2
+            Else
+                out = out & nx
+                p = p + 2
+            End If
+        Else
+            out = out & cc
+            p = p + 1
+        End If
+    Loop
+    UtilJsonStrMember = out
+    Err.Clear
+End Function
+
+' R-1021-04 helper: read a small text file (ANSI) for the registry probe.
+Private Function UtilReadTextFile(ByVal path As String) As String
+    On Error Resume Next
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso Is Nothing Then Exit Function
+    If Not fso.FileExists(path) Then Exit Function
+    Set ts = fso.OpenTextFile(path, 1, False)
+    If ts Is Nothing Then Exit Function
+    UtilReadTextFile = ts.ReadAll
+    ts.Close
+    Err.Clear
+End Function
+
+' R-1021-04 helper: path identity for the probe (case, separators, trailing sep).
+Private Function UtilNormPathForCompare(ByVal p As String) As String
+    Dim s As String
+    s = Trim$(p)
+    s = Replace(s, "/", Chr$(92))
+    Do While Len(s) > 3 And Right$(s, 1) = Chr$(92)
+        s = Left$(s, Len(s) - 1)
+    Loop
+    UtilNormPathForCompare = LCase$(s)
+End Function
+
+' R-1021-04 helper: are two spellings the same project file?
+Private Function UtilPathEq(ByVal a As String, ByVal b As String) As Boolean
+    UtilPathEq = (UtilNormPathForCompare(a) = UtilNormPathForCompare(b))
+End Function
+
+' R-1021-04 helper: WMI scan of VB6.EXE command lines. Returns hit / no-hit /
+' unavailable; on a hit it fills the holder fields of the caller's dictionary.
+Private Function UtilVb6CommandLineHolder(ByVal want As String, ByRef d As Object) As String
+    On Error Resume Next
+    UtilVb6CommandLineHolder = "unavailable"
+    Dim loc As Object, svc As Object, q As Object, pr As Object
+    Set loc = CreateObject("WbemScripting.SWbemLocator")
+    If loc Is Nothing Then Exit Function
+    Set svc = loc.ConnectServer(".", "root\cimv2")
+    If svc Is Nothing Then Exit Function
+    Set q = svc.ExecQuery("SELECT ProcessId,CommandLine FROM Win32_Process WHERE Name='VB6.EXE'")
+    If q Is Nothing Then Exit Function
+    UtilVb6CommandLineHolder = "no-hit"
+    For Each pr In q
+        Dim cl As String
+        cl = CStr(pr.CommandLine)
+        If Len(cl) > 0 Then
+            Dim cln As String
+            cln = LCase$(Replace(cl, "/", Chr$(92)))
+            If InStr(1, cln, want, vbBinaryCompare) > 0 Then
+                d("held") = True
+                d("holderPid") = CLng(pr.ProcessId)
+                d("holderIsSelf") = (CLng(pr.ProcessId) = UtilProcessId())
+                d("holderKind") = "commandline"
+                d("evidence") = "WMI Win32_Process: VB6.EXE pid " & CStr(pr.ProcessId) & " command line names this project"
+                UtilVb6CommandLineHolder = "hit"
+                Exit Function
+            End If
+        End If
+    Next pr
+    Err.Clear
+End Function
+
+' R-1021-04 helper: read a NUMERIC JSON member (the registry writes "pid":1234
+' unquoted, so the string parser cannot read it). Returns 0 when absent.
+Private Function UtilJsonNumMember(ByVal json As String, ByVal member As String) As Long
+    On Error Resume Next
+    UtilJsonNumMember = 0
+    Dim key As String
+    key = Chr$(34) & member & Chr$(34) & ":"
+    Dim p As Long
+    p = InStr(1, json, key, vbTextCompare)
+    If p = 0 Then Exit Function
+    p = p + Len(key)
+    Dim cc As Long
+    Do While p <= Len(json)
+        cc = AscW(Mid$(json, p, 1))
+        If cc = 32 Or cc = 9 Then
+            p = p + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    Dim s As String
+    Dim n As Long
+    Do While p <= Len(json)
+        s = Mid$(json, p, 1)
+        If s >= "0" And s <= "9" Then
+            n = n * 10 + (AscW(s) - 48)
+            p = p + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    UtilJsonNumMember = n
+    Err.Clear
 End Function

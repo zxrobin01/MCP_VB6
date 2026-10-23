@@ -30,8 +30,11 @@ End Sub
 Private Sub IDTExtensibility2_OnDisconnection(ByVal RemoveMode As ext_DisconnectMode, custom() As Variant)
     On Error Resume Next
     If Not m_host Is Nothing Then
+        LogLine "lifecycle hook=ondisconnection shutdown=run"
         m_host.Shutdown
         Set m_host = Nothing
+    Else
+        LogLine "lifecycle hook=ondisconnection shutdown=skipped reason=already_shutdown"
     End If
     LogLine "VB6MCP add-in disconnected"
 End Sub
@@ -45,5 +48,15 @@ Private Sub IDTExtensibility2_OnStartupComplete(custom() As Variant)
 End Sub
 
 Private Sub IDTExtensibility2_OnBeginShutdown(custom() As Variant)
-    ' Keep non-empty: VB6 may drop empty interface procedures.
+    ' This hook fires BEFORE the host tears its windows down, which is the earliest
+    ' point where the code-pane subclassing can be removed safely. OnDisconnection
+    ' stays as the fallback for the paths that never call this one.
+    On Error Resume Next
+    If Not m_host Is Nothing Then
+        LogLine "lifecycle hook=onbeginshutdown shutdown=run"
+        m_host.Shutdown
+        Set m_host = Nothing
+    Else
+        LogLine "lifecycle hook=onbeginshutdown shutdown=skipped reason=already_shutdown"
+    End If
 End Sub

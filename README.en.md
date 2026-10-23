@@ -42,8 +42,7 @@ matters to both users and contributors.
 - **No guarantee of human line-by-line review**: do not assume a human read every line. Assess
   it yourself before using it in production or building on it, and open an issue if you find a
   problem (see CONTRIBUTING).
-- **Known limitations**: see section 7 - in particular that **this project is developed and
-  verified on a Chinese (zh-CN) VB6**.
+- **Known limitations**: see section 7 - in particular that **end-to-end verification has only been done on a Chinese (zh-CN) VB6; an English IDE is supported in capability but not yet closed-loop verified**.
 ## Why this exists (background)
 
 VB6 stopped evolving in 2008, but the systems it wrote are still running: factories, finance,
@@ -227,13 +226,13 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
 
 **The add-in face (120 tools): a live IDE is required.** Every one of them is implemented by the add-in that runs inside the `VB6.EXE` process (reading and editing code, static checks, building, breakpoints, forms, snapshots, ...), so with no executable instance there is nothing to run them. **Listing** them works without an IDE (the hub answers `tools/list` from the bundled snapshot, marked `faceSource=snapshot`), but **calling** one needs a live local instance, or an explicitly addressed remote endpoint that has one. The refusal codes for "no IDE" are in the next subsection.
 
-**The hub face (10 tools): they run outside the IDE process and need no add-in loaded**, but their dependencies differ:
+**The hub face (11 tools): they run outside the IDE process and need no add-in loaded**, but their dependencies differ:
 
 - **No IDE at all** (they read local state, or read/write local JSON storage):
   - `ide_list` - reads this machine's instance registry + a port scan + the **probe status of every configured remote endpoint**; it still answers when there is no instance at all (and says why, including stale registry entries);
   - `ide_target` - only changes the hub's own default target (local state; the IDE is not touched);
   - `list_lessons` / `add_lesson` / `delete_lesson` / `export_lessons` / `import_lessons_md` - only read/write the JSON under `mcp_lessons/` (writes keep a `.bak`).
-- **Need one target instance to act on**: `ide_stop` (stops, by pid, an instance **this hub started**; a foreign instance is never touched) and `ide_restart` (recovers our own instance and proves it is ready). With no instance they answer a structured refusal instead of pretending: `ide_restart` answers `no_ide_running` when there is **no instance at all**.
+- **Need one target instance to act on**: `ide_stop` (stops, by pid, an instance **this hub started**; a foreign instance is never touched), `ide_restart` (recovers our own instance and proves it is ready), and `ide_kill_and_relaunch` (the out-of-band reset for a busy/wedged pipe: stops an owned instance, clears its registration, relaunches on the same project and polls readiness; it never touches port 8766 or a remote instance). With no instance they answer a structured refusal instead of pretending: `ide_restart` answers `no_ide_running` when there is **no instance at all**.
 - **Need no existing IDE, but need the conditions to start one**: `ide_start` (an explicit `project` or `VB6MCP_AUTOSTART_PROJECT`, plus a resolvable `VB6.EXE`; otherwise `not_implemented` / `vb6_exe_not_found` / `project_not_found`).
 
 > The offline gates are the `tools/check_*` group; `tests/smoke_test.py` and `mcp_strict_audit` **must** have the IDE open with the add-in loaded - they are not offline self-checks.
@@ -353,7 +352,7 @@ The same as Claude Desktop: `command: node`, `args: ["<repo>/bridge/vb6mcp_hub.m
 
 To check the whole chain: `python tests/smoke_test.py --port <middle-service port>` (that script sends **no token**, so it only works while the server has no credential configured; and it **needs the VB6 IDE open with the add-in loaded** - this is not an offline self-check).
 
-## 4. Tool list (add-in face 120 + hub face 10 = 130 tools)
+## 4. Tool list (add-in face 120 + hub face 11 = 131 tools)
 
 > The authoritative list is `docs/TOOL_CATALOG.md` (exported from a running add-in via
 > `tools/list` and merged with the hub's own tools); the offline baseline is
@@ -361,8 +360,8 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 > compares the shipped snapshot against that baseline.
 >
 > Tools come from **two faces**: the **add-in face, 120 tools** (`docs/tools_schema.json`, inside
-> the VB6 IDE process) and the **hub face, 10 tools** (`bridge/hub_tools.json`, outside it). Below,
-> all **130** tools are grouped: 16 add-in categories plus the hub section (17); each tool
+> the VB6 IDE process) and the **hub face, 11 tools** (`bridge/hub_tools.json`, outside it). Below,
+> all **131** tools are grouped: 16 add-in categories plus the hub section (17); each tool
 > appears exactly once. The key-parameter column is taken straight from each tool's own
 > `inputSchema` (required parameters first), never typed from memory. The five hub lesson tools
 > **work with no IDE online**.
@@ -573,9 +572,9 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `set_addin_state` | Load or unload an IDE add-in by ProgID | `prog_id`, `connect` |
 | `quit_ide` | Quit the IDE after responding, unsaved changes are lost | - |
 
-### 17. Hub face: IDE instance management & lesson store (10 tools, they run outside the IDE process)
+### 17. Hub face: IDE instance management & lesson store (11 tools, they run outside the IDE process)
 
-These 10 tools come from the MCP hub (`bridge/vb6mcp_hub.mjs`) and run **outside the IDE
+These 11 tools come from the MCP hub (`bridge/vb6mcp_hub.mjs`) and run **outside the IDE
 process**: the client does not have to load the add-in first. `ide_list`, `ide_target` and the five
 lesson tools **do not depend on any IDE** (the lesson store only reads/writes local JSON);
 `ide_stop` / `ide_restart` need **one target instance**, and `ide_start` needs **the conditions to
@@ -594,9 +593,10 @@ start VB6**. The itemised list and the preconditions of the two refusal codes ar
 |------|--------------|----------------|
 | `ide_list` | List **every** VB6 IDE the hub can address: local instances plus each **configured remote endpoint** (allow-list only, never discovered; unreachable ones still listed with their probe status). Reports pid/port/project, the one-set identity (endpoint / targetKey / pathVia), the canonical real path beside the registry spelling, and echoes the caller's alias that resolves to the same identity; includes stale entries and same-identity conflicts | - |
 | `ide_target` | Set or clear the default IDE target: pid, project or auto | `target` |
-| `ide_start` | Start a VB6 IDE instance for a .vbp project | `project` |
+| `ide_start` | Start a VB6 IDE instance for a .vbp project and poll until the add-in is ready (`ready` is the real readiness) | `project`, `ready_wait_ms` |
 | `ide_stop` | Stop an IDE instance that this hub started (needs one target instance) | `pid`, `force` |
-| `ide_restart` | Restart a wedged own IDE instance and prove readiness (needs one target instance) | `pid`, `project` |
+| `ide_restart` | Restart a wedged own IDE instance and prove readiness (needs one target instance); a long restart returns `pending` + `opId` after `wait_ms`, and `opId` only queries (never restarts) | `pid`, `project`, `opId`, `wait_ms` |
+| `ide_kill_and_relaunch` | Out-of-band reset for a busy/wedged pipe: stops only an owned instance, clears its registration, relaunches on the same .vbp and polls readiness (does not depend on the add-in pipe) | `pid`, `project`, `ready_wait_ms` |
 | `list_lessons` | List lesson entries: scenario, trap, do (hub face, no IDE online) | `includeDisabled` |
 | `add_lesson` | Add or overwrite a user lesson, with backup (no IDE online) | `id`, `scenario`, `trap`, `do` |
 | `delete_lesson` | Remove a user lesson, or disable a shipped one (no IDE online) | `id` |
@@ -650,12 +650,13 @@ in the internal type-library dump).
 - Incoming connections are forced to 127.0.0.1 (MSWINSCK's LocalIP is read-only, so the loopback
   address cannot be bound before listening and the check is done on accept instead). There is no
   authentication - only local processes are trusted.
-- **Localization**: this project is developed and verified on a **Chinese (zh-CN) VB6**. The IDE
-  title's mode markers, the "Immediate" window name and some dialog button captions are matched
-  in Chinese; an English VB6 shows `[Design]`/`Immediate` and so on, which means **mode
-  detection and some dialog flows may fail**. The hub side (`bridge/`) is locale-independent
-  (it only assumes the `VB98` folder name, which is the same in every language). See section 1
-  of the known-gaps list in section 7 of this file.
+
+### Localization and English-IDE support
+
+- **Verdict**: an English (en-US) VB6 is **supported in capability**, but it has **not been end-to-end verified** (our verification machine runs the Chinese zh-CN IDE; see the end of this section).
+- **What is language-independent**: menu/debug commands are matched by caption, ignoring the localised bar name (`Start`/`Continue`/`End`, `Toggle Breakpoint`, `Step Into/Over`, `Run To Cursor`, `Start With Full Compile`, `Clear All Breakpoints`, ...); both the English and Chinese captions of the breakpoint toggle and the debug commands are in the table; the IDE mode markers are the same set in both languages and case-insensitive (`[Design]`/`[Run]`/`[设计]`/`[运行]`); dialog buttons are chosen by **control ID first, caption text as fallback**; the English wording of the runtime-error box (`RUN-TIME ERROR` / `RUNTIME ERROR`) is recognised; comment/diagnostic language is **UI-first** (an English IDE gets English comments); the hub/bridge side only assumes the `VB98` folder name and is locale-independent.
+- **Still worth knowing**: a few flows still match **window titles** in Chinese and some dialogs are Chinese-based; on an English IDE, start with three read-only calls - `mcp_info` / `ide_state` / `command_bars{action:"list"}` - to confirm the tool face and state.
+- **Feedback welcome**: if you use an English (or other-language) VB6, please report the **tool name + receipt + IDE UI language** - even "works / does not work" is a valuable contribution.
 
 ## 8. FAQ / troubleshooting
 
@@ -792,6 +793,44 @@ sha256) - they are not injected into IDE memory.
 
 ---
 
+## Hub-side recovery primitives and reliability switches (v1.13 - v1.16)
+
+> This section is **user-facing**: what failure each capability fixes, when to use it, and which words in the receipt matter. Field-level contracts are in the v1.13.0 ~ v1.16.5 rows of `docs/CONTRACTS.md`.
+
+1. **`ide_kill_and_relaunch` (v1.13.0, hub-side, does not depend on the add-in pipe)** - the **only** recovery primitive when a pipe is busy/wedged: it stops an instance **this hub owns**, clears its registration, relaunches on the same `.vbp` and polls for readiness. It never touches port 8766, remote instances, or an IDE someone else started. Read `ready` / `threeWay{http,mcpInfo,project}` / `ownership`; `ready:false` only means "the process is up but the add-in has not answered yet" - poll `ide_list` as `howToProceed` says, do not retry the kill.
+   **Why**: the add-in is single-threaded; while the pipe is busy even `ide_state{release_inflight:true}` cannot be delivered. The old exit was a manual `Stop-Process` plus restarting the IDE; now one call does it without touching anyone else's instance.
+
+2. **`ide_restart`: `wait_ms` + `opId` (v1.14.0)** - a restart can outlive the client timeout: `wait_ms` bounds how long **one call** blocks, then answers `pending:true + state:"in_progress" + opId`; `ide_restart{opId}` only queries the in-process operation registry and **starts nothing** (kept 30 minutes, forgotten when the hub restarts). Only **one restart at a time** is allowed per hub; a second one is refused with `restart_in_progress`.
+   **Why**: the restart had actually completed while the caller only saw `Request timed out` (no receipt), leaving it to inspect processes - and a blind retry would restart twice.
+
+3. **`ide_restart`: one JSON document in content (v1.14.0)** - `content[0].text` is now **one** JSON document: array/scalar bodies become `{singleDocument:true, data, receipt}` (an empty result is `data: []`, distinguishable from a parse failure), a non-JSON body becomes a structured `content_not_json` document, object bodies stay flat; `VB6MCP_LEGACY_TEXTBODY=1` restores the old two-part form for one version. A transport failure with a provably dead peer adds `peerState:"peer_dead"` + `lostContext` + `howToRecover[]`.
+   **Why**: the old form concatenated "JSON array + appended receipt object", so strict clients failed `JSON.parse` - and for a no-hit `find_gui` result (`[]`) there was no way to tell "empty" from "unparseable".
+
+4. **`build` / `make_project`: offline routing (v1.13.0)** - with no live IDE, `build` / `make_project(route!="ide")` / `project_meta` are served by the hub itself: `offline:true + offlineRoute:"cli"|"file" + targetResolved:false`, running an isolated `VB6.EXE /make`; when no compiler can be started it answers `reason:"cli_unavailable"` + `howToProceed` and **never** reports "there is no IDE" as `target_mismatch`. With zero instances `package_app`/`verify` say `offlineServed:false + no_live_ide` instead of pretending to be offline-capable.
+   **Why**: offline compilation is the only path to a real compiler log; previously closing the IDE still left `build` blocked by a stale target, so the only option was to run `/make` outside the MCP.
+
+5. **`verify` / `verify_scope`: `requireCompiler` (v1.16.0)** - default false keeps the receipt byte-for-byte; true either returns **compiler authority** (`authority:"compiler"` + `errorCount` + `artifactChanged` + `compiler{...}`) or refuses structurally with `compiler_not_configured` + `compilerProbe{...}` + `howToProceed`, and **never substitutes lint for the compiler**.
+   **Why**: lint is lexical/structural only - it once reported 49 errors for a large module while `/make` reported 0; treating "suspected" as a compile verdict produces a false red.
+
+6. **`apply_edits` / `preview_edit`: multi-component batches (v1.16.0, same tools)** - `edits[].component` lets one batch span up to 40 components; `expected_shas[]` refuses the whole batch (writing zero bytes) on any mismatch; ops apply in `edits[]` order and each anchor is resolved on its component's **updated** text; failure is all-or-nothing with rollback (`rolledBack` + `restoreVerified` + `restoredComponents[]`); `max_ops` defaults to 200 (cap 1000). `preview_edit` uses the same shape, groups hunks per component and **writes nothing**.
+   **Why**: a cross-file rename/move used to take a dozen single-component calls, and a mid-way failure left a half-edited state; a batch is one transaction, and preview shows every landing before writing.
+
+7. **`breakpoints{action:"probe"}`: two-phase behavioural verification (v1.16.0)** - the only channel that answers "is this breakpoint actually effective": `phase:"start"` (default) checks design state / no modal box / breakable line, then **starts the program** (never saves, never writes source) and returns `probeId + startedPending + howToContinue`; `phase:"observe"` waits with the same `probeId`, reads `position` + `callstack`, End the program and proves `stateAfter=design` by read-back. `probeId` is single-use with a 600000 ms TTL; `probeResult` is a closed enum. In the same version `control_execution{mode:"end"|"stop"}` no longer falsely refuses in RUN state (the old `commandbars_unavailable_while_running` was a false rejection), and `programEnded:true` appears only after a design read-back.
+   **Why**: native breakpoints "record success but never hit", injected ones write the source and twice killed the IDE; only a real run that stops on the target line proves it works.
+
+8. **`run_project`: observe budget and completion marker (v1.15.0)** - `observe_max_wait_ms` (defaults to `timeout_ms`, clamped 1000..120000) **returns** when it expires: `state` is the closed five-value set `done-by-marker | exited | break | error | timeout`; `done_marker{path,contains}` waits for a file marker on the IDE machine (UNC allowed), reading only the first 65536 bytes and writing nothing. ★`timeout` is `ok:true + timeout:true + retrySafe:true + suggestedAction:"observe_again"` (**not a failure**); observe in BREAK is refused (`observe_in_break_not_supported`); the IDE's own Find dialog is classified as `observe_blocked_by_ide_dialog` instead of being misreported as a program error.
+   **Why**: a replay finished in 7 seconds while the tool reported `Request timed out` and left the pipe busy; a completion marker makes "already done" decidable without outside polling.
+
+9. **`get_locals{allowUnsafeInBreak}` (v1.15.0) and structured `last_error` (v1.16.3)** - in BREAK state `get_locals` is refused by default (`break_eval_requires_opt_in`); `true` is informed consent and does **not** guarantee it will not hang - recovery is the hub-side `ide_kill_and_relaunch`. `last_error` (and `ide_state.lastError`) adds read-only structured fields while the error box is **still up**: `err{number,description,source,hresult,numberBasis}` / `errBasis` / `errChannel{...}` / `errCrossCheck` / `errLocation{...}`; it does **not** suppress, auto-dismiss or read errors without a box, and unreadable fields are null with a reason - never guessed.
+   **Why**: reading locals in BREAK can wedge the single-threaded pipe, so the caller must opt in and know the recovery path; the localised dialog text used to be the only source, and when it was unreadable the only fallback was an external screenshot.
+
+10. **`quit_ide`: `exitWrites` (v1.16.4)** - a `requested:true` receipt adds `exitWrites{declaration,observed,condition,evidence,basis}`: it is a **declaration**, not a measurement (a process cannot observe its own exit phase). `condition` is decided only from the project count visible now: 0 projects ⇒ `no_project_observed_no_write` (measured: nothing written); 2+ projects ⇒ `project_group_context_then_clean_quit` (a 50~53 B `.vbg` appears about 250 ms later); exactly 1 ⇒ `undetermined` (the two measured shapes disagree). `sideEffects.filesWritten` covers only writes during the call and **never the exit phase**.
+   **Why**: the exit phase may write a `.vbg`, and the tool can neither confirm nor prevent it; rather than promise "nothing was written", it states what it can observe, the evidence, and the uncertainty.
+
+> None of these change existing default behaviour (without the new parameters, without probe and without requireCompiler the receipts are unchanged); contract and frozen-face changes are in `docs/CONTRACTS.md`.
+
+---
+
 ## What is `modMcpTrace` for, and is it required?
 
 **1. What it is for**: a tiny standard module holding just `McpTrace` / `McpTraceOn` (plus a switch variable). It exists only to serve `inject_trace` - the injected tracing calls land on it and it writes one JSON line per event to the trace file.
@@ -908,6 +947,4 @@ baseline) **are** included, so the offline gate scripts under `tools/` (`check_s
 
 See CONTRIBUTING.md (English; Chinese: CONTRIBUTING.zh-CN.md) and see section 7 above for the known gaps.
 
-**Localization comes first**: this project is developed and verified on a **Chinese VB6**, and
-the known coupling points are enumerable (see section 7 of this file). If you run an English or other
-language build, even a report of "works / does not work" is a valuable contribution.
+**Localization**: an English VB6 is **supported in capability** (menu/debug commands are matched by caption, mode markers are the same set in both languages, dialog buttons prefer the control ID, and the English runtime-error wording is recognised), but it has **not been end-to-end verified** (the verification machine runs the Chinese zh-CN IDE). English-IDE users are welcome to report which tool works and which fails, with the receipt and the IDE UI language - even "works / does not work" is a valuable contribution.

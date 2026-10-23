@@ -17,11 +17,6 @@ Begin VB.Form ServerForm
    ShowInTaskbar   =   0   'False
    StartUpPosition =   3  'Windows Default
    Visible         =   0   'False
-   Begin VB.Timer tmrWatch 
-      Interval        =   0
-      Left            =   0
-      Top             =   0
-   End
    Begin MSWinsockLib.Winsock sck 
       Index           =   0
       Left            =   0
@@ -72,6 +67,12 @@ Private m_instProjectPath As String
 ' the identity check no longer rides the 15 ms tick (it used to hash the whole DLL on
 ' every tick). It runs at most once per second, or immediately when a project event marks it dirty.
 Private m_identityDirty As Boolean
+' The host tick is a Win32 TIMERPROC (WinOps.WoHostTick*), NOT a VB6 Timer
+' control. A Timer CONTROL never re-enters, which is exactly why a DoEvents inside a
+' long tool call could not dispatch another tick and the ADR 7.4 progress frame was
+' never produced under this default host (measured: nestedTicks=0).
+Private m_tickMs As Long
+Private m_tickDepth As Long
 Private m_identityCheckedAt As Long
 Private m_instSha As String
 Private m_instStartedAt As String
@@ -150,8 +151,9 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
     ' fast-return below, so the registration attempt can carry its window identity.
     IngressStartup
     If m_mode = "pipe" Then
-        tmrWatch.Interval = m_pipe.TickMs
-        tmrWatch.Enabled = True
+        TickSetPeriod m_pipe.TickMs
+    WinOps.WoProfInit m_pipe.TickMs
+        TickArm
         LogLine "transport=pipe reason=forced_pipe tcpEnabled=false pipe=" & m_pipe.PipeNameRedacted() & " nonce=" & m_pipe.NoncePrefix() & "... tickMs=" & CStr(m_pipe.TickMs)
         Exit Sub
     End If
@@ -159,7 +161,7 @@ Public Sub StartListening(ByVal mcp As McpServer, Optional ByVal basePort As Lon
 End Sub
 
 Public Sub StopListening()
-    tmrWatch.Enabled = False
+    TickStop
     ' only clear the port file if THIS instance actually published one -
     ' in pipe-only mode m_port is just the requested default, and clearing it
     ' could delete a live instance's file.
@@ -350,8 +352,8 @@ Private Sub TryListen()
     Else
         m_tried = m_tried & "," & CStr(m_port)
     End If
-    tmrWatch.Interval = 350
-    tmrWatch.Enabled = True
+    TickSetPeriod 350
+    TickArm
 End Sub
 
 ' register this IDE in %TEMP%\vb6mcp\instances\<pid>.json so the hub
@@ -407,8 +409,11 @@ Private Sub RefreshInstanceIfChanged()
     On Error Resume Next
     If m_mcp Is Nothing Then Exit Sub
     Dim proj As String, ppath As String
+    Dim identT As Double
+    identT = WinOps.WoProfNow()
     proj = m_mcp.ProjectName()
     ppath = m_mcp.ProjectFileName()
+    WinOps.WoProfAdd 4, WinOps.WoProfNow() - identT
     If StrComp(proj, m_instProject, vbBinaryCompare) <> 0 _
        Or StrComp(ppath, m_instProjectPath, vbBinaryCompare) <> 0 Then
         LogLine "Re-publishing instance identity: project='" & proj & "' path='" & ppath & "'"
@@ -574,34 +579,88 @@ Private Function PipeRegistryPort() As Long
     End If
 End Function
 
-Private Sub tmrWatch_Timer()
+' --- host tick control (a Win32 TIMERPROC armed through WinOps) ---------------------
+' These three calls replace every write the code used to make to the retired VB6 Timer
+' control, so the tick can only be armed, re-period'd or killed from ONE place.
+Private Sub TickArm()
+    If WinOps.WoHostTickRunning() Then Exit Sub
+    If m_tickMs < 1 Then m_tickMs = 5000
+    If Not WinOps.WoHostTickStart(Me, m_tickMs) Then
+        LogLine "host tick: SetTimer failed (ms=" & CStr(m_tickMs) & ")"
+    End If
+End Sub
+
+Private Sub TickStop()
+    WinOps.WoHostTickStop
+End Sub
+
+' A period change on an ARMED tick restarts its countdown, which is what assigning a new
+' value to a running Timer control's Interval used to do.
+Private Sub TickSetPeriod(ByVal ms As Long)
+    If ms < 1 Then ms = 1
+    m_tickMs = ms
+    If WinOps.WoHostTickRunning() Then WinOps.WoHostTickSetPeriod ms
+End Sub
+
+Public Sub HostTick()
+    ' Entry point for the Win32 TIMERPROC (WinOps.HostTickProc). This used to be
+    ' the VB6 Timer control's event handler; a Timer control is NOT re-entrant, so
+    ' it could never deliver the nested pass that produces the ADR 7.4 progress frame.
+    ' Level 1 runs the whole watchdog pass. Level 2 is the nested pass a DoEvents inside a
+    ' long tool call dispatches: it runs ONLY the pipe pass, which is what becomes a
+    ' progress frame. WinOps.HostTickProc caps the depth hard at 2, so this can never fan
+    ' out; the branch below is what keeps the rest of the watchdog from running twice.
+    m_tickDepth = m_tickDepth + 1
     On Error GoTo TimerFail
+    If m_tickDepth > 1 Then
+        If Not m_pipe Is Nothing Then m_pipe.Tick
+        GoTo TimerDone
+    End If
+    Dim pfT As Double, pfLine As String
+    Dim tmrT0 As Double
+    Dim pfOn As Boolean
+    ' R2 PERF GATE: ONE cross-module probe per tick. With VB6MCP_PERF_DIAG unset every
+    ' WoProf* call below is now skipped by a LOCAL test; before this, each of the ~19
+    ' calls per tick still crossed into WinOps and crossed back after an early exit.
+    pfOn = WinOps.WoProfOn()
+    If pfOn Then tmrT0 = WinOps.WoProfNow()
+    If pfOn Then WinOps.WoProfTickCount
+    If pfOn Then pfLine = WinOps.WoProfConsume(Util.PumpCount())
+    If Len(pfLine) > 0 Then LogLine pfLine
     ' exactly one bounded pipe servicing pass per tick, on this same UI
     ' thread / same watchdog. PipeTransport handles re-entrancy internally (a
     ' nested tick, reached from DoEvents during a long tool call, only emits a
     ' progress frame - it never re-enters request handling).
-    If Not m_pipe Is Nothing Then m_pipe.Tick
+    If Not m_pipe Is Nothing Then
+        If pfOn Then pfT = WinOps.WoProfNow()
+        m_pipe.Tick
+        If pfOn Then WinOps.WoProfAdd 0, WinOps.WoProfNow() - pfT
+    End If
     ' (step 3): the textbox DOORBELL pump. The Change handler only read,
     ' cleared and queued the payload; the tool is executed HERE, on the watchdog
     ' tick, AFTER that handler returned. Guarded so the default "pipe" deployment
     ' leaves this path inert, and so a nested tick (DoEvents inside a long tool
     ' call) can never start a second request on the same connection.
+    If pfOn Then pfT = WinOps.WoProfNow()
     IngressPump
+    If pfOn Then WinOps.WoProfAdd 2, WinOps.WoProfNow() - pfT
     ' the registration retry runs on the SAME watchdog tick as the transport, so it
     ' cannot introduce a second timer and cannot block: once the state is "registered" it
     ' costs one string compare per tick.
+    If pfOn Then pfT = WinOps.WoProfNow()
     RegistrationTick
+    If pfOn Then WinOps.WoProfAdd 6, WinOps.WoProfNow() - pfT
     If m_restartArmed Then
         m_restartArmed = False
-        tmrWatch.Interval = 5000
+        TickSetPeriod 5000
         If Not m_mcp Is Nothing Then m_mcp.DoRestart
-        Exit Sub
+        GoTo TimerDone
     End If
     If m_quitArmed Then
         m_quitArmed = False
-        tmrWatch.Enabled = False
+        TickStop
         If Not m_mcp Is Nothing Then m_mcp.DoQuit
-        Exit Sub
+        GoTo TimerDone
     End If
     ' THE PIPE TRACK ARMED NOTHING. Only WinsockTransport.CheckDeferred and
     ' the winsock SendResponse ever set m_quitArmed, so a quit_ide that arrived over
@@ -618,24 +677,32 @@ Private Sub tmrWatch_Timer()
     If Not m_pipe.Active() Then GoTo PipeQuitSkipped
     If Not m_mcp.ConsumeQuit() Then GoTo PipeQuitSkipped
     m_quitArmed = True
-    tmrWatch.Interval = 150
-    Exit Sub
+    TickSetPeriod 150
+    GoTo TimerDone
 PipeQuitSkipped:
     ' in pipe-only mode no winsock listener was ever created, so the
     ' port-probing path below must not run (sck() was only Loaded, never Listen-ed).
     If m_mode = "pipe" Then
+        If pfOn Then pfT = WinOps.WoProfNow()
         WinOps.WheelTick
+        If pfOn Then WinOps.WoProfAdd 5, WinOps.WoProfNow() - pfT
+        If pfOn Then pfT = WinOps.WoProfNow()
         IdentityWatchTick
-        Exit Sub
+        If pfOn Then WinOps.WoProfAdd 3, WinOps.WoProfNow() - pfT
+        GoTo TimerDone
     End If
     If m_listening Then
         ' thriftily (re)install the optional code-pane wheel on code
         ' panes that appeared after startup. Returns at once while the wheel is
         ' OFF (the default), so the timer's cost is unchanged.
+        If pfOn Then pfT = WinOps.WoProfNow()
         WinOps.WheelTick
+        If pfOn Then WinOps.WoProfAdd 5, WinOps.WoProfNow() - pfT
         SweepIdleConnections
+        If pfOn Then pfT = WinOps.WoProfNow()
         IdentityWatchTick
-        Exit Sub
+        If pfOn Then WinOps.WoProfAdd 3, WinOps.WoProfNow() - pfT
+        GoTo TimerDone
     End If
     If sck(0).State = sckListening Then
         m_listening = True
@@ -647,29 +714,42 @@ PipeQuitSkipped:
         ' keep the watchdog fast enough to service the pipe track; the TCP
         ' track alone keeps the historical 5000 ms cadence.
         If m_pipe Is Nothing Then
-            tmrWatch.Interval = 5000
+            TickSetPeriod 5000
         Else
-            tmrWatch.Interval = m_pipe.TickMs
+            TickSetPeriod m_pipe.TickMs
+    WinOps.WoProfInit m_pipe.TickMs
+            ' the diag switch can turn ON inside this very tick: re-read it so this tick's
+            ' remaining probes behave exactly as they do today
+            pfOn = WinOps.WoProfOn()
         End If
-        tmrWatch.Enabled = True
+        TickArm
     ElseIf m_explicitPort Then
         ' the port was NAMED (VB6MCP_PORT / registry) - never take
         ' another one behind the caller@s back; report a structured conflict.
-        tmrWatch.Enabled = False
+        TickStop
         WriteBindConflict "port_in_use", m_tried, "the requested port " & CStr(m_port) & " is already owned by another process; this instance will NOT share it. Close the other server, set VB6MCP_PORT to a free port, or clear the override so the add-in can pick a free port in 8766..8799."
         LogLine "VB6MCP: explicit port " & CStr(m_port) & " is in use - refusing to share it (wrote %TEMP%\vb6mcp\bind_conflict.json)"
     ElseIf m_tries < MAX_PORT_TRIES Then
         m_port = m_port + 1
         TryListen
     Else
-        tmrWatch.Enabled = False
+        TickStop
         WriteBindConflict "no_free_port", m_tried, "the whole range " & CStr(FIRST_PORT) & ".." & CStr(FIRST_PORT + MAX_PORT_TRIES - 1) & " is occupied; free a port or set VB6MCP_PORT to a free one."
         LogLine "VB6MCP could not bind any port in range (" & m_tried & ")"
     End If
-    Exit Sub
+    GoTo TimerDone
 TimerFail:
     LogLine "Timer error: " & CStr(Err.Number) & " " & Err.Description
-    tmrWatch.Enabled = True
+    TickArm
+TimerDone:
+    m_tickDepth = m_tickDepth - 1
+    If m_tickDepth < 0 Then m_tickDepth = 0
+    Dim tmrUs As Double
+    If pfOn Then tmrUs = WinOps.WoProfNow() - tmrT0
+    If pfOn Then WinOps.WoProfAdd 15, tmrUs
+    If pfOn Then
+        If m_pipe.IsServicing() Then WinOps.WoProfNestedTick tmrUs
+    End If
 End Sub
 
 Private Sub SweepIdleConnections()
@@ -1121,16 +1201,29 @@ Private Sub SendResponse(ByVal Index As Integer, ByVal response As String, ByVal
         If m_mcp.ConsumeQuit() Then
             ' deferred IDE quit: response has been sent
             m_quitArmed = True
-            tmrWatch.Interval = 150
-            tmrWatch.Enabled = True
+            TickSetPeriod 150
+            TickArm
         End If
         If m_mcp.ConsumeRestart() Then
             ' deferred restart: wait for the run-mode teardown
             m_restartArmed = True
-            tmrWatch.Interval = 500
-            tmrWatch.Enabled = True
+            TickSetPeriod 500
+            TickArm
         End If
     End If
+End Sub
+
+' The Win32 tick is killed on EVERY teardown path, not just StopListening.
+' A timer that outlived the host would keep firing into a torn-down form - the zombie
+' tick this card says must not exist. All three calls are idempotent.
+Private Sub Form_QueryUnload(Cancel As Integer, UnloadMode As Integer)
+    TickStop
+    WinOps.WoHostTickDetach
+End Sub
+
+Private Sub Form_Unload(Cancel As Integer)
+    TickStop
+    WinOps.WoHostTickDetach
 End Sub
 
 Private Sub Form_Terminate()
@@ -1140,5 +1233,7 @@ Private Sub Form_Terminate()
     ' swallowed errors), so a double delete is harmless and no other instance's
     ' registration can be touched.
     On Error Resume Next
+    TickStop
+    WinOps.WoHostTickDetach
     DeleteInstanceFile FormProcessId()
 End Sub

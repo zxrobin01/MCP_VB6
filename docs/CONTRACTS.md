@@ -14,6 +14,18 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| **v1.16.5** | 2026-10-24 | **版本说明补正（工具面零变化；add-in 120 → 120、hub 11 → 11、DSH 面 131 → 131；无工具增删、无参数增删、无 inputSchema/描述变化 ⇒ 冻结面不变、不重冻）** ① 客户端可见的 initialize.instructions 末条由硬编码 v1.11.4 current (110 tools) 改为动态：VB6MCP_CONTRACT_VERSION + CStr(Owner.ToolCount())（不再写死版本与数量）；② 同一 instructions 的第 2 段标题由 BREAKING (read before calling): 改为 HISTORICAL CONTRACT NOTES (oldest first; the authoritative breaking[] is in mcp_info): —— 那 4 条是 v1.6~v1.11 时代的历史条款，不是当前 breaking；③ README.md / README.en.md 新增「hub 侧恢复原语与可靠性开关（v1.13 ~ v1.16）」章节，并把工具面口径修正为 120 + 11 = 131；④ Util.bas 的 VB6MCP_CONTRACT_VERSION 由 v1.16.4 改为 v1.16.5（只改这一个字符串）；⑤ README 中英新增「本地化与英文版 IDE 支持」小节，并把原「英文版可能失效 / 第一优先是本地化」的口径更正为「能力支持、未端到端验证」（只改文档）。判据：mcp_info.contract = v1.16.5、toolCount 仍 120；tools/list 的 name/description/inputSchema 逐字节不变。 |
+| **v1.16.4** | 2026-10-23 | **34b 退出阶段写盘声明（ADDITIVE，回执 only）：`quit_ide` 在 requested=true 回执新增 `exitWrites{declaration,observed,condition,evidence,basis}` 声明块；工具面 add-in 120->120、hub 11->11、DSH 面 131->131；无工具增删、无参数增删；1 处 description 变更（`quit_ide`）故冻结面必须活体重冻；另修文档->生成物的合同戳横幅一致性（旧横幅 v1.16.0 -> v1.16.4）。** |
+| **v1.16.3** | 2026-10-23 | **34a 结构化错误通道（RE-1）：`last_error` 与 `ide_state.lastError` 新增只读的结构化错误字段（框仍存在）。工具面 ADDITIVE：add-in 120→120、hub 11→11、DSH 面 131→131；无工具增删、无参数增删、无 required 变化；唯 1 个 description 变更（`last_error` 追加 2 段 RE-1 文案）⇒ 冻结面显式重冻（`docs/tools_schema.json` == `tools/schema_baseline.json` = `D2A3EF0DFBCF22D3B8F586FC31266E8C79FED37E6BEE49067B8E6ED4EA7805B4`，190,535 B / 120 工具，两件逐字节相同；`check_schema_baseline: schema_changes=0`；`check_live_tools: live_tool_changes=0 ORDER_MATCH=True`）；`docs/TOOL_CATALOG.md` = `46550B46F7676D71CBA2C01BD3895D5DA7694886D195EB6B7E7AB4578A957C7B`（76,260 B / CATALOG_TOOLS=131）；`bridge/hub_schema.generated.json` 重生成（`contractVersion:"v1.16.3"` / DECLARED=120 / sha `1409F34B90F9967F81907A86399035234EBCD418FF0F7214B6EEEE7B23E75871`）；`Util.bas` 契约常量 v1.16.2→v1.16.3（1 行 / 99,324 B / `743655621D5A41CA6D7E981D6B69C229ED6884CA74828A474662AD08244E0174`→`A5DB10B72E204FC39CE28E6075527B01D32E05806A833FB12A80E6963330C542`）。① **新增字段（只增不改）**：`err{number,description,source,hresult,numberBasis}`、`errBasis`（封闭四值 `vb6map|dialog|none|unavailable`）、`errChannel{readOk,recordUsed,selector{raw010,dword074,bit24,chosen,basis},fields,bstrReads[{offset,role,error,chars,bytes}],why}`、`errCrossCheck{available,number,description,relation,note}`、`errLocation{line,column,file,basis,why}`；既有键（`errorDialog` / `errNumber` / `errDescription` / `errSource` / `errParsed` / `callstack` / `localsNames` / `position` / `stopped_at` / `howToRecover`）语义不变（ADDITIVE；缺省参数与动作路径全部不变）。② **数据来源**：零 VBA6 导出调用 —— 纯进程内 `GetModuleHandleW("VBA6.DLL")` + `CopyMemory` 读**异常记录**（record A RVA `0x17D078` / record B `0x17D0A8`；选择子 = `dword_FC0D074 & 0x1000000`，不可读时回退为对两条记录各自按空判定 = `basis:"fallback_probe"`；`+0x04`=Source BSTR、`+0x08`=Description BSTR、`+0x1C`=HRESULT，facility 命中 `(hr & 0x1FFF0000)==0x000A0000` 时低 16 位即 VB errnum，否则 `number:null + numberBasis:"facility_not_vb"`），**不调用 `EbExceptionHandled`**（实测它会清 `dword_FC0D010` 并吞掉错误状态）。③ **诚实边界（禁止误读）**：本批不抑制、不自动关闭、不无框读取错误框 —— 框仍然存在且仍然模态；`last_error{dismiss:true}` 沿用既有按钮投递通道；**自动关框的前置是 BREAK→DESIGN 恢复通道，本批不做**；行/列/文件位置仍不可得（`errLocation.basis:"not_attempted"`，需虚拟调用，超出本批）；`+0x0C`（默认帮助文件 `VBENLR98.CHM`）/ `+0x10`（=1005555）/ `+0x18` 不发布。④ **失败显式化（不伪造）**：设计态/无框 → `ok:false + stopped_at:"no_error_dialog" + errBasis:"none" + err.number:null + errChannel.readOk:false + errChannel.why`（具名四值 `vba6_not_loaded|selector_unreadable|record_unreadable|record_empty`）；**绝不用 `Err` 对象或猜测值冒充记录值**，`errCrossCheck` 只作对照（add-in 线程 `Err` 在处置入口快照，`relation:"addinThreadErrAtHandlerEntry"`，且仅当可得）。⑤ **证据/验收**：跨进程 2/2 命中异常记录映射（G2 探针 `fix/TASK_RE_ERROR_CHANNEL_20261023/` 的 fixture + probe 与手测回执 JSON，按 receiptSha 对账）；**产品代码不含任何可切换的假偏移/假记录开关（C10）**；完整验收、battery 覆盖缺口披露与回执索引见 `fix/TASK_RE_ERROR_CHANNEL_20261023/RECORD_34a.md`。 ⑥ **errChannel.selector.basis="unavailable" 的语义（Lead 裁定）**：它表示**选择子未参与选择**（record A 在 modal 与 settled 两种状态下均为当前记录；实测 bit24 只跟随 modal 对话框状态、不是 record 选择子，选择子未参与），**不是读不到/读取失败**；A5 枚举无“record A 恒选”项，故用 unavailable 表示“未据此判据选择”，**未新增枚举值、未改 schema 形状**（last_error 描述已同步这句）。 |
+| **v1.16.2** | 2026-10-23 | **33b 语义批：dirty-untitled 关闭路径默认拒绝 + 显式 opt-in + `open_project` 成功面归一 + 断点台账落点固定。工具面 ADDITIVE：add-in 120→120、hub 11→11、DSH 面 131→131；`inputSchema` 恰 +2 个可选参数（`open_project.allowHostWrite`、`remove_project.allowHostWrite`），**无工具增删、无 required 变化、无既有参数类型变化**；另有 2 个工具 description 与 1 个参数 description（`remove_project.allowDirty`）文本变更 ⇒ 冻结面**显式重冻**（`docs/tools_schema.json` == `tools/schema_baseline.json` = `0F0CC82D0E72D7CBB99255FBD5C31255EC4298D44BEF28159F3C2DFE6B50560B`，120 工具；`check_live_tools: live_tool_changes=0`）。① **S1 脏且无标题（dirty ∧ untitled）的关闭路径默认拒绝、零写盘**：工程**无盘上 `.vbp`**（`VBProject.FileName` 为空）且 `VBProject.Saved=False`（或组件 `IsDirty=True`）时，VB6 在关闭（`VBProjects.Remove` / `open_project{exclusive:true}` 的换工程路径）时会把未保存工程**写进 IDE 当前目录**（33a 实测：`工程1.vbp` + `工程1.vbw` + 组件文件，并覆盖同名 `Form1.frm`），而 `VBProject.Saved` 在 VBIDE 里**只读** ⇒ 无法抑制。现默认**拒绝且零写盘**：`ok:false + reason:"dirty_untitled_would_write" + tool + projectName + fileName:"" + untitled:true + dirtySource + evidenceSource + dirtyUnknown + componentProbe + dirtyComponents[{name,isDirty,lines?}]（**组件级不可读时为 `null`**，此时 `dirtyUnknown:true` + `componentProbe:"unreadable"` + `componentSavedReadErrors[]` 共同说明，**绝不**以空数组冒充「没有脏组件」）+ componentSavedReadErrors[] + cwdCandidateFiles[]（CWD 深度 1 的现有文件 = 宿主可能覆盖的同名文件）+ cwdCandidateFilesScanned/Truncated/ScanFailed + **zeroWriteBasis + zeroWriteScanPre/Post**（33b.1：拒绝回执装配完成后**再扫一次** IDE 当前目录，`pre_cwd_scan_equals_post_cwd_scan` = 零写盘自证）+ why + howToProceed + note`。opt-in = 两工具各自的 **`allowHostWrite`**（boolean，默认 false）置 true 才恢复 3a 行为，并**如实报告**写入：`hostWrites[] + hostWritesBasis + hostWritesTruncated + hostWritesScanned` 与 `sideEffects.filesWritten[]`。`open_project` 的闸门只在 `exclusive:true` 的关闭路径、且只判定**将被关闭的其它工程**；`remove_project` 的闸门在 `allowDirty:true`（已选择丢弃改动）**之后**追加 ⇒ `allowDirty:false` 对**有** `.vbp` 的脏工程**沿用旧 reason** `unsaved_changes_would_be_discarded`，**不是** `dirty_untitled_would_write`（E5 回归保持）。★**实测（2026-10-23，srcBB→srcBC 手测 T1/T1b/T3）**：组件级 dirty 必须读 **`VBComponent.IsDirty`** —— **`VBComponent.Saved` 不是该接口的成员**，本机对每个组件都抛 **438（对象不支持该属性或方法）**，这正是 33b 初版 `dirtyComponents:[]` + `dirtyUnknown:false` 的根因（同一作用域内 `VBProject.Saved` 是合法成员，两者不可混用）。33b.1 起 `open_project{exclusive:true}` 闸门与 `remove_project` 共用**同一个** `ComponentDirtyProbe`（读 `IsDirty` 并附 `lines`），实测输出形如 `[{name:"UntitledDirty1",isDirty:true,lines:6}]`；组件级**读不出**时两条路径**一致**给 `dirtyComponents:null` + `dirtyUnknown:true` + `componentProbe:"unreadable"` + `componentSavedReadErrors[{name,errorNumber,errorDescription}]`。**拦截判定只依赖项目级证据**（`VBProject.Saved=false` ∧ 无盘上 `.vbp`），与组件列表是否可读无关。② **S2 `open_project` 成功面归一**：此前 `AddFromFile` 抛 IDE API 错误但工程实际已打开时会回 `ok:false + apiError`（33a 判为诚实性缺陷，3/3 会话复现）。现**打开成功即 `ok:true`**，非致命 IDE API 噪音只进 `apiWarnings[]{code,message,raw,phase,spurious}` + `note`，**不再占用 `apiError`**（`apiError` 只表示真的没打开；真正的失败仍抛错）。③ **S3 断点台账落点固定**：`breakpoints{action:"set"}` 的注入台账默认写 **`%TEMP%\vb6mcp\breakpoints.json`**（不再落在工程 CWD / 深度 2），可用环境变量 **`VB6MCP_BP_REG_FILE`** 覆盖；实际写入路径必须出现在回执 `sideEffects.filesWritten[]`（写失败或未写则不列，不发明路径）。★**实测（2026-10-23，srcBB→srcBC 手测 T6/T7）**：`BP_REG_DIR` 由 33b 开发期的 **`.vb6mcp`** 统一为 **`vb6mcp`**（与 `%TEMP%\vb6mcp\instances`、与 `prune` 回执 note 的写法一致），旧位置 `%TEMP%\.vb6mcp` **不再读写**；实测 `set` 把 `%TEMP%\vb6mcp\breakpoints.json` 列进 `sideEffects.filesWritten[]`，`VB6MCP_BP_REG_FILE` 覆盖**实测有效**（T7：写入指定文件并在 `filesWritten[]` 列出，默认路径 mtime 不变）；**工程 CWD 及其父目录均不出现 `.vb6mcp`/`vb6mcp` 目录**。④ **验收（33b.1 重测，2026-10-23，srcBC）**：`docs/tools_schema.json` == `tools/schema_baseline.json` = `8AE015325F577466CE9E4A0CFB36AEA11C5240FC46BD4B2D3659CFC08D19951A`（189,227 B / 120 工具；`check_live_tools: live_tool_changes=0`）；`bridge/hub_schema.generated.json` = `86BE1C1B5EA4957DB847B9F12EEFA04887230539E14E59169B6065E8B92B9AF4`（VERSION=v1.16.2 / DECLARED=120 / MISMATCH=False / FACEFP=`5b37d606…`；`LIVE_FACE_FINGERPRINT … FRESH`、`hub_alignment_failures=0`）；`docs/TOOL_CATALOG.md` = `E3E65030A986C0F49D1208A66FC2C32A74096A3575CEF96CA2798030E80FA173`；构建产物 `_vb6build\srcBC\VB6MCP.dll` = 5,152,814 B / `4359CDB1632725614C931E2DB4265E8EE9F931A9EDCD52BAE3DC1B1FB8E79922`（`/make` 日志 `'VB6MCP.dll' 编译成功`、errorCount=0）；`SOURCE_HASH=5c17fba90928f5f9ce8e5b36e67cf8907966348c450d1c8d94899c42a680dff0`（FILES=54）；`check_skill_truth` 4/4、`check_schema_baseline: schema_changes=0`；gates 12/12（×3）。手测（srcBC，disposable IDE + 诱饵/全清单口径）：**T1/T1b/T3 PASS**（`dirtyComponents:["UntitledDirty1"]` + `dirtyUnknown:false` + `componentProbe:"readable"` + `zeroWriteBasis:"pre_cwd_scan_equals_post_cwd_scan"` + 零写盘）、**T2/T4/T5 PASS**、**T6 PASS**（ledger 落 `%TEMP%\vb6mcp\breakpoints.json` 且在 `sideEffects.filesWritten[]`，旧 `%TEMP%\.vb6mcp` 不再被触碰，CWD/父目录无 `.vb6mcp`/`vb6mcp`）、**T7 PASS**（`VB6MCP_BP_REG_FILE` 覆盖写到指定文件、列进 `filesWritten`、默认 ledger mtime 不变）。 |
+| **v1.16.1** | 2026-10-22 | **工具面零变化（add-in 120 / hub 11 / DSH 131）；契约版本号 bump v1.16.0→v1.16.1；`add_component` 回执**只增不改**：新增 `fileSyncSkipped` / `fileSyncSkippedDetail` / `failedAt` / `adoptedAfterError` / `adoptedVbError` / `adoptedNote`，新增失败原因 `add_component_failed`（旧 `add_component_vbp_failed` 保留，仅用于 component_file/vbp_sync 阶段），并修正 `vbError` 语义（旧值恒为 `"0:"`，现为真实 `Number:Description`）；`tools_schema.json` / `schema_baseline.json` **未变**（`check_schema_baseline: CHANGED=none`，不需重冻）。功能侧：静息 CPU（私有拓扑 300 s）0.281% 总/0.231% 稳态/0-of-30（改造前 1.797%/1.781%）；默认宿主 tick 由 VB6 Timer 控件改为 Win32 `TIMERPROC`（长调用期间 progress 帧实测 3–15 帧）；bridge `stamp_body` 对数组/标量 body 改为单文档 `{singleDocument:true,data,receipt}`（`find_gui`/`vba6_probe_plan`/`audit_tail` 修复）；hub 面检测改为注册表文件轮询。基线：`srcZ` = 5,083,181 B / sha256 `c48962e6…` / `SOURCE_HASH=a67e873c…` / FILES=42 / gates 12/12 / HEAD `6a83646`。验收：battery 92/0、tick 臂 5/5、私有静息按预先注册判据 PASS。 |
+| **v1.16.0** | 2026-10-22 | **add-in 面：断点行为验证（两阶段 probe）+ RUN 态 End 去伪拒绝 + 编译器权威开关 + 多组件批量编辑；工具数不变（add-in 120、hub 11、DSH 面 131），全部 ADDITIVE（缺省参数/动作路径不变）；本版已重冻冻结面** ① **`breakpoints{action:"probe"}`（行为验证 —— 唯一能回答「这个断点有效吗」的通道）必须两阶段**：`phase:"start"`（默认）判定 design 态 / 无模态框 / 可断行后**启动程序**（**不快照、不保存工程、不写源码**），回执 `probePhase:"start" + probeResult:"started_pending" + probeId + startedPending:true + startQueued:true + howToContinue`（Start 在单线程 STA IDE 里是**排队命令**，程序在本调用返回**之后**才真正开跑）；`phase:"observe"`（带同一 `probeId`）等待至多 `timeout_ms`，命中后读 `position{component,proc,paneLine}` + `callstack`，再 **End** 程序并按**回读**证明 `stateAfter=design`；End 收尾可能需再确认一次 —— 尚未观测到时回执 `endPending:true`（不谎报已停），直到回读到 `stateAfter=design`。`phase:"auto"` 是 `start` 的显式别名（**不是**一次调用跑完两段：一次调用无法观测它自己启动的运行）。`probeResult` 是**封闭枚举**：`started_pending | stopped_at_target | stopped_elsewhere | did_not_stop | timeout | did_not_stop_unobserved | line_not_breakable | not_attempted | run_failed`。`probeId` **单次使用**且有 TTL（600000 ms）；未知/过期 ⇒ `ok:false + reason:"probe_not_found" + howToProceed`。★代价：它**真的跑程序**（observe 命中 = 等停 ≤timeout + 可能一段确认；实测 6.2 s / 12.1 s），且**不做 pre-run flush**。 ② **`control_execution{mode:"end"|"stop"}` 在 RUN 态不再假拒绝**：旧的 `reason:"commandbars_unavailable_while_running"` 对 end/stop 是**伪拒绝**（实测 End 命令条在 RUN 态返回 true 且真停机）；现走 `runStateEndPath:"dbclick_end_while_running"`，回执新增 `endCommandDelivered / endPending / stateAfterVerifiedBy:"ide_state" / stateAfterReadBack / programEnded / deliveryVsStateNote / endSettleMs` —— **`programEnded:true` 只在 design 回读之后出现**；已发出但尚不可观测时回 `ok:false + endPending:true + howToContinue`。**其它 mode 的 RUN 态拒绝不变**。 ③ **`verify` / `verify_scope` 新增可选 `requireCompiler`（boolean，默认 false）**：false 时回执**逐字节不变**；true 时取**编译器**证据（`authority:"compiler"` + `errorCount` + `artifactChanged` + `compiler{path,logPath,errorCount,artifactChanged}`；`verify_scope` 取得的是**一次项目级**编译判定），拿不到编译器 ⇒ **结构化拒绝** `ok:false + reason:"compiler_not_configured" + compilerProbe{resolved,path,why} + howToProceed`，**绝不用 lint 顶替编译**（该路径不保存工程、不碰真产物）。 ④ **`apply_edits` / `preview_edit` 多组件批量（同一工具，不新增工具）**：`edits[].component`（工具级 `name` 变**选填**；两者都缺 ⇒ `reason:"component_required" + opIndex`）；`expected_shas[]`（`[{component,sha256}]`，任一不符 ⇒ **整批拒绝、一字节不写**，回 `guards[]`）；**顺序语义** = 按 `edits[]` 顺序，每条的锚点在**该组件已更新文本**上解析（前面的 op 可移动后面的锚点），组件之间互不影响；**全或无**：任一失败即把**已写组件**恢复到批前 pane 文本并用**回读**证明（`rolledBack / restoreVerified / restoredComponents[]`），回 `ok:false + failedOpIndex`（**全局**下标）+ `hits[]`；上限 `max_ops` 默认 **200 / 上限 1000**、单批最多 **40 个组件** ⇒ 超限 `reason:"batch_too_large" + limits{ops,components,max_ops}` 且不写；成功回执新增 `appliedOps / totalOps / components[] / batchElapsedMs`；`preview_edit` 用**同一** `edits[]` 形状，按组件分组 hunks（`components[{component,ops,hunks,hunkCount,algorithm}] + totalHunks`）且**仍然什么都不写**（`writes:false`）。 ⑤ **工具数量不变**：add-in **120 → 120**、hub **11 → 11**、DSH 面 **131 → 131**；ADDED/REMOVED = 0；**本版已重冻**（`dump_tools_schema --freeze` + `gen_hub_snapshot` + `export_tool_catalog`；活体车道 = 最终 DLL `BB20AD87…`，contract v1.16.0 / toolCount 120）。 ⑥ 本版一并落冻三处**此前已声明但未进冻结面**的纯描述变更（`immediate_eval` / `immediate_run` 的 sink 失败分类措辞；`run_project` 的 STA 排队说明 + `diag{}`），无参数变化。 **FACE_DELTA = ADDED 7 optional params**（breakpoints.phase / breakpoints.probeId / apply_edits.expected_shas / apply_edits.max_ops / preview_edit.max_ops / verify.requireCompiler / verify_scope.requireCompiler）+ **breakpoints.action 枚举 +probe**；**CHANGED descriptions ×9**（apply_edits / breakpoints / control_execution / immediate_eval / immediate_run / preview_edit / run_project / verify / verify_scope）；`apply_edits`/`preview_edit` 的 `required` 由 `["name","edits"]` 变为 `["edits"]`。 |
+| **v1.16.0+冻结面台账补登（hub 面哈希 + 快照语义）** | 2026-10-22 | **只改台账文字：登记 v1.16.0 重冻后的实测哈希，并把 `bridge/hub_schema.generated.json` 的冻结语义写清（防止下一次漂移被误判）。工具面零变化（add-in 120→120、hub 11→11、DSH 面 131→131），不新增版本、不改任何散列值、不动冻结件。** **实测（本机工作区文件，Get-FileHash -Algorithm SHA256，2026-10-22）**：① `docs/tools_schema.json` == `tools/schema_baseline.json` = **`7FCC00AE6B6C8CE5BB9A08E64FA0D35B6A228E50EA26482D631DB260FD645355`**（120 工具；两份逐字节相等）；② `bridge/hub_schema.generated.json` = **`D95A85F6678838C640CCF7F1117D8B60102AD32296181DAFCDA2AE7BF6F0A250`**（VERSION=v1.16.0 / DECLARED=120 / MISMATCH=False）；③ `docs/TOOL_CATALOG.md` = **`3D6A3CC1E246227BC72C65BD8E42F7DA39A80950ACBF92C39A23CFAF2566154A`**；④ 活体 DLL = **`BB20AD876C152260C61A6B1953A5BC21A66B40EF98AE0181721C1AC66592A94C`**（3,939,828 B；contract v1.16.0 / toolCount 120；活体自证见该版冻结执行报告）。**冻结语义（关键，必须按此判读）**：**(a) 逐字节冻结件 = `docs/tools_schema.json` 与 `tools/schema_baseline.json` 这一对** —— 两者必须逐字节相等，任何工具面变化只能走 freeze 流程；**(b) `bridge/hub_schema.generated.json` 是「生成物 / 缓存」，不是逐字节冻结件**：唯一生产者 `tools/gen_hub_snapshot.py`（输入 = `docs/tools_schema.json` + `docs/CONTRACTS.md` 的版本表与 instructions 文本块）；它的正确性判据是**关系**而不是自身 sha —— ① `faceFingerprint` 必须等于由当前 `docs/tools_schema.json` 重算的指纹（`tools/check_hub_alignment.py` ⇒ `LIVE_FACE_FINGERPRINT … FRESH`），② `tools[]` 的 name/description/inputSchema 与冻结面**逐字段、同顺序**相等，③ hub-only 名称不冲突；⇒ **重新生成必然改变它自己的 sha（这是生成物的预期行为）**，上面登记的 `D95A85F6…` 只是「本版重冻那一次」的证据锚点，**不是**要求逐字节保持不变的目标；**不得**为保持旧 sha 而拒绝运行 `gen_hub_snapshot.py`（那样只会让快照 STALE）。**(c) 历史补记**：提交 `82129c2`（live 面追加 ROUTING/ENCODING 指引，+14/−2）曾使该生成物在 git blob（LF 计）下为 `2E1277073A3281B8…` 且**未新增版本行 / 未登记哈希**；该值已被 v1.16.0 重冻取代（现 `D95A85F6…`），工具面自 v1.11.4 起零变化（`tools/check_schema_baseline.py` ⇒ `BASELINE=120 CURRENT=120`、`schema_changes=0`）。**(d) 生效边界**：本行登记值必须与 `Get-FileHash` 实测**逐字符相等**；哈希值本身不会变，变的只是「哪一次重冻」。 |
+| **v1.15.0** | 2026-10-22 | **add-in 面参数变更：`run_project` +2 可选参数、`get_locals` +1 可选参数；add-in 面 120→120、hub 11→11、DSH 面 131→131；冻结面待活体重冻（本版本未重冻）** ① **`run_project.observe_max_wait_ms`**（可选，integer，毫秒，默认 `timeout_ms`，**clamp 1000..120000**）：observe 预算。到点即**返回**（**ok:true**，超时**不是失败**）+ `state:"timeout" + timeout:true + retrySafe:true + suggestedAction:"observe_again" + observedState + elapsedMs`（elapsedMs 为**实测**值）+ `marker.unmetReason="budget reached before the marker appeared"`（请求了 marker 但未命中时）+ `pipeReleasedByReturn:true` —— 单飞门不被长期持有（单线程 STA 不能抢占已执行的 VB 语句；"返回超时"是调用方决定，不是杀语句）。 ② **`run_project.done_marker`**（可选，object `{path, contains}`）：`path` 是 **IDE 所在机器**的路径（远端时由 middle service 侧判读；允许 UNC），只读**前 65536 字节**、不写任何文件；`contains` **大小写敏感**，纯 ASCII 按字节匹配，非 ASCII 同时尝试 UTF-8 与系统 ANSI 字节（`marker.matchedBy = bytes|ansi|utf8`）。命中即返回 `state:"done-by-marker" + marker{path,contains,matched,bytesRead,matchedBy}`。`state` 是**封闭五值**（互斥、可判定）：`done-by-marker`（**仅当** `marker.matched:true`，真命中文件标记）| `exited`（程序**正常结束**：run/进程已退出）| `break`（停在断点/调试上下文）| `error`（未处理错误框在场）| `timeout`（预算到点仍未终止，**不是**程序失败）。`done-by-marker` **恒蕴含** `marker.matched:true`；`exited` + `marker.requested:true` + `marker.matched:false` 时回执带 `marker.unmet:true`（"程序结束了但没等到要的证据"，**不得**读成目标达成）。 ③ **`observe` 在 break 态显式拒绝**：`reason:"observe_in_break_not_supported" + howToProceed`（先 `control_execution{mode:"continue"|"end"}` 再 observe；一次性读断点上下文用 `debug_session`）。 ④ **对话框预检/分类**：observe 前先分类 #32770 —— 只有 VB6 **运行时错误框**算 `program_error`；IDE 自身对话框（查找/替换/选项/引用/组件/工程属性）是 `ide_own_dialog`，返回 `reason:"observe_blocked_by_ide_dialog" + dialogPrecheck{dialogs[],isProgramError:false}`，**不再被误报成程序错误**。 ⑤ **`get_locals.allowUnsafeInBreak`**（可选，boolean，默认 false）：break 态 get_locals **默认拒绝**（`reason:"break_eval_requires_opt_in" + howToWorkAround + howToRecover`）；`true` 是知情同意——**不保证语句不挂**，仍可能 wedge 管道，恢复走 hub 的 `ide_kill_and_relaunch`（**不是** taskkill）。任何失败回执带 `gateReleased:true/false` + `howToRecover`。 **FACE_DELTA = ADDED 2 optional params to run_project, 1 optional param to get_locals**；工具名/工具数不变（120/11/131）。**冻结面滞后（事实）**：`docs/tools_schema.json` 与 `tools/schema_baseline.json` **本版本未改**，上述三个参数"声明有、冻结无"，须在新 DLL 部署后由活体车道 `dump_tools_schema --freeze` + `gen_hub_snapshot` + `export_tool_catalog` 重冻。 |
+| **v1.14.0** | 2026-10-22 | **hub 面工具变更：可续查的重启操作 + 单 JSON 文档内容通道 + peer_dead 判定；add-in 面 120→120、hub 11→11、DSH 面 131→131** ① **`ide_restart` 新增两个可选参数**：`wait_ms`（限制**单次调用**阻塞时长，默认 25000，env `VB6MCP_HUB_RESTART_WAIT_MS`，夹取 1500..300000）与 `opId`（**续查**上一次调用返回的操作）。**等待超时不是失败**：到点返回 `ok:false + pending:true + state:"in_progress" + opId + currentStep + lastKnownState`，重启本身继续在后台进行；`ide_restart{opId}` 从进程内操作注册表回答（保留 30 分钟，hub 重启即忘）且**不启动任何东西**；同一时刻只允许一个重启，进行中再调返回 `reason:"restart_in_progress" + inProgress{opId,...}`（第二次重启可能杀掉第一次刚拉起的进程）。 ② 每条 `ide_restart` 回执新增 `opId/started/state(done|refused|error|in_progress)/finished/elapsedMs/currentStep/lastKnownState/opRule`。 ③ **`content[0].text` 是单个 JSON 文档**：数组/标量型 body 变为 `{singleDocument:true, data, receipt}`（空结果 = `data:[]`，与解析失败可区分），非 JSON body 变为结构化 `content_not_json` 文档（保留 `rawText`），对象型 body **维持扁平**；`VB6MCP_LEGACY_TEXTBODY=1` 只保留旧两段式**一个版本**。 ④ 传输失败信封在 peer 进程**可证明已死**时给出 `peerState:"peer_dead"` + `peerDead:true` + `lostContext{}` + `howToRecover[]`（指向 hub 侧 `ide_kill_and_relaunch`，不再让调用方去 release 一个已不存在的门）。 **FACE_DELTA = CHANGED hub tool ide_restart（+2 可选参数）**；add-in face 无变化，`toolCount` 仍 **120**（hub 11，DSH 面 131）。 |
+| **v1.13.0** | 2026-10-22 | **目标解析与离线路由分离 + 就绪等待 + hub 级带外复位（新增 1 个 hub 工具 `ide_kill_and_relaunch`；`ide_start` 新增可选 `ready_wait_ms`；add-in 工具面 120→120，hub 10→11，DSH 面 130→131）** ① **目标阶梯只从活实例选**：discovery 后先按 pid/transport 复核并丢弃已死候选，hub 自己的陈旧记录不再能成为默认目标；显式 `_target` 指向死 pid 时返回结构化 `target_mismatch`，回执带 `onlinePids[]` / `targetDiagnostic{rule,reason,deadTargetPid,...}` / `howToProceed[]` / `suggestion{action,useTarget}`；**0 个活实例**时 IDE 面工具返回 `reason:"no_live_ide"`（`reasonLegacy:"no_ide_running"`）+ `howToProceed` + `suggestion`，不再出现 pid 级 target_mismatch。② **离线路由**：`build` / `make_project(route!="ide")` / `project_meta` 在**无活 IDE** 时由 hub 自己服务（`offline:true` + `offlineRoute:"cli"|"file"` + `targetResolved:false`）：独立 `VB6.EXE /make <vbp> /out <log>` 子进程（回执含 `logPath/logBytes/logEncoding/exitCode/errorCount/firstError{file,line,lineSpace,text}`）、**编译后**补 `IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020)` 并回读（`laaBefore/laaAfter/laaSet/laaSource`）、**所有改写之后**才取 `artifact{exists,bytes,mtime,sha256}` 与 `artifactChanged`（`hashedAfterRewrites:true` + `rewriteSteps[]`）；VB6.EXE 不可解析时 `reason:"cli_unavailable"` + howToProceed（不是 target_mismatch）；`package_app` / `verify` 在 0 实例时明确 `offlineServed:false` + `no_live_ide`（不假装离线可用）。③ **ide_start 就绪语义**：`ok:true+started:true` 只声明**进程已创建**；`ready:true` 才表示**观测到 add-in 对同一 pid 应答 mcp_info**（轮询、有上限，绝不固定 sleep）；超时返回 `ready:false` + `readyWaitMs` + `readyChecks{registryVisible,transportUp,addInAnswers,addInAnswersBasis,pidAlive,projectMatches}` + `readyProbeRounds` + `pollingHint`（就绪**只测刚拉起的那个 pid**：每轮直读它的注册文件 + transport + `mcp_info`，不用 discovery 集合；`addInAnswersBasis` 三态互斥 `no_route|direct_rpc|middle_service_forward`，`no_route` ⇒ `addInAnswers:null`）；同一 .vbp 已打开时**复用**（`started:false,reused:true,processesCreated:0`）。④ **新 hub 工具 `ide_kill_and_relaunch{pid, project?, ready_wait_ms?}`**：不依赖 add-in 管道——结束**本 hub 拥有**的实例（内存 `startedByHub` 或注册 `startedByHub=true`）、清其注册项、在原 `.vbp` 上重启并轮询就绪；回执固定 `stoppedPid/newPid/ready/readyWaitMs/threeWay{http,mcpInfo,project}/elapsedMs/steps[]`，拒绝路径给 `refused_reason` + `howToProceed`；**非本 hub 实例、已知端口 <8767（含 8766）、远程 bridge 实例一律拒绝**。⑤ 诊断：所有最终失败回执保留 `failureKind/suggestedAction/retrySafe`；`targetDiagnostic` 区分 `explicit_target_not_live` / `stale_default_ignored` / `no_live_ide` / `hub_record_stale`。**FACE_DELTA = ADDED hub tool ide_kill_and_relaunch；CHANGED ide_start（新增可选 `ready_wait_ms`）**；add-in face 无变化，`toolCount` 仍 **120**（hub 11，DSH 面 131）。 |
+| **v1.12.2** | 2026-10-21 | **运行/单步落盘的观测与知情同意（R-1021-02；新增 1 个可选参数 `allowDiskMutation`；回执全部增量）** ① **归因更正**：运行/单步把 IDE 内存改动写盘**不是 MCP 工具的行为**，而是 VB6 IDE 的全局选项 **工具(T) → 选项(O)... → 环境 → 组「启动程序时」**（保存更改 / 提示 / 不保存更改）；注册表载体经 t16 实测为 `HKEY_CURRENT_USER\Software\Microsoft\Visual Basic\6.0\SaveBeforeRun`（REG_SZ，**0=不保存更改 / 1=提示 / 2=保存更改**，三值各跑一轮定案）。**本工具不改该选项**，只**只读**读出并在回执给 `ideAutoSaveMode`/`ideAutoSaveReadFrom`。② `control_execution`/`run_project` 新增 **`allowDiskMutation`**（boolean，默认 false）：从**脏内存**（`VBProject.Saved=False` 或某组件 `IsDirty=True`）启动时默认**拒绝启动**，`reason:"dirty_memory_would_be_saved"` + 脏组件清单（>64 截断并标 `truncated`）+ `howToProceed`（save_project / 关 IDE 开关 / `allowDiskMutation:true`）；`dirtyUnknown`（标志读不出）**不拒绝**但在回执写明判据。③ 两工具新增**磁盘快照**：调用前（**早于 run/full_compile 已有的 pre-run flush**）与调用后各一次，覆盖当前工程 `.vbp` + 全部组件文件 + 成对 `.frx/.res`；回执固定 `diskWrites:[{file,beforeBytes,afterBytes,beforeSha,afterSha,reason:"pre-run-save",attribution}]`（`attribution` ∈ `mcp_pre_run_flush` / `ide_auto_save` / `unknown`；**step_* 路径绝不归因 flush**，**run/full_compile 的 flush 写盘绝不归因 ide_auto_save**，归属按 pre-run flush 自己回执的 `projectDirWrites` 交集判定）、`touchedFiles[]`（mtime/size 变而 sha 相同，**不进 diskWrites**）、`diskSnapshot{hashMode,budgetBytes,checkedFiles,snapshotMs,taken}`、`checkedFiles`。工程源文件合计 ≤32 MiB 时**两侧全量 SHA**（`hashMode:"full"`）；超预算降级 `"gated"`（只哈希 .vbp + 脏组件 + stat 变化的文件，未取的摘要一律 `""` + `beforeShaNote/afterShaNote`，**不许编**）。④ **`saveOnRun` 语义**：= 「**本次调用自身**会把 IDE 内存写盘」（**仅** run/full_compile 的 pre-run flush 为 true，并配 `saveOnRunReason:"mcp_pre_run_flush"`），与**恒存在**的 `ideAutoSaveHint:"may_save_on_start"` **并列**；`saveOnRun:false` **不是**「磁盘不变」的保证。⑤ **restart**：回执 `saveOnRun:false` + `deferredStart.pending:true`；deferred Start 的落盘在**下一次 `tools/call` 回执**里以 `deferredStart{startedAt,diskSnapshotRef,emittedInThisReceipt,diskWrites,touchedFiles}` 补齐（**不静默丢**）。⑥ `debug_session`/`run_until_break` 也会 Start 程序：**只加提示**（`saveOnRun:false` + `ideAutoSaveHint/ideAutoSaveMode`），**不加参数、不加拒绝**。⑦ **值 1（提示）可达**：脏内存 Start 会弹**模态**保存框；本次回执先给 `savePromptExpected:true`，下一次回执给 `savePromptPresent/startDialog`，并把「只点取消 / 改开关」写进 `howToProceedSavePrompt`。⑧ 文档：`docs/KNOWN_LIMITATIONS_AND_FAQ.md` §51（开关位置/三取值/人工关闭步骤/「仍以运行后核对 sha 为硬门禁」/edit→run 现在会被拒）与 `docs/T16_SANDBOX_RECIPE.md`（t16 实测默认值 0，**不能反推作者机**）。**FACE_DELTA = CHANGED control_execution,run_project**（各自 `inputSchema.properties` 仅新增布尔 `allowDiskMutation`，不新增 required），`toolCount` 仍 **120**。 |
+| **v1.12.1** | 2026-10-20 | **行为修复：E112 保留字判定改为实测分类（工具面/参数/inputSchema 逐字节不变 ⇒ 不重冻）** ① 旧实现用一张约 110 词的平表，把内建函数名、类型名也当成「任何位置都非法」的关键字，`Dim name` / `Dim left` / `Dim mid` / `Dim time` / `Sub Property()` 等合法写法被误报 E112；本版换成分位置实测的三类：**HARD_FORBIDDEN**（lint 会检查的每个位置都被编译器拒绝 ⇒ 仍报）、**POSITION_RULES**（仅部分位置非法，如 `property` 只在模块变量/公有类字段非法，而这两个位置 lint 不检查 ⇒ 不再报）；★实测另发现 **Type 成员（UDT 字段）与模块名这两个位置根本不校验关键字**（`If As Long` 作 UDT 成员、`If` 作模块名都能编译），故矩阵中这两列**不计入**合法性判定，未来复测不要把它们读成「合法」；③ **第二轮按区域复筛**（24 个更细位置 × 同一 264 词 = 6,336 例，全部实测 + 3,739 例二次重编 0 mismatch）确认：**lint 可达的过程类/声明类/参数类三个保守交集仍都是同一 123 词集**（added/removed 均为空）⇒ **不改代码、不升版、不重冻**。同轮实测补充：`property` 作 `Dim` 合法但作 `Static` 被拒（lint 本就不报 `property` ⇒ 属**保守漏报**，非误报）；`.vbp` 的 `Name=` 项目名对非法/关键字值会被编译器**静默改名**（`9abc`→`Vb9abc`、`if`→`vb4projectif`）⇒ 记 `AUTO_RENAMED`、按不可用处理；窗体控件名**只有被代码引用时**才校验（纯声明不校验）；窗体级变量还会与窗体隐式成员（`left/line/name/width`）冲突——这些均属**位置命名空间效应**，不进规则、**INTRINSIC_OK**（编译器接受的内建名 ⇒ 永不报）。② 判定取自 VB6 编译器实测矩阵（264 词 × 11 个语法位置 = 2904 个独立极小工程，证据 `evidence/kw/matrix.tsv` + `evidence/kw/summary.md`），E112 只在该词被实测拒绝的位置触发；词表对比：去掉 17 个误报词、纳入 47 个原先漏掉的真保留字（后者都无法通过编译，故不会命中可编译代码）。③ 无工具/参数/描述变更，`tools/list` 不变，**FACE_DELTA = none**。 |
 | **v1.12.0** | 2026-10-20 | **调试能力 + 写/验/构加固（工具 110→120，新增 10 个；既有工具新增参数；回执全部**增量**）** ① 新增 `debug_session`/`run_until_break`/`breakpoints`/`get_locals`/`eval_at_frame`/`run_project`/`last_error`/`move_procedure`/`delete_procedures`/`edit_by_byte_anchor`。② **Start/End 是排队命令**（STA）：一次调用无法覆盖 start→break ⇒ 两段式（start 回 `startedPending`+`howToContinue`，attach 观测）；`debug_session` **不保存工程**（`preRunSave=false`），排队中的 End 报 `endQueued` 而非假 `wedged`（`wedged` 仅指调用内无法恢复）。③ 断点带 **`paneLine`+`diskLine`+来源声明**；手工设的原生断点不可枚举/不可验证（`nativeStateVerified=false`）；条件断点用 `hitCount` 等价表达。④ `get_locals` 只给**名字**（立即窗上下文不是断点帧 ⇒ 值 `localsUnavailable`+原因）；`eval_at_frame` 仅 IDE 立即上下文，break/run 下**默认拒绝**，`allowUnsafeEval` 才执行，**对象/数组表达式求值前静态拒绝**（`object_expression_unsupported`，会挂死 IDE），每次求值闸门兜底、`timeoutMs` 只是调用方预算提示。⑤ `run_project` 两段式、Start 前设 env；Standard EXE 从 IDE 启动**拒绝命令行参数**；**不能 attach 已运行的 -Embedding 进程**；`last_error` 给错误对话框正文+调用栈+局部变量**名字**。⑥ `move_procedure`/`delete_procedures` **事务化**（快照+回滚）；`edit_by_byte_anchor` 按 **ANSI 原始字节**编辑、GBK lead/trail 边界+roundtrip 校验，**失败绝不写盘**（`fileUntouched`+sha 相等）。⑦ `build`/`make_project` 增 `sourceFreshness`（逐组件 disk-vs-pane，只比**规范化文本**，sha 仅供参考）、`final{}`（**LAA 补丁后**采样：hash/PE/FileVersion/`verifiedOnDisk`）、`project`（仅 cli 路线）与 **CLSID `InprocServer32` 守卫**（前后读回/恢复）、以及 cache-hit 的 `compileLogHint`+`diagnoseRecommended`（**cache hit 不解析旧日志**）。⑧ `verify` 增 `semanticDiff`（大小写/Attribute/尾空格归一 + 逐行 `paneLine/diskLine/category`）、`failureLayers{ideDiskDiff,lint,build,modal}`、`overallBasis`；`verify_scope` 仅把**已证 IDE≠disk** 计 fail（`failBasis=ide_disk_diff_proven`）并支持 `baseline`，不变量 `pass+fail+unknown==checked` 恒发布。⑨ `add_component`/`remove_component` 的 `.vbp` 行与组件文件**原子同步**（**文件先落盘**再改 `.vbp`；`.vbp` 恰好一个行尾 CRLF；失败**双侧回滚**），`Form`/`UserControl` add **显式拒绝**（`pairedBinaryUnsupported`）。⑩ `write_file`/`write_source` 对**已存在非空文件 + 空内容**拒绝（`empty_content_would_truncate`，`confirm_truncate=true` 才允许），VB 源文件**永不写空**。⑪ `dependency_graph` 在 `partial` 时发布 `minQuotaHint{charQuota,budgetMs,basis}`，按建议一次重跑即可完整；否则报 `cannotComplete` 而不编造。⑫ **schema 形状**：每个工具的 `inputSchema` 的 `properties` **恒为对象**（无参时 `{}`）、`required` **恒为数组**（无必填时 `[]`）；六个新工具先前误发 `"required":{}`（把空 Dictionary 当成列表传），已在发布前修正，schema 构造器现会把这种形状**强制转换或拒绝**；`dump_tools_schema --freeze` 与严格审计（3e/3f）都会拒绝非数组 `required`。**限制（如实）**：断点帧局部变量**值**不可读、对象/数组 inspect 不可达、任何立即窗求值都可能挂（`release_inflight` 恢复）、`run_project` 的 env 程序内回读**未证实**、UNC 路径未验证。 |
 | **v1.11.12** | 2026-10-20 | **诊断一致性 + 写类行序 + 挂死可观测（三张缺陷卡同批；无工具增删；inputSchema 无结构变化 ⇒ 不重冻）** ① **归属判据统一（作者编号 114）**：`ide_list`、转发回执 `ide_state`、`ide_restart`（`ide_stop` 亦附）共用**唯一**解析器 `resolveOwnership()`，回执新增 `ownershipVerdict{verdict, basis[], registryAlive, portAvailable, pid, port, project, projectPath, registryFile, registeredPid, portOwnerPids, portOwnerWhy, netstatAvailable, ownedEvidence[], foreignEvidence[], rule}` + `ownershipVerdictRule`；**两轴并列写清**：legacy `ownership` / `ownedByHub`（＝「本 hub 启动的」→ `ide_stop` / `ide_restart` 的**许可轴**，**不变**）vs 新 `ownershipVerdict`（＝**归属身份轴**）；**归属不授予许可**（用户手工启动但能应答的 IDE ⇒ verdict=owned，仍 `ownedByHub=false`、仍不可被 `ide_restart` 动）。判定：**owned** = 可归因本机 add-in 安装（hub 启动证据 或 注册表 + pid 存活 + add-in 亲自应答 `mcp_info`）；**foreign** = **仅正面证据**（注册 pid 已死但端口仍应答 / 监听端口的 OS owner ≠ 注册 pid / 保留区端口 < 8767 且应答 / 实例监听 pid ≠ 其注册记录 pid）；**unknown** = 其余一切，**含 `portAvailable=false`**（端口不可得 ≠ 别人的：pipe-only 注册故意发布 port 0）。`ide_restart` 的 `not_owned` 拒绝**保留**；**归属未知**改用 `refused_reason:"ownership_unknown"` + `legacyReason`（改造前该路径的旧 reason，供旧消费者比对）+ `ownershipUnknown:true` + `howToDisambiguate`（默认拒绝重启 + 消歧步骤）。`hubInstance.ownership` 不再为 `null`（此前 `ide_list` 说 ours、`ide_state` 回执说 null 的**字面矛盾**）。 ② **写类行序（作者编号 113）**：**`apply_edits`** 新增 `deletedLines` / `deletedText`（截断）/ `deletedTextLines` / `deletedTextTruncated` / `deletedTextLimit`；**`apply_edits` 与 `preview_edit` 都**新增拒绝 `reason:"delete_with_text"`、`reason:"would_empty_component"`（两者**逐字同 reason**），但 **`preview_edit` 不报 `deleted*` 键**（preview 的删除体现在 diff 中；读 `preview_edit.deletedLines` 会得到 `undefined`，不要依赖）；`reload_component` 新增 `vbpPath` / `vbpOrderChecked` / `vbpOrderPreserved` / `vbpOrderRestored` / `vbpOrderChanges[]{key, line, beforeLine, afterLine, beforeOrder, afterOrder}` / `vbpOrderLinesBefore[]` / `vbpOrderLinesAfter[]` / `vbpOrderLinesCapped` / `vbpRevisionBefore` / `vbpRevisionAfter` / `vbpRevisionBumped` / `vbpOrderNote` / `inMemoryOrderMoved` / `inMemoryOrderChanges[]{component, beforeIndex, afterIndex}` / `inMemoryOrderBefore` / `inMemoryOrderAfter`；`save_project` 新增 `vbpOrderChecked` / `vbpOrderPreserved` / `vbpOrderRestored` / `vbpOrderFinalPreserved` / `vbpOrderChanges[]` / `vbpOrderChangeCount` / `vbpOrderLinesBefore[]` / `vbpOrderLinesAfter[]` / `vbpOrderLinesCapped` / `vbpRevisionBefore` / `vbpRevisionAfter` / `vbpRevisionBumped` / `vbpOrderNote` —— **保存后行序变了必须恢复原序**（只重排行、不丢 VB6 写入内容；**恢复失败 ⇒ `ok=false` + `reason:"vbp_order_restore_failed"`，说明文本在 `okReason`**），`vbpRevisionBumped` 是**实测**值；**上限（锁定值）**：`vbpOrderLinesCapped` = **400** 行（`VBP_ORDER_MAX_LINES`；`vbpOrderLinesBefore[]` / `vbpOrderLinesAfter[]` 各最多 400 行，超则截断）、`vbpOrderChanges[]` 最多 **50** 条（`VBP_ORDER_MAX_CHANGES`）、`deletedTextLimit` = **4000** 字符（`VBP_DELETED_MAX_CHARS`）。 ③ **挂死可观测（作者编号 115，字段已锁定）**：`make_project` 新增 `timedOut`（子进程到预算被**杀**）、`budgetEnforced`（预算真的执行了终止；cache hit / 未起子进程 = false）、`budgetMs`（实际预算；未起编译器 = 0）、`budgetSource`（`timeout_ms` / `default` / `clamped_min` / `clamped_max` / `not_applicable`；默认与上下界：`build` **180000 / 1000 / 600000 ms**，`make_project(diagnose)` **120000 / 5000 / 600000 ms**；`budgetMs` 报 **clamp 之后**的实际生效值，clamp 时不叠加原来源名；`not_applicable` = in-IDE Make / 缓存命中 / 预检拒绝，此时 `budgetMs=0`、`budgetEnforced=false`）、`stopReason`（**四值写死**：`completed` / `timeout` / `refused` / `host_modal_blocking`）、`stopReasonPriority`（两者同真时 `timedOut` 是**终止原因**、`host_modal_blocking` 描述**宿主状态**）、`host_modal_blocking`（与 `timedOut` **独立**）、`host_modal{blocking, stage, count, risk, riskReason, riskClass, ownerDisabled, hwnd, title, controls[], dialogs[], observedDuringCall, source}`（`observedDuringCall`/`source` = 调用期间出现过模态框、收尾时已被守卫取消，活体已看不到框）、`isolatedMake{attempted, pid, exitCode, killed, killMethod, elapsedMs, leftover, budgetMs}`（**`exitCode=-1` = 被 kill / 未真正运行**）、`budgetNote` / `timeoutNote`（说明字符串，**不参与判定**）；预算到点**杀子进程且事后无泄漏**。 **`build` 同机制**：`timedOut` / `budgetEnforced` / `budgetMs` / `killMethod` / `childPid` / `compilerElapsedMs` / `childLeftover`，**超时时 `ok:false` + `verdict:"timeout"`**（不再抛「build process failed to run」）—— **本版一并关闭该缺陷卡（`build` 的 `timeout_ms` 现为强制预算）**。 `ide_state` **零工具面变化**（无参数/描述/schema 改动，`inflight{}` 字段集不变），只改行为：隔离编译等待循环泵消息（`Util.PumpNow`），使 `depth>0` 的**只读探测在长调用期间被派发**，`serviceable` 语义按实测 = 该只读调用**确实被服务**。 Tool face：add-in **110 → 110**、hub **10 → 10**、DSH-facing **120 → 120**；ADDED / REMOVED 参数：**无**；`tools/check_schema_baseline.py` ⇒ `schema_changes=0`（**不重冻**）；闸门集 **8/8**。 |
 | **v1.11.11** | 2026-10-17 | **版本说明补正 + 一次参数描述 hygiene（10 个参数描述文本变更；无工具增删；inputSchema 无结构变化）** ① `mcp_info.changelog` 里 v1.11.10 的条目此前写成「wording only, no behaviour change」，与事实不符 —— 本版**如实重述**：v1.11.10 修了**三个 winsock 传输缺陷**（a 每连接对象未持久化 ⇒ 跨 TCP 段到达的请求丢前半段、30 s 空闲清扫后才断；b close-after-send 在队列已清空后才判定 ⇒ `Connection: close` 响应滞留至空闲清扫；c flush 累积 `Mid$` 起点越过 64 KiB，且 `send()=-1` 且 `WSAGetLastError()=0` 被误判为致命 ⇒ 正文在 64/96 KiB 处截断），合起来**修掉了间歇 `RemoteDisconnected` 与 >64 KiB 截断**（属**行为修复**）；同批**描述级改动逐项**：**3 个工具描述**（`edit_by_anchor` / `apply_edits` / `preview_edit`：去内部号前缀）、**1 个工具描述**（`verify_scope`：build 证据按项目判定）、**2 个参数描述**（`replace_code.expected_sha256` / `make_project.wait_for_build`）、**1 处运行期回执文本**（`make_project.buildStateNote` 去内部号前缀，字段与语义不变）。② 本版新增：**vba6_probe 的 10 个参数描述**（`exec_probe` / `exec_set_frame` / `frame_probe` / `frame_set` / `frame_set_a1` / `frame_set_a2` / `worker_call` / `worker_p2_engine` / `mem_dump` / `mem_scan`）去掉内部实验编号与逆向轮次号（**语义不变**；无参数增删、无类型/required 变化），发布树注释里的同类编号一并清除；导出审计 regex **不扩**（一次性 hygiene，非审计规则）。面变化构成：add-in **110 -> 110**、hub 10 -> 10、DSH-facing **120 -> 120**，ADDED/REMOVED = 0；GENERATED 三件套按新面重冻。`tools/dump_tools_schema.py` 沿用 v1.11.10 更正后的表述：**仓库内冻结用脚本、不在公开导出树**。 |
@@ -38,6 +50,17 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 | **v1.6.0** | 2026-10-09 | **工具面扩容**：新增 `replace_in_files`（跨组件字面/正则替换，`dry_run` 默认 true）与 `undo_edit`（组件级显式单步撤销；写入前把 pane 文本快照到 `<工程>\_undo\`）⇒ **109 → 111，必须显式重冻**；同一次重冻并落地 `send_window_message` 的**描述补全 + 高危消息护栏**（新增参数 `confirm` ⇒ 本版 `CHANGED=send_window_message`）；另**登记**（不改 schema）`add_component{type:"form"}` 改由 IDE 自建 + `createdVia`/`ideRouteNote`、`control_execution.mode` 的 12 值 enum、以及两条工具面局限（`command_bars{list}` 不含 Add-Ins 弹层；`AddFromTemplate` 窗体模板路线本机不可用） |
 | v1.0.0（隐含） | 2026-09-21 | 既有 96 个工具（此前只有 live 快照与冻结基线，没有书面契约） |
 
+> **v1.16.4 后补（hub ADDITIVE 输出字段；不新增版本、不重冻、不重生成 hub snapshot、不影响 G13）**：2026-10-23 批次 35 —— `ide_start` / `ide_restart` / `ide_kill_and_relaunch` 的**成功回执**新增
+> `cwd`（绝对路径字符串，或 `null`）与 `cwdBasis`（`"spawn_cwd"` | `"unavailable"`，固定两值）。**语义**：`cwd` = 该次启动在 **spawn 点**捕获的工作目录（未显式传 `cwd` 选项时即 hub 进程当时的 cwd）；
+> 该次调用**没有 spawn**（例如 `ide_start` 命中已有实例的复用路径）或取不到时 ⇒ `cwd:null` + `cwdBasis:"unavailable"`（fail-closed，不猜、不读目标进程 PEB）。**追加边界（34b 同源实测）**：
+> VB6 在**优雅退出阶段**可能向该 CWD 写工程组文件 `.vbg`（已实测条件：会话中建立过工程组上下文且退出时工程干净 —— W37.T6 53 B / +250 ms、W38b.B1b 50 B / +250 ms；单工程 clean quit 与无工程 quit 不写；
+> hub stop/kill 族**未测**，不声明）。**冻结面零变化**：工具面 add-in 120 / hub 11 / DSH 131；`docs/tools_schema.json` == `tools/schema_baseline.json` = `AAFA1C6C…`；`bridge/hub_schema.generated.json` = `828B4DAD…`（未重生成）。
+> 证据目录：`fix/TASK_HUB_CWD_35_20261023/`（`PREREGISTER_35.md` / `STATIC_IMPL_35.md` / `BATCH35_RUNTIME_RESULT.md`）。
+
+> **批次 37 修复（同属 v1.16.4 后补；行为修复，不改工具面/冻结面）**：`ide_restart` 的新实例就绪判定**改用「新实例注册的 `project` 名」为期望值**（W44 根因：此前 pipe 分支用 `.vbp` 路径 basename、TCP 分支用 pre-restart `target.project`，都会把「工程名 vs 工程路径/旧实例」错配 ⇒ `projectMatches` 恒 false ⇒ `three_way_ok=false` ⇒ 误回 `refused new_instance_not_ready`）。现在 `wantNameSource = "registration" | "basename_fallback" | "unavailable"`，比较为 trim + 大小写不敏感、缺失侧保持 `null`（unverified）；W45 复测 pipe/TCP 两分支 `ide_restart` 均 `ok:true / restarted:true / three_way_ok:true`。证据：`fix/TASK_RUNTIME_PROBES/WINDOW_44_RESULT.md`（根因）/ `WINDOW_45_RESULT.md`（复测）/ `fix/TASK_HUB_CWD_35_20261023/BATCH37_IMPL.md`。
+
+> **批次 39（同属 v1.16.4 后补；add-in 行为改进，不改工具面/描述/参数/冻结面，不重冻）**：`last_error` / `close_active_dialogs` 的对话框按钮选择改为 **控件 ID 优先、文本兜底**。按对话框种类**分域**（runtime_error：Debug=4801 / End=4800 / Continue=4802 / Help=4902 / Body=4803；save_confirm：Yes=6 / No=7 / Cancel=2；eject_refused：OK=2；load_fail：Yes=6 / No=7 / Help=9），必须 `Button` + `enabled` + **文本二次校验**（冲突 ⇒ `id_text_conflict` 拒绝）才点击；`continue`/`end` **永不点击**，`last_error{dismiss}` 保持 **Debug-only**，`close_active_dialogs` 对 runtime_error 框按 kind 拒绝；无 ID / 未知 ID 时回退原文本路径（行为与旧一致）。仅在真正发生 ID 解析/点击时，回执新增 `idBasis` / `controlId` / `idTableVersion`（`last_error` 为 `dismissIdBasis` / `dismissControlId`）；无框/无错误路径**零新增键**（lane 27-call 0-diff，verify_39 PASS 仅 build_identity×3）。回滚开关 `VB6MCP_DLG_ID_FIRST=0`（运行期，无需重编）。G5 现场：runtime_error 4 次独立冷启 ID 集 `[4800,4801,4802,4803,4902]`、pairs=6 / text-varies=4 / unstable=0（PASS_P15=TRUE）；save-confirm / References 触发路径 **UNOBSERVABLE**、英文 IDE 未测（如实披露）。冻结面不变：schema 两件 `AAFA1C6C…`、hub snapshot `828B4DAD…`、工具数 120/11/131。证据：`fix/TASK_DIALOG_IDFIRST_20261024/`（`PREREGISTER_39.md` / `STATIC_IMPL_39.md` / `RECORD_39.md` / `verify_39_result.json`）、`fix/TASK_RUNTIME_PROBES/WINDOW_46_RESULT.md` / `WINDOW_47_RESULT.md`。
+
 > 注（2026-10-17）：上表历史行中的**机器专用路径**已替换为占位符（如 `<scratch>`），原文语义与结论不变；公共树不得含本机路径（导出审计要求）。
 | **v1.5.0** | 2026-10-09 | **消息型窗口原语 + 可选滚轮 + 写入回执的相位/分块字段**：新增 `read_active_dialogs`（只读）/ `close_active_dialogs`（**只显式调用**）/ `send_window_message`（**只发窗口消息**），**106 → 109，必须显式重冻**；`command_bars` 在**既有 `control` 参数内**接受 `#<id>` 寻址（**不改 inputSchema**）；写入回执新增 `hunks` 与相位字段（**纯增量**，见下）；可选代码窗滚轮（env/注册表，**默认关**，**不新工具、不改 schema**） |
 | **v1.4.0** | 2026-10-09 | **OCX 防挂死**：`add_control` 预校验（未登记部件 ⇒ `control_part_not_registered`，绝不进入会挂死的调用）+ 新只读工具 `list_component_parts`（**105 → 106，需显式重冻**） |
@@ -46,6 +69,60 @@ S 预写本节并 `bus.mjs contract` 广播（主卡 + 受影响进程确认卡 
 | **v1.3.0** | 2026-10-08 | **版本变更可见化**：新增只读 `mcp_info`（104 -> 105）+ `initialize.instructions` 固定版块 + 每次 `tools/call` 正文带 `mcp:{product,contract}` 版本戳 + 产品版本 0.2.0 -> 0.3.0 |
 | **v1.2.0** | 2026-10-08 | **工具加固**（从真实工程实战反推）：α 回执诚实性（纯增量）+ β 行为加固（**破坏性**）+ γ 输入参数（触 inputSchema）+ δ 3 个新工具；分 A 批（α+β）与 B+C 批（γ+δ）两次落地，见下节 |
 | ~~v1.1.0~~ **v1.1.0（含勘误）** | 2026-09-22 | **新增 5 个只读工具**：`ide_state` / `current_position` / `list_breakpoints` / `find_gui` / `ui_text`（96 → 101）；另有 1 条非 schema 变更（断点态写权限错误的 `reason`，见下） |
+
+## v1.16.0 变更说明（add-in 面；纯增量，冻结面已重冻）
+
+> **结论先行**：**工具数不变**（add-in **120** / hub **11** / DSH 面 **131**），**ADDED/REMOVED 工具 = 0**；新增 **7 个可选参数** + **breakpoints.action 多一个枚举值 `probe`**，**9 个工具描述**变长；**缺省路径行为不变**（不传新参数、不用 `probe` 时，回执与旧版一致）。本版在活体车道（最终 DLL `BB20AD87…`，contract v1.16.0、toolCount 120）上执行 `dump_tools_schema --freeze` → `export_tool_catalog` → `gen_hub_snapshot` 重冻冻结面。
+
+### 0. 冻结面哈希与冻结语义（台账补登，2026-10-22）
+
+- **逐字节冻结件（唯一一对）**：`docs/tools_schema.json` == `tools/schema_baseline.json` = `7FCC00AE6B6C8CE5BB9A08E64FA0D35B6A228E50EA26482D631DB260FD645355`（120 工具）。工具面任何变化必须走 freeze 流程并显式重冻。
+- **生成物（不是逐字节冻结件）**：`bridge/hub_schema.generated.json` = `D95A85F6678838C640CCF7F1117D8B60102AD32296181DAFCDA2AE7BF6F0A250`（本次重冻锚点）。判据见 `tools/check_hub_alignment.py`：`faceFingerprint` 必须 FRESH + `tools[]` 逐字段同顺序相等；重新生成会改变自身 sha，属预期。
+- `docs/TOOL_CATALOG.md` = `3D6A3CC1E246227BC72C65BD8E42F7DA39A80950ACBF92C39A23CFAF2566154A`；活体 DLL = `BB20AD876C152260C61A6B1953A5BC21A66B40EF98AE0181721C1AC66592A94C`（contract v1.16.0 / toolCount 120）。
+- 细则与历史补记见版本表 `v1.16.0+冻结面台账补登` 行。
+
+### 1. `breakpoints{action:"probe"}`：行为验证，且必须**两阶段**
+
+VBIDE 对象模型没有断点 API，"这个断点有效吗"只能**行为验证**。一次调用**无法**观测它自己启动的运行（Start 是 STA 里的**排队命令**），所以本工具是两段：
+
+| 阶段 | 入参 | 回执 |
+|---|---|---|
+| `phase:"start"`（**默认**） | `breakpoints{action:"probe", component, line, timeout_ms?}` | 先判定 design 态 / 无模态框 / 行可断；通过后**启动程序**（**不保存工程、不写源码、不做 pre-run flush**），回 `probePhase:"start"`、`probeResult:"started_pending"`、`probeId`、`startedPending:true`、`startQueued:true`、`howToContinue` |
+| `phase:"observe"` | `breakpoints{action:"probe", phase:"observe", probeId, timeout_ms?}` | 等至多 `timeout_ms`，命中后读 `position{component,proc,paneLine}` + `callstack`，再 **End** 程序，并按**回读**证明 `stateAfter=design`；尚未观测到停机时回 `endPending:true`（不谎报已停），直到读回 `stateAfter=design` |
+
+- `phase:"auto"` 是 `start` 的**显式别名**（不是"一次调用跑完两段"）。
+- `probeResult` 是**封闭枚举**：`started_pending | stopped_at_target | stopped_elsewhere | did_not_stop | timeout | did_not_stop_unobserved | line_not_breakable | not_attempted | run_failed`。
+- `probeId` **单次使用**、有 TTL（**600000 ms**）；未知/过期 ⇒ `ok:false + reason:"probe_not_found" + howToProceed`（不猜、不复用旧运行）。
+- **代价（如实）**：它**真的跑程序**——observe 命中 = 等停 ≤`timeout_ms` + 可能一段 End 确认；实测一次完整验证 **6.2 s / 12.1 s**。它是唯一诚实通道，但**不是**廉价只读操作。
+
+### 2. `control_execution{mode:"end"|"stop"}`：RUN 态不再**假拒绝**
+
+旧实现在程序 RUN 时对 `end`/`stop` 回 `reason:"commandbars_unavailable_while_running"` —— 实测这是**伪拒绝**（End 命令条在 RUN 态返回 true 且真的停止程序）。现走 `runStateEndPath:"dbclick_end_while_running"`，回执新增：
+
+`endCommandDelivered` / `endPending` / `stateAfterVerifiedBy:"ide_state"` / `stateAfterReadBack` / `programEnded` / `deliveryVsStateNote` / `endSettleMs`。
+
+★`programEnded:true` **只在 design 回读之后**出现；End 已发出但本次调用内尚不可观测 ⇒ `ok:false + endPending:true + howToContinue`。**其它 mode 在 RUN 态的拒绝不变**。
+
+### 3. `verify` / `verify_scope`：`requireCompiler`（默认关）
+
+- `requireCompiler:false`（默认）⇒ 回执**逐字节不变**。
+- `requireCompiler:true` ⇒ 必须拿**编译器**证据：对**盘上工程的副本**跑隔离 `VB6.EXE /make`，成功回执新增 `authority:"compiler"` + `errorCount` + `artifactChanged` + `compiler{path,logPath,errorCount,artifactChanged}`；`verify_scope` 取得的是**一次项目级**编译判定。
+- **拿不到编译器**（解析不到 / 起不来 / 没写日志 / 预算到点被杀）⇒ **结构化拒绝** `ok:false + reason:"compiler_not_configured" + compilerProbe{resolved,path,why} + howToProceed`；**绝不用 lint 结论顶替编译结论**。该路径**不保存工程、不碰真产物**。
+
+### 4. `apply_edits` / `preview_edit`：多组件批量（**同一接口**，不新增工具）
+
+- `edits[].component`：每条 op 可带自己的组件名；工具级 `name` 变**选填**（作为默认值）。**两者都缺** ⇒ `ok:false + reason:"component_required" + opIndex`。
+- `expected_shas[]`：`[{component, sha256}]` 前置守卫；**任一不符 ⇒ 整批拒绝、一字节不写**，回 `guards[{component,expected,actual,ok}]`（旧的 `expected_sha256` 继续守默认/单组件）。
+- **顺序语义**：op 按 `edits[]` **数组顺序**应用，且**每个锚点在"该组件已更新文本"上解析**（前面的 op 可移动后面的锚点）；组件之间互相独立。
+- **全或无**：任一 op 失败 ⇒ 把**已写入的组件**恢复到批前 pane 文本，并用**回读**证明恢复（`rolledBack` + `restoreVerified` + `restoredComponents[]`），然后 `ok:false + failedOpIndex`（**全局**下标）+ `hits[]`。
+- **上限**：`max_ops` 默认 **200**、**上限 1000**；单批最多 **40 个组件** ⇒ 超限 `reason:"batch_too_large" + limits{ops,components,max_ops}` 且**不写**。
+- **成功回执**新增 `appliedOps` / `totalOps` / `components[]` / `batchElapsedMs`。
+- `preview_edit`：**同一** `edits[]` 形状，按组件分组 hunks（`components[{component,ops,hunks,hunkCount,algorithm}]` + `totalHunks`），**仍然什么都不写**（`writes:false`）。
+- **实测收益只能表述为"省往返"**：12 ops / 4 组件 **812 → 376 ms**；40 ops / 8 组件 **3013 → 847 ms**。add-in 是**单线程 STA，没有并行** —— 变快来自一次调用完成多次往返，不是并发执行。
+
+### 5. 随本版落冻的纯描述变更（此前已声明、未进冻结面）
+
+`immediate_eval` / `immediate_run`（sink 失败分类措辞：`engine_refused_line` 与 `eval_sink_error` / `run_sink_error` 分开）与 `run_project`（STA 排队语义 + `diag{}` 块说明）的描述变长；**无参数变化**，属"声明有、冻结无"的滞后在本版一次补齐。
 
 ## v1.1.0 新增工具
 
@@ -109,6 +186,123 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 | 字段 | 工具 | 语义 |
 |---|---|---|
 | `buildOk` / `buildSource` / `buildNote` | `verify` / `verify_scope` | ★**build 证据按【项目】判定，与组件无关**：三者来自**项目级** build 缓存（`ToolVerify` 读 `Build.CacheLoad`，key/hash 都是**项目级**），同一工程内**所有组件共享同一份** build 证据。因此 `buildSource: "none"` / `buildNote: "no build has been recorded for this project; run build for a real compile verdict"` 是**项目级**结论 —— **单个组件不可能“仅自己缺 build 证据”**；在**从未构建**的工程里，**任何**一致组件都会是 `unknown`（`pass` 不可达）；`pass` 只能在**有 fresh build cache 的工程**上出现。`buildOk` = `-1` 表示 unknown、`0` 表示 FAIL、`1` 表示 PASS（同样是**项目级**判定）。 |
+
+★**判据提醒（核对口径，不是新行为）**：在**从未构建**的工程上，`verify_scope` 的 `pass` **恒为 0**（`pass + fail + unknown == checked` 依然成立，全部落在 `unknown`）—— 这是**已文档化的正确行为**（项目级 build 证据缺失），**不是回归**；要拿到 `pass`，先在该工程上跑一次 `build` 生成项目级 build 缓存。
+
+### v1.15.0 回执字段补充（无 schema 变化、无版本 bump）：新建组件的初始声明区 / `add_code` 的「成败」与重复声明 / `immediate_eval` 的值传输
+
+> 本批**只做两件事**：新增**回执字段**，以及在**写入前**多做一次检查。没有新增/改名工具，没有新增或修改参数，`inputSchema` 与工具描述未变 ⇒ 契约版本保持 **v1.15.0**，冻结面**不需要**重冻。
+
+#### 1) `add_component`：新建组件的初始内容可预知
+
+- 固定字段（**每一次成功回执都有**，含 `name` 缺省与设计器类型这两条早期返回路径）：
+  - `component`：组件名（与既有 `created` 同值，供按通用字段名读取的调用方使用）；
+  - `initialDeclarations[]`：**新建组件代码窗格**在**第一个过程头之前**的声明区行（去首尾空白、按窗格顺序、跳过空行）；
+  - `initialDeclarationsCount`：上面的条数；
+  - `initialDeclarationsRule`：声明区口径的完整文字；
+  - `filePath` / `componentFile`：组件成员文件路径（工程没有盘上文件时为空串）；
+  - `fileMaterialized`：回执生成时该文件是否已在盘上；
+  - `fileSizeAfterWrite`：该文件的**实测字节数**（`FileLen`）；`0` 且 `fileMaterialized:false` 表示“文件当时不在盘上”，**不是**“没测”；
+  - `fileSizeAfterWriteBasis`：上一字段的口径原文。
+- ★**默认内容**：VB6 的 `VBComponents.Add` 会给新模块种一条 `Option Explicit`，因此 `add_component{type:"module"}` 的 `initialDeclarations` 通常是 `["Option Explicit"]`。
+- ★**口径**：`initialDeclarations` 只描述**代码窗格**。`Attribute VB_Name = "..."` 是**磁盘组件文件**的头行，**不出现在代码窗格**，因此**不会**出现在该数组里 —— 它随工程保存写入组件文件。
+- 调用方因此**不需要先读回组件**就能决定“要不要再补一条 Option Explicit”。
+
+#### 2) `add_code`：`ok` == “是否写入”；重复声明在**写入之前**检查
+
+- ★**`ok` 只有一个含义：本次调用是否改动了代码窗格。** 新增字段：
+  - `written`（boolean）、`writeOutcome`（`appended` | `not_written`）；
+  - `ok = written`，`okBasis` 把这条口径写进回执；
+  - 未写入 ⇒ `ok:false` **且一定有 `reason`**（当前取值 `no_write`），不再出现 `reason` 缺省。
+- ★**内容校验与写入成败分离**：`landedVerified` 仍是“结果**恰好**等于旧文本 + 追加块”的逐字节判定（语义未变）；当**写已发生**而该判定失败时，`ok` 仍为 `true`，并用
+  - `landingDifference`：`trailing_line_break_only`（IDE 只规范化了尾行断行）| `content_mismatch`（内容确有差异）；
+  - `landingNote`：说明“写已发生、不要重复追加、用 `sha256After` / `newTotalLines` / `appliedRange` 核对”。
+  - 依据（实测）：`InsertLines` 追加后 IDE 可能规范化尾行断行，旧的 `ok = landedVerified And …` 会把**已写入**报成 `ok:false`，调用方因此重复追加。
+- ★**重复声明前置检查（写入之前）**：扫描“当前窗格文本 + 本次提交块”的声明区，检查
+  - `Option Explicit`（模块只允许一条）；
+  - 模块级 `Dim` / `Const` / `Type` / `Enum`（以及 `Declare`）的**同名**冲突（大小写不敏感）。
+  回执固定带 `declaredCheck`（`performed` | `not_performed`）、`declaredCheckBasis`（口径与限制）、`duplicateDeclarations[]`、`duplicateDeclarationCount`、`duplicatePolicy`。
+  - `validate:"strict"` 且有命中 ⇒ **不写**：`ok:false`、`reason` 为 `duplicate_option_explicit` 或 `duplicate_declaration`，并给 `sha256Before`/`sha256After`（两者相等）、`newTotalLines`、`readbackUnchanged:true` 作为“内容未变”的证据；
+  - `validate:"warn"` / `off` ⇒ **照常写入**（`ok:true`），每个命中作为 **`severity:"warning"`** 的诊断进入既有 `diagnostics[]`（`ruleId` = `duplicate_option_explicit` | `duplicate_declaration`，`source:"add_code_precheck"`）；它**不会**变成阻断写入的 error。
+  - ★**限制（如实）**：文本级检查，不展开 `#If` 条件编译分支，不判“声明落在了过程之后”（那是另一个编译错误），也不是编译器。
+- ★`newTotalLines` / `insertedAt{ide,disk}` / `sha256Before` / `sha256After` 语义未变。
+
+#### 3) `immediate_eval`：多行字符串**无损**传输
+
+- 值现在走**三条** sink 行：①旧有的 Print 格式化值；②`<<MCPLEN>>Len(CStr(值))`（**完整**长度，先打印，故 sink 被截断也能读到）；③`<<MCPV>>` + 把反斜杠 / CR / LF 转义后的**完整**值（单行，Print 无法把它拆行）。
+- 新增字段：
+  - `valueEncoding`：`raw`（单行标量，`value` 保持旧的 Print 语义与首行取值，**既有单行行为逐字节不变**）| `json`（**多行**结果：`value` 是**完整**文本，回执 JSON 把 CR/LF 转义，`JSON.parse` 后即为原文，**不要**按行切）；
+  - `valueBytes`：**完整**值的长度（`Len(CStr(值))`）；`valueBytesReturned`：本次实际交付的 `value` 长度；
+  - `valueLines`：完整值按 CR/LF 切分的行数（尾行断行也算一行）；被截断时为 `-1`（未知）；
+  - `valueComplete`：`value` 是否就是完整值；
+  - `valueEscaped`：转义形式（反斜杠 `\\`、CR `\r`、LF `\n`），供只能处理单行 ASCII 的调用方；截断时带 `valueEscapedPartial:true`；
+  - `valueTruncated`（boolean）+ `valueTruncatedReason`（截断原因）+ `valueSinkTruncated`（sink 读取是否触顶）；
+  - `outputDescribes`：★`output` / `outputBytes` / `outputLines` 描述的是**第一阶段 sink（TypeName 通道）**，**不是返回值**；返回值只看 `value*` 字段。
+- ★**截断语义（绝不给半个值假装完整）**：确认真截断时 `value` = `null`，`valueBytes` 仍是**完整**长度，`valueTruncated:true` 且给原因（sink 读取上限 65536 字节，或转义行比独立打印的完整长度短）。
+- ★`Null` 结果：`CStr(Null)` 会抛错并弹 IDE 模态框，因此 `Null` 走**常量标记**路径（`"Null"` + 长度 4），与旧的 `Print #` 行为一致；`Empty` 同理为长度 0。
+
+
+### v1.15.0 hub 侧回执字段补充（无 schema 变化、无版本 bump）：默认目标阶梯的 live fallback
+
+> 只改 **hub 的默认目标解析行为** 与回执里**新增**的诊断字段；hub 工具面（11）、add-in 面（120）、DSH 面（131）与所有 `inputSchema` **不变** ⇒ 契约版本保持 **v1.15.0**，冻结面**不需要**重冻。
+
+- **缺陷（t16 实测）**：同一 hub 同一时刻，`run_project{observe:false}`（不带 `_target`）两次回 `reason:"no IDE instance listening (scanned 34 default ports + registry)"` + `suggestedAction:"ide_start"`，241 ms 后 `ide_state{}` 却成功（pid 9252）；带 `_target` 的调用始终正常。两者走**同一条**路径（`handleCall → resolveLocalPick → pickTarget`，`run_project` 在 hub **没有**专门分支），差别是**时机**：`discoverSoft()` 只等 400 ms，而一次发现可能几秒；空发现结果还会按 `DISCOVERY_TTL_MS`（15 s）缓存 ⇒ 阶梯把「我还不知道」当成「没有活实例」。
+- **修复（行为）**：阶梯在回答 `no_candidate` **之前**做两件有界的事：① 等**正在运行**的那一次发现（等待时长报在 `waitedMs`，上限默认 2500 ms，env `VB6MCP_LADDER_EMPTY_FACE_WAIT_MS`）；② 仍为空则读**直连源**（hub 自己的注册文件**当场**从盘读 → 仍为空再强制一次**全新**发现：注册表 + middle service `/health` + 端口扫描）。显式 `_target` 不受影响（原样下传）。
+- **新增回执字段（ADDITIVE）**：`resolution.ladderLiveFallback{used,sources[],waitedMs,elapsedMs,rule}`（转发回执里同一块在 `targetResolution.ladderLiveFallback`）。`sources` 取值：`in_flight_discovery_pass[:timed_out|:none]`、`direct_registry_read[:no_live_instance]`、`forced_fresh_discovery_pass[:timed_out_or_empty]`。`used:false` 表示两条直连源都查过且为空（`no_live_ide` 拒绝照旧，**不会**凭空造出目标）。
+- 附带硬化：被 `invalidateDiscovery()` 取代的旧发现**不再发布**其结果（旧实现会让一次被作废的慢发现覆盖掉更新的 face）。
+- 回归：`tests/hub_default_target_live_fallback_test.mjs`（13 条，无需 VB6；假 add-in 经**端口扫描**被发现）——修前 hub 同测试 5 PASS / 8 FAIL，失败形状即 t16 原文。
+
+- **第五轮补正（t16 复议）**：
+  - `ladderLiveFallback` 现在**无条件**出现在走过「空 face → fallback」路径的**任何**回执上：顶层 `ladderLiveFallback`（转发回执亦同；`mergeNote` 只填缺省顶层键，所以不会被上游 body 遮蔽），并在有 `resolution` 时带同内容的 `resolution.ladderLiveFallback`。覆盖转发/各类拒绝（含 python 模式 0 IDE 的 `no_live_ide`、remote-only、MULTI_BRIDGE 跨桥）/离线回执。
+  - 字段扩充（ADDITIVE）：`ladderLiveFallback{used, sources[], waitedMs, elapsedMs, budgetMs, complete, timedOut, rule}`。`budgetMs` = 本次 fallback 的**总**预算（`VB6MCP_LADDER_EMPTY_FACE_WAIT_MS`，默认 2500 ms）；三段（等 in-flight 发现 / 直连注册表 / 强制 fresh pass）**共用**该预算；用尽即返回 `complete:false + timedOut:true`（找到实例则 `used:true`，否则 `used:false`），**不会**等一个不完成的发现。
+  - 观测口径：`used:false + complete:true` = 直连源都读完了、确实没有实例；`used:false + complete:false + timedOut:true` = 预算用尽、无法确认（回执 `reason` 仍是 `no_live_ide`，`howToProceed` 照旧）。
+  - 测试钩子（仅测试）：`VB6MCP_TEST_DISCOVERY_NEVER_RESOLVE=1` 让发现永不完成，用于证明总预算仍回执；生产不得设置。
+  - 第六轮补正（转发预算可见）：`forwardBudget{budgetMs,plusSlackMs,env{name,set,value},rule}` 出现在**任何**转发回执上（成功与 `forward_timeout` 都有）——`budgetMs` 默认 python 模式 `FORWARD_TIMEOUT_MS + 10000`（inproc 直连为 `FORWARD_TIMEOUT_MS`），env 覆盖时 `plusSlackMs:0` 并在 `env{name,set,value}` 里点名；`probePending:true` 表示选中的实例**还没应答过 probe**（正是会吃满预算的状态）；`selectedBy:"ladder_live_fallback"` 表示候选来自空 face fallback 的直连源（读取来源仍见 `ladderLiveFallback.sources`）。`forward_timeout` 另带 `failureKind:"wedged"`、`retrySafe:true`、`howToProceed[]`（`_target` 直达 / 先 `ide_state` 探活 / **不要**盲目重试）与 `retryNote`。**恢复语义不变**：implicit 目标在 probe pending 时仍会转发（那是 wedged IDE 唯一的恢复通道），本批只把预算与状态变成可见的。
+  - 第七轮补正（B1/B7/g1，仍 v1.15.0，无 schema/工具面变化）：
+    - **`ide_restart` 的 `resolve_target` 用与转发同一套探针**（`waitForAddinReady`，与 `ide_start` 同构）：注册表里有条目、pid 活、但 add-in 未应答时**先轮询**（上限 `VB6MCP_RESTART_PROBE_READY_MS`，默认 15000），不再从一次软发现就判 `instance_found_but_unresponsive`。`wait_ms` 只约束**本次调用**，因此 `pending → opId → done/refused` 成为常规路径（`pending` 可达）。等不到才拒绝，且必带 `probeChecks`（与 `readyChecks` 同构：`registryVisible/transportUp/addInAnswers/addInAnswersBasis/pidAlive/projectMatches`）+ `probeBudgetMs` + `readyWaitMs` + `howToProceed[]` + `retrySafe:true`/`suggestedAction:"retry_once"`。
+    - **显式 `_target` 命中「注册表有条目但 pid 已死」→ `reason:"peer_dead"`**（`failureKind:"peer_dead"`，`reasonLegacy:"no_ide_running"` 保留兼容）：`peerDead:true` + `peerState{pid,pidAlive:false,registrationPresent:true,port,transport,project,projectPath,registryFile,startedAt}` + `lostContext{debugger:null,debuggerBasis,projectPath,note}`（`debugger:null` = 未知，不是 design）+ `howToRecover[]`（重启该工程 / 换活实例 / 清残留注册）；只有**确实没有任何候选**才回 `no_live_ide`。
+    - **隐式目标的转发上限**：`VB6MCP_IMPLICIT_FORWARD_TIMEOUT_MS`（默认 15000）。仅当调用**没有显式 `_target`** 且（选中实例 `probePending` 或候选来自 ladder 空 face fallback）时生效；到点必回执 `forward_timeout` + `forwardBudget{budgetMs,baseBudgetMs,implicit:true,...}` + `implicitForward:true`/`implicitForwardCapMs` + `probePending` + `retrySafe:true` + `howToProceed[]`（显式 `_target` 重试 / 先 `ide_state` 探活）。**显式 `_target` 保持长预算**（wedged `release_inflight` 恢复通道）。
+  - 第八轮补正（按活体裁定收口，仍 v1.15.0、无 schema 变化）：
+    - 隐式转发 cap 判定：!explicit 即 cap（不再要求 probePending/ladder fallback）；forwardBudget.decidedBy{explicit,probePending,ladderFallbackUsed,capApplied,capMs} + 顶层 forwardBudgetDecidedBy 记录判定输入，forwardBudget.baseBudgetMs 是未 cap 的原预算。
+    - peer_dead 的三路来源（peerState.source）：registry_file（直读原始注册文件，默认）/ discovery_stale / middle_service_health；另给 peerState.hubRegistryDir、hubRegistryReadable。
+  - 第九轮补正（B1 注册可见性，仍 v1.15.0、无 schema 变化）：
+    - `ide_start` / `ide_kill_and_relaunch` 回执新增 `registration{written,by,path,existed,readbackVisible,owner,reason}`（hub 只在 **add-in 已在 pinned 端口应答** 且 `<pid>.json` 不存在时写一条最小注册，`by:"hub"`；否则 `written:false` + 原因），`ide_start` 另加 `registrationNote`（add-in 未注册时的处置说明）与 `readyPortSource`（`registration|pinned_hint|none`）。
+    - readiness 现接受 **pinned-port hint**：注册文件缺失时用 hub 自己 pin 的端口探 `mcp_info`；`readyChecks.portSource` 标明通道，`registryVisible` 仍如实为 false。
+  - 第十轮补正（FIX-26：活体验收挖出的 hub 缺陷收口，仍 v1.15.0、无 schema/工具面变化）：
+    - **`ide_restart` 的 relaunch 命中 PIPE-ONLY 新实例**：新实例自己的注册项若 `port===0` 且（`transport==="pipe"` 或 `tcpEnabled===false` 或带 `pipe`），`wait_instance` 不再空等满 120 s 再报 `new_instance_never_came_up`（那是**假话**：IDE 已经重启），而是**快速**返回 `refused_reason:"new_instance_is_pipe_only"` + `restarted:true` + `ok:false` + `newInstanceFacts{pid,port,transport,tcpEnabled,pipe,project,projectPath,registryFile,startedAt,registered,addressableByMiddleService}` + `note`（明说 "the IDE WAS RESTARTED"）+ `howToProceed[]`（起 hub 时带 `VB6MCP_TRANSPORT=tcp`，或改用 python 模式让中间服务走 pipe）。成因：add-in 默认轨是 pipe（本机无 `HKCU\\Software\\VB6MCP\\Transport`），而 relaunch 继承 **hub 的**环境。
+    - **`ide_restart` 的 relaunch 改用 `spawnProgram`**：`.cmd/.bat` 形态的 `VB6MCP_VB6EXE` 之前被裸 `spawn()` 直接失败（op 死在 step `spawn`，`reason:"restart_error"`），现在与 `ide_start` / `ide_kill_and_relaunch` 一致（对 `.exe` 字节级等价）。
+    - **`ide_restart{opId}` 续查回执带终态结果**：除进度标量外，另含 `ok/restarted/stopConfirmed/saveOk/registryCleared/pinPort/projectVbp/ownership/ownershipBasis/ownedByHub/truth/note/howToProceed/newInstanceFacts/probeChecks/manualCommand/nextStep` 等（从 op 的 `out` 取，缺省即不出现）——否则「先 pending 再续查」的调用方永远看不到结果。
+    - **pending 回执的 `reason` 改为 `pending_op`**（`restart_in_progress` 仅保留给「同一 hub 同一时刻已有 restart 在跑 ⇒ 第二次 restart 被拒」），两者不再同词。
+    - **`ide_start` reuse 的 `readyChecks.projectMatches` 现在是真比对**（add-in 的 `ide_state.project` vs 复用注册项的 `project`），另带 `projectMatchesActual/projectMatchesExpected/projectMatchesBasis`；比不了时 `null` + `projectMatchesBasis` 以 `nullReason:` 开头；比到**不相等**时 `ready:false`（四项不全就不发 ready:true）。
+    - **`ide_start` 的两条拒绝回执带 `processesCreated:0` + `attemptedSpawn:false`**（`vb6_exe_not_found` / `project_not_found`），不再让 `processesCreated` 为 null。
+    - **`forwardBudget` 新增 `capSource`（`env|default`，仅 implicit）与 `capEnvName`；`VB6MCP_IMPLICIT_FORWARD_TIMEOUT_MS` 生效时 `env{name,set,value}` 点名它**（此前 capMs 已变但 env 仍 null）。
+    - 断言：`tests/hub_default_target_live_fallback_test.mjs` R0–R8 / S1–S4 / T1–T3，其中 R6/R7 是对 pinned 旧 hub（0528f0a）的**变异对照**（旧代码 6 s 时仍在跑，且永不产出 `new_instance_is_pipe_only`）。
+
+
+
+### v1.15.0 参数归属澄清（无 schema 变化、无行为变更）：`diagnose` 只在 `make_project` 上，`build` 没有
+
+- `make_project{diagnose:true}` = 在 **IDE 之外**做一次**副本隔离编译**（`VB6.EXE /make` 打到临时目录），拿真编译器日志与 `firstError{file,line,text}`；它还会在「in-IDE Make 说 `compiled:true` 但 `artifactChanged:false`」时**自动**跑一次（那种回执否则无法区分「编译失败」与「编译了但产物没变」）。
+- `build` **没有** `diagnose` 参数：它自己的正常路线本来就是隔离 `VB6.EXE /make` + `/out` 日志，不存在第二层「诊断」开关。传 `build{diagnose:true}` 得到的是**结构化拒绝** `reason:"unknown_argument"` + `acceptedArguments[]`（+ hint），**不是**静默忽略，也**不是** `unexpected_error`。
+- 判据：**某工具接受哪些参数，以该工具自己的 `acceptedArguments` / `inputSchema` 为准，不要按兄弟工具猜** —— `build` 与 `make_project` 是两个工具，参数集本来就不同（例如 `output_path` / `route` / `wait_for_build` / `diagnose` 只在 `make_project` 上）。
+- 选路：要诊断一个 **IDE 正持有**的工程 ⇒ `make_project{diagnose:true}`（或对该工程的**副本**调用 `build`）；要拿被构建工程的真编译器日志 ⇒ 直接用 `build`。
+
+### v1.15.0 参数/能力边界（FIX-29，无 schema 变化）：immediate_* 的 1000 字符上限与恢复语义
+
+- `immediate_eval` / `immediate_run` 只接受**一行**；**上限 900 字符，量的是真正执行的那一行**
+  （表达式 + `Open <sink> For Output As #511` / `Print #511,` / `Close #511` 包裹，约 +123 字符），常量 `IM_MAX_EXEC_LINE_CHARS`。
+  本机实测：**执行行 ≤900 稳定 33/33**；表达式 901–998（执行行 1024–1131）**14/15 失败**（10 次 `value_not_parsed`、
+  4 次 `engine_refused_line` ret 40036，且**非单调**——905 有一次 OK），符合立即窗口/EbExecuteLine 行缓冲 ~1024 截断；
+  表达式 1000/2000/2040/2047 → `ret:0` + 空 sink；**2048 → VB6 进程消失并重启**，遗留 `#32770` 运行时错误 55「文件已打开」。
+  超限时本工具**执行前**拒绝：`reason: statement_too_large` + `limitChars` / `limitBasis: full_exec_line` /
+  `actualChars`（=执行行长度）/ `actualBytes` / `expressionLimitHint` / `howToProceed`，并同样发布 `sinkEntryClose*`。
+  1000 / 2000 / 2040 / 2047 → `ret:0` + 空 sink（表现成 `value_not_parsed`，**不是**显式截断）；**2048 → VB6 进程消失并重启**，
+  遗留 `#32770` 运行时错误 55「文件已打开」。超限时本工具**执行前**拒绝：`reason: statement_too_large` + 
+  `limitChars` / `actualChars` / `actualBytes` + `howToProceed`。
+- 每次调用**入口无条件 `Close #511`**（不再依赖上一次的记录），结果见 `sinkEntryCloseAttempted` / `sinkEntryCloseRet` /
+  `sinkEntryCloseClosed`；语句行尾仍保证 `Close #511`。
+- **书面边界**：若超长语句通过别的途径发出（或本限制被绕过），**IDE 可能需要重启**才能恢复 immediate 通道；
+  重启后通道恢复，代价是该 IDE 会话里未保存的内存改动会丢失（先 `save_project`）。
 
 ### v1.11.10 传输修复（根因记录 — 为什么过去会「间歇失败」）
 
@@ -284,6 +478,95 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 - **口径 5（`textSha256` 不是文件哈希）**（2026-10-08）：`get_component_code` 的 `textSha256` 是**返回文本**的哈希（文件末尾 CRLF 等差异会让它与 `read_source` 的字节 sha256 不同）。判据里不得把两者当同一个值比对；要文件哈希请用 `read_source`。
 - **勘误 3（`.frm` 的 headerOffset 不是常量）**（2026-10-08，实测）：**工具生成**的 `.frm` headerOffset=**17**；**手写**的 `.frm` = **16** 且 `coords.resolved:false`（窗格首行在盘上定位不到）。故 `17` 是「工具生成布局」的性质，**不是** `.frm` 的通用常量；判据里不得写死 `.frm=17`。同理 `.bas`：含 `Attribute` 行=1、手工无 Attribute=0。
 
+
+
+
+
+
+
+
+
+
+
+### BREAK 态的 control_execution：**有界交付**（新增稳定 reason）
+
+- BREAK 态是唯一允许走 CommandBars 的例外，但它必须**有界**：交付期限常量 `CB_CMD_DEADLINE_MS = 2000`，交付后的状态等待用同一个预算 `CB_CMD_STATE_WAIT_MS = 2000`（此前是 12,000 ms，实测把 single-flight 门占了 11.7 s，后续调用全 busy）。
+- 交付前做**有界 liveness 探活**（2000 ms 上限）；不响应则不执行、直接结构化失败。
+- 交付未生效（状态在预算内没变化）⇒ `ok:false, reason:"commandbars_command_not_delivered"` + `commandBarsTouched:true` + `attemptedSteps[]` + `boundedMs` + `howToProceed`。
+- 存在**模态运行时错误框**时不再走"CommandBars 驱动解决"（那会排队，实测 12 s）：直接返回结构化 `commandbars_command_not_delivered`（`blockedBy:"runtime_error_dialog"`），先让调用方用 `last_error{dismiss:true}` / `send_window_message` 关框再重试。
+- 交付期间 `ArmGateRelease "control_execution", CB_CMD_DEADLINE_MS` + `DisarmGateRelease`：即使 CommandBars.Execute 本身挂住，单飞门也会在预算内被释放。
+### 运行期间的 CommandBars：**做不到**（实测 APPCRASH，架构限制）
+
+- **事实**：VB6 在程序 RUN 期间使 CommandBars（mscomctl.ocx）进入 suspended 状态，**任何触碰都可能让 VB6.EXE 硬崩**。WER 1001 APPCRASH：`VB6.EXE c0000005 @000a250f`、`VBA6.dll c0000005 @000b90a9`（与 FIX-16 同一偏移）、`mscomctl.ocx c000041d/c0000094`。
+- **拒绝**：需要 CommandBars 的工具在 RUN 态直接返回 `ok:false, reason:"commandbars_unavailable_while_running"`，带 `commandBarsTouched:false` + `howToProceed`（从 IDE 界面停止程序或等它结束）。BREAK 态下非 debug-control 的 CommandBars 工具返回 `reason:"commandbars_unavailable_while_in_break"`。
+- **只读安全路径**：`ide_state` 在 RUN 态只用 VBA6 `EbMode` 回答（`stateSource:"ebMode"`，`commandBarsSuspended:true`），**不触碰 CommandBars**；只有 DESIGN 态才用 CommandBars 增强信息。
+- **唯一例外**：BREAK 态的 `control_execution`（continue/step/end）仍走 CommandBars（否则无法恢复；69fa3f7f 实测该路径可用）。
+### `run_project{observe:true}` 在 RUN 态的 STA 排队语义（实测，ADDITIVE）
+
+**dispatch 字段口径（第二轮修正）**：`programStateAtEntry` = **工具真正开始执行那一刻** 的程序状态（不是客户端发请求时）；`queuedBeforeToolEntryMs` 在 STA 下**结构性不可测**（add-in 只有在被调度之后才开始跑），因此固定为 `null` + `queuedBeforeToolEntryUnavailableReason:"STA: the add-in cannot observe the interval before its own dispatch"` —— **不许报 0 冒充测量**；`dispatchedLate` 是可判定定义：**入口状态 ≠ "run"** 即 true（对 `observe:true`），message 前置说明"本次调用被调度时程序已不在运行；无法证明期间有实时观察，marker 命中的是调度时刻的状态"。
+
+
+- **事实**：VB6 IDE 是单线程 STA。程序 RUN 期间，消息泵**不派发新的工具调用**；`run_project{observe:true}` 只有在程序**让出控制权**（自身调用 `DoEvents`）、**命中断点**、或**退出**之后才被服务。活体数据：client 20,533 ms，而 add-in 内部 `addInObserveMs=0` / `toolEntryToObserveMs=78` / `observeEntryTickMs==clockAtLoopEntry==clockAtExit` / `iterations=1`。
+- **因此**：`observe` 在 RUN 态**不是实时观察**，语义 = "等程序让出控制权/结束"；`state="timeout"` 在 RUN 态**结构性不可达**（除非程序自己 DoEvents）。B3 那次"7 s 命中 marker"实际是**退出那一刻**才返回，不是实时观察。
+- **正确做法**：用断点 + `run_until_break`（BREAK 态可被服务），或让程序自身 DoEvents。
+- **回执新增** `diag.dispatch{toolEntryToObserveMs, addInObserveMs, queuedBeforeToolEntryMs, dispatchedLate, programStateAtEntry}`（取不到时写 `null` + `queuedBeforeToolEntryUnavailableReason`）。当 `programStateAtEntry="exited"` 时 `dispatchedLate:true`，`state` 仍保持 `exited`，但 message 明说"本次观察在程序结束后才被调度，期间没有实时观察，marker 命中的是退出那一刻的状态"。
+### `get_locals` 在 BREAK 的默认拒绝 + opt-in（稳定 reason，不 bump 契约）
+
+- **BREAK 且未给 `allowUnsafeInBreak:true`** ⇒ 立即返回 `ok:false + reason:"break_eval_requires_opt_in"` + `failureKind:"toolError"` + `refusedBeforeExecution:true` + 回显 `allowUnsafeInBreak:false` + `howToWorkAround[]`（① 传 `allowUnsafeInBreak:true`（知情同意；可能 wedge，恢复走 hub `ide_kill_and_relaunch`）② 先 `control_execution{mode:"continue"}` 离开 BREAK 再取）+ `howToRecover`；**不执行任何取值**，且 `localsUnavailable:false`（它不是"读不到值"）。
+- **带 `allowUnsafeInBreak:true`** ⇒ 走取值路径，回执 `optInAccepted:true` + `howToRecover`；若仍取不到值，用**另一套**字段区分：`localsUnavailable:true + localsUnavailableReason:"values_unreadable: …"`（**没有** `reason:break_eval_requires_opt_in`）。
+- **两种 ok:false 必须可区分**：`break_eval_requires_opt_in`（未同意）vs `values_unreadable`（同意但读不到）——活体 FAIL 正是把两者混成了一个 ok:false。
+### ADDITIVE reason 值：`immediate_eval` / `immediate_run` 的 sink 失败分类（不 bump 契约）
+
+- `engine_refused_line` 只表示**表达式/语句被引擎拒绝**（`ret=40036` 一类）。
+- 新增 `eval_sink_error` / `run_sink_error`：**sink 行自身**在运行期失败（文件号/路径/权限等 VB 文件错误码 52/53/54/55/59/61/62/63/64/67/68/70/71/75/76），回执同时带 `errNumber`/`errDescription`/`lineText`/`sinkFile`/`ret`/`retHex`，且 `sinkErrorKind` 明说"表达式没有被拒绝"。
+- phase-2（取值阶段）失败时另带 `phase2Ret`/`phase2ErrNumber`/`phase2Reason`。
+- 背景（实测）：执行行曾以 `Close #511:` 开头，而该文件号此时尚未打开 ⇒ VB6 在该语句处运行期报错 ⇒ 整行被 `EbExecuteLine` 拒绝 ⇒ 被误报 `engine_refused_line`。现在 sink 行用 `FreeFile` 自取文件号，且**不再前导 Close**；旧注释"a leading Close #511 is harmless"已被实测推翻，源码里保留为**历史误记**说明。
+### ADDITIVE 回执字段（不 bump 契约）：`run_project(observe)` 的 `diag{}` 与 `clockSuspect`
+
+观察回执新增一个**只读诊断块**，用于让"这一轮到底谁在耗墙钟、时钟是否可信"可判定，而不是靠猜：
+
+```text
+diag = {
+  blockingProc,            // 实测耗墙钟最多的那个被测过程（raw clock 跨度最大者）
+  blockingProcMs,          // 它的累计实测跨度（ms）
+  clockImpl,               // 选中的时钟：codetools_gettickcount | util_tickms | vb_timer | calendar_now | none_available
+  clockUsable,             // 该时钟是否通过了入口的 Sleep 自检（delta > 0）
+  clockStart, clockAtLoopEntry, clockAtExit, tickDelta,   // 真实读数（不可得时 null + 相应 unavailableReason）
+  iterations,              // 等待循环体内真实执行次数
+  errNumber, errDescription, errProc,   // 被吞掉的最后一次 Err（每个被测调用后立即采样）
+  waitSpans = { <proc> = {proc, ms, calls}, ... },   // 至少覆盖 ReCaptureRuntimeError / GetIdeState / WinOps.HasVisibleHostDialog / DbOfWait / DbBriefWait / DoEvents 中被测到的几项
+  clockSelfTest = { sleepMs:50, before{}, after{}, delta{}, rule },  // 入口用 Sleep 50 前后各读一次，零 delta 即"本构建时钟不前进"
+  rule
+}
+clockSuspect                 // true = 本构建没有任何时钟跨 Sleep 50 前进；message 会明说"预算不可信"
+```
+
+约束：`iterations` 与 `clockStart/clockAtLoopEntry/clockAtExit/tickDelta` 都是**真实读数/计数**
+
+**诊断轮 2 修正（同一 ADDITIVE 块，字段名以这里为准）**
+**诊断轮 3 修正（同一 ADDITIVE 块；根因是 error 91）**：
+- `diag.clockSelfTest` 的 `start/end/delta` 必须走 `RpSetInto`（Set 失败写 `<key>Error*` 而不是丢字段）；**不得**出现 `cst("start") = Nothing` 这种漏 `Set` 的对象赋值（VB6 抛 error 91，整段自检丢 start）。
+- 新增墙钟字段：`diag.observeEntryTickMs`、`diag.addInObserveMs`（observe 内部实测墙钟）、`diag.toolEntryToObserveMs` / `diag.toolTotalMsAtObserveReturn`（用 `CallTool` 的 `m_callStartAt`，可判"客户端的 20 s 是否根本没进入 observe"）。
+- `waitSpans` 现在也覆盖**循环外的等待**：`ReFindRuntimeErrorDialog`、`ReRuntimeErrorText`、`ReFindDebugButton`、`ReFindEndButtonInDialog`、`DebugClickSend`（同步 BM_CLICK）、`RePollBreakMs`（有界 EbMode 轮询）、`ReFindRuntimeErrorDialogAfterClick`；由 `m_diagSpans/m_diagClock + DgNow/DgSpan` 采集。
+- `diag.blockingProc` **只报耗时最长的 span**；所有 span 都是 0 ms 时它必须是 `null` + `blockingProcUnavailableReason`（"报第一个 0 ms span 是撒谎"）。
+
+
+
+
+
+**immediate_eval 第四轮（定案：即时上下文属于"当前打开的项目"）**：活体 `line="Util.ImSinkVal = 1+1"` ⇒ `ret=40036` —— 因为即时窗口在 **打开的项目** 里执行，而该项目没有 add-in 的 `Util` 模块，任何 `Util.*` 标识符都是编译错误。**执行行只能使用字面量文件号 `#511` + 标准语句（隐式变量/`FreeFile` 在 Option Explicit 的打开工程里是编译错，实测 ret=40036/errNumber=0）**。因此 eval 走 `immediate_run` 已验证可用的通路：执行 `Debug.Print <expr>`（body 由 `ImRewriteDebugPrint` 改写进 add-in 的 Debug.Print sink），add-in 读 sink 文本作为 `value`，`valueTransport="debug_print"`；多行值按 sink 原样保留（`valueLines/valueBytes` 照旧）；`TypeName` 在这条路上不可得，回执给 `typeNameUnavailableReason`。对象表达式仍先被 `object_expression_unsupported` 拦下；空输出是 `value_not_parsed`（不猜）。
+**immediate_eval 第三轮（实测：`EbExecuteLine` 不接受任何一个 sink 行）**：`Open/Print #/Close #` 组成的执行行在活体上**一律被拒**（即使只用已声明变量）。执行行现在**只有一条赋值**：`Util.ImSinkVal = <expr>`；`TypeName/Len/LenB/行数/转义` 全部由 **add-in 代码**从该 scratch Variant 直接读取（`valueTransport="direct_variant"`），**没有文件 sink、没有 MCPLEN/MCPV 标记**。表达式本身非法时 `EbExecuteLine` 的非零返回才是真正的 `engine_refused_line`。`immediate_run` 仍用临时文件 sink（它要搬运 `Debug.Print` 的输出来）。
+**即时上下文允许的语句形态（`immediate_eval`/`immediate_run` 口径）**：执行行里**只允许**出现工程已声明的标识符（本项目固定为 `Util.ImSinkFn` / `Util.ImSinkVal`）+ 字面量 + 标准函数；**不得**引入隐式新变量（工程开了 `Option Explicit`，隐式变量是**编译期**错误，整行 `ret<>0` 且 `errNumber=0`，看起来像"引擎拒绝表达式"）。行内不使用 `On Error Resume Next`、不嵌 CRLF、不以 `Close #n` 开头（文件号未打开时该语句会运行期报错并让整行被拒）。
+：`diag` 必须**先落盘再判断**——`clockSelfTest` 在自检**运行之前**就写入 `diag`（自检把 start/end/delta 与失败的 `clockSelfTestError{errNumber,errDescription,errProc}` 写进同一个对象），`clocksAtStart` / `clockEndToStart` / `waitSpans` / `preLoopSpans` 同理；**任何被文案引用到的 `diag.X` 键必须真实存在**（否则视为缺陷）。新增：
+- `clockSelfTest{start,end,delta,sleepRequestedMs,nowDeltaMs,sleepApiErr,sleepIneffective,timePassProven,busyWait{attempts,clockImpl,deltaMs,unavailableReason}}` —— 区分"**睡眠本身没生效**"与"**时间过去了但钟不动**"；
+- `clockVerdict` = `clock_advancing` | `time_passed_no_clock_advanced` | `unknown_time_pass_not_proven`；`clockSuspect` **只有在前两者（证明确实测到时间流逝）时才允许为 true**，`unknown_time_pass_not_proven` 时不得声称"时钟死了"；
+- `budgetClockImpl` / `budgetClockTrusted` / `spanClockImpl`（预算与跨度各用哪个钟、是否被自检证明）；
+- `clockEndToStart`（整次调用前后的四钟真实差值，**不需要 Sleep** 即可判读）；
+- `preLoopSpans[{proc,ms,calls}]` + `preLoopMs` + `preLoopTopProc`（解释"iterations=1 但墙钟 20 s"：时间是否花在**进循环之前**）；
+- 每条被测调用后的 `errNumber/errDescription/errProc`，以及 `blockingProc/blockingProcMs/blockingProcUnavailableReason`。
+收据还新增 `preObserveGetTickCountMs` / `preObserveClockImpl` / `preObserveGetIdeStateBlocked`（observe 入口之前那次 `GetIdeState` 的耗时，用 CodeTools 自己的 `GetTickCount()` 量）。
+；拿不到就写 `null` + `unavailableReason`，**不写 0 冒充**。工具面不变（无新参数、无新工具、不 bump 契约、不改冻结面）。
+
 ## v1.3.0 版本变更可见化（避免调用方按旧思路调用）
 
 ### 问题
@@ -299,8 +582,13 @@ VB6 权限错误（`拒绝的权限`）必须追加 `reason:"ide_busy_in_break_m
 
 ### 1. `instructions` 版块（首行必须可一行读完）
 ```text
-PRODUCT vb6-mcp <semver>  CONTRACT v1.11.4  TOOLS 110  BUILT <sha256 前 8 位>
+PRODUCT vb6-mcp <semver>  CONTRACT v1.16.4  TOOLS 120  BUILT <sha256 前 8 位>
 BREAKING (read before calling):
+- v1.16.0 ADD-IN face, purely ADDITIVE (no tool added or removed; add-in 120, hub 11, DSH-facing 131): breakpoints{action:"probe"} is the BEHAVIOURAL breakpoint verifier and it is TWO-PHASE - phase="start" (default) only STARTS the program (QUEUED in the STA IDE, so the run begins AFTER the call returns) and answers probePhase=start + probeResult=started_pending + probeId + startedPending:true + startQueued:true + howToContinue; phase="observe" (the SAME probeId, single-use, TTL 600000 ms) waits up to timeout_ms for the stop, reads position{component,proc,paneLine} + callstack, ENDs the program and reports endPending:true until stateAfter=design is PROVEN by read-back (unknown/expired probeId answers reason=probe_not_found). probeResult is a CLOSED set: started_pending | stopped_at_target | stopped_elsewhere | did_not_stop | timeout | did_not_stop_unobserved | line_not_breakable | not_attempted | run_failed. The probe REALLY runs the program and never saves it (no pre-run flush; measured 6.2 s / 12.1 s). control_execution{mode:"end"|"stop"} in RUN state no longer false-refuses (measured End path; endCommandDelivered/endPending/stateAfterVerifiedBy/stateAfterReadBack/programEnded/deliveryVsStateNote/endSettleMs; programEnded:true ONLY after a design read-back). verify and verify_scope gain OPTIONAL requireCompiler (default false = receipt unchanged): true demands a REAL isolated VB6.EXE /make verdict (authority=compiler + compiler{path,logPath,errorCount,artifactChanged}) and REFUSES with reason=compiler_not_configured + compilerProbe{resolved,path,why} instead of ever substituting lint. apply_edits and preview_edit accept a MULTI-COMPONENT batch: edits[].component (tool-level name becomes OPTIONAL; neither present = reason=component_required), expected_shas[] guard, ops applied in edits[] order with each anchor resolved on its component UPDATED text, all-or-nothing rollback (rolledBack/restoreVerified/restoredComponents[]), max_ops default 200 / cap 1000 and at most 40 components (batch_too_large + limits), success adds appliedOps/totalOps/components[]/batchElapsedMs, and preview_edit groups hunks per component with writes:false
+- v1.15.0 ADD-IN face parameter change (ADDITIVE for callers that do not pass them): run_project.observe_max_wait_ms (OPTIONAL integer ms, default timeout_ms, clamped 1000..120000) and run_project.done_marker (OPTIONAL object {path,contains}; path is ON THE MACHINE THAT RUNS THE IDE, UNC allowed; the first 65536 bytes are read as BYTES and nothing is written; contains is CASE-SENSITIVE, a pure-ASCII value is byte-exact and a non-ASCII value is tried as UTF-8 and as system ANSI). observe RETURNS with state = done-by-marker | exited | break | error | timeout (a CLOSED five-value set: done-by-marker IMPLIES marker.matched:true, exited means the program ended normally, and a requested-but-unmatched marker reports marker.unmet:true - the run finished without the requested evidence), observedState, elapsedMs, marker{...} and pipeReleasedByReturn:true, so a timeout no longer holds the single-flight gate (a timeout receipt is ok:true + timeout:true + retrySafe:true + suggestedAction=observe_again with the measured elapsedMs - NOT a failure - and marker.unmetReason names the budget when a requested marker never appeared; the budget is enforced INSIDE the wait loop, not only in a loop condition); observe in BREAK is REFUSED with reason="observe_in_break_not_supported"; a #32770 dialog is CLASSIFIED (only a runtime-error box is program_error; an IDE Find/Replace dialog answers reason="observe_blocked_by_ide_dialog" with dialogPrecheck.isProgramError:false). get_locals.allowUnsafeInBreak (OPTIONAL boolean, default false): BREAK-state get_locals is REFUSED with reason="break_eval_requires_opt_in" unless true - the opt-in is INFORMED CONSENT and does NOT guarantee the statement will not hang; recovery is the hub-side ide_kill_and_relaunch, not taskkill; failure receipts carry gateReleased + howToRecover. The FROZEN FACE lag was closed at v1.16.0: docs/tools_schema.json and tools/schema_baseline.json now carry these declarations (toolCount stays 120; hub 11; DSH-facing 131).
+- v1.14.0 hub tool face (ADDITIVE for the add-in face): ide_restart gains OPTIONAL wait_ms (bound how long ONE call blocks) and opId (continue/poll an operation a previous call returned). A restart that outlives wait_ms answers pending:true + state="in_progress" + opId + currentStep + lastKnownState instead of looking like a failure, and ide_restart{opId} answers from the in-process operation registry and starts NOTHING; a second restart while one is in flight is refused with reason="restart_in_progress". Every ide_restart receipt carries opId/started/state/finished/elapsedMs/currentStep/lastKnownState/opRule. content[0].text is ONE JSON document: array/scalar bodies are {singleDocument:true, data, receipt} (empty = data:[]), a non-JSON body is a structured content_not_json document, object bodies stay FLAT; VB6MCP_LEGACY_TEXTBODY=1 restores the old two-part form for one version. Transport failures add peerState="peer_dead" (+peerDead/lostContext/howToRecover) when the peer process is provably gone. add-in face unchanged (120 tools; hub 11; DSH-facing 131)
+- v1.13.0 +1 HUB tool: ide_kill_and_relaunch{pid, project?, ready_wait_ms?} (hub-side, add-in independent: stops ONLY a hub-owned instance, clears its registration, relaunches on the same .vbp and polls for readiness) and an OPTIONAL ide_start.ready_wait_ms. Receipts gain ready/readyWaitMs/readyChecks{registryVisible,transportUp,addInAnswers,addInAnswersBasis,pidAlive,projectMatches}/readyProbeRounds/pollingHint (ide_start; readiness is measured on the STARTED pid only - its own registration, its transport, mcp_info - never on the discovered set; addInAnswersBasis is exactly one of no_route|direct_rpc|middle_service_forward, and no_route means no channel existed, so addInAnswers is null, never false), offline/offlineRoute/targetResolved (build/make_project/project_meta with no live IDE), no_live_ide + onlinePids[]/targetDiagnostic/howToProceed (target refusals; the old reason no_ide_running is preserved as reasonLegacy). ADDITIVE for the ADD-IN face: no add-in tool or parameter changed (toolCount 120; hub 10 -> 11; DSH-facing 130 -> 131)
+- v1.12.2 +1 OPTIONAL parameter: control_execution.allowDiskMutation / run_project.allowDiskMutation (boolean, default false). Starting from DIRTY IDE memory is now REFUSED with reason=dirty_memory_would_be_saved unless true; receipts add diskWrites/touchedFiles/diskSnapshot/saveOnRun/ideAutoSaveHint (ADDITIVE: existing fields unchanged; saveOnRun:false is NOT a promise that the disk did not change)
 - v1.11.0 the 5 lessons tools (list_lessons / add_lesson / delete_lesson / export_lessons / import_lessons_md) MOVED from the add-in face to the hub face: names/descriptions/inputSchema are unchanged and they now also work with NO IDE online; the add-in face is 110 tools, the hub face 5 -> 10, DSH-facing total stays 120
 - v1.10.0 +1 tool: desktop_probe (read-only live desktop/interactivity identity; fail-closed: ok:false + failureKind="api_unavailable" when an API fails). +3 OPTIONAL file-fed params (vba6_probe.exec_line_file / immediate_eval.expression_file / immediate_run.code_file, ADDITIVE). 12 tool DESCRIPTIONS were neutralized (internal label text only - no behaviour change); vba6_probe gains a 7-value structured failure envelope and the immediate_* exec_error wrappers add channel_error / statement_raised (ADDITIVE)
 - v1.9.0 +3 tools: immediate_eval / immediate_run / ide_quiet_mode; ide_state gains release_inflight / release_min_held_ms and a release{} block; ide_quiet_mode ON adds quiet{...advisory} to every receipt (ADDITIVE: quiet OFF and the no-release path are byte-for-byte unchanged)
@@ -324,7 +612,7 @@ ROUTING (use the tool; never hand-edit VB project files):
 - project-wide checkpoint / rollback -> project_snapshot (whole project: .vbp + component files)
 - build verdict -> build (offline /make) or make_project (in-IDE): judge by artifactChanged + verdict; compiled:true alone is NOT built
 - ENCODING: VB project files (.vbp / .frm / .cls / .bas / .ctl / .pag / .dsr / .res / .inc) must stay system ANSI (GBK) WITHOUT a BOM - never hand-edit or re-encode them (a UTF-8 BOM makes VB6 refuse the project: "invalid keyword"); the tools above already write ANSI for those extensions.
-- v1.11.4 current (110 tools): the bullets above are historical - call mcp_info once after initialize for the authoritative breaking[] / migrations[] / changelog[]
+- v1.11.4 current (120 tools): the bullets above are historical - call mcp_info once after initialize for the authoritative breaking[] / migrations[] / changelog[]
 CAPABILITY INDEX (question -> tool; read this before improvising):
 - impact / who calls whom -> dependency_graph  (component edges + PROCEDURE-level procNodes/procEdges/procCount + cycles + purity)
 - who references a symbol -> rename_symbol  (dry_run=true by default; skips strings and comments)
@@ -335,6 +623,9 @@ CAPABILITY INDEX (question -> tool; read this before improvising):
 - NOT available: screenshots; driving a standalone built EXE (message tools are in-process only)
 FILE ENCODING: .vbp/.frm/.cls/.bas/.ctl are ANSI WITHOUT BOM (write_file / write_source already do this); never write them as UTF-8-with-BOM, or VB6 reads a mangled first keyword and the project stops loading; use project_meta for .vbp version metadata (keeps a .bak).
 ```
+
+
+**同步规则（lane 门禁 G13）**：hub 快照的 contractVersion 取「## 版本记录」最新行，而 instructions 首行与 BREAKING 列表取「## v1.3.0」的 text 块 —— **契约升级时必须两处同步**（横幅字面 CONTRACT <ver> 改到与最新版本行一致），否则快照自相矛盾；G13 断言 contractVersion == instructions 首行 CONTRACT <ver> == add-in 侧契约值。
 
 ### 2. 版本戳（键固定为 `mcp`，只增不改）
 `"mcp":{"product":"<semver>","contract":"v1.3.0"}` 与既有响应字段并列；**不得**为此新增顶层 JSON-RPC 结果键（保住 `tools/call` 结果键 = `{content,isError}` 的严格性）。
@@ -1266,3 +1557,107 @@ clean IDE（`list_addins count=21`，`connect=true` 仅 `VB6MCP.Connect`）。
 · **返回信封**：每次 `tools/call` 的 `result.content[0].text` 是 **一整串 JSON 字符串**（工具回执），不是已解析的对象；客户端必须对该字符串再解码一次。此前该事实只体现在实现里（`McpServer.cls` 的 envelope 构造），现作为契约写明。
 · **`get_component_code{proc|symbol}` 的行号语义**：`startLine`/`endLine` 是 **IDE code-pane 行**（与所有写类工具同一坐标空间），并新增 `startLineDisk`/`endLineDisk`（= IDE 行 + `coords.headerOffset`）给出同一范围的**文件行**；被编号的文本本身仍跟随 `coords`（`coords:"disk"` 时编号为文件行），因此范围字段与编号**不是同一空间**，换算已完成并双写。
 · **`check_public_api{membersOnly:true}` 的作用与局限**：作用 = 在一次调用里同时拿到**成员表**（kind/name/signature）与 `violations[]/added[]/counts`；局限 = 成员表是**文本级轻解析**（参数名按设计丢弃、无类型解析，不是编译器符号表），且**比对永远执行**（`membersOnly` 只是输出大小，不能用来跳过比对）。
+
+## 2026-10-23 · Build 1（a+b+c+d）
+
+- `vba6_probe{engine_items}` 回执**语义收窄（非破坏）**：`items` 与 `available` 均置 **null**，声明「不支持项号」；`available` 是 `items` 的**历史别名**（同一含义，两个键同时保留只为显式说明）。
+- 新增（附加）：`bitmap_len`(72) / `bitmap_hex`(144 hex) / `byte_offsets[]`(5 段，`confidence=inferred`) / `confidence` / `note`；`hex` 与 `availableCount` 保留，其中 `availableCount` 的语义明确为**非零字节数**（不是项数）。
+- `get_project_info` 回执**恒发** `noProject`（`true`/`false`），此前仅在无工程时出现。
+- 描述变更（4 处，输入 schema 零变更）：`vba6_probe.engine_items` 参数、`add_project`（独占替换）、`breakpoints`（三条规则）、`get_project_info`（`noProject` 恒发）。
+- 工具数不变：add-in 120（hub 11 / DSH 131 不涉及）。
+
+### 冻结时发现的两项事实（必须记录，非本批功能）
+
+1. **carried-in drift（继承漂移）**：冻结前三方对照证明 `tools/schema_baseline.json` 已**落后于源码**——
+   `find_in_component` 与 `search_in_files` 的输入 schema 各有 2 个参数（`include_procedure`、`include_leading_comment`）
+   已经存在于**基线二进制 srcAE0 的实况面**里，但从未进入冻结面（旧 `docs/tools_schema.json` 是更早的捕获）。
+   本次 `--freeze` 一并把它们纳入冻结面；**这不是本批新增的功能**，属把契约面补成事实。工具数仍 120。
+2. **`engine_items` 的位语义实测**：两态（design vs RUN）对照显示 `+0x07/+0x08` **在两种状态下都是 0**，
+   规格里「受 EbMode==1 门控」的推断**未获确认**；实测发生变化的字节是 `+0x09/+0x14/+0x15/+0x1D`。
+   因此 `byte_offsets[]` 的条目统一标注 `INFERRED_STATIC`，并新增回执字段 `observedTwoStateChanged:[9,20,21,29]`
+   与 `twoStateProbe`（明确写出「gating claim NOT confirmed」）。
+
+## 2026-10-23 · Build 2（e）：`open_project` 同文件多种拼写短路（**无 untitled 守卫**）
+
+- **行为变更（仅 `open_project`）**：目标 `.vbp` 已经打开时，如果调用方给出的路径只是**另一种拼写**
+  （8.3 短名、正斜杠、大小写差异、目录别名），现在也会被识别为「同一个文件」，走**既有**的
+  already-open 分支：返回 `alreadyOpen:true` ＋ `diskVsMemory`，**不**关闭再重开工程。
+  原来的精确比较 `StrComp(VBProject.FileName, full, vbTextCompare)` **一个字符都没改**，只在它没命中后
+  追加一轮规范化比较（文本归一化 → `GetAbsolutePathName` → 规范路径 `GetFinalPathNameByHandleW`；
+  任何一步证不出来就保持 `False`，绝不猜）。
+- **回执键集合未变**：短路复用 already-open 分支既有字段（`alreadyOpen` / `diskVsMemory` /
+  `keptInMemory` / `reloadNotAttempted` …），**没有新增回执键**；**inputSchema 零变更**；工具数 120。
+- **描述变更 1 处**：`open_project`。
+- **不做 untitled 守卫**：本项目原先假设的「exclusive 分支先 `save_project("")`、对 untitled 工程会弹
+  VB6 宿主 Save-As 模态框并阻塞 add-in」已被实测**反驳** —— 在 srcAE（Build 1 二进制）上
+  A / A2 / B / B2 四个实验全部**正常返回**（33–69 ms，外部 `#32770` 前后均为 0），
+  `remove_project{allowDirty:true}` 与 `open_project{exclusive:true}` 都不会卡住。
+  真正的副作用是「未保存的 untitled 工程在关闭时被 VB6 **静默写进 IDE 当前目录**（并可覆盖同名组件文件）」，
+  已单列新卡，实测口径见 `docs/KNOWN_LIMITATIONS_AND_FAQ.md` §62。
+- 验收出证：`fix/TASK_CODETOOLS_SPLIT_20261022/handtest_build2/measure_untitled.json`（srcAE 七实验：
+  A/B/B2/A2/S/H2-old/H6）与同目录 `handtest_build2_v2.json`（srcAG 手测矩阵：2b/H2/H2b×2/2c/H6/3a/3b，
+  八步全部按预登记形状通过）。
+
+## 2026-10-23 · 批次 3a：隐式写盘的**回执诚实性**（行为不变）
+
+实测（`fix/TASK_CODETOOLS_SPLIT_20261022/handtest_build2/card_silent_write_measure.json`，M1–M4）：
+`VBProject.Saved` 在 VBIDE 里**只读**（隔离 diag 构建编译失败于 cannot assign to a read-only property），
+因此 add-in **无法**阻止宿主写盘。`VBProjects.Remove` 对**未保存**工程（untitled 与 named 皆然）会把工程
+静默写进 IDE 当前目录（named 还可能写进它自己的工程目录），并可覆盖同名组件文件。故本批**不改行为**，
+只让回执如实。
+
+**`remove_project`（成功路径）**
+
+- `discardedUnsavedChanges`：**语义更正** —— 旧值只表示「请求了丢弃」；新值表示「确实丢弃」。
+  `dirtyFound And allowDirty` 且宿主写盘 ⇒ `false`，原因见 `discardedUnsavedChangesBasis`
+  （取值：`host_persists_changes_on_remove` / `nothing_to_discard` / `no_host_write_observed`）。
+- 新增：`discardedUnsavedChangesBasis`、`hostWritePrevented`、`hostWritePreventedWhy`、
+  `hostWrites[]`、`hostWritesBasis`、`hostWritesTruncated`、`hostWritesScanned`。
+- `hostWrites[i]` = `{path,sizeBefore,sizeAfter,existedBefore,overwritten}`：depth-1 快照、
+  覆盖 IDE 当前目录 ＋（named 时）被删工程自己的目录、上限 2000、fail-open；
+  **同尺寸且 mtime 相同的改写不可区分**（写在 `hostWritesBasis` 原文里）。
+- `sideEffects.filesWritten[]` **并入** `hostWrites[].path`（本调用确实写了这些文件；provenance 看 `hostWrites`）。
+
+**`open_project`（关闭旧工程路径）**
+
+- `savedBeforeClose`：**语义更正** —— 旧值只表示「尝试过 preSave」；新值 = preSave 之后重读被关闭工程的
+  `Saved`，全 True 才 true（untitled 的 no-op preSave ⇒ **false**）。
+- 新增：`preCloseSave{attempted,result,saved,projectSavedAfter,basis}`、
+  `hostWrites[]` / `hostWritesBasis` / `hostWritesTruncated`、
+  `hostWritePrevented` / `hostWritePreventedWhy`。
+- `hostWrites` 在**所有** `open_project` 回执里恒在；already-open / 非 exclusive 分支为空且
+  `hostWritesBasis="not_applicable: no project was closed in this call"`；`preCloseSave` 只在关闭路径出现。
+- 行为（`closedProjects` / `alreadyOpen` / 短路 / 不拒绝）**一律不变**；close 路径**绝不**写 `Saved`。
+
+## 2026-10-23 · P1 #1：`ide_state` 的成功回执**恒定**给出 `mode`（纯加法）
+
+**先纠正卡片前提（实测更正）**：`ide_state` 只有**一种**成功结构。`ToolIdeState` 在**每条**成功路径都写 `state`
+（`design|run|break|runtime_error`）；所谓「commandBars 降级形状」并不是另一种结构，而是同一结构下 `stateSource` 的差异
+（`ebMode` / `commandBars` / `ebMode+commandBars` / `runtime_error_dialog`）。`ideState` **从来不是 `ide_state` 的字段**
+（它属于 `get_project_info` / `run_project` 等其它工具）；FAQ §61 的「形状 A 含 `ideState`」是误记。
+
+**ADDITIVE 回执字段（3；工具数 120 不变、`inputSchema` 逐字节不变）**
+
+- `mode`：`design | run | break | unknown`，**每条成功回执都有**（= 「该读哪个字段」的唯一答案）；`state` 保留原始四态，
+  `runtime_error` 归一为 `unknown`（模态框是独立状态，不冒充三态）。
+- `modeBasis`：`ebMode | commandBars | ebMode+commandBars | runtime_error_dialog | unrecognized_state`，**每条成功回执都有**
+  （= `mode` 的判定来源；与 `stateSource` 同词表，但语义是「mode 的源」而不是「判定器的源」）。
+- `modeConflict`：**只在矛盾时出现**（object）：`{state, ebMode, expectedFromEbMode}`。权威口径：`mode` 永远镜像 `state`，
+  `modeConflict` 只报告「原始 EbMode 与已判状态不一致」，不把 `mode` 降为 `unknown`（避免双重语义）。
+
+**不变**：`state` / `stateSource` / `ebMode` / `notRunning` / `running` / `commandBarsSuspended` / `autoRecover` / `pump` / `wheel` /
+`cancel` / `release` / `inflight` / `lastError` 全部原样；**拒绝信封**（`ok:false` + `reason:ide_not_ready` + `vbErrorCode:438` +
+`ideState:"design"`）**不加 `mode`**（拒绝不是成功形状，「先看 `ok`」的规则不变）。
+
+**实现位置**：`CodeTools.cls` 的 `IdeModeBlock()`（唯一推导点）+ `ToolIdeState` 末尾唯一调用点（在 `autoRecover` 重算之后，
+保证与最终 `state` 一致）；共享判定器 `GetIdeStateEx` **未改**。
+
+**schema 重冻结**：仅 `ide_state.description` 变化 ⇒ `docs/tools_schema.json` == `tools/schema_baseline.json` =
+`BD570A792925835EE206763E5036F7A2D2B7AF7E6A2E3E45A357DF84D68F54E6`（120 工具）；`bridge/hub_schema.generated.json` 重生成
+（VERSION=v1.16.1、DECLARED=120、MISMATCH=False、FACEFP=`ff5cacae…`）；`hub_alignment_failures=0` / `live_tool_changes=0`。
+
+**实测（srcAK，四形状）**：design（`stateSource=commandBars`）⇒ `mode=design`/`modeBasis=commandBars`；run（EbMode=1）⇒ `mode=run`/`ebMode`；
+break（EbMode=2，注入断点命中）⇒ `mode=break`/`ebMode`；`runtime_error` **本轮不可靠复现、未测**（代码路径按上表映射为
+`unknown` + `runtime_error_dialog`）。另：post-run 的 `ebMode+commandBars` 在 `ide_state` 回执里**不可观测**——该工具在返回前会
+`autoRecover` 清一次悬挂窗口并**重读** ⇒ 降级源只存在于 `autoRecover` 之前的内部状态；`control_execution{end}` 的
+`commandBarsSuspendedAfter=true` 是这条路径的外部证据。

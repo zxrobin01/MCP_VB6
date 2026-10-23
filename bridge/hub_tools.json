@@ -30,12 +30,16 @@
     },
     {
       "name": "ide_start",
-      "description": "Start a VB6 IDE for the given project (.vbp). Minimal mode: needs VB6MCP_AUTOSTART_PROJECT or an explicit project plus a resolvable VB6.EXE; otherwise returns a structured not_implemented with the reason.",
+      "description": "Start a VB6 IDE for the given project (.vbp), then WAIT FOR READINESS and say which part is proven: ok:true + started:true means the process was created; ready:true means the add-in was OBSERVED answering mcp_info for that pid within ready_wait_ms (default 15000, min 1000, max 180000). ready:false is a truthful timeout: the receipt carries readyWaitMs, readyChecks{registryVisible,transportUp,addInAnswers,projectMatches} and pollingHint, and the pid is still valid (poll ide_list for it). If that .vbp is already open on this machine the running instance is REUSED (started:false, reused:true, processesCreated:0) instead of starting a second one. Needs an explicit project or VB6MCP_AUTOSTART_PROJECT plus a resolvable VB6.EXE; otherwise a structured not_implemented / vb6_exe_not_found is returned.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "project": {
             "type": "string"
+          },
+          "ready_wait_ms": {
+            "type": "integer",
+            "description": "readiness poll budget in ms (default env VB6MCP_IDE_START_READY_MS or 15000; min 1000, max 180000). The poll observes the add-in; it is never a fixed sleep"
           }
         },
         "additionalProperties": false
@@ -59,7 +63,7 @@
     },
     {
       "name": "ide_restart",
-      "description": "RECOVER a wedged IDE by stopping OUR OWN instance and starting it again on the same project. Sequence: best-effort save_project -> graceful quit_ide -> confirm the process is gone (force kill only if it will not go) -> clear our own instances/<pid>.json registry entry -> start VB6.EXE on the same .vbp -> wait for the new instance -> prove three-way readiness (add-in answers, mcp_info answers, project matches). It NEVER stops an instance below port 8767: 8766 belongs to an EXTERNAL process on this machine (discipline 107). Every path returns the same key set: {ok,restarted,stoppedPid,newPid,port,project,targetSource,ownership,refused_reason,stopConfirmed,saveAttempted,saveOk,registryCleared,lockCleared,three_way_ok,threeWay,vb6Exe,vb6ExeSource,waitMs,instances,steps,note}.",
+      "description": "RECOVER a wedged IDE by stopping OUR OWN instance and starting it again on the same project. Sequence: best-effort save_project -> graceful quit_ide -> confirm the process is gone (force kill only if it will not go) -> clear our own instances/<pid>.json registry entry -> start VB6.EXE on the same .vbp -> wait for the new instance -> prove three-way readiness (add-in answers, mcp_info answers, project matches). It NEVER stops an instance below port 8767: 8766 belongs to an EXTERNAL process on this machine (discipline 107). Every path returns the same key set: {ok,restarted,stoppedPid,newPid,port,project,targetSource,ownership,refused_reason,stopConfirmed,saveAttempted,saveOk,registryCleared,lockCleared,three_way_ok,threeWay,vb6Exe,vb6ExeSource,waitMs,instances,steps,note}. CONTINUABLE OPERATION (WP-22-02): the call waits at most wait_ms (default 25000, env VB6MCP_HUB_RESTART_WAIT_MS, min 1500) and then returns a PENDING receipt (ok:false + pending:true + state:\"in_progress\" + opId + currentStep + lastKnownState - a client-side request timeout is NOT this tool's answer and is NOT a failure). Continue it with ide_restart{opId:\"...\"}: that answers from the in-process operation registry (kept 30 minutes, NOT across a hub restart) and starts NOTHING. Every path carries opId/started/state(done|refused|error|in_progress)/finished/elapsedMs/currentStep/lastKnownState/opRule. A SECOND restart while one is in flight is refused with reason:\"restart_in_progress\" + inProgress{opId,...}, because a second restart could stop the process the first one just started; the oldest op is never replayed.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -70,8 +74,41 @@
           "project": {
             "type": "string",
             "description": "The .vbp to restart the IDE on. Required unless the target instance reports its project path."
+          },
+          "opId": {
+            "type": "string",
+            "description": "Continue (poll) an operation that a previous ide_restart returned, e.g. from a PENDING receipt. With opId this call answers from the operation registry and starts NOTHING: pid/project/wait_ms are ignored. An unknown/expired opId refuses with reason:\"op_not_found\"."
+          },
+          "wait_ms": {
+            "type": "number",
+            "description": "How long THIS call may block before it returns the pending receipt (default 25000, env VB6MCP_HUB_RESTART_WAIT_MS; clamped to 1500..300000). The restart itself KEEPS RUNNING in the background after a pending receipt, so a small wait_ms plus ide_restart{opId} is the non-blocking usage."
           }
         },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ide_kill_and_relaunch",
+      "description": "HUB-side, add-in-INDEPENDENT reset for ONE VB6 IDE: stop the process, clear its registration, launch VB6.EXE on the same .vbp and poll until the add-in answers. This is the recovery primitive for a BUSY/WEDGED add-in pipe, where ide_state{release_inflight:true} cannot even be delivered because it travels the same pipe. Only an instance THIS hub owns (started by it, or its registration says startedByHub=true) is ever signalled; a known port below 8767 (including the reserved 8766) is REFUSED, and a remote-bridge instance is never touched. Every path returns: {pid, stoppedPid, newPid, port, ready, readyWaitMs, threeWay{http,mcpInfo,project}, three_way_ok, ownership, ownershipBasis, ownedByHub, stopConfirmed, registryCleared, projectVbp, pinPort, vb6Exe, steps[], elapsedMs, refused_reason, howToProceed, failureKind, suggestedAction, retrySafe}. ready:false after a relaunch means the process WAS started but the add-in had not answered within ready_wait_ms - poll ide_list for newPid.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "description": "the instance to reset (as reported by ide_list). Required - this tool never guesses a target."
+          },
+          "project": {
+            "type": "string",
+            "description": "absolute .vbp to relaunch on; defaults to the project path the instance published in its registration (if it publishes none, the call is refused BEFORE anything is stopped)."
+          },
+          "ready_wait_ms": {
+            "type": "integer",
+            "description": "readiness poll budget in ms (default env VB6MCP_IDE_RELAUNCH_READY_MS or 60000; min 1000, max 300000). The poll observes the add-in; it is never a fixed sleep"
+          }
+        },
+        "required": [
+          "pid"
+        ],
         "additionalProperties": false
       }
     },

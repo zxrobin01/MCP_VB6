@@ -502,7 +502,7 @@ Public Function EngineItemsJson() As String
     Dim mem As Long, code As Long, p As Long, rc As Long, i As Long, av As Long
     Dim b(31) As Byte
     Dim buf(71) As Byte
-    Dim hexs As String, ids As String
+    Dim hexs As String
     Dim s As String
     s = "{"
     hMod = Vba6Base()
@@ -540,24 +540,41 @@ Public Function EngineItemsJson() As String
     End If
     On Error GoTo 0
     s = s & "," & Q("rc") & ":" & CStr(rc)
+    s = s & "," & Q("bitmap_len") & ":72"
     If IsBadReadPtr(mem, 72) = 0 Then
         CopyMemory buf(0), mem, 72
         hexs = ""
-        ids = ""
         av = 0
         For i = 0 To 71
             hexs = hexs & Right$("0" & Hex$(buf(i)), 2)
-            If buf(i) <> 0 Then
-                av = av + 1
-                If Len(ids) > 0 Then ids = ids & ","
-                ids = ids & CStr(i)
-            End If
+            If buf(i) <> 0 Then av = av + 1
         Next
-        s = s & "," & Q("hex") & ":" & Q(hexs)
-        s = s & "," & Q("available") & ":[" & ids & "]"
-        s = s & "," & Q("availableCount") & ":" & CStr(av)
+        s = s & "," & Q("hex") & ":" & Q(hexs)                 ' unchanged (back-compat)
+        s = s & "," & Q("bitmap_hex") & ":" & Q(hexs)
+        s = s & "," & Q("byte_offsets") & ":[" & ByteOffsetsJson() & "]"
+        s = s & "," & Q("availableCount") & ":" & CStr(av)     ' now documented as NON-ZERO BYTE count
+    Else
+        s = s & "," & Q("bitmap_hex") & ":null"
+        s = s & "," & Q("byte_offsets") & ":null"
+        s = s & "," & Q("availableCount") & ":null"
     End If
+    s = s & "," & Q("items") & ":null"
+    s = s & "," & Q("available") & ":null"
+    s = s & "," & Q("confidence") & ":" & Q("inferred")
+    s = s & "," & Q("note") & ":" & Q("72-byte status bitmap; no item index semantics")
+    s = s & "," & Q("observedTwoStateChanged") & ":[9,20,21,29]"
+    s = s & "," & Q("twoStateProbe") & ":" & Q("design vs RUN in one IDE session: +0x09/+0x14/+0x15/+0x1D changed; +0x07/+0x08 stayed 0, so the EbMode==1 gating claim was NOT confirmed")
     EngineItemsJson = s & "}"
+End Function
+
+Private Function ByteOffsetsJson() As String
+    ' offsets are INFERRED from static write-site analysis (docs/RE_ROUND451_ANSWERS.md G4 r3-r5)
+    ByteOffsetsJson = _
+        "{""offset"":7,""offsetHex"":""0x07"",""note"":""INFERRED_STATIC +0x07/+0x08: static analysis suggested EbMode==1 gating; the two-state probe did NOT confirm it (both 0 in design and RUN)""}," & _
+        "{""offset"":16,""offsetHex"":""0x10"",""note"":""INFERRED_STATIC +0x10/+0x11 derived from the state dword at [0xFC0D0F4]""}," & _
+        "{""offset"":19,""offsetHex"":""0x13"",""note"":""INFERRED_STATIC +0x13 state dword low byte (edx-derived)""}," & _
+        "{""offset"":30,""offsetHex"":""0x1E"",""note"":""INFERRED_STATIC +0x1E/+0x1F/+0x21 helper/branch-derived status bits""}," & _
+        "{""offset"":43,""offsetHex"":""0x2B"",""note"":""INFERRED_STATIC +0x2B normalized result of 0xFA922BE""}"
 End Function
 
 ' ---------------------------------------------------------------------------
@@ -1773,6 +1790,205 @@ Private Function BytesToHex(ByRef b() As Byte, ByVal n As Long) As String
         s = s & Right$("0" & Hex$(b(i)), 2)
     Next
     BytesToHex = s
+End Function
+
+' =====================================================================
+' RE-1 (34a): STRUCTURED ERROR RECORD (read-only, zero engine calls)
+' =====================================================================
+' The VBA6 exception record is a 32-byte global (RE rounds 117 / 60) and the G2
+' runtime probe CONFIRMED its field offsets across TWO IDE processes
+' (fix/TASK_RUNTIME_PROBES/evidence/g2_mapping.json: verdict=CONFIRMED,
+' eventVerdicts=[CONFIRMED,CONFIRMED], desc +0x08 / src +0x04 / num +0x1C).
+'
+' WHY A MEMORY READ AND NOT AN EXPORT: while the modal runtime-error box owns the
+' IDE thread this code path must make NO VBA6 call at all (measured discipline
+' documented in CodeTools.ToolLastError). Reading two globals plus two BSTRs with
+' CopyMemory makes no call and does not touch engine state. EbExceptionHandled is
+' NEVER called: it CLEARS the exception state bit (dword_FC0D010 = 0) and would
+' blind the IDE's own error handling.
+'
+' RECORD SELECTOR: static disassembly says the record is chosen by
+' dword_FC0D074 AND &H1000000 (0 -> record A at +0x17D078, non-zero -> record B
+' at +0x17D0A8). The G2 probe read 0x17D010 instead, which is the exception STATE
+' bit, not the selector; both agreed (0) in the captured event, so the confirmed
+' field mapping stays valid. This reader uses the static selector and FALLS BACK
+' to the other record when the selected one reads empty, publishing which path it
+' took (selectorBasis = dword074_bit24 | fallback_probe).
+'
+' Returns a Dictionary (never raises). Keys: readOk, recordUsed, raw010,
+' dword074, bit24, chosen, selectorBasis, source, description, hresult, number,
+' numberBasis, sourceOk/sourceChars/sourceBytes/sourceError, description<same>,
+' why. Nothing is invented: unreadable -> Null + why.
+Public Function ErrRecordInfo() As Object
+    Dim d As Object
+    Dim hMod As Long, selAddr As Long, recA As Long, recB As Long, stateAddr As Long
+    Dim state As Long, selDword As Long, bit24 As Boolean
+    Dim used As String, basis As String, recAddr As Long, hr As Long
+    Dim src As String, desc As String
+    On Error Resume Next
+    Set d = CreateObject("Scripting.Dictionary")
+    d("readOk") = False
+    d("recordUsed") = Null
+    d("raw010") = Null
+    d("dword074") = Null
+    d("bit24") = Null
+    d("chosen") = Null
+    d("selectorBasis") = "unavailable"
+    d("source") = Null
+    d("description") = Null
+    d("hresult") = Null
+    d("number") = Null
+    d("numberBasis") = "unavailable"
+    d("sourceOk") = False
+    d("descriptionOk") = False
+    d("sourceChars") = 0
+    d("sourceBytes") = 0
+    d("descriptionChars") = 0
+    d("descriptionBytes") = 0
+    d("sourceError") = Null
+    d("descriptionError") = Null
+    d("why") = Null
+    hMod = Vba6Base()
+    If hMod = 0 Then
+        d("why") = "vba6_not_loaded"
+        Set ErrRecordInfo = d
+        Exit Function
+    End If
+    selAddr = hMod + &H17D074
+    recA = hMod + &H17D078
+    recB = hMod + &H17D0A8
+    stateAddr = hMod + &H17D010
+    If IsBadReadPtr(selAddr, 4) <> 0 Then
+        d("why") = "selector_unreadable"
+        Set ErrRecordInfo = d
+        Exit Function
+    End If
+    state = 0
+    CopyMemory state, stateAddr, 4
+    selDword = 0
+    CopyMemory selDword, selAddr, 4
+    bit24 = ((selDword And &H1000000&) <> 0)
+    d("raw010") = state
+    d("dword074") = selDword
+    d("bit24") = bit24
+    ' 34a LIVE MEASUREMENT: record A is the active record BOTH while the modal box is up
+    ' (bit24 = 1) and after it settles (bit24 = 0), so bit24 tracks the MODAL DIALOG STATE
+    ' and is NOT a record selector. A is therefore read first, and B is only an
+    ' empty-record fallback probe (its basis stays "fallback_probe" when it is used).
+    used = "A"
+    basis = "unavailable"
+    recAddr = recA
+    If IsBadReadPtr(recA, &H20) <> 0 Then
+        used = "B"
+        basis = "fallback_probe"
+        recAddr = recB
+        If IsBadReadPtr(recB, &H20) <> 0 Then
+            d("chosen") = used
+            d("selectorBasis") = basis
+            d("why") = "record_unreadable"
+            Set ErrRecordInfo = d
+            Exit Function
+        End If
+    End If
+    hr = 0
+    CopyMemory hr, recAddr + &H1C, 4
+    src = ErrReadBstr(recAddr + &H4, d, "source")
+    desc = ErrReadBstr(recAddr + &H8, d, "description")
+    If (Not CBool(d("sourceOk"))) And (Not CBool(d("descriptionOk"))) And hr = 0 Then
+        ' the chosen record is EMPTY: probe the other one (never used to paper over a
+        ' readable-but-failing read)
+        If used = "A" Then
+            recAddr = recB
+            used = "B"
+        Else
+            recAddr = recA
+            used = "A"
+        End If
+        basis = "fallback_probe"
+        If IsBadReadPtr(recAddr, &H20) = 0 Then
+            d("sourceError") = Null
+            d("descriptionError") = Null
+            hr = 0
+            CopyMemory hr, recAddr + &H1C, 4
+            src = ErrReadBstr(recAddr + &H4, d, "source")
+            desc = ErrReadBstr(recAddr + &H8, d, "description")
+        End If
+    End If
+    d("chosen") = used
+    d("selectorBasis") = basis
+    d("recordUsed") = used
+    If CBool(d("sourceOk")) Then d("source") = src
+    If CBool(d("descriptionOk")) Then d("description") = desc
+    If (Not CBool(d("sourceOk"))) And (Not CBool(d("descriptionOk"))) And hr = 0 Then
+        d("why") = "record_empty"
+        Set ErrRecordInfo = d
+        Exit Function
+    End If
+    d("hresult") = hr
+    If (hr And &H1FFF0000&) = &HA0000& Then
+        d("number") = (hr And &HFFFF&)
+        d("numberBasis") = "hresult_low16"
+    Else
+        d("numberBasis") = "facility_not_vb"
+    End If
+    d("readOk") = True
+    Set ErrRecordInfo = d
+End Function
+
+' Read one BSTR out of the exception record. Bounded, guarded, never raises:
+' a bad pointer / bad length leaves the field Null and records the reason.
+Private Function ErrReadBstr(ByVal fieldAddr As Long, ByRef d As Object, ByVal which As String) As String
+    Dim n As Long, i As Long, s As String, w As Long, p As Long
+    Dim okKey As String, charsKey As String, bytesKey As String, errKey As String
+    okKey = which & "Ok"
+    charsKey = which & "Chars"
+    bytesKey = which & "Bytes"
+    errKey = which & "Error"
+    ErrReadBstr = ""
+    d(okKey) = False
+    d(charsKey) = 0
+    d(bytesKey) = 0
+    If fieldAddr = 0 Then
+        d(errKey) = "null_pointer"
+        Exit Function
+    End If
+    If IsBadReadPtr(fieldAddr, 4) <> 0 Then
+        d(errKey) = "pointer_unreadable"
+        Exit Function
+    End If
+    ' the record stores a POINTER to the BSTR data; fieldAddr is the address of that slot
+    p = 0
+    CopyMemory p, fieldAddr, 4
+    If p = 0 Then
+        d(errKey) = "null_pointer"
+        Exit Function
+    End If
+    If IsBadReadPtr(p, 8) <> 0 Then
+        d(errKey) = "pointer_unreadable"
+        Exit Function
+    End If
+    n = SysStringLen(p)
+    If n <= 0 Then
+        d(errKey) = "empty"
+        Exit Function
+    End If
+    If n > 4096 Then
+        d(errKey) = "length_out_of_range"
+        Exit Function
+    End If
+    If IsBadReadPtr(p, n * 2 + 2) <> 0 Then
+        d(errKey) = "payload_unreadable"
+        Exit Function
+    End If
+    For i = 0 To n - 1
+        w = 0
+        CopyMemory w, p + i * 2, 2
+        s = s & ChrW$(w And &HFFFF&)
+    Next
+    d(okKey) = True
+    d(charsKey) = n
+    d(bytesKey) = n * 2
+    ErrReadBstr = s
 End Function
 
 Public Function IdeEbMode() As Long
