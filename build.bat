@@ -47,6 +47,18 @@ rem Compatibility and mints NEW class IDs, so every registration on every machin
 rem goes stale - the exact failure this mode exists to prevent. Fail LOUDLY.
 set "COMPAT_REF=%~dp0dist\compat\VB6MCP_ref.dll"
 set "COMPAT_SHA=%~dp0dist\compat\VB6MCP_ref.sha256"
+rem PUBLISHED (source-only) trees declare CompatibleMode="0" and ship NO binary
+rem compatibility reference, so this guard must not fatal there. Read the mode from
+rem the project file and only enforce the reference checks when it is 2.
+set "COMPAT_MODE=0"
+for /f "tokens=2 delims==" %%M in ('findstr /b /c:"CompatibleMode=" "%~dp0MCP_VB6.vbp"') do set "COMPAT_MODE=%%~M"
+if not "%COMPAT_MODE%"=="2" goto compat_ref_skipped
+
+:compat_ref_skipped
+>&2 echo Binary-compatibility guard SKIPPED: MCP_VB6.vbp declares CompatibleMode="%COMPAT_MODE%"
+>&2 echo        (a source-only tree mints its own class IDs on every build; no reference is shipped).
+goto compat_ref_done
+
 if not exist "%COMPAT_REF%" goto compat_ref_missing
 if not exist "%COMPAT_SHA%" goto compat_ref_nosha
 set "WANT_SHA="
