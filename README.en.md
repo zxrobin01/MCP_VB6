@@ -346,6 +346,37 @@ header: Authorization: Bearer <token>    # only when a token is configured
 
 (Starting the hub over stdio works too - see above.)
 
+#### Connecting DeepSeek Harness (DSH)
+
+DSH does not keep MCP servers in the Windows registry; it keeps them in the **plugin list of a DSH profile**
+(typically `~/.dsh/profiles/<profile>/cordis.patch.yml`). Add one `@deepseek-ai/dsh-mcp-client` entry:
+
+```yaml
+- id: mcp-vb6
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: vb6                      # tools appear as mcp__vb6__<tool>; [A-Za-z0-9_-]{1,32}, unique in scope
+    transport: stdio                     # recommended: the stdio hub still exposes the tool-face snapshot with no IDE
+    command: node                        # an absolute path to your own node executable also works
+    args: [ '<repo>/bridge/vb6mcp_hub.mjs' ]
+    cwd:  '<repo>'
+    env:
+      VB6MCP_BRIDGE_URL: http://127.0.0.1:8767     # the middle-service port, NOT 8766
+      VB6MCP_TOKEN_FILE: '<repo>/vb6mcp_token.txt' # omit when no credential is configured
+```
+
+Three measured pitfalls:
+
+1. **`VB6MCP_BRIDGE_URL` is mandatory.** Without it the hub falls back to its own default, takes the local discovery
+   path, adopts the **middle service as a fake IDE** and forwards WITHOUT the token -> HTTP 401 -> every forwarded
+   call fails with `Expected property name or '}' in JSON at position 1`.
+2. **Never point at 8766** (reserved for the maintainer's interactive session). If you really want to talk to the
+   service directly, use `transport: streamable-http` with `url: http://127.0.0.1:8767/mcp` - but that exposes only
+   the **add-in face** and NONE of the hub-face tools (the hub-face tools are available only through the stdio hub).
+3. Restart DSH afterwards; check `mcp__vb6__mcp_info` (`contract` / `toolCount`) and `mcp__vb6__ide_list` for IDE
+   discovery. `bridge_unreachable` / `bridge_auth_failed` means the middle service is not UP (see the previous
+   section).
+
 ### Other stdio clients
 
 The same as Claude Desktop: `command: node`, `args: ["<repo>/bridge/vb6mcp_hub.mjs"]`, plus `VB6MCP_BRIDGE_URL` and `VB6MCP_TOKEN` / `VB6MCP_TOKEN_FILE` as needed.

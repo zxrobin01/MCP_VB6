@@ -1,0 +1,26 @@
+# dsh_mcp.example.yml - register this server with DeepSeek Harness (DSH).
+#
+# DSH keeps MCP servers in a PROFILE PLUGIN LIST, not in the Windows registry. Put the
+# entry below into that profile file (typically ~/.dsh/profiles/<profile>/cordis.patch.yml)
+# and restart DSH. Replace <repo> with the absolute path of this checkout.
+#
+# WHY stdio (not streamable-http): the hub answers tools/list from its snapshot, so DSH
+# sees the whole tool face even while no VB6 IDE is running. Pointing DSH straight at the
+# middle service exposes only the add-in face and none of the hub-face tools.
+#
+# WHY VB6MCP_BRIDGE_URL is required: without it the hub uses its own default, takes the
+# local discovery path, adopts the middle service as a fake IDE and forwards WITHOUT the
+# token -> HTTP 401 -> every call fails with
+#   Expected property name or } in JSON at position 1
+# 8766 is reserved for the maintainer interactive session; the middle service is 8767.
+- id: mcp-vb6
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: vb6
+    transport: stdio
+    command: node
+    args: [ '<repo>/bridge/vb6mcp_hub.mjs' ]
+    cwd:  '<repo>'
+    env:
+      VB6MCP_BRIDGE_URL: http://127.0.0.1:8767
+      VB6MCP_TOKEN_FILE: '<repo>/vb6mcp_token.txt'

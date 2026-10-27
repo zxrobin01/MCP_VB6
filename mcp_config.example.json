@@ -7,13 +7,6 @@
         "VB6MCP_BRIDGE_URL": "http://127.0.0.1:8767",
         "VB6MCP_TOKEN_FILE": "C:/path/to/vb6mcp_token.txt"
       }
-    },
-    "pcode": {
-      "command": "python",
-      "args": ["C:/path/to/MCP_VB6/tools/pcode_mcp_server.py"],
-      "env": {
-        "PCODE_DATA_DIR": "C:/path/to/pcode_data"
-      }
     }
   }
 }

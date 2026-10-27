@@ -312,6 +312,34 @@ URL: http://127.0.0.1:8767/mcp
 
 （用 stdio 启动 hub 也可以，见上。）
 
+#### 接入 DeepSeek Harness（DSH）
+
+DSH 的 MCP 服务器不在 Windows 注册表里，而在 **DSH profile 的 plugin 列表**（典型路径
+`~/.dsh/profiles/<profile>/cordis.patch.yml`）。加一条 `@deepseek-ai/dsh-mcp-client` 条目即可：
+
+```yaml
+- id: mcp-vb6
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: vb6                      # 工具呈现为 mcp__vb6__<tool>；[A-Za-z0-9_-]{1,32}，同一作用域内唯一
+    transport: stdio                     # 推荐：走 stdio hub，DSH 启动时即使没有 IDE 也能看到完整工具面快照
+    command: node                        # 也可写你自己的 node 可执行文件绝对路径
+    args: [ '<仓库路径>/bridge/vb6mcp_hub.mjs' ]
+    cwd:  '<仓库路径>'
+    env:
+      VB6MCP_BRIDGE_URL: http://127.0.0.1:8767          # 中间服务端口，不是 8766
+      VB6MCP_TOKEN_FILE: '<仓库路径>/vb6mcp_token.txt'  # 未配置凭据时可省略
+```
+
+三个实测坑（都踩过）：
+
+1. **必须显式给 `VB6MCP_BRIDGE_URL`**。省略时 hub 用自己的默认值走本地发现路径，会把**中间服务误当成一个"假 IDE"**，
+   转发时不带 token → HTTP 401 → 每次工具调用都报 `Expected property name or '}' in JSON at position 1`。
+2. **不要指向 8766**。8766 是维护者交互会话保留端口。若要直连服务（不经 hub），用 `transport: streamable-http` +
+   `url: http://127.0.0.1:8767/mcp`，但那样只暴露**插件面**工具，**不含** hub 面的 11 个工具（hub 面工具只在 stdio hub 路径下可见）。
+3. 改完**重启 DSH**；用 `mcp__vb6__mcp_info` 核对 `contract` / `toolCount`，用 `mcp__vb6__ide_list` 看 IDE 发现情况。
+   若报 `bridge_unreachable` / `bridge_auth_failed`，先确认中间服务 `-Action status` 的 verdict 是 **UP**（见上一节）。
+
 ### 其它 stdio 客户端
 
 与 Claude Desktop 相同：`command: node`、`args: ["<仓库>/bridge/vb6mcp_hub.mjs"]`，按需设置 `VB6MCP_BRIDGE_URL` 与 `VB6MCP_TOKEN` / `VB6MCP_TOKEN_FILE`。
