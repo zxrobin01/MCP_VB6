@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Source stamp (algorithm identifier: vb6src/2) for a VB6 project.
+"""Source stamp (algorithm identifier: vb6src/3) for a VB6 project.
 
 WHY THIS EXISTS
     "Is this VB6MCP.dll built from this tree?" must be decidable, and it must NOT be
@@ -36,29 +36,43 @@ code => same I" direction breaks:
          would be self-referential) and, defensively, a legacy invalid "Comments=" line;
        - *.bak*, *.obj, *.dll, *.exe, *.log, *.pdb, docs/**.
 
-ALGORITHM (spec section 4)
-    manifest line : <relative path> TAB <byte count> TAB <sha256(raw)>   (tab separated)
+ALGORITHM (spec section 4; the hashed input is canonicalised - see NORMALISATION)
+    manifest line : <relative path> TAB <byte count> TAB <sha256(canonical bytes)>  (tab)
     ordering      : by the UTF-8 bytes of the relative path (cross-platform stable)
-    header        : "vb6src/2" LF  +  mode name LF
+    header        : "vb6src/3" LF  +  mode name LF
     payload       : header + lines joined with LF + a final LF
     I             : sha256(payload) as lowercase hex
 
     The manifest file on disk IS the payload, so the useful identity
     I == sha256(bytes of the manifest file) holds and can be checked by hand.
-    The algorithm identifier changes whenever the definition changes; moving to
-    vb6src/2 requires recomputing every stamp.
+    <byte count> is the length of the CANONICAL bytes (LF-terminated, see NORMALISATION),
+    so for a CRLF file it is SMALLER than the on-disk size.  The algorithm identifier
+    changes whenever the definition changes; moving to vb6src/3 requires recomputing
+    every stamp.
+
+NORMALISATION (line-ending independence; the stamp only - source files are NEVER rewritten)
+    A CRLF checkout and an LF checkout of the same text are the same source, so the bytes
+    that are hashed are canonicalised first: CRLF and lone CR are unified to LF for every
+    TEXT project file (.vbp / .bas / .cls / .frm / .ctl / .pag / .dca).  Everything else
+    stays byte-significant in strict mode (case, BOM, encoding, comments, blank lines,
+    trailing newline).  BINARY designer companions (.frx / .res / .ctx / .dsr) are always
+    hashed raw: a 0x0D 0x0A inside them is data, not a line break.
+    Every subcommand reports the caliber it used (the JSON/text "normalization" field:
+    "eol=lf"), and the stamp of a tree recorded by an older tool version is stale by
+    definition - "check" reports the mismatch instead of hiding it.
 
 MODES (spec section 3)
-    strict   (default) : sha256 of the RAW bytes.  Any byte change (CRLF/LF, encoding,
-                         comment, blank line) is visible in I.
-    semantic (secondary): line endings normalised to LF, a leading UTF-8 BOM removed,
-                         trailing blank lines collapsed.  Used only to separate a real
-                         semantic change from formatting noise.  I is NEVER taken from
-                         semantic mode; it is not written into any artifact.
+    strict   (default) : sha256 of the canonical bytes.  Any byte change OTHER than a line
+                         ending (encoding, comment, blank line, case, BOM, trailing
+                         newline) is visible in I; CRLF vs LF is NOT.
+    semantic (secondary): additionally strips a leading UTF-8 BOM and collapses trailing
+                         blank lines.  Used only to separate a real semantic change from
+                         formatting noise.  I is NEVER taken from semantic mode; it is not
+                         written into any artifact.
 
 WRITE POINTS (spec section 5) -- two redundant places, both excluded from the input set:
     1. runtime  : BuildStamp.bas with
-                      Public Const VB6MCP_SOURCE_ALGO As String = "vb6src/2"
+                      Public Const VB6MCP_SOURCE_ALGO As String = "vb6src/3"
                       Public Const VB6MCP_SOURCE_HASH As String = "<I>"
                   which the add-in surfaces as mcp_info -> build.sourceHash/sourceAlgo
                   (structured read, no string parsing);
@@ -134,7 +148,7 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-ALGO = "vb6src/2"   # spec sec 11.3.3: version VALUES no longer enter the hash
+ALGO = "vb6src/3"   # spec sec 11.3.3 (version values out) + sec 13 (EOL canonicalised)
 MODES = ("strict", "semantic")
 DEFAULT_VBP = "MCP_VB6.vbp"
 STAMP_BASENAME = "BuildStamp.bas"
@@ -155,6 +169,17 @@ VBP_COMPONENT_KEYS = (
 # semantic-mode normalisation applies to text project files only, never to the
 # binary companions (.frx/.res/.ctx), whose bytes are always hashed raw.
 SEMANTIC_TEXT_EXTS = (".vbp", ".bas", ".cls", ".frm", ".ctl", ".dsr", ".pag", ".dca")
+
+#: Text project files whose LINE ENDINGS are canonicalised before hashing in BOTH modes: a
+#: CRLF checkout and an LF checkout of the same text must give the same I.  The binary
+#: designer companions are deliberately absent - .dsr is binary like .frx/.res/.ctx, where a
+#: 0x0D 0x0A is DATA, not a line break.
+EOL_TEXT_EXTS = (".vbp", ".bas", ".cls", ".frm", ".ctl", ".pag", ".dca")
+
+#: The normalisation caliber reported by every subcommand (JSON field + text line).  Keep it
+#: identical to what normalize_eol()/normalize_semantic() actually do - it is evidence, not
+#: decoration.
+NORMALIZATION = "eol=lf (text project files; binary companions raw; sources never rewritten)"
 NON_SOURCE_SUFFIXES = (".bak", ".obj", ".dll", ".exe", ".log", ".pdb", ".lib", ".exp")
 NON_SOURCE_PREFIXES = ("docs/",)
 # The input set is driven by the .vbp component list plus its sidecars, so an
@@ -373,12 +398,21 @@ def parse_vbp_components(raw):
     return comps
 
 
+def normalize_eol(raw):
+    """Canonicalise line endings to LF.  STAMP ONLY: the file on disk is never rewritten.
+
+    CRLF and lone CR both become LF; no other byte is touched.  This is what makes a CRLF
+    checkout and an LF checkout of the same text the same source identity.
+    """
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
 def normalize_semantic(raw, ext):
     if ext.lower() not in SEMANTIC_TEXT_EXTS:
         return raw
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
-    raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    raw = normalize_eol(raw)
     raw = raw.rstrip(b"\n")
     if raw:
         raw += b"\n"
@@ -416,7 +450,9 @@ def collect_input_tree(tree, vbp_rel, mode):
     vbp_raw = read_bytes(vbp_abs)
     stripped = vbp_strip_comments(vbp_raw)
     stripped = vbp_mask_version_values(stripped)   # sec 11.3.2 - version values never move I
-    hashed = stripped if mode == "strict" else normalize_semantic(stripped, ".vbp")
+    # strict: canonical LF line endings (EOL is not part of the source identity); semantic:
+    # the same plus BOM strip / trailing-blank collapse.
+    hashed = normalize_eol(stripped) if mode == "strict" else normalize_semantic(stripped, ".vbp")
     entries.append(dict(rel=rel_vbp, abspath=vbp_abs, raw=vbp_raw, hashed=hashed))
 
     components = parse_vbp_components(vbp_raw)
@@ -452,7 +488,11 @@ def collect_input_tree(tree, vbp_rel, mode):
             continue
         raw = read_bytes(ap)
         ext = os.path.splitext(rel)[1]
-        hashed = raw if mode == "strict" else normalize_semantic(raw, ext)
+        if mode == "strict":
+            # Text sources: canonical LF.  Binary companions: raw bytes (see EOL_TEXT_EXTS).
+            hashed = normalize_eol(raw) if ext.lower() in EOL_TEXT_EXTS else raw
+        else:
+            hashed = normalize_semantic(raw, ext)
         entries.append(dict(rel=rel, abspath=ap, raw=raw, hashed=hashed))
     return entries, problems
 
@@ -718,7 +758,7 @@ def read_version_strings_winapi(path, names, table_key):
 
 
 def parse_stamp_text(text):
-    """'algo=vb6src/2;src=<hex>' -> {'algo':..., 'src':...} (missing keys absent)."""
+    """'algo=vb6src/3;src=<hex>' -> {'algo':..., 'src':...} (missing keys absent)."""
     out = {}
     if not text:
         return out
@@ -1156,6 +1196,7 @@ def cmd_compute(args):
         recorded = [write_with_evidence(p, payload) for p in targets]
         write_mode = "wrote %d file(s)" % len([e for e in recorded if e["touched"]])
     out = dict(algo=ALGO, mode=args.mode, source_hash=stamp,
+               normalization=NORMALIZATION,
                files=len(entries), payload_bytes=len(payload),
                manifest_sha256_matches=(sha256_hex(payload) == stamp),
                write_mode=write_mode,
@@ -1166,6 +1207,7 @@ def cmd_compute(args):
     else:
         print("ALGO=" + ALGO)
         print("MODE=" + args.mode)
+        print("NORMALIZATION=" + NORMALIZATION)
         print("SOURCE_HASH=" + stamp)
         print("FILES=%d" % len(entries))
         for e in recorded:
@@ -1182,7 +1224,8 @@ def cmd_emit(args):
             eprint("  - " + p)
         return 2
     data = render_buildstamp(ALGO, stamp, args.mode)
-    result = dict(algo=ALGO, mode=args.mode, source_hash=stamp, files=len(entries),
+    result = dict(algo=ALGO, mode=args.mode, source_hash=stamp,
+                  normalization=NORMALIZATION, files=len(entries),
                   buildstamp=None, vbp=None, manifest=None,
                   tree=os.path.abspath(args.tree))
     if args.out:
@@ -1215,6 +1258,7 @@ def cmd_emit(args):
     else:
         print("ALGO=" + ALGO)
         print("MODE=" + args.mode)
+        print("NORMALIZATION=" + NORMALIZATION)
         print("SOURCE_HASH=" + stamp)
         print("FILES=%d" % len(entries))
         if result["buildstamp"]:
@@ -1239,8 +1283,9 @@ def cmd_check(args):
             eprint("  - " + p)
         return 2
     report = dict(algo=ALGO, mode=args.mode, tree_hash=stamp, artifact=args.artifact,
-                  read_points={}, failures=[], notes=[])
+                  normalization=NORMALIZATION, read_points={}, failures=[], notes=[])
     if not args.json:
+        print("NORMALIZATION=" + NORMALIZATION)
         print("SOURCE_TREE_HASH=" + stamp)
     mcp = None
     if args.mcp_url:
@@ -1345,6 +1390,7 @@ def cmd_selftest(args):
         for p in problems:
             eprint("selftest: " + p)
         return 2
+    print("NORMALIZATION=" + NORMALIZATION)
 
     def say(name, good, detail=""):
         nonlocal_ok = None  # noqa: F841 - keep py2/py3 parsing simple
@@ -1420,8 +1466,11 @@ def cmd_selftest(args):
                 f.write(body.replace(b"\r\n", b"\n"))
             ss, _ps, _es, prs = compute_stamp(tmp, rel_vbp, "semantic")
             base_s, _b, _c, _d = compute_stamp(args.tree, args.vbp, "semantic")
-            ok = say("5. semantic mode is stable across CRLF -> LF normalisation",
-                     (not prs) and ss == base_s, "%s" % ((ss or "ERR")[:16],)) and ok
+            st_lf, _pt, _et, prt = compute_stamp(tmp, rel_vbp, "strict")
+            ok = say("5. EOL only (CRLF -> LF) changes NEITHER strict nor semantic I",
+                     (not prs) and ss == base_s and (not prt) and st_lf == stamp,
+                     "strict=%s semantic=%s" % ((st_lf or "ERR")[:16],
+                                                (ss or "ERR")[:16])) and ok
 # ---- version independence (spec sec 11.3.2 - the point of)
         def _rewrite(path, fn):
             raw = read_bytes(path)
@@ -1538,11 +1587,14 @@ def cmd_selftest(args):
                  "%s / %s / %s" % ((s_rel or "ERR")[:16], (s_abs or "ERR")[:16],
                                    (s_ta or "ERR")[:16])) and ok
         # ---- 10.x  the 12-class change matrix (->) ------------------------
-        # PROVES THE REVERSE DIRECTION: "source changed => I changes".  The forward direction
-        # ("same source => same I") is cases 1-9 above.  Runs in its OWN temp copy so the
-        # mutations of the earlier cases cannot pollute the baseline, and EVERY class is
-        # restored and re-checked against I0 before the next one starts.  Writes only inside
-        # the copy (guarded by _inside()).
+        # PROVES THE REVERSE DIRECTION: "a SOURCE change moves I".  The forward direction
+        # ("same source => same I") is cases 1-9 above.  Line-ending-only classes are the
+        # deliberate exception: EOL is canonicalised away in BOTH modes (see NORMALISATION),
+        # so their expectation is "same" - and the falsification block below proves that this
+        # is the normalisation's doing (disable it and the classes DO detect again).  Runs in
+        # its OWN temp copy so the mutations of the earlier cases cannot pollute the baseline,
+        # and EVERY class is restored and re-checked against I0 before the next one starts.
+        # Writes only inside the copy (guarded by _inside()).
         MCLASS = []
         mtmp = tempfile.mkdtemp(prefix="srcstamp_matrix_")
         try:
@@ -1603,15 +1655,25 @@ def cmd_selftest(args):
                            good,
                            "%s->%s / %s->%s" % (_b_s[:12], _a_s[:12], _b_m[:12], _a_m[:12]))
 
-            ok = _mclass(1, "%s: line endings only" % _bas, True, False,
+            ok = _mclass(1, "%s: line endings only" % _bas, False, False,
                          lambda: _mwr(_bas, _bas0.replace(b"\r\n", b"\n") if _sep == b"\r\n"
                                       else _bas0.replace(b"\n", b"\r\n")),
                          lambda: _mwr(_bas, _bas0)) and ok
             ok = _mclass(2, "%s: prepend UTF-8 BOM" % _bas, True, False,
                          lambda: _mwr(_bas, b"\xef\xbb\xbf" + _bas0),
                          lambda: _mwr(_bas, _bas0)) and ok
+            # Remove the WHOLE final line terminator: stripping only b"\n" from a CRLF file
+            # leaves a bare CR, which line-ending canonicalisation legitimately folds back
+            # into an LF - it would not be a content change any more.
+            def _drop_final_eol(raw):
+                if raw.endswith(b"\r\n"):
+                    return raw[:-2]
+                if raw.endswith(b"\n") or raw.endswith(b"\r"):
+                    return raw[:-1]
+                return raw
+
             ok = _mclass(3, "%s: final newline removed" % _bas, True, False,
-                         lambda: _mwr(_bas, _bas0.rstrip(b"\n")),
+                         lambda: _mwr(_bas, _drop_final_eol(_bas0)),
                          lambda: _mwr(_bas, _bas0)) and ok
             ok = _mclass(4, "%s: 1 char in a code token" % _bas, True, True,
                          lambda: _flip(_bas), lambda: _mwr(_bas, _bas0)) and ok
@@ -1631,7 +1693,7 @@ def cmd_selftest(args):
             ok = _mclass(10, "%s: touch only (same bytes)" % _bas, False, False,
                          lambda: (os.utime(_mp(_bas), (2000000000, 2000000000)),),
                          lambda: _mwr(_bas, _bas0)) and ok
-            ok = _mclass(11, "%s: line endings only" % rel_vbp, True, False,
+            ok = _mclass(11, "%s: line endings only" % rel_vbp, False, False,
                          lambda: _mwr(rel_vbp, _vbp0.replace(b"\r\n", b"\n") if b"\r\n" in _vbp0
                                       else _vbp0.replace(b"\n", b"\r\n")),
                          lambda: _mwr(rel_vbp, _vbp0)) and ok
@@ -1651,7 +1713,8 @@ def cmd_selftest(args):
 
             # ---- 11.x  CASE must stay significant (->) ------------------
             # The stamp is a BYTE-level identity: a case-only change IS a source change, in
-            # BOTH modes (semantic only absorbs line endings / BOM / trailing newline).  These
+            # BOTH modes (line endings are canonicalised away in both; semantic additionally
+            # absorbs a BOM / trailing blank lines).  These
             # cases exist so a future "harmless" case fold cannot be introduced silently, and
             # the block ends with a falsification that INJECTS such a fold and requires the
             # cases to stop detecting - i.e. the guard is proven able to fail.
@@ -1815,6 +1878,32 @@ def cmd_selftest(args):
             ok = say("10.%-30s semantic-sabotage detected" % "FALSIFICATION",
                      _detected,
                      "with normalisation disabled, class 3 DOES move semantic I: %s" % _detected) and ok
+            # NORMALISATION falsification: disable normalize_eol() and the line-ending-only
+            # classes MUST move strict I again - otherwise the new "EOL is not identity"
+            # expectation would be inert (a test that cannot fail proves nothing).
+            _real_eol = normalize_eol
+            try:
+                globals()["normalize_eol"] = lambda raw: raw
+                _eol_detected = True
+                for _rel, _orig in ((_bas, _bas0), (rel_vbp, _vbp0)):
+                    _lf = (_orig.replace(b"\r\n", b"\n") if b"\r\n" in _orig
+                           else _orig.replace(b"\n", b"\r\n"))
+                    # Compare BOTH sides under the SAME (sabotaged) normaliser: M0S was
+                    # measured with the real one, so comparing against it here would only
+                    # measure the missing normalisation rather than the mutation.
+                    _mwr(_rel, _orig)
+                    _before = _mi("strict")
+                    _mwr(_rel, _lf)
+                    _after = _mi("strict")
+                    _mwr(_rel, _orig)
+                    _eol_detected = _eol_detected and (_before != _after)
+            finally:
+                globals()["normalize_eol"] = _real_eol
+            _eol_restored = _mi("strict") == M0S
+            ok = say("10.%-30s eol-normalisation sabotage detected" % "FALSIFICATION",
+                     _eol_detected and _eol_restored,
+                     "with normalize_eol disabled, EOL-only mutations DO move strict I: %s "
+                     "(restored=%s)" % (_eol_detected, _eol_restored)) and ok
             _mc_bad = [c for c in MCLASS if not c[1]]
             ok = say("10.%d 12-class matrix (reverse direction: change => dI)" % 99,
                      not _mc_bad,
@@ -1834,7 +1923,7 @@ def cmd_selftest(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="srcstamp.py",
-        description="Source stamp (vb6src/2): a stable indicator of a VB6 source "
+        description="Source stamp (vb6src/3): a stable indicator of a VB6 source "
                     "input set.  Equal indicator => same origin.")
     sub = p.add_subparsers(dest="cmd")
 

@@ -314,7 +314,7 @@ Private Function HandlePromptGet(ByVal obj As Object, ByVal id As Variant) As St
                "2) verify every touched component (IDE == DISK)." & vbCrLf & _
                "3) project_meta set: MajorVer / MinorVer / RevisionVer / CompanyName / FileDescription." & vbCrLf & _
                "4) app_manifest write: choose the UAC level and DPI awareness the app needs." & vbCrLf & _
-               "5) make_project or build; then git status / git diff to review the change set." & vbCrLf & _
+               "5) make_project or build; then review the change receipt / workspace_status." & vbCrLf & _
                "6) project_snapshot create before handing the build over." & vbCrLf
     Else
         HandlePromptGet = JsonRpcError(id, -32602, "unknown prompt: " & nm, "")

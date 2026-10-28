@@ -362,7 +362,7 @@ Public Const VB6MCP_PRODUCT_VERSION As String = "0.3.0"
 '   * the new DLL is built from the SAME project: no tool was added or removed (add-in 120 -> 120; hub and
 '     DSH-facing tool counts are unaffected by this add-in-face change). The freeze artifacts are
 '     re-frozen only after the new DLL is deployed to a live IDE.
-Public Const VB6MCP_CONTRACT_VERSION As String = "v1.16.5"
+Public Const VB6MCP_CONTRACT_VERSION As String = "v1.17.0"
 ' message-pump period and state. The DECLARATIONS live here (VB6 only accepts
 ' module-level declarations before the first procedure); the pump itself is documented at
 ' the bottom of this module next to PumpReset / MaybePump / PumpNow.
@@ -896,19 +896,28 @@ Public Function TempDir() As String
     If TempDir = "" Then TempDir = "C:\"
 End Function
 
-Public Function FindBarControl(ByVal vbe As Object, ByVal barCands As String, ByVal ctrlCands As String) As Object
+Public Function FindBarControl(ByVal vbe As Object, ByVal barCands As String, ByVal ctrlCands As String, _
+        Optional ByRef hitBar As String, Optional ByRef hitPath As String, _
+        Optional ByRef hitPos As String) As Object
     ' Two passes, because the menu bar NAME is localized: on a Chinese IDE it
     ' is the local word for "menu bar", so a bar-name filter never matches and
     ' the whole lookup died before reaching any control - which surfaced as
     ' "Menu command not found: Start|..." even when the item existed.
     '   1) restrict to bars whose name matches barCands (precise, fast)
     '   2) ignore the bar name entirely
-    Set FindBarControl = FindBarControlPass(vbe, barCands, ctrlCands, True)
+    ' v1.16.9: the optional ByRef cells capture the identity of the match this
+    ' lookup ACTUALLY takes - the bar name, the exact path the list publishes and
+    ' the enumeration position. Omitting them keeps the pre-v1.16.9 call shape, so
+    ' no existing caller moves; command_bars passes them so a success receipt can
+    ' echo matched{} instead of leaving the caller to guess which twin ran.
+    Set FindBarControl = FindBarControlPass(vbe, barCands, ctrlCands, True, hitBar, hitPath, hitPos)
     If Not FindBarControl Is Nothing Then Exit Function
-    Set FindBarControl = FindBarControlPass(vbe, barCands, ctrlCands, False)
+    Set FindBarControl = FindBarControlPass(vbe, barCands, ctrlCands, False, hitBar, hitPath, hitPos)
 End Function
 
-Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String, ByVal ctrlCands As String, ByVal filterBar As Boolean) As Object
+Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String, ByVal ctrlCands As String, ByVal filterBar As Boolean, _
+        Optional ByRef hitBar As String, Optional ByRef hitPath As String, _
+        Optional ByRef hitPos As String) As Object
     ' Returns the matching CommandBarControl (searching bars and one level of
     ' popup sub-menus) or Nothing.
     ' Candidates are pipe-separated names covering English and localized
@@ -929,8 +938,8 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
             barOk = MatchCand(b.Name, barCands)
             ' bar= names a BAR *or a menu-path segment*. The id path already
             ' honoured an ancestor on the path; the caption path did not, so a caller who
-            ' copied the 'path' the list published ('菜单条>文件(&F)>...') could not use
-            ' its middle segment. Matching power only GROWS here.
+            ' copied the path the list published (for example MenuBar>File(&F)>...) could
+            ' not use its middle segment. Matching power only GROWS here.
             Dim gateBar As Boolean
             gateBar = (filterBar And Len(barCands) > 0)
             If (Not filterBar) Or barOk Then
@@ -942,6 +951,9 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
                     Set c = b.Controls.Item(ci)
                     If Not c Is Nothing Then
                         If MatchCand(c.Caption, ctrlCands) Then
+                            hitBar = b.Name
+                            hitPath = b.Name & ">" & CStr(c.Caption)
+                            hitPos = CStr(ci)
                             Set FindBarControlPass = c
                             Exit Function
                         End If
@@ -963,6 +975,9 @@ Public Function FindBarControlPass(ByVal vbe As Object, ByVal barCands As String
                                 If Not subc Is Nothing Then
                                     If (Not gateBar) Or underOk Or MatchCand(subc.Caption, barCands) Then
                                         If MatchCand(subc.Caption, ctrlCands) Then
+                                            hitBar = b.Name
+                                            hitPath = b.Name & ">" & CStr(c.Caption) & ">" & CStr(subc.Caption)
+                                            hitPos = CStr(ci) & "." & CStr(si)
                                             Set FindBarControlPass = subc
                                             Exit Function
                                         End If
@@ -1173,32 +1188,38 @@ End Function
 Public Function FindBarControlByIdOnly(ByVal vbe As Object, ByVal barCands As String, _
         ByVal capCands As String, ByVal wantId As Long, _
         ByRef matchCount As Long, ByRef candsOut As String, _
-        Optional ByRef disabledCount As Long) As Object
+        Optional ByRef disabledCount As Long, _
+        Optional ByRef hitBar As String, Optional ByRef hitPath As String, _
+        Optional ByRef hitPos As String) As Object
     On Error Resume Next
     matchCount = 0
     candsOut = ""
     disabledCount = 0
+    hitBar = ""
+    hitPath = ""
+    hitPos = ""
     Dim v As Object
     If Len(barCands) > 0 Then
         ' pass 1: the caller's bar argument must match the BAR NAME or a node on
-        ' the control's menu PATH (e.g. bar="工程" for 工程>部件).
-        Set v = FindByIdOnlyPass(vbe, barCands, capCands, wantId, matchCount, candsOut, disabledCount)
+        ' the control's menu PATH (e.g. bar="Project" for Project>Components).
+        Set v = FindByIdOnlyPass(vbe, barCands, capCands, wantId, matchCount, candsOut, disabledCount, hitBar, hitPath, hitPos)
         If Not v Is Nothing Then
             Set FindBarControlByIdOnly = v
             Exit Function
         End If
         If matchCount > 0 Then Exit Function   ' ambiguous inside that scope: do not widen
         ' pass 2: the bar name is localized, so retry with no bar scope
-        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount)
+        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount, hitBar, hitPath, hitPos)
     Else
-        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount)
+        Set v = FindByIdOnlyPass(vbe, "", capCands, wantId, matchCount, candsOut, disabledCount, hitBar, hitPath, hitPos)
     End If
     If Not v Is Nothing Then Set FindBarControlByIdOnly = v
 End Function
 
 Private Function FindByIdOnlyPass(ByVal vbe As Object, ByVal barCands As String, ByVal capCands As String, _
         ByVal wantId As Long, ByRef matchCount As Long, ByRef candsOut As String, _
-        ByRef disabledCount As Long) As Object
+        ByRef disabledCount As Long, ByRef hitBar As String, ByRef hitPath As String, _
+        ByRef hitPos As String) As Object
     On Error Resume Next
     Dim bars As Object
     Set bars = vbe.CommandBars
@@ -1211,7 +1232,7 @@ Private Function FindByIdOnlyPass(ByVal vbe As Object, ByVal barCands As String,
         If Not b Is Nothing Then
             under = True
             If Len(barCands) > 0 Then under = MatchCand(b.Name, barCands)
-            FindByIdOnlyIn b.Controls, b.Name, 0, wantId, barCands, capCands, under, hit, matchCount, candsOut, disabledCount
+            FindByIdOnlyIn b.Controls, b.Name, b.Name & ">", "", 0, wantId, barCands, capCands, under, hit, matchCount, candsOut, disabledCount, hitBar, hitPath, hitPos
         End If
     Next
     If matchCount = 1 Then Set FindByIdOnlyPass = hit
@@ -1221,11 +1242,16 @@ End Function
 ' name or an ancestor on the menu PATH) AND (when the caller also gave a caption,
 ' the caption matches). The caption conjunct is REQUIRED: measured
 ' that id=746 has 525 ENABLED matches across the menus and still 6 inside the
-' 工程 submenu alone, so an id on its own cannot name a control.
-Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal depth As Long, _
+' project submenu alone, so an id on its own cannot name a control.
+' v1.16.9: prefixPath / ancPos carry the identity of the candidate that becomes the
+' hit, so command_bars can publish WHERE an id address landed (bar, exact path, and
+' the top-level/popup index the list key uses). candsOut keeps its historical
+' "bar>caption" text shape so existing message consumers are unchanged.
+Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal prefixPath As String, _
+        ByVal ancPos As String, ByVal depth As Long, _
         ByVal wantId As Long, ByVal barCands As String, ByVal capCands As String, ByVal under As Boolean, _
         ByRef hit As Object, ByRef matchCount As Long, ByRef candsOut As String, _
-        Optional ByRef disabledCount As Long)
+        ByRef disabledCount As Long, ByRef hitBar As String, ByRef hitPath As String, ByRef hitPos As String)
     On Error Resume Next
     If col Is Nothing Then Exit Sub
     If depth > 2 Then Exit Sub
@@ -1249,7 +1275,12 @@ Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal d
             If qual And Len(capCands) > 0 Then qual = MatchCand(cap, capCands)
             If qual Then
                 matchCount = matchCount + 1
-                If hit Is Nothing Then Set hit = c
+                If hit Is Nothing Then
+                    Set hit = c
+                    hitBar = barName
+                    hitPath = prefixPath & cap
+                    hitPos = ancPos & CStr(k)
+                End If
                 If Len(candsOut) < 300 Then
                     If Len(candsOut) > 0 Then candsOut = candsOut & "; "
                     candsOut = candsOut & barName & ">" & cap
@@ -1266,7 +1297,7 @@ Private Sub FindByIdOnlyIn(ByVal col As Object, ByVal barName As String, ByVal d
             Err.Clear
             Set subCol = c.Controls
             If Not subCol Is Nothing Then
-                FindByIdOnlyIn subCol, barName, depth + 1, wantId, barCands, capCands, selfOk, hit, matchCount, candsOut, disabledCount
+                FindByIdOnlyIn subCol, barName, prefixPath & cap & ">", ancPos & CStr(k) & ".", depth + 1, wantId, barCands, capCands, selfOk, hit, matchCount, candsOut, disabledCount, hitBar, hitPath, hitPos
             End If
         End If
     Next

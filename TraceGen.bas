@@ -52,7 +52,7 @@ End Function
 
 ' ---------------- trace ----------------
 
-Public Function InjectTrace(ByVal text As String, ByVal procName As String, ByVal exprsCsv As String, ByVal id As String, ByRef newText As String, ByRef errMsg As String) As Boolean
+Public Function InjectTrace(ByVal text As String, ByVal procName As String, ByVal exprsCsv As String, ByVal id As String, ByVal condText As String, ByVal recordCond As Boolean, ByRef newText As String, ByRef errMsg As String) As Boolean
     Dim lines() As String, di As Long, cnt As Long, body As String
     lines = Split(AsLf(text), vbLf)
     FindProc lines, procName, di, cnt
@@ -66,7 +66,13 @@ Public Function InjectTrace(ByVal text As String, ByVal procName As String, ByVa
         InjectTrace = False
         Exit Function
     End If
-    body = BuildCall(id, exprsCsv)
+    Dim cond As String
+    cond = Trim$(condText)
+    If Len(cond) > 0 Then
+        body = BuildCallCond(id, exprsCsv, CondRecordText(cond, recordCond))
+    Else
+        body = BuildCall(id, exprsCsv)
+    End If
     Dim ins As Long, ind As String
     ins = BodyInsertIndex(lines, di, ind)
     ' the guard is a RUNTIME check on purpose. "#If MCP_TRACE Then" is a
@@ -76,13 +82,148 @@ Public Function InjectTrace(ByVal text As String, ByVal procName As String, ByVa
     ' produces nothing (measured by S/P4: the same block works when it is present at
     ' project LOAD time). "If McpTraceOn() Then" has no load-order dependency; the cost
     ' is that the call is always compiled (one boolean check per traced line).
-    newText = InsertMarkedBlock(lines, ins, "@mcp-trace ", id, "If McpTraceOn() Then", "End If", body, ind)
+    If Len(cond) > 0 Then
+        ' logpoint (condition): 7-line block. The OUTER guard stays outermost so a
+        ' TRACE-OFF call never evaluates the condition (ACC-TQ17). The marker pair is
+        ' IDENTICAL to the 5-line form, so remove_trace needs no new removal path.
+        Dim blk() As String
+        blk = CondBlockLines(id, cond, body, ind)
+        newText = InsertBlockLines(lines, ins, blk)
+    Else
+        newText = InsertMarkedBlock(lines, ins, "@mcp-trace ", id, "If McpTraceOn() Then", "End If", body, ind)
+    End If
     errMsg = ""
     InjectTrace = True
 End Function
 
 Public Function RemoveTrace(ByVal text As String, ByVal id As String, ByRef newText As String, ByRef errMsg As String) As Boolean
     RemoveTrace = RemoveBlockByMarkers(text, "@mcp-trace ", id, newText, errMsg)
+End Function
+
+' ---------------- logpoint condition (v1.17.0 batch) ----------------
+
+' The 7-line logpoint block: begin marker / outer runtime guard / inner condition /
+' call / inner End If / outer End If / end marker.  The OUTER guard is FIRST so a
+' TRACE-OFF call never evaluates the condition (one boolean check, exactly as today);
+' the marker pair text is IDENTICAL to the 5-line form, so RemoveBlockByMarkers
+' deletes a logpoint with no new removal path.
+Private Function CondBlockLines(ByVal id As String, ByVal cond As String, ByVal body As String, ByVal indent As String) As String()
+    Dim blk(0 To 6) As String
+    blk(0) = indent & "' @mcp-trace " & id & " begin"
+    blk(1) = indent & "If McpTraceOn() Then"
+    blk(2) = indent & "    If (" & cond & ") Then"
+    blk(3) = indent & "        " & body
+    blk(4) = indent & "    End If"
+    blk(5) = indent & "End If"
+    blk(6) = indent & "' @mcp-trace " & id & " end"
+    CondBlockLines = blk
+End Function
+
+' The text that may be carried as the "@cond" kv key: the user's EXACT text, and it is
+' NEVER rewritten.  Ruling O5: recordCondition=false, or a double quote anywhere in the
+' condition, means "@cond" is NOT recorded (a quote cannot be embedded in the emitted VB
+' string literal without rewriting the user's text) and the injection still proceeds.
+Private Function CondRecordText(ByVal cond As String, ByVal recordCond As Boolean) As String
+    If Len(cond) = 0 Then Exit Function
+    If Not recordCond Then Exit Function
+    If InStr(cond, Chr$(34)) > 0 Then Exit Function
+    CondRecordText = cond
+End Function
+
+' Public so the inject_trace receipt reports the SAME decision the emitter made.
+Public Function CondAreRecorded(ByVal condText As String, ByVal recordCond As Boolean) As Boolean
+    CondAreRecorded = (Len(CondRecordText(Trim$(condText), recordCond)) > 0)
+End Function
+
+' LEXICAL condition validation: NECESSARY, NOT SUFFICIENT.  A modal compile-error
+' dialog blocks the whole IDE, so a condition that cannot survive these rules is
+' refused BEFORE anything is written - and VB6 is never asked to compile, so "cannot
+' raise" / "has no side effect" is NOT proven (the receipt states that too).
+' Returns "" when acceptable, else one of the closed-set reasons with a human "why".
+Public Function CondLexicalRefusal(ByVal condText As String, ByRef why As String) As String
+    Dim s As String, i As Long, ch As String
+    Dim qn As Long, depth As Long, tok As String, total As Long
+    why = ""
+    s = condText
+    total = Len(s)
+    If total = 0 Then Exit Function
+    ' 1) one physical line
+    If InStr(s, vbCr) > 0 Or InStr(s, vbLf) > 0 Then
+        CondLexicalRefusal = "condition_not_single_line"
+        why = "the condition contains a line break; a logpoint condition must be ONE physical line"
+        Exit Function
+    End If
+    ' 2) no statement separator / comment marker (either one would end the single
+    '    emitted statement, so the emitted line could not compile)
+    i = InStr(s, ":")
+    If i = 0 Then i = InStr(s, "'")
+    If i > 0 Then
+        CondLexicalRefusal = "condition_has_statement_separator"
+        why = "the condition contains " & Chr$(34) & Mid$(s, i, 1) & Chr$(34) & " at column " & CStr(i) & "; ':' (statement separator) and ' (comment) are not allowed"
+        Exit Function
+    End If
+    ' 3) double quotes must be balanced, and no bare control character (TAB included)
+    qn = 0
+    For i = 1 To total
+        ch = Mid$(s, i, 1)
+        If ch = Chr$(34) Then qn = qn + 1
+        If AscW(ch) < 32 Then
+            CondLexicalRefusal = "condition_has_control_char"
+            why = "the condition contains a control character (AscW=" & CStr(AscW(ch)) & ") at column " & CStr(i) & "; TAB and other control characters are not allowed"
+            Exit Function
+        End If
+    Next
+    If (qn Mod 2) <> 0 Then
+        CondLexicalRefusal = "condition_unbalanced_quote"
+        why = "the condition contains " & CStr(qn) & " double quote(s); they must be balanced (an odd count cannot form a complete string literal)"
+        Exit Function
+    End If
+    ' 4) parentheses must balance
+    depth = 0
+    For i = 1 To total
+        ch = Mid$(s, i, 1)
+        If ch = "(" Then depth = depth + 1
+        If ch = ")" Then depth = depth - 1
+        If depth < 0 Then Exit For
+    Next
+    If depth <> 0 Then
+        CondLexicalRefusal = "condition_unbalanced_paren"
+        why = "the condition's parentheses do not balance (final depth " & CStr(depth) & ")"
+        Exit Function
+    End If
+    ' 5) no standalone block keyword (word boundary, case-insensitive)
+    tok = ""
+    For i = 1 To total
+        ch = Mid$(s, i, 1)
+        If IsIdentChar(ch, Len(tok) > 0) Then
+            tok = tok & ch
+        Else
+            If IsCondBlockKeyword(tok) Then
+                CondLexicalRefusal = "condition_has_block_keyword"
+                why = "the condition contains the block keyword " & Chr$(34) & tok & Chr$(34) & "; a logpoint condition must be a single expression"
+                Exit Function
+            End If
+            tok = ""
+        End If
+    Next
+    If IsCondBlockKeyword(tok) Then
+        CondLexicalRefusal = "condition_has_block_keyword"
+        why = "the condition contains the block keyword " & Chr$(34) & tok & Chr$(34) & "; a logpoint condition must be a single expression"
+        Exit Function
+    End If
+    ' 6) length
+    If total > 512 Then
+        CondLexicalRefusal = "condition_too_long"
+        why = "the condition is " & CStr(total) & " characters; the limit is 512"
+        Exit Function
+    End If
+End Function
+
+Private Function IsCondBlockKeyword(ByVal w As String) As Boolean
+    Select Case LCase$(w)
+        Case "then", "else", "elseif", "end"
+            IsCondBlockKeyword = True
+    End Select
 End Function
 
 ' =====================================================================
@@ -380,15 +521,25 @@ End Function
 ' ---------------- shared helpers ----------------
 
 Private Function BuildCall(ByVal id As String, ByVal exprsCsv As String) As String
+    BuildCall = BuildCallCond(id, exprsCsv, "")
+End Function
+
+' condText is the text to RECORD as the "@cond" kv key ("" means: do not record).
+' McpTrace is (id, ParamArray kv()), so @cond travels the EXISTING kv mechanism and
+' the generated modMcpTrace template does not change at all.
+Private Function BuildCallCond(ByVal id As String, ByVal exprsCsv As String, ByVal condText As String) As String
     Dim e() As String, i As Long, s As String, nm As String
     s = "McpTrace " & Chr$(34) & id & Chr$(34)
+    If Len(condText) > 0 Then
+        s = s & ", " & Chr$(34) & "@cond" & Chr$(34) & ", " & Chr$(34) & condText & Chr$(34)
+    End If
     e = Split(exprsCsv, ",")
     For i = 0 To UBound(e)
         MaybePump
         nm = Trim$(e(i))
         If Len(nm) > 0 Then s = s & ", " & Chr$(34) & nm & Chr$(34) & ", " & nm
     Next
-    BuildCall = s
+    BuildCallCond = s
 End Function
 
 Private Function FaultBody(ByVal procName As String, ByVal declLine As String, ByVal mode As String, ByVal value As String, ByVal id As String, ByRef errMsg As String) As String
@@ -447,8 +598,7 @@ Private Sub FindProc(ByRef lines() As String, ByVal procName As String, ByRef di
 End Sub
 
 Private Function InsertMarkedBlock(ByRef lines() As String, ByVal di As Long, ByVal prefix As String, ByVal id As String, ByVal gOpen As String, ByVal gClose As String, ByVal body As String, ByVal indent As String) As String
-    Dim blk(0 To 4) As String, out() As String
-    Dim i As Long, j As Long, n As Long
+    Dim blk(0 To 4) As String
     ' An earlier batch: indentation now comes from the target line instead of a hardcoded 4
     ' spaces, and the markers/guards are indented with it (RemoveBlockByMarkers
     ' compares Trim$() so that is still safe).
@@ -457,20 +607,30 @@ Private Function InsertMarkedBlock(ByRef lines() As String, ByVal di As Long, By
     blk(2) = indent & body
     blk(3) = indent & gClose
     blk(4) = indent & "' " & prefix & id & " end"
-    n = (UBound(lines) + 1) + 5
+    InsertMarkedBlock = InsertBlockLines(lines, di, blk)
+End Function
+
+' Insert a CALLER-SUPPLIED block (any number of lines) after index di. This is the
+' generic form of InsertMarkedBlock, which keeps building the 5-line form itself so
+' fault_inject and a condition-less trace stay byte-identical to before.
+Private Function InsertBlockLines(ByRef lines() As String, ByVal di As Long, ByRef blk() As String) As String
+    Dim out() As String
+    Dim i As Long, j As Long, n As Long, m As Long
+    m = UBound(blk) + 1
+    n = (UBound(lines) + 1) + m
     ReDim out(0 To n - 1)
     For i = 0 To di
         MaybePump
         out(i) = lines(i)
     Next
-    For j = 0 To 4
+    For j = 0 To m - 1
         out(di + 1 + j) = blk(j)
     Next
     For i = di + 1 To UBound(lines)
         MaybePump
-        out(i + 5) = lines(i)
+        out(i + m) = lines(i)
     Next
-    InsertMarkedBlock = Join(out, vbCrLf)
+    InsertBlockLines = Join(out, vbCrLf)
 End Function
 
 Private Function RemoveBlockByMarkers(ByVal text As String, ByVal prefix As String, ByVal id As String, ByRef newText As String, ByRef errMsg As String) As Boolean

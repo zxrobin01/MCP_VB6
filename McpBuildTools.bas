@@ -169,8 +169,10 @@ Public Function BuildSha256(Owner As CodeTools) As String
     On Error Resume Next
     Dim p As String
     p = Owner.OwnDllPath()
-    If Len(p) > 0 Then Owner.m_buildSha = Encoding.Sha256HexFile(p)
+    If Len(p) > 0 Then
+        Owner.m_buildSha = Encoding.Sha256HexFile(p)
+        If Len(Owner.m_buildSha) > 0 Then Owner.m_buildShaAtText = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    End If
     Err.Clear
     BuildSha256 = Owner.m_buildSha
 End Function
-

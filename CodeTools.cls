@@ -98,6 +98,17 @@ Private Declare Function GetForegroundWindow Lib "user32" () As Long
 Private Declare Function GetTickCount Lib "kernel32" () As Long
 ' this DLL's own path, so mcp_info can hash the file that is loaded.
 Private Declare Function OwnModuleFileNameW Lib "kernel32" Alias "GetModuleFileNameW" (ByVal hModule As Long, ByVal lpFileName As Long, ByVal nSize As Long) As Long
+
+' v1.16.9 (the 2026-10-20 loaded-image incident): the module handle of THIS DLL as the RUNNING PROCESS reports
+' it. OwnModuleFileNameW (above) resolves a path FROM a handle; GetModuleHandleW answers
+' "does this process have this module loaded, and under which name", so the pair lets
+' mcp_info.loadedModule derive its path from the live process instead of from a record.
+Private Declare Function OwnModuleHandleW Lib "kernel32" Alias "GetModuleHandleW" (ByVal lpModuleName As Long) As Long
+' v1.16.9: command_bars still RAISES its ambiguity refusal, so the candidate list it collected
+' has to travel out of band. These two cells are written immediately before that raise and are
+' read ONLY by ClassifiedRefusalJson, and only for reason=menu_control_ambiguous.
+Private m_cmdBarsIdCands As String
+Private m_cmdBarsIdHits As Long
 ' memo cells for the LOAD-TIME build identity (OwnDllPath / BuildSha256 / BuildBuiltAt).
 ' They must sit in the declarations section - VB6 rejects a module-level declaration that appears
 ' after the first procedure (only comments may appear after End Sub/End Function).
@@ -105,6 +116,10 @@ Private m_ownDllPath As String
 Private m_ownDllPathDone As Boolean
 Public m_buildSha As String
 Public m_buildShaDone As Boolean
+' v1.16.9: WHEN the load-time sha was captured (set by McpBuildTools.BuildSha256 on its
+' first real computation, which CodeTools.Init forces at connection). mcp_info.loadedModule
+' publishes this so the caller can audit that the hash predates any later disk replacement.
+Public m_buildShaAtText As String
 Public m_buildBuiltAt As String
 Public m_buildBuiltAtDone As Boolean
 Public m_onDiskSig As String
@@ -235,6 +250,14 @@ Private m_bpProbeSeq As Long
 Private m_bpProbeAwaitEnd As Boolean
 Private m_bpProbePendingResult As String
 Private m_bpProbePendingPos As String
+' D-B4a fix: the classification MEASURED by phase=start in DESIGN for this very (component,
+' pane-line) target is kept here. In RUN/BREAK the VBIDE project lookup can raise and be
+' swallowed, so re-classifying there used to publish lineClass="component_not_found" with
+' targetLineText="" although the component is present; phase=observe reuses THIS measurement
+' for those two reported fields. Module state only: no ledger field, no receipt key.
+Private m_bpProbeLiveLineClass As String
+Private m_bpProbeLiveLineText As String
+Private m_bpProbeLiveBreakable As Boolean
 Private Const BP_PROBE_ID_TTL_MS As Long = 600000
 ' the breakpoint records armed by run_until_break PHASE 1, kept for PHASE 2 (the observe call
 ' is a DIFFERENT call, so the hitCount targets must survive it).
@@ -418,6 +441,22 @@ Private m_seUndo As Collection
 
 Public Sub Init(ByVal vbe As Object)
     Set m_vbe = vbe
+    ' v1.16.9: seed the LOADED-module identity HERE, at add-in initialization, so
+    ' mcp_info.loadedModule describes the image loaded for THIS session and can never become a
+    ' "hash of whatever is on disk at the first mcp_info call". Both memos are per process; a
+    ' failure is deliberately silent here and is reported by loadedModule as basis_unavailable.
+    On Error Resume Next
+    Dim seedPath As String
+    Dim seedSha As String
+    seedPath = OwnDllPath()
+    If Len(seedPath) > 0 Then
+        seedSha = McpBuildTools.BuildSha256(Me)
+        If Len(seedSha) = 0 Then Util.LogLine "loadedmodule seed path=" & seedPath & " sha=unavailable"
+    Else
+        Util.LogLine "loadedmodule seed path=unavailable"
+    End If
+    Err.Clear
+    On Error GoTo 0
     ' R-1021-03 A3: every generic pump point lets this call stop ITSELF.
     Util.SetAbortSink Me
 End Sub
@@ -921,6 +960,17 @@ Private Function ClassifiedRefusalJson(ByVal tool As String, ByVal failMsg As St
     If Not IsOwnGuardCode(vbErr) Then
         If vbErr <> 0 Then d("vbErrorCode") = vbErr
     End If
+
+    ' v1.16.9: command_bars' AMBIGUOUS id refusal is still RAISED (so this classified path
+    ' and the audit trail stay byte-identical), but it must publish the candidate list it
+    ' collected. The two cells command_bars writes immediately before raising are read ONLY
+    ' here and only for this reason; command_bars clears them on every execute call, so no
+    ' other receipt can inherit them.
+    If reason = "menu_control_ambiguous" Then
+        If Len(m_cmdBarsIdCands) > 0 Then d("idCandidates") = m_cmdBarsIdCands
+        If m_cmdBarsIdHits > 0 Then d("idCandidateCount") = m_cmdBarsIdHits
+        d("matchRule") = "id_exact_one_enabled"
+    End If
     ClassifiedRefusalJson = JsonStringify(d)
 End Function
 
@@ -1190,12 +1240,12 @@ Private Function ToolReadOnly(ByVal name As String) As Boolean
              "desktop_probe", "execution_state", "export_public_api", "ext_list", _
              "find_gui", "find_in_component", "get_callstack", "get_codepane", _
              "get_component_code", "get_component_list", "get_component_properties", "get_locals", _
-             "get_project_info", "get_selection", "git", "ide_quiet_mode", _
+             "get_project_info", "get_selection", "ide_quiet_mode", _
              "ide_state", "last_error", "list_addins", "list_breakpoints", _
              "list_component_parts", "list_files", "list_members", "list_windows", _
              "mcp_info", "preview_edit", "project_changes", "purity_check", _
              "read_active_dialogs", "read_file", "read_source", "search_in_files", _
-             "todo_status", "ui_text", "validate_code", "vba6_probe_plan", _
+             "todo_status", "trace_query", "ui_text", "validate_code", "vba6_probe_plan", _
              "verify", "verify_scope", "workspace_status"
             ToolReadOnly = True
         Case Else
@@ -1285,7 +1335,7 @@ Private Function ModalDialogsBodySuffix(ByVal body As String) As String
     q = Chr$(34)
     Dim ins As String
     ins = ""
-    If InStr(1, body, q & "dialogs" & q, vbTextCompare) = 0 Then
+    If Not JsonHasTopLevelKey(body, "dialogs") Then
         Dim dl As Object
         Set dl = Nothing
         Set dl = WinOps.WoModalDialogs()
@@ -1300,13 +1350,18 @@ Private Function ModalDialogsBodySuffix(ByVal body As String) As String
     ' emitted on a JSON receipt - honest values, explicit null for "no recovery action".
     Dim awaitingNow As Boolean
     awaitingNow = WinOps.WoModalGuardAwaiting()
-    If InStr(1, body, q & "awaiting_user" & q, vbTextCompare) = 0 Then
+    ' D-1: a box the ENTRY pass HELD is awaiting the user exactly like a guard-held box (the
+    ' measured held receipt said awaiting_user=false / howToRecover="" for a box nobody could
+    ' click). The guard stays the primary source; the entry-pass hold is OR-ed in.
+    If PreDlgHeldAwaiting() Then awaitingNow = True
+    If Not JsonHasTopLevelKey(body, "awaiting_user") Then
         ins = ins & "," & q & "awaiting_user" & q & ":" & IIf(awaitingNow, "true", "false")
     End If
     If awaitingNow Then
-        If InStr(1, body, q & "howToRecover" & q, vbTextCompare) = 0 Then
+        If Not JsonHasTopLevelKey(body, "howToRecover") Then
             Dim hr As String
             hr = WinOps.WoModalGuardHowToRecover()
+            If Len(hr) = 0 Then hr = PreDlgHowToRecover()
             If Len(hr) > 0 Then ins = ins & "," & q & "howToRecover" & q & ":" & JsonStringify(hr)
         End If
     End If
@@ -1323,11 +1378,11 @@ Private Function ModalDialogsBodySuffix(ByVal body As String) As String
             If Len(guWhy) = 0 Then guWhy = "the recovery step is documented as not guaranteed safe"
         End If
     End If
-    If InStr(1, body, q & "guaranteedUnsafe" & q, vbTextCompare) = 0 Then
+    If Not JsonHasTopLevelKey(body, "guaranteedUnsafe") Then
         ins = ins & "," & q & "guaranteedUnsafe" & q & ":" & IIf(gu, "true", "false")
         ins = ins & "," & q & "guaranteedUnsafeReason" & q & ":" & JsonStringify(guWhy)
     End If
-    If InStr(1, body, q & "recovery" & q, vbTextCompare) = 0 Then
+    If Not JsonHasTopLevelKey(body, "recovery") Then
         If recov Is Nothing Then
             ins = ins & "," & q & "recovery" & q & ":null"
         Else
@@ -1335,12 +1390,110 @@ Private Function ModalDialogsBodySuffix(ByVal body As String) As String
         End If
     End If
     If Not m_preDlgHandled Is Nothing Then
-        If InStr(1, body, q & "preExistingHandled" & q, vbTextCompare) = 0 Then
+        If Not JsonHasTopLevelKey(body, "preExistingHandled") Then
             ins = ins & "," & q & "preExistingHandled" & q & ":" & JsonStringify(m_preDlgHandled)
         End If
     End If
     If Len(ins) = 0 Then Err.Clear : Exit Function
     ModalDialogsBodySuffix = Left$(body, Len(body) - 1) & ins & "}"
+    Err.Clear
+End Function
+
+' D-1: STRUCTURAL top-level-key test for a receipt body. The old test was a naive substring
+' search for  "key"  anywhere in the body; a receipt whose OWN nested block carries an
+' embedded JSON string containing "dialogs" (make_project: host_modal.dialogs) was mis-read
+' as "already published", so the unified dialogs[] was silently skipped. This walks the OUTER
+' object only: string contents are skipped (escapes honoured), nested objects/arrays are
+' excluded by depth, and a key counts only when its closing quote is followed (after optional
+' whitespace) by ':' at depth 1.
+Private Function JsonHasTopLevelKey(ByVal body As String, ByVal key As String) As Boolean
+    JsonHasTopLevelKey = False
+    On Error Resume Next
+    If Len(body) < 2 Or Len(key) = 0 Then Err.Clear : Exit Function
+    Dim i As Long, n As Long
+    Dim depth As Long, strDepth As Long
+    Dim inQuote As Boolean, esc As Boolean
+    Dim ch As String, buf As String, nx As String
+    Dim j As Long
+    n = Len(body)
+    For i = 1 To n
+        ch = Mid$(body, i, 1)
+        If inQuote Then
+            If esc Then
+                esc = False
+                buf = buf & ch
+            ElseIf ch = "\" Then
+                esc = True
+            ElseIf ch = Chr$(34) Then
+                inQuote = False
+                If strDepth = 1 Then
+                    If StrComp(buf, key, vbTextCompare) = 0 Then
+                        j = i + 1
+                        Do While j <= n
+                            nx = Mid$(body, j, 1)
+                            If nx = " " Or nx = Chr$(9) Or nx = Chr$(10) Or nx = Chr$(13) Then
+                                j = j + 1
+                            Else
+                                Exit Do
+                            End If
+                        Loop
+                        If j <= n Then
+                            If Mid$(body, j, 1) = ":" Then
+                                JsonHasTopLevelKey = True
+                                Err.Clear
+                                Exit Function
+                            End If
+                        End If
+                    End If
+                End If
+            Else
+                buf = buf & ch
+            End If
+        Else
+            If ch = "{" Then
+                depth = depth + 1
+            ElseIf ch = "}" Then
+                depth = depth - 1
+            ElseIf ch = "[" Then
+                depth = depth + 1
+            ElseIf ch = "]" Then
+                depth = depth - 1
+            ElseIf ch = Chr$(34) Then
+                inQuote = True
+                esc = False
+                buf = ""
+                strDepth = depth
+            End If
+        End If
+    Next i
+    Err.Clear
+End Function
+
+' D-1: TRUE when the ENTRY pass held a pre-existing box (nothing was clicked). Reads the
+' entry-pass record the dispatcher already built; no second enumeration, no second policy.
+Private Function PreDlgHeldAwaiting() As Boolean
+    PreDlgHeldAwaiting = False
+    If m_preDlgHandled Is Nothing Then Exit Function
+    On Error Resume Next
+    If m_preDlgHandled.Exists("result") Then
+        PreDlgHeldAwaiting = (LCase$(CStr(m_preDlgHandled("result"))) = "held_policy")
+    End If
+    Err.Clear
+End Function
+
+' D-1: the recovery instruction for a box the ENTRY pass held. Non-empty ONLY for that case,
+' so the uniform receipt fields (awaiting_user/howToRecover) carry real content instead of a
+' false "false" + "".
+Private Function PreDlgHowToRecover() As String
+    PreDlgHowToRecover = ""
+    If Not PreDlgHeldAwaiting() Then Exit Function
+    On Error Resume Next
+    Dim cl As String, pa As String
+    cl = ""
+    pa = ""
+    If m_preDlgHandled.Exists("classification") Then cl = CStr(m_preDlgHandled("classification"))
+    If m_preDlgHandled.Exists("plannedAction") Then pa = CStr(m_preDlgHandled("plannedAction"))
+    PreDlgHowToRecover = "the ENTRY pass HELD this pre-existing dialog (policy: " & cl & "/" & pa & ") and sent NOTHING. From ANOTHER connection: read_active_dialogs (read-only) -> inspect it -> dismiss it yourself in the IDE, or send_window_message{hwnd, action:""click"", message:""bm_click""} on a caption YOU have verified (NEVER End/Continue). close_active_dialogs{dry_run:true} previews it; close_active_dialogs refuses an unclassified (unknown) box by policy."
     Err.Clear
 End Function
 
@@ -1684,7 +1837,7 @@ Private Function ModalBoxSafeTool(ByVal name As String) As Boolean
         Case "ide_state", "mcp_info", "read_active_dialogs", "find_gui", "list_windows", _
              "desktop_probe", "execution_state", "ui_text", "last_error", "audit_tail", _
              "close_active_dialogs", "send_window_message", "list_files", "read_file", _
-             "read_source", "git", "todo_status", "ide_list"
+             "read_source", "todo_status", "ide_list", "trace_query"
             ModalBoxSafeTool = True
         Case Else
             ModalBoxSafeTool = False
@@ -1708,6 +1861,41 @@ Private Function ModalBlockedJson(ByVal toolName As String, ByVal hb As Object) 
     d("howToProceed") = "answer or dismiss the dialog manually (program MsgBoxes are never answered for you), or call close_active_dialogs explicitly, then retry"
     d("detail") = "a pre-existing owner-disabled modal dialog is still on screen; entering the IDE now would block until the host modal loop ends"
     ModalBlockedJson = JsonStringify(d)
+End Function
+
+' (hostmodal-fix D2b): the only tool that owns the pre-existing host-modal path end to
+' end. It probes the box itself (HostModalRiskProbe -> modal_blocked=true + modalDialogs +
+' host_modal_risk=known) and never presses the confirm caption, so the generic
+' pre-existing refusal must not pre-empt it.
+Private Function ModalSelfHandlesHostModal(ByVal name As String) As Boolean
+    ModalSelfHandlesHostModal = (LCase$(Trim$(name)) = "make_project")
+End Function
+
+' (hostmodal-fix D2b): TRUE when the entry pass classified the remaining blocking box as a
+' KNOWN host-modal box (VB6's Make Project box). Reads the very receipt block the entry pass
+' built, so no second enumeration and no second policy is introduced.
+Private Function PreDlgHostModalKnown() As Boolean
+    PreDlgHostModalKnown = False
+    If m_preDlgHandled Is Nothing Then Exit Function
+    On Error Resume Next
+    If m_preDlgHandled.Exists("classification") Then
+        PreDlgHostModalKnown = (LCase$(CStr(m_preDlgHandled("classification"))) = "host_modal_risk_known")
+    End If
+    Err.Clear
+End Function
+
+' P1 (property-sheet domain): TRUE when the ENTRY pass classified the remaining blocking box
+' as a VB6 tabbed property sheet. Reads the very record the entry pass built (no second
+' enumeration, no second policy), so the top-level refusal classification can be aligned with
+' the preExistingHandled.classification value instead of the message-free probe default.
+Private Function PreDlgPropertySheet() As Boolean
+    PreDlgPropertySheet = False
+    If m_preDlgHandled Is Nothing Then Exit Function
+    On Error Resume Next
+    If m_preDlgHandled.Exists("classification") Then
+        PreDlgPropertySheet = (LCase$(CStr(m_preDlgHandled("classification"))) = "property_sheet")
+    End If
+    Err.Clear
 End Function
 
 Private Function ModalRuntimeAwareTool(ByVal name As String) As Boolean
@@ -1800,23 +1988,58 @@ Public Function CallTool(ByVal name As String, ByVal args As Object) As Object
         ' so boxes do not accumulate across calls.
         ' FIX-21b: only enter the title-reading handler when a MESSAGE-FREE scan already saw a
         ' visible #32770; on a clean IDE this path performs no window message at all.
+        ' (hostmodal-fix D1a/D2a): the FROZEN FACE promises a read-only tool "never sends a
+        ' message" and a dry_run preview "reports what WOULD be clicked without sending
+        ' anything". The automatic pre-existing pass CLICKED a pre-existing box during such a
+        ' call (measured: read_active_dialogs / close_active_dialogs{dry_run:true} receipts
+        ' carried preExistingHandled{clickedId:2} and the box then vanished). It is skipped
+        ' for READ-ONLY tools and for close_active_dialogs (the ONE explicit dialog tool):
+        ' those calls report the box themselves and send nothing here.
+        Dim preSkip As Boolean
+        preSkip = ToolReadOnly(name)
+        If Not preSkip Then
+            If LCase$(name) = "close_active_dialogs" Then preSkip = True
+        End If
         Dim preCnt As Long
         preCnt = 0
-        If WinOps.WoModalFastPresent(preCnt) Then
-            Set m_preDlgHandled = WinOps.WoModalClearPreexisting()
-        Else
-            Set m_preDlgHandled = Nothing
+        Set m_preDlgHandled = Nothing
+        If Not preSkip Then
+            If WinOps.WoModalFastPresent(preCnt) Then
+                Set m_preDlgHandled = WinOps.WoModalClearPreexisting()
+            End If
         End If
         ' FIX-21: if a pre-existing owner-disabled box is STILL on screen (HOLD-policy program
         ' MsgBox, or a box our safe caps could not dismiss), do NOT enter the IDE: refuse
         ' immediately with evidence. Reads that only touch Win32/Files stay served.
+        ' (hostmodal-fix D2b): the ONE box a tool owns end-to-end is VB6's own Make Project
+        ' box: make_project probes it and answers modal_blocked=true + hwnd/title/controls
+        ' (exactly what the frozen allow_host_modal text promises) and never presses its
+        ' confirm caption. That tool is let through to its own probe instead of being
+        ' stopped by the generic pre-existing refusal; every other non-safe tool keeps it.
         If Not ModalBoxSafeTool(name) Then
             Dim hb As Object
             Set hb = WinOps.WoModalBlockingBox()
             If Not hb Is Nothing Then
-                Call CallUnwind(name, mySeq, wasMut, prevSelfMut)
-                Set CallTool = TextResult(SealedReceipt(name, ModalBlockedJson(name, hb)), False)
-                Exit Function
+                If ModalSelfHandlesHostModal(name) And PreDlgHostModalKnown() Then
+                    ' (hostmodal-fix D2b): let the owning tool report it (modal_blocked=true +
+                    ' hwnd/title/controls) instead of stopping it with the generic refusal.
+                Else
+                    ' (hostmodal-fix D1d): when the ENTRY pass classified the box, publish THAT
+                    ' classification instead of the message-free probe's default
+                    ' "preexisting_modal_unknown", so the refusal is actionable ("a Make box is
+                    ' up") rather than vague. No new key is introduced.
+                    If PreDlgHostModalKnown() Then
+                        If hb.Exists("classification") Then hb("classification") = "host_modal_risk_known"
+                    ElseIf PreDlgPropertySheet() Then
+                        ' P1: pass the ENTRY-pass classification through to the TOP-LEVEL
+                        ' ModalBlockedJson.classification (same key, aligned value). No new key
+                        ' is introduced and the policy is unchanged: property_sheet is HOLD.
+                        If hb.Exists("classification") Then hb("classification") = "property_sheet"
+                    End If
+                    Call CallUnwind(name, mySeq, wasMut, prevSelfMut)
+                    Set CallTool = TextResult(SealedReceipt(name, ModalBlockedJson(name, hb)), False)
+                    Exit Function
+                End If
             End If
         End If
     End If
@@ -2084,7 +2307,12 @@ Public Sub MergeModalGuard(ByRef root As Object)
         End If
     End If
     If mg.Exists("modalCloseSent") Then root("modalCloseSent") = mg("modalCloseSent")
-    root("howToRecover") = mg("howToRecover")
+    Dim htr As String
+    htr = CStr(mg("howToRecover"))
+    ' D-1: a box the ENTRY pass held never entered the guard's awaiting state, so the guard
+    ' how-to was "" - fill it from the entry-pass hold so the uniform receipt field is real.
+    If Len(htr) = 0 Then htr = PreDlgHowToRecover()
+    root("howToRecover") = htr
     If mg.Exists("modalButtons") Then
         If IsObject(mg("modalButtons")) Then Set root("modalButtons") = mg("modalButtons")
     End If
@@ -2365,8 +2593,6 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
             outText = ToolProjectSnapshot(args)
         Case "package_app"
             outText = ToolPackageApp(args)
-        Case "git"
-            outText = ToolGit(args)
         Case "format_code"
             outText = ToolFormatCode(args)
         Case "rename_symbol"
@@ -2441,9 +2667,27 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
         Case "verify"
             outText = ToolVerify(JsonGetStr(args, "name"), JsonGetStr(args, "disk_path"), JsonGetStr(args, "baseline"), JsonGetBool(args, "requireCompiler", False))
         Case "inject_trace"
-            outText = ToolInjectTrace(JsonGetStr(args, "name"), JsonGetStr(args, "procedure"), JsonGetStr(args, "expressions"), JsonGetStr(args, "id"), JsonGetStr(args, "expected_sha256"))
+            outText = ToolInjectTrace(JsonGetStr(args, "name"), JsonGetStr(args, "procedure"), JsonGetStr(args, "expressions"), JsonGetStr(args, "id"), JsonGetStr(args, "expected_sha256"), JsonGetStr(args, "condition"), JsonGetBool(args, "recordCondition", True))
         Case "remove_trace"
             outText = ToolRemoveTrace(JsonGetStr(args, "name"), JsonGetStr(args, "id"), JsonGetStr(args, "expected_sha256"))
+        Case "trace_query"
+            Dim tqRaw As Boolean
+            Dim tqAudit As String
+            outText = TraceQuery.ToolTraceQuery(args, tqRaw, tqAudit)
+            If tqRaw Then
+                ' format:"jsonl" (rulings BATCH-O2 / D16): the body is the RAW matched
+                ' JSONL lines, so it must bypass StampMcp, SealedReceipt and the
+                ' DispatchTail splices - otherwise "raw" would be polluted.  This is a
+                ' documented B-only path; every other tool is untouched.
+                item("text") = outText
+                content.Add item
+                Set res("content") = content
+                res("isError") = False
+                Audit.AuditAdd "trace_query", "ok", tqAudit
+                Set CallToolInner = res
+                Exit Function
+            End If
+
         Case "fault_inject"
             outText = ToolFaultInject(JsonGetStr(args, "name"), JsonGetStr(args, "procedure"), JsonGetStr(args, "mode"), JsonGetStr(args, "value"), JsonGetStr(args, "id"), JsonGetStr(args, "expected_sha256"))
         Case "clear_faults"
@@ -2598,7 +2842,7 @@ Private Function CallToolInner(ByVal name As String, ByVal args As Object) As Ob
             outText = Extensions.UninstallJson(JsonGetStr(args, "name"))
             ToolsCachesReset
         Case "workspace_status"
-            outText = ToolWorkspaceStatus(JsonGetStr(args, "repo"))
+            outText = ToolWorkspaceStatus()
         Case "verify_scope"
             outText = ToolVerifyScope(AnyObjOf(args, "components"), JsonGetStr(args, "path"), JsonGetStr(args, "baseline"), JsonGetBool(args, "requireCompiler", False))
         Case "todo_status"
@@ -5173,8 +5417,26 @@ Private Function ToolGetComponentCode(ByVal name As String, ByVal includeLineNum
         On Error Resume Next
         root("startLineDisk") = sIde + CLng(cd("headerOffset"))
         root("endLineDisk") = eIde + CLng(cd("headerOffset"))
+        root("startLineDiskExact") = False
+        root("endLineDiskExact") = False
+        ' v1.16.6 (line-space honesty): the SCALAR headerOffset ignores the hidden inline
+        ' Attribute lines, so on a module that carries them startLineDisk disagreed with the
+        ' number THIS receipt prints (coords.diskLine was already exact). Prefer the
+        ' accumulated map and publish which basis produced the value; with an unresolved map
+        ' the scalar stays, explicitly flagged exact=false instead of being presented as exact.
+        If CBool(em("resolved")) Then
+            If ExactDiskLineOf(em, sIde, 0) > 0 Then
+                root("startLineDisk") = ExactDiskLineOf(em, sIde, 0)
+                root("startLineDiskExact") = True
+            End If
+            If ExactDiskLineOf(em, eIde, 0) > 0 Then
+                root("endLineDisk") = ExactDiskLineOf(em, eIde, 0)
+                root("endLineDiskExact") = True
+            End If
+        End If
         Err.Clear
         On Error GoTo 0
+        root("startLineDiskBasis") = "startLineDisk/endLineDisk are the FILE lines of the FIRST/LAST line of the slice; exact=true means the accumulated pane->disk map (header lines + hidden inline Attribute lines above) resolved them, exact=false means the scalar headerOffset fallback was used and MUST NOT be trusted on a module with hidden inline Attribute lines"
         root("rangeLineSpaceNote") = "startLine/endLine are IDE code-pane lines (the same space the edit tools take); startLineDisk/endLineDisk are the component FILE lines, derived with coords.headerOffset, and the emitted number=1 line follows coords (disk numbering when coords=disk)"
         If Len(Trim$(procName)) > 0 Then
             root("proc") = procName
@@ -5893,7 +6155,14 @@ Private Function ToolAddComponent(ByVal compType As String, ByVal name As String
             rjc("reason") = "cancelled_by_policy"
             rjc("cancelledBy") = "modal_guard"
             Set rjc("priorDialog") = prior
-            rjc("advice") = "creating a VB6 form through the IDE's Add Form command is inherently interactive (template selection); the modal dialog that was already open was cancelled. Use add_component{type:""module""} or import_component of a prepared .frm."
+            Dim priorRes As String
+            priorRes = ""
+            If prior.Exists("result") Then priorRes = LCase$(CStr(prior("result")))
+            If priorRes = "held_policy" Then
+                rjc("advice") = "creating a VB6 form through the IDE's Add Form command is inherently interactive (template selection); the modal dialog that was already open could not be classified (unknown), so it was HELD - nothing was clicked. Dismiss it yourself (read_active_dialogs shows it) and retry, or use add_component{type:""module""} / import_component of a prepared .frm."
+            Else
+                rjc("advice") = "creating a VB6 form through the IDE's Add Form command is inherently interactive (template selection); the modal dialog that was already open was cancelled. Use add_component{type:""module""} or import_component of a prepared .frm."
+            End If
             Set rjc("dialogs") = WinOps.WoModalSnapshot()
             ToolAddComponent = JsonStringify(rjc)
             Exit Function
@@ -11492,7 +11761,27 @@ Private Sub DiagnoseInto(ByVal root As Object, ByVal vbp As String, ByVal timeou
     If o.Exists("rawLen") Then d("rawLen") = CLng(Val(CStr(o("rawLen"))))
     If o.Exists("rawSha256") Then d("rawSha256") = CStr(o("rawSha256"))
     If o.Exists("errorCount") Then d("errorCount") = CLng(Val(CStr(o("errorCount"))))
-    If o.Exists("artifact") Then d("artifactPath") = CStr(o("artifact"))
+    ' (hostmodal-fix D3a): the build receipt's "artifact" member is an OBJECT (ArtifactFullSnap:
+    ' path/exists/size/mtime/sha256), so CStr(o("artifact")) raised VB error 450 ("Wrong number of
+    ' arguments or invalid property assignment") and the whole diagnosis fell into the Bad:
+    ' handler - measured on t16: the isolated /make really ran (exit 0, real 34 B log) yet
+    ' diagnosis.ok=false, artifactPath="", artifactExists=false. Read the PATH from the string
+    ' member the receipt publishes (artifactPath), then from the object's "path" member; never
+    ' CStr an Object.
+    If o.Exists("artifactPath") Then
+        If Not IsObject(o("artifactPath")) Then d("artifactPath") = CStr(o("artifactPath"))
+    End If
+    If Len(CStr(d("artifactPath"))) = 0 Then
+        If o.Exists("artifact") Then
+            If IsObject(o("artifact")) Then
+                Dim oArt As Object
+                Set oArt = o("artifact")
+                If oArt.Exists("path") Then d("artifactPath") = CStr(oArt("path"))
+            Else
+                d("artifactPath") = CStr(o("artifact"))
+            End If
+        End If
+    End If
     If o.Exists("output") Then
         If IsObject(o("output")) Then
             Dim ob As Object
@@ -11781,6 +12070,25 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         ToolMakeProject = JsonStringify(ideNoProj)
         Exit Function
     End If
+    ' ---- D-11 (OPEN-42 232-A2 D-V2a): the PRE-EXISTING host-modal HOLD is decided ------
+    ' BEFORE any write. The in-IDE route used to run save_project (and the Reference=
+    ' repair) above its modal preflight, so a call that was going to answer
+    ' modal_blocked/held still rewrote the dirty project (measured: autoSaved=true,
+    ' v27a.vbp 371 -> 529 B; no compile and no artifact). A held call must write NOTHING.
+    ' This probe is READ-ONLY (window enumeration + text reads; no message is sent), and
+    ' when it sees a KNOWN host-modal box while allow_host_modal is false, BOTH writes
+    ' below are skipped; the existing hold branch (host_modal_risk=known) then publishes
+    ' the refusal with autoSaved=false.
+    Dim preHoldN As Long, preHoldRisk As String, preHoldReason As String
+    Dim preHoldClass As String, preHoldDetails As String
+    Dim preHold As Boolean
+    preHold = False
+    preHoldN = 0
+    If Not allowHostModal Then
+        preHoldN = WinOps.HostModalRiskProbe("#32770", preHoldRisk, preHoldReason, preHoldClass, preHoldDetails)
+        preHold = (preHoldN > 0 And preHoldRisk = "known")
+    End If
+
     ' R-1021-04 (item 2, BEHAVIOUR PRESERVED): the in-IDE route SAVES the project
     ' itself before compiling, exactly as it always did. MakeCompiledFile on a
     ' project the IDE still considers dirty makes VB6 raise its own "save changes?"
@@ -11816,7 +12124,11 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     dirtyCount = CLng(dscan("dirtyCount"))
     dirtyUnknown = CBool(dscan("dirtyUnknown"))
     pbSaved = CBool(dscan("projectSaved"))
-    If dirtyCount > 0 Then
+    ' D-11: when the read-only pre-save preflight above holds a KNOWN host-modal box,
+    ' NOTHING may be written, so the pre-compile auto-save is SKIPPED (autoSaved stays
+    ' false). The dirty scan itself is read-only and still runs, so the receipt can say
+    ' truthfully what WOULD have been saved.
+    If dirtyCount > 0 And Not preHold Then
         ' (4) a project with NO file name cannot be saved at all. That is the
         ' ORIGINAL failure path, kept separate from the dirty check on purpose: it
         ' fails whether or not the project was dirty.
@@ -11899,10 +12211,15 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     Set mpRefs = NewRefsInfo()
     Dim mpRefsPasses As Long
     mpRefsPasses = 0
-    On Error Resume Next
-    mpRefsPasses = McpProjTools.VbpRefsRepairOnDisk(Me, p.FileName, mpPaths, mpRefs)
-    If Err.Number <> 0 Then Err.Clear
-    On Error GoTo 0
+    ' D-11: the canonical Reference= repair is a second WRITE (it may rewrite the .vbp).
+    ' It is skipped under exactly the same hold condition as the auto-save, so a held
+    ' call leaves every project and component file byte-identical.
+    If Not preHold Then
+        On Error Resume Next
+        mpRefsPasses = McpProjTools.VbpRefsRepairOnDisk(Me, p.FileName, mpPaths, mpRefs)
+        If Err.Number <> 0 Then Err.Clear
+        On Error GoTo 0
+    End If
     ' ---- (A10 sidecar): resolve WHERE the LAA decision comes from ----
     Dim laaWant As Boolean, laaSrc As String, laaProjFile As String, laaSrcNote As String, laaCfgErr As String
     Dim laaUsable As Boolean
@@ -12000,6 +12317,19 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
     Dim preNDlg As Long
     preNDlg = WinOps.HostModalRiskProbe("#32770", preRisk, preReason, preClass, preDetails)
     root("dialogs_before") = preNDlg
+    ' D-11: the pre-save preflight (preHold*) already decided this hold from its OWN
+    ' read-only probe. If the box is no longer visible to this second probe (a click
+    ' landed in between), the hold decision STAYS: the auto-save was skipped on that
+    ' evidence, so starting a compile now would compile without its pre-compile save.
+    ' Publish the preflight's observation instead of dropping the hold.
+    If preHold And Not (preNDlg > 0 And preRisk = "known") Then
+        preNDlg = preHoldN
+        preRisk = preHoldRisk
+        preReason = preHoldReason
+        preClass = preHoldClass
+        preDetails = preHoldDetails
+        root("dialogs_before") = preNDlg
+    End If
     If preNDlg > 0 And preRisk = "known" And Not allowHostModal Then
         root("modal_blocked") = True
         root("modal_stage") = "preexisting"
@@ -12012,10 +12342,22 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         Call ApplyHostModalFields(root, "preflight")
         root("stopReason") = "host_modal_blocking"
         root("verdict") = "modal_blocked"
+        ' D-5 / D-A4a: the SAME buildState vocabulary the non-blocked branches use (the value
+        ' already exists on this tool's blocked_by_host_modal path further below). This branch
+        ' never started a compile and never touched the artifact.
+        root("buildState") = "blocked_by_host_modal"
         root("logUnavailableReason") = "no compile was attempted, so no compiler log exists"
         root("suggested_action") = "read the box with read_active_dialogs and close it with close_active_dialogs (dry_run=true previews it, including host_modal_risk); pass allow_host_modal=true only if you deliberately want THIS call to confirm it."
         root("recovery_hint") = "Nothing was started and the artifact was not touched (see output{}). If a previous call is still in flight, its busy receipt carries inflight_tool / inflight_since_ms; read_active_dialogs still answers because read-only tools are not gated."
         root("note") = "a host-modal box was already up before this call, so make_project neither compiled nor touched the artifact"
+        ' D-11 (OPEN-42 232-A2 D-V2a): the pre-existing hold is decided BEFORE the
+        ' pre-compile auto-save and before the Reference= repair, so a held call performs
+        ' ZERO writes. autoSaved is already false (set above from the skipped save); say so
+        ' in the branch's EXISTING note key instead of leaving it unexplained. No top-level
+        ' key is added or renamed.
+        If preHold Then
+            root("note") = CStr(root("note")) & " The pre-compile auto-save was SKIPPED on purpose: a known host-modal box was detected before any save, so autoSaved=false and this call wrote no project (.vbp) or component file."
+        End If
         ' (discipline 98): this early exit must still report the same
         ' shape, including the dialog counts and the elapsed time.
         ' an earlier fix : the box that was already up is now DISMISSED with a
@@ -12024,19 +12366,31 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
         ' it only aborts something nobody asked THIS call to do. The confirm caption is
         ' still never pressed. Nothing is compiled and the artifact is NOT touched, which
         ' is what the pre-existing path already promised.
+        ' (hostmodal-fix D1b): the frozen allow_host_modal text says "false = LEAVE THE BOX ALONE
+        ' and report modal_blocked=true with its hwnd/title/controls instead of clicking it", and
+        ' the automatic paths no longer press a pre-existing host-modal box (see
+        ' WinOps.WoModalClearPreexisting / WinOps.WoModalGuardTick). So NOTHING is sent here and
+        ' the box stays for the caller to dismiss explicitly - the settle call only lets the
+        ' guard run its (now refusal-only) pass before the report is built.
         If Not allowHostModal Then
             Call ModalGuardSettle(mgWait)
             If Util.PumpAbortDue() Then
             ToolMakeProject = AbortReceiptFor("make_project", Nothing)
             Exit Function
             End If
-            root("modalDismissPolicy") = "cancel_only: the box predated this call, so only a Cancel/Close/Ignore/No caption could be pressed; the confirm caption was never pressed and no compile was started"
         End If
         WinOps.WoModalGuardSiteDisarm
         DisarmGateRelease
         Call MergeModalGuard(root)
         root("dialogs_after") = WinOps.HostModalRiskProbe("#32770", preRisk, preReason, preClass, preDetails)
         root("dialogs_leaked") = root("dialogs_after")
+        If Not allowHostModal Then
+            If CLng(root("dialogs_after")) > 0 Then
+                root("modalDismissPolicy") = "leave_alone: the box predated this call, so NOTHING was pressed (its confirm caption would start a compile inside the host's modal loop, and its Cancel would silently abort a build nobody asked THIS call to abort); dismiss it explicitly with close_active_dialogs{button:""Cancel""} (or in the IDE), then retry"
+            Else
+                root("modalDismissPolicy") = "gone_before_report: the box that predated this call was already gone when this report was built, so nothing was pressed and no compile was started"
+            End If
+        End If
         root("elapsedMs") = GetTickCount() - t0
         ToolMakeProject = JsonStringify(root)
         Exit Function
@@ -12746,6 +13100,17 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
             If dg.Exists("isolatedMake") Then
                 If IsObject(dg("isolatedMake")) Then Set root("isolatedMake") = dg("isolatedMake")
             End If
+            ' (hostmodal-fix D3c): compilerElapsedMs belongs to the subprocess that actually ran.
+            ' The in-IDE route has none (0), so with an isolated /make that ran, the top-level
+            ' value must come from isolatedMake instead of contradicting it (measured on t16:
+            ' compilerElapsedMs=0 vs isolatedMake.elapsedMs=375).
+            If CLng(Val(CStr(root("compilerElapsedMs")))) = 0 Then
+                Dim imElapsedObj As Object
+                Set imElapsedObj = root("isolatedMake")
+                If Not imElapsedObj Is Nothing Then
+                    If imElapsedObj.Exists("elapsedMs") Then root("compilerElapsedMs") = CLng(Val(CStr(imElapsedObj("elapsedMs"))))
+                End If
+            End If
             If CBool(root("timedOut")) Then
                 root("ok") = False
                 root("verdict") = "timeout"
@@ -12765,6 +13130,11 @@ Private Function ToolMakeProject(ByVal outputPath As String, ByVal route As Stri
             If Len(CStr(dg("log"))) > 0 Then
                 root("logAvailable") = True
                 root("logWrittenByThisCall") = True
+                ' (hostmodal-fix D3b): a REAL compiler log is present now, so the in-IDE-route
+                ' explanation filled in before the diagnosis ran is no longer true. Leaving it
+                ' made the receipt say logAvailable=true AND carry a non-empty
+                ' logUnavailableReason (measured on t16, N13). Clear it.
+                root("logUnavailableReason") = ""
                 root("log") = CStr(dg("log"))
                 root("logPath") = CStr(dg("logPath"))
                 root("logBytes") = CLng(dg("logBytes"))
@@ -15098,37 +15468,6 @@ Private Function ActiveProjectDir() As String
     ActiveProjectDir = Left$(f, p - 1)
 End Function
 
-Private Function ToolGit(ByVal args As Object) As String
-    Dim action As String
-    action = LCase$(JsonGetStr(args, "action"))
-    Dim repo As String
-    repo = JsonGetStr(args, "repo")
-    If Len(repo) = 0 Then repo = ActiveProjectDir()
-    If Len(repo) = 0 Then Err.Raise vbObjectError + 80, "CodeTools", "repo is required when no project is open in the IDE"
-    repo = ResolvePath(repo)
-    Dim gitExe As String
-    gitExe = JsonGetStr(args, "exe")
-    If Len(gitExe) = 0 Then gitExe = "git.exe"
-    Dim sub_ As String
-    Dim f As String
-    f = JsonGetStr(args, "file")
-    Select Case action
-        Case "status"
-            sub_ = "-C " & Qq(repo) & " status --porcelain=v1 -b"
-        Case "diff"
-            If Len(f) > 0 Then
-                sub_ = "-C " & Qq(repo) & " --no-pager diff --stat -- " & Qq(f)
-            Else
-                sub_ = "-C " & Qq(repo) & " --no-pager diff --stat"
-            End If
-        Case "log"
-            sub_ = "-C " & Qq(repo) & " --no-pager log --oneline -n " & CStr(JsonGetLong(args, "max", 20))
-        Case Else
-            Err.Raise vbObjectError + 80, "CodeTools", "Invalid action: " & action & " (expected status/diff/log)"
-    End Select
-    ToolGit = ProjShip.RunCaptureJson(gitExe, sub_, 30000)
-End Function
-
 ' ---------------------------------------------------------------------
 ' project metadata (version resource, app title, conditional compilation)
 ' ---------------------------------------------------------------------
@@ -17084,14 +17423,18 @@ Private Function ExecKey(ByVal cap As String) As String
 End Function
 
 ' annotate ONE listed control with action=execute's own answer. 'enabled' is the
-' control's VB6 state; 'executable' is whether execute would actually run something for this
-' caption right now (it matches by caption and takes the FIRST enabled match, so twins matter).
+' control's VB6 state; 'executable' is the CAPTION-KEY prediction: action=execute
+' normalises the caption through CandBase (drop the accelerator group, drop a trailing
+' ellipsis, trim) and takes the FIRST control carrying that key, so twins share ONE verdict
+' and this field alone cannot say WHICH twin runs - execute.matched{} says that. v1.16.9:
+' the wording below names the same domain the matcher uses, and says explicitly that an id
+' address (#123) is a DIFFERENT domain.
 Private Sub MarkExecutable(ByVal e As Object, ByVal enByKey As Object)
     Dim k As String
     k = ExecKey(CStr(e("caption")))
     If Len(k) = 0 Then
         e("executable") = False
-        e("enabledReason") = "the control carries no caption, so it cannot be addressed by caption at all"
+        e("enabledReason") = "the control carries no caption, so a caption address normalises to an empty key and cannot reach it; an id address (#<id>) is a different domain and can still reach it"
         Exit Sub
     End If
     Dim ex As Boolean
@@ -17099,9 +17442,9 @@ Private Sub MarkExecutable(ByVal e As Object, ByVal enByKey As Object)
     If enByKey.Exists(k) Then ex = CBool(enByKey(k))
     e("executable") = ex
     If Not ex Then
-        e("enabledReason") = "action=execute matches by caption and takes the FIRST such control, which is DISABLED in the current IDE state, so the call refuses with menu_control_disabled"
+        e("enabledReason") = "action=execute matches by caption KEY (CandBase: accelerator group and trailing ellipsis dropped, trimmed) and takes the FIRST control carrying that key; that first control is DISABLED in the current IDE state, so a caption address refuses with menu_control_disabled. An id address (#<id>) matches by Id AND caption and requires ENABLED, so it is a different domain and may still run an enabled twin - read matched{} on the execute receipt."
     ElseIf Not CBool(e("enabled")) Then
-        e("enabledReason") = "this control is DISABLED, but the FIRST control carrying this caption (the one execute would actually take) IS enabled, so the call runs"
+        e("enabledReason") = "this control is DISABLED, but the FIRST control carrying this caption KEY (the one a caption address would take) IS enabled, so the call runs - on that twin, not on this one; matched{} on the receipt names it. An id address (#<id>) requires ENABLED and therefore cannot reach this disabled control."
     Else
         e("enabledReason") = ""
     End If
@@ -17207,26 +17550,43 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
         Dim ctrl2 As Object
         Dim idHits As Long, idCands As String
         Dim idOff As Long
+        Dim mbBar As String, mbPath As String, mbPos As String, mbRule As String
         idHits = 0
         idCands = ""
         idOff = 0
+        mbBar = ""
+        mbPath = ""
+        mbPos = ""
+        mbRule = ""
+        ' v1.16.9: the ambiguity refusal below still RAISES, so the candidate list it collected
+        ' has to travel out of band; ClassifiedRefusalJson reads these two cells for that reason
+        ' only, and they are cleared here on EVERY execute call.
+        m_cmdBarsIdCands = ""
+        m_cmdBarsIdHits = 0
         If byId Then
-            Set ctrl2 = FindBarControlByIdOnly(m_vbe, bar, ctlCap, ctlId, idHits, idCands, idOff)
+            Set ctrl2 = FindBarControlByIdOnly(m_vbe, bar, ctlCap, ctlId, idHits, idCands, idOff, mbBar, mbPath, mbPos)
             If ctrl2 Is Nothing Then
                 ' a control that EXISTS but is disabled is NOT 'not found'. Measured:
-                ' '#620 µ÷ÓÃ¶ÑÕ»(&K)...' used to answer menu_control_not_found while the only
+                ' '#620 ...' used to answer menu_control_not_found while the only
                 ' problem was that the Call Stack item is disabled in design mode.
                 If idHits = 0 And idOff > 0 Then
                     Err.Raise vbObjectError + 71, "CodeTools", "Menu control is disabled in the current IDE state: " & control
                 End If
                 If idHits = 0 Then
                     Err.Raise vbObjectError + 73, "CodeTools", "no ENABLED menu control with id=" & CStr(ctlId) & IIf(Len(ctlCap) > 0, " and caption like """ & ctlCap & """", "") & " (bar filter=""" & bar & """)"
-                Else
-                    Err.Raise vbObjectError + 74, "CodeTools", "id=" & CStr(ctlId) & " is AMBIGUOUS: " & CStr(idHits) & " enabled controls match; narrow it with bar= (a bar name OR a menu path segment) and/or the caption as ""#746 <caption>"". Candidates: " & idCands
                 End If
+                ' AMBIGUOUS: same raise as before (the classified handler keeps answering
+                ' reason=menu_control_ambiguous, and the audit still records a refusal), but the
+                ' candidates now travel out of band so the REFUSAL can carry the same
+                ' idCandidates / idCandidateCount fields a SUCCESSFUL id address publishes.
+                m_cmdBarsIdCands = idCands
+                m_cmdBarsIdHits = idHits
+                Err.Raise vbObjectError + 74, "CodeTools", "id=" & CStr(ctlId) & " is AMBIGUOUS: " & CStr(idHits) & " enabled controls match; narrow it with bar= (a bar name OR a menu path segment) and/or the caption as ""#746 <caption>"". Candidates: " & idCands
             End If
+            mbRule = "id_exact_one_enabled"
         Else
-            Set ctrl2 = FindBarControl(m_vbe, bar, control)
+            Set ctrl2 = FindBarControl(m_vbe, bar, control, mbBar, mbPath, mbPos)
+            mbRule = "caption_first"
         End If
         If ctrl2 Is Nothing Then
             ' fallback: substring prefix search across every bar and popup
@@ -17252,6 +17612,11 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
                                 If Len(c2.Caption) > 0 Then
                                     If InStr(1, c2.Caption, control, vbTextCompare) = 1 Then
                                         If c2.Enabled Then
+                                            mbBar = b2.Name
+                                            mbPath = b2.Name & ">" & CStr(c2.Caption)
+                                            mbPos = CStr(ci2)
+                                            mbRule = "caption_prefix_scan"
+                                            Set root("matched") = CmdBarsMatched(mbBar, mbPath, mbPos, c2, mbRule)
                                             c2.Execute
                                             found2 = True
                                             Exit For
@@ -17272,12 +17637,24 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
             ok2 = ctrl2.Enabled
             On Error GoTo 0
             If Not ok2 Then Err.Raise vbObjectError + 71, "CodeTools", "Menu control is disabled in the current IDE state: " & control
+            ' v1.16.9 ADDITIVE: WHICH control the call actually took, captured BEFORE the command
+            ' runs so 'enabled'/'executable' are the state that GOVERNED this decision (a toggle
+            ' command can change its own state while running, which would otherwise make matched{}
+            ' disagree with the list row it must reconcile with). Before this batch the receipt
+            ' said only executed/byId/id - useless when a caption repeats (measured: 18 controls
+            ' carry the caption for Hide, 17 of them with id=865). uid/executable use the SAME
+            ' rules the list uses, so a list row and matched{} with the same uid agree field by field.
+            Set root("matched") = CmdBarsMatched(mbBar, mbPath, mbPos, ctrl2, mbRule)
             ctrl2.Execute
         End If
         root("executed") = control
         root("byId") = byId
         root("id") = ctlId
-        If Len(idCands) > 0 Then root("idCandidates") = idCands
+        If byId Then
+            If Len(idCands) > 0 Then root("idCandidates") = idCands
+            root("idCandidateCount") = idHits
+        End If
+
     Else
         Dim arr As Object
         Set arr = New Collection
@@ -17321,6 +17698,7 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
                             Dim e As Object
                             Set e = CreateObject("Scripting.Dictionary")
                             AddCtrlMeta c, e, b.Name & ">"
+                            e("uid") = CmdCtrlUid(b.Name, CLng(e("id")), CStr(e("caption")), CStr(ciL))
                             Dim subs As Object
                             Set subs = New Collection
                             Dim sc As Object
@@ -17336,6 +17714,7 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
                                         Dim se As Object
                                         Set se = CreateObject("Scripting.Dictionary")
                                         AddCtrlMeta sc, se, b.Name & ">" & CStr(e("caption")) & ">"
+                                        se("uid") = CmdCtrlUid(b.Name, CLng(se("id")), CStr(se("caption")), CStr(ciL) & "." & CStr(siL))
                                         subs.Add se
                                     End If
                                 Next
@@ -17386,10 +17765,109 @@ Private Function ToolCommandBars(ByVal action As String, ByVal bar As String, By
                 End If
             Next
         Next
+        ' v1.16.9 ADDITIVE: the key every list row now carries. (bar, id, caption) alone is
+        ' NOT unique on a real IDE - measured: 258 groups share it and VB6 ids are not unique
+        ' by design (17 controls carry id=865) - so the enumeration position discriminates.
+        ' list[].uid and execute.matched.uid use the SAME construction, so a caller can find
+        ' the ONE row a call took.
+        root("uidRule") = "uid = ""<bar> > <id> > <caption> @<pos>""; pos = the 1-based index inside that bar's Controls, or ""<top>.<sub>"" for a popup sub-item. The string is an OPAQUE key (a caption may itself contain "">""), so compare it - do not parse it. Same construction in list[].uid and in execute.matched.uid."
         root("barCount") = arr.Count
         Set root("bars") = arr
     End If
     ToolCommandBars = JsonStringify(root)
+End Function
+
+' =====================================================================
+' v1.16.9: the receipts that make an EXECUTION
+' reconcilable with the LIST.
+'
+' Measured background: on a real IDE a full list is 2,918 controls over 36 bars; 258
+' groups of them share the SAME (bar, id, caption) triple (seven groups of 20 identical
+' toolbar items, one group of 8 window-name items, ...) and 17 controls carry id=865.
+' A list row therefore needs a key that is unique, and an execute receipt has to say
+' WHICH row it took - otherwise "predicted" and "executed" can never be compared.
+' =====================================================================
+Private Function CmdCtrlUid(ByVal barName As String, ByVal ctrlId As Long, ByVal caption As String, ByVal posText As String) As String
+    ' the GLOBAL unique key of one listed control: "<bar> > <id> > <caption> @<pos>", where
+    ' pos is the control's own enumeration position in that bar (1-based; "<top>.<sub>" for
+    ' a popup sub-item). The triple alone is NOT unique (see above), and the position is the
+    ' ONE discriminator both sides can compute without a second search, so list[] and
+    ' execute.matched.uid are the same string for the same control. Treat it as an OPAQUE
+    ' key (a caption may itself contain ">" or " > "): compare it, do not parse it.
+    CmdCtrlUid = barName & " > " & CStr(ctrlId) & " > " & caption & " @" & posText
+End Function
+
+' list[]'s 'executable' answer for ONE caption key: the enabled state of the FIRST control
+' that carries that key, enumerated in EXACTLY the order the list builds (bar order, control
+' order, and that control's popups after it). This is the same question MarkExecutable
+' answers from enByKey; having it as a function lets a SUCCESS receipt echo the identical
+' value instead of voicing a second opinion.
+Private Function CmdBarsExecutableForKey(ByVal cap As String) As Boolean
+    On Error Resume Next
+    CmdBarsExecutableForKey = False
+    Dim k As String
+    k = ExecKey(cap)
+    If Len(k) = 0 Then Exit Function
+    Dim bars As Object, b As Object, c As Object, sc As Object, subCol As Object
+    Dim bi As Long, ci As Long, si As Long
+    Set bars = m_vbe.CommandBars
+    If bars Is Nothing Then Exit Function
+    For bi = 1 To bars.Count
+        Set b = bars.Item(bi)
+        If Not b Is Nothing Then
+            For ci = 1 To b.Controls.Count
+                Set c = b.Controls.Item(ci)
+                If Not c Is Nothing Then
+                    If ExecKey(CStr(c.Caption)) = k Then
+                        CmdBarsExecutableForKey = CBool(c.Enabled)
+                        Exit Function
+                    End If
+                    Set subCol = Nothing
+                    Err.Clear
+                    Set subCol = c.Controls
+                    If Not subCol Is Nothing Then
+                        For si = 1 To subCol.Count
+                            Set sc = subCol.Item(si)
+                            If Not sc Is Nothing Then
+                                If ExecKey(CStr(sc.Caption)) = k Then
+                                    CmdBarsExecutableForKey = CBool(sc.Enabled)
+                                    Exit Function
+                                End If
+                            End If
+                        Next
+                    End If
+                End If
+            Next
+        End If
+    Next
+End Function
+
+' the identity of the control action=execute ACTUALLY took: every field is read back from
+' that control, 'executable' comes from the same rule the list uses for this caption key,
+' and 'uid' is the list key. matchRule is a CLOSED set:
+'   id_exact_one_enabled | caption_first | caption_prefix_scan
+Private Function CmdBarsMatched(ByVal barName As String, ByVal pathText As String, ByVal posText As String, _
+        ByVal ctrlObj As Object, ByVal matchRule As String) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim cap As String, cId As Long, en As Boolean
+    cap = ""
+    cId = 0
+    en = False
+    On Error Resume Next
+    cap = ctrlObj.Caption
+    cId = ctrlObj.Id
+    en = ctrlObj.Enabled
+    On Error GoTo 0
+    d("bar") = barName
+    d("path") = pathText
+    d("id") = cId
+    d("caption") = cap
+    d("enabled") = en
+    d("executable") = CmdBarsExecutableForKey(cap)
+    d("matchRule") = matchRule
+    d("uid") = CmdCtrlUid(barName, cId, cap, posText)
+    Set CmdBarsMatched = d
 End Function
 
 ' =====================================================================
@@ -21661,6 +22139,17 @@ Private Function ToolBuild(ByVal project As String, ByVal defines As String, ByV
                 croot("okDemotionReason") = "cache hit: no compiler ran in this call, so compiled/ok are not build evidence; use artifactChanged"
                 croot("cachedArtifactMatches") = True
                 croot("cachedNote") = "cache hit: the recorded artifact is present at the recorded size; nothing was compiled in this call, so ok is false by design and the build itself did NOT fail"
+                ' v1.16.6: a cache hit starts NO compiler subprocess, so the subprocess-budget
+                ' group is structurally NOT APPLICABLE. Publish it (0 / not_applicable / false -
+                ' the same values a preflight-refused build publishes) so a caller can read the
+                ' group on EVERY build path instead of discovering the keys ABSENT here. The
+                ' real-build and timeout paths are untouched (byte-identical).
+                croot("timedOut") = False
+                croot("budgetEnforced") = False
+                croot("budgetMs") = 0
+                croot("budgetSource") = "not_applicable"
+                croot("childPid") = 0
+                croot("childLeftover") = False
                 ToolBuild = JsonStringify(croot)
                 Exit Function
             End If
@@ -24746,7 +25235,7 @@ End Function
 
 
 
-Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByVal exprs As String, ByVal id As String, ByVal expectedSha As String) As String
+Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByVal exprs As String, ByVal id As String, ByVal expectedSha As String, ByVal condText As String, ByVal recordCondition As Boolean) As String
     Dim cur As String, em As String, nx As String
     ' the same segment timing edit_by_anchor/apply_edits report,
     ' so a slow inject is attributed instead of guessed.
@@ -24758,8 +25247,12 @@ Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByV
     ' NEVER emit code that cannot compile. A modal compile-error dialog
     ' blocks the whole IDE (end/remove_trace included), so an invisible symbol is a
     ' structured refusal decided LEXICALLY - VB6 is never asked to compile.
+    ' logpoint condition (v1.17.0 batch): Trim$ ONCE; an all-space value means
+    ' "no condition" and keeps the 5-line block byte-identical to today.
+    Dim cond As String
+    cond = Trim$(condText)
     Dim refusal As String
-    refusal = TraceExprRefusal(name, cur, proc, exprs)
+    refusal = TraceVisibilityRefusal(name, cur, proc, exprs, cond)
     If Len(refusal) > 0 Then
         ToolInjectTrace = refusal
         Exit Function
@@ -24770,7 +25263,7 @@ Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByV
     Dim modInfo As Object
     Set modInfo = CreateObject("Scripting.Dictionary")
     EnsureTraceModule modInfo
-    If Not TraceGen.InjectTrace(cur, proc, exprs, id, nx, em) Then Err.Raise vbObjectError + 85, "CodeTools", em
+    If Not TraceGen.InjectTrace(cur, proc, exprs, id, cond, recordCondition, nx, em) Then Err.Raise vbObjectError + 85, "CodeTools", em
     tPredict = GetTickCount()
     Dim pack As Object
     ' region target = the instrumented procedure's declaration line.
@@ -24788,6 +25281,27 @@ Private Function ToolInjectTrace(ByVal name As String, ByVal proc As String, ByV
     extra("guard") = "runtime"
     extra("expressionCheck") = "ok"
     extra("checkedExpressions") = exprs
+    ' ---- logpoint receipt (v1.17.0 batch): present ONLY when a condition was given,
+    ' so the condition-less receipt stays byte-identical to the published one.
+    If Len(cond) > 0 Then
+        Dim condRec As Boolean
+        condRec = TraceGen.CondAreRecorded(cond, recordCondition)
+        extra("condition") = cond
+        extra("conditionChecked") = "lexical"
+        extra("conditionGuarantee") = "necessary_not_sufficient"
+        extra("conditionRisk") = "a condition that raises or has side effects CHANGES the behaviour of the program when tracing is ON; keep conditions pure/side-effect-free"
+        extra("recordCondition") = recordCondition
+        extra("conditionRecorded") = condRec
+        extra("guardLines") = 7
+        extra("blockLineCount") = 7
+        If condRec Then
+            extra("recordedCondition") = cond
+        ElseIf InStr(cond, Chr$(34)) > 0 Then
+            extra("conditionRecordNote") = "the condition contains a double quote; it was NOT recorded as @cond (the supplied text is never rewritten)"
+        Else
+            extra("conditionRecordNote") = "recordCondition was false; the condition was NOT recorded as @cond"
+        End If
+    End If
     extra("guardLine") = "If McpTraceOn() Then"
     extra("condCompRequired") = False
     extra("condCompNote") = "the emitted guard is a RUNTIME check, so it does not depend on the project's CondComp. A '#If MCP_TRACE' block would be COMPILE-TIME: the VBIDE object model does not expose CondComp and project_meta edits the .vbp text, so an already-loaded project keeps its old in-memory CondComp and the block is compiled out (measured)."
@@ -26497,93 +27011,515 @@ End Function
 
 ' ================= delta tools (read-only) ======================
 
-' delta-1: unsaved components in the IDE next to uncommitted files in git.
-' READ-ONLY: it only reads the component model and runs read-only git subcommands.
-Private Function ToolWorkspaceStatus(ByVal repoArg As String) As String
+Private Function ToolWorkspaceStatus() As String
     Dim root As Object
-    Set root = CreateObject("Scripting.Dictionary")
     Dim dirty As Object
-    Set dirty = New Collection
     Dim prj As VBIDE.VBProject
+    Dim comp As VBIDE.VBComponent
+    Dim d As Object
+    Dim pvd As Object
+    Dim pv As Object
+    Dim dr As Boolean
     Dim openCount As Long
+    Dim i As Long
+    Dim di As Long
+    Dim realN As Long, caseN As Long, wsN As Long, identN As Long, eolN As Long, unkN As Long
+    Dim clsN As String
+    Set root = CreateObject("Scripting.Dictionary")
+    Set dirty = New Collection
     openCount = 0
     On Error Resume Next
     Set prj = GetProject()
     On Error GoTo 0
-    Dim i As Long
     If Not prj Is Nothing Then
         On Error Resume Next
         openCount = prj.VBComponents.Count
         On Error GoTo 0
         For i = 1 To openCount
-            Dim comp As VBIDE.VBComponent
             On Error Resume Next
+            Set comp = Nothing
             Set comp = prj.VBComponents(i)
             On Error GoTo 0
             If Not comp Is Nothing Then
-                Dim d As Object
                 Set d = CreateObject("Scripting.Dictionary")
                 d("name") = comp.Name
                 d("file") = ComponentFileNameOf(comp)
-                Dim dr As Boolean
                 dr = False
                 On Error Resume Next
                 dr = comp.IsDirty
                 On Error GoTo 0
                 d("isDirty") = dr
-                If dr Then dirty.Add d
+                If dr Then
+                    Set pvd = Nothing
+                    On Error Resume Next
+                    Set pvd = WsPaneVsDisk(comp)
+                    On Error GoTo 0
+                    If pvd Is Nothing Then
+                        Set pvd = CreateObject("Scripting.Dictionary")
+                        pvd("classification") = "unknown"
+                        pvd("caseOnlyLineCount") = 0
+                        pvd("whitespaceOnlyLineCount") = 0
+                        pvd("basis") = "the pane-vs-disk classifier did not return a result (unexpected internal failure); unknown is reported instead of a false real"
+                        pvd("caseFoldingScope") = "identifiers_only"
+                        pvd("truncated") = False
+                    End If
+                    Set d("paneVsDisk") = pvd
+                    dirty.Add d
+                End If
             End If
         Next
     End If
+    realN = 0
+    caseN = 0
+    wsN = 0
+    identN = 0
+    eolN = 0
+    unkN = 0
+    For di = 1 To dirty.Count
+        clsN = "unknown"
+        On Error Resume Next
+        Set pv = Nothing
+        Set d = Nothing
+        Set d = dirty(di)
+        If Not d Is Nothing Then
+            Set pv = d("paneVsDisk")
+        End If
+        If Not pv Is Nothing Then clsN = CStr(pv("classification"))
+        Err.Clear
+        On Error GoTo 0
+        Select Case clsN
+            Case "real"
+                realN = realN + 1
+            Case "case_only"
+                caseN = caseN + 1
+            Case "whitespace_only"
+                wsN = wsN + 1
+            Case "identical"
+                identN = identN + 1
+            Case "eol_only"
+                eolN = eolN + 1
+            Case Else
+                unkN = unkN + 1
+        End Select
+    Next
     Set root("dirtyComponents") = dirty
     root("dirtyCount") = dirty.Count
+    root("realDirtyCount") = realN
+    root("caseOnlyCount") = caseN
+    root("whitespaceOnlyCount") = wsN
+    root("identicalCount") = identN
+    root("eolOnlyCount") = eolN
+    root("unknownCount") = unkN
     root("ideOpenComponents") = openCount
     root("readOnly") = True
-    Dim repo As String
-    repo = repoArg
-    If Len(repo) = 0 Then repo = ActiveProjectDir()
-    Dim git As Object
-    Set git = CreateObject("Scripting.Dictionary")
-    If Len(repo) = 0 Then
-        git("available") = False
-        git("note") = "no project is open in the IDE and no repo argument was given"
-    Else
-        repo = ResolvePath(repo)
-        Dim st As String, ds As String, so As String
-        st = ""
-        ds = ""
-        so = ""
-        ' WScript.Shell.Exec only drains the pipe after the child exits, so a git
-        ' status whose output exceeds the pipe buffer DEADLOCKS and looks like a
-        ' timeout (measured). Redirect to a temp file and read the file instead.
-        Dim tmpF As String
-        tmpF = Environ$("TEMP") & "\vb6mcp_git_status.txt"
-        On Error Resume Next
-        st = ProjShip.RunCaptureJson("cmd.exe", "/c git -C " & Qq(repo) & " status --porcelain=v1 -b > " & Qq(tmpF) & " 2>&1", 60000)
-        so = ""
-        so = Build.ReadLogAnsi(tmpF)
-        ds = ProjShip.RunCaptureJson("git.exe", "-C " & Qq(repo) & " --no-pager diff --stat", 30000)
-        On Error GoTo 0
-        git("repo") = repo
-        git("available") = (Len(so) >= 0)
-        git("branch") = BranchOfPorcelain(so)
-        git("ahead") = CountTag(so, "ahead ")
-        git("behind") = CountTag(so, "behind ")
-        Dim fls As Object
-        Set fls = ParsePorcelain(so)
-        Set git("files") = fls
-        git("fileCount") = fls.Count
-        git("statusText") = so
-        git("diffStat") = JsonUnescape(JsonFieldRaw(ds, "stdout"))
-        git("exitCode") = CLng(Val("0" & JsonFieldRaw(st, "exitCode")))
-        If Len(JsonFieldRaw(st, "error")) > 0 Then git("error") = JsonUnescape(JsonFieldRaw(st, "error"))
-        If JsonFieldRaw(st, "timedOut") = "true" Then git("timedOut") = True
-    End If
-    Set root("git") = git
+    root("caseFoldingScope") = "identifiers_only"
+    root("note") = "VB6 automatically corrects identifier and keyword CASE while editing, which sets VBComponent.IsDirty without changing the source semantics. paneVsDisk.classification=case_only means the code pane and the component file differ ONLY in code-token case (string literal and comment text is compared EXACTLY, so a literal edit is never folded away) and needs no action; realDirtyCount counts components with at least one real difference. identical means the IDE flag is set but the code text equals the file. designer/layout properties are outside this code-text comparison."
     ToolWorkspaceStatus = JsonStringify(root)
 End Function
 
-' delta-2: IDE-vs-disk + lint for a set of components, summary first and only the
+' ---- pane-vs-disk classification for the dirty list (READ-ONLY) ------------------
+' One line normaliser for the comparison. mode bit 1 = fold ASCII case, bit 2 = collapse
+' whitespace runs. Both act ONLY on code text outside string literals and comments: VB6
+' is case-insensitive for identifiers/keywords, but string literals are case-SENSITIVE
+' and comments are not rewritten by the editor, so folding either one would hide a real
+' edit (the exact false-negative this classifier must not have).
+Private Function WsNormLine(ByVal ln As String, ByVal mode As Long) As String
+    Dim i As Long, n As Long, a As Long
+    Dim ch As String, out As String
+    Dim inS As Boolean, inRem As Boolean, atStmt As Boolean, sp As Boolean
+    Dim isRem As Boolean
+    n = Len(ln)
+    out = ""
+    inS = False
+    inRem = False
+    atStmt = True
+    sp = False
+    i = 1
+    Do While i <= n
+        ch = Mid$(ln, i, 1)
+        If inS Then
+            out = out & ch
+            If ch = """" Then
+                If i < n Then
+                    If Mid$(ln, i + 1, 1) = """" Then
+                        out = out & """"
+                        i = i + 1
+                    Else
+                        inS = False
+                    End If
+                Else
+                    inS = False
+                End If
+            End If
+        ElseIf inRem Then
+            out = out & ch
+        Else
+            isRem = False
+            If atStmt Then
+                If LCase$(Mid$(ln, i, 3)) = "rem" Then
+                    If i + 3 > n Then
+                        isRem = True
+                    ElseIf Mid$(ln, i + 3, 1) = " " Or Mid$(ln, i + 3, 1) = vbTab Then
+                        isRem = True
+                    End If
+                End If
+            End If
+            If isRem Then
+                If sp Then
+                    out = out & " "
+                    sp = False
+                End If
+                inRem = True
+                out = out & ch
+            ElseIf ch = """" Then
+                If sp Then
+                    out = out & " "
+                    sp = False
+                End If
+                inS = True
+                out = out & ch
+                atStmt = False
+            ElseIf ch = "'" Then
+                If sp Then
+                    out = out & " "
+                    sp = False
+                End If
+                inRem = True
+                out = out & ch
+            ElseIf ch = " " Or ch = vbTab Then
+                If (mode And 2) <> 0 Then
+                    If Len(out) > 0 Then sp = True
+                Else
+                    out = out & ch
+                End If
+            Else
+                If sp Then
+                    out = out & " "
+                    sp = False
+                End If
+                a = Asc(ch)
+                If (mode And 1) <> 0 Then
+                    If a >= 65 And a <= 90 Then
+                        ch = Chr$(a + 32)
+                        a = a + 32
+                    End If
+                End If
+                out = out & ch
+                sp = False
+                If a = 58 Then
+                    atStmt = True
+                Else
+                    atStmt = False
+                End If
+            End If
+        End If
+        i = i + 1
+    Loop
+    WsNormLine = out
+End Function
+
+' Split a text into lines after normalising CRLF/CR to LF; count = 0 for an empty text.
+Private Function WsSplitLines(ByVal text As String, ByRef count As Long) As String()
+    Dim ls() As String
+    If Len(text) = 0 Then
+        count = 0
+        WsSplitLines = Split("", vbLf)
+        Exit Function
+    End If
+    ls = Split(Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf), vbLf)
+    count = UBound(ls) + 1
+    WsSplitLines = ls
+End Function
+
+' TRUE when the file text carries an EOL that is not CRLF (lone LF or lone CR).
+Private Function WsHasNonCrlfEol(ByVal s As String) As Boolean
+    Dim i As Long, n As Long, a As Long, b As Long
+    n = Len(s)
+    For i = 1 To n
+        a = Asc(Mid$(s, i, 1))
+        If a = 10 Then
+            If i = 1 Then
+                WsHasNonCrlfEol = True
+                Exit Function
+            End If
+            b = Asc(Mid$(s, i - 1, 1))
+            If b <> 13 Then
+                WsHasNonCrlfEol = True
+                Exit Function
+            End If
+        ElseIf a = 13 Then
+            If i = n Then
+                WsHasNonCrlfEol = True
+                Exit Function
+            End If
+            b = Asc(Mid$(s, i + 1, 1))
+            If b <> 10 Then
+                WsHasNonCrlfEol = True
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+' Lenient line equality used to find where the pane's first code line sits in the file.
+' Raw equality first (cheap); only differing lines pay the two normalisers.
+Private Function WsLenientEq(ByVal a As String, ByVal b As String) As Boolean
+    If a = b Then
+        WsLenientEq = True
+        Exit Function
+    End If
+    WsLenientEq = (WsNormLine(a, 3) = WsNormLine(b, 3))
+End Function
+
+' How many body lines (and how many unfoldable lines) a candidate header length yields.
+' The body skips the header, every hidden inline Attribute line, and ONE trailing empty
+' line (the file's final line break); pane text has no such trailing break.
+Private Function WsCandidateScore(ByRef paneLines() As String, ByVal paneN As Long, _
+                                  ByRef diskLines() As String, ByVal diskN As Long, _
+                                  ByVal bodyStart As Long, ByRef bodyN As Long, _
+                                  ByRef hiddenN As Long) As Long
+    Dim i As Long, j As Long, bad As Long
+    Dim body() As String
+    Dim bn As Long
+    WsCandidateScore = 0
+    bodyN = 0
+    hiddenN = 0
+    bn = 0
+    ReDim body(0 To diskN)
+    For i = bodyStart To diskN - 1
+        If IsInlineAttributeLine(diskLines(i)) Then
+            hiddenN = hiddenN + 1
+        Else
+            body(bn) = diskLines(i)
+            bn = bn + 1
+        End If
+    Next
+    If bn > 0 Then
+        If Len(body(bn - 1)) = 0 Then bn = bn - 1
+    End If
+    bodyN = bn
+    bad = 0
+    For i = 0 To bn - 1
+        If i >= paneN Then
+            If Len(body(i)) > 0 Then bad = bad + 1
+        ElseIf Not WsLenientEq(paneLines(i), body(i)) Then
+            bad = bad + 1
+        End If
+    Next
+    For i = bn To paneN - 1
+        If Len(paneLines(i)) > 0 Then bad = bad + 1
+    Next
+    WsCandidateScore = bad * 8 + Abs(paneN - bn)
+    If bodyN <> paneN Then WsCandidateScore = WsCandidateScore + 1
+End Function
+
+' Classify pane vs the file body at a chosen header length. Fills d (paneVsDisk).
+Private Sub WsClassifyAt(ByRef d As Object, ByRef paneLines() As String, ByVal paneN As Long, _
+                         ByRef diskLines() As String, ByVal diskN As Long, _
+                         ByVal bodyStart As Long, ByVal nonCrlf As Boolean, _
+                         ByVal hiddenN As Long)
+    Dim i As Long, bn As Long, firstDiff As Long
+    Dim caseCnt As Long, wsCnt As Long, realCnt As Long
+    Dim body() As String
+    ReDim body(0 To diskN)
+    bn = 0
+    For i = bodyStart To diskN - 1
+        If Not IsInlineAttributeLine(diskLines(i)) Then
+            body(bn) = diskLines(i)
+            bn = bn + 1
+        End If
+    Next
+    If bn > 0 Then
+        If Len(body(bn - 1)) = 0 Then bn = bn - 1
+    End If
+    caseCnt = 0
+    wsCnt = 0
+    realCnt = 0
+    firstDiff = 0
+    For i = 0 To bn - 1
+        If i >= paneN Then
+            If Len(body(i)) > 0 Then
+                realCnt = realCnt + 1
+                If firstDiff = 0 Then firstDiff = i + 1
+            Else
+                wsCnt = wsCnt + 1
+            End If
+        ElseIf paneLines(i) = body(i) Then
+            ' equal
+        Else
+            If firstDiff = 0 Then firstDiff = i + 1
+            If WsNormLine(paneLines(i), 2) = WsNormLine(body(i), 2) Then
+                wsCnt = wsCnt + 1
+            ElseIf WsNormLine(paneLines(i), 1) = WsNormLine(body(i), 1) Then
+                caseCnt = caseCnt + 1
+            ElseIf WsNormLine(paneLines(i), 3) = WsNormLine(body(i), 3) Then
+                ' foldable only when case AND whitespace are both folded: count it as
+                ' case-only (the editor's identifier/keyword normalisation is the case
+                ' half); whitespaceOnlyLineCount reports the pure-whitespace lines.
+                caseCnt = caseCnt + 1
+            Else
+                realCnt = realCnt + 1
+            End If
+        End If
+    Next
+    For i = bn To paneN - 1
+        If Len(paneLines(i)) > 0 Then
+            realCnt = realCnt + 1
+            If firstDiff = 0 Then firstDiff = i + 1
+        Else
+            wsCnt = wsCnt + 1
+        End If
+    Next
+    d("caseOnlyLineCount") = caseCnt
+    d("whitespaceOnlyLineCount") = wsCnt
+    d("realLineCount") = realCnt
+    d("paneLineCount") = paneN
+    d("diskBodyLineCount") = bn
+    d("hiddenAttributeLinesDropped") = hiddenN
+    d("diskEolNonCrlf") = nonCrlf
+    If firstDiff > 0 Then d("firstDiffLine") = firstDiff
+    If realCnt > 0 Then
+        d("classification") = "real"
+        d("basis") = "at least one line differs beyond identifier/keyword case and whitespace folding (a string-literal, comment or token change); case folding is scoped to code outside string literals and comments"
+    ElseIf caseCnt > 0 Then
+        d("classification") = "case_only"
+        If wsCnt > 0 Then
+            d("basis") = "every differing line folds away, with at least one identifier/keyword case difference (VB6 is case-insensitive for code tokens; string-literal and comment text is compared exactly). whitespaceOnlyLineCount reports " & CStr(wsCnt) & " additional whitespace-foldable line(s)."
+        Else
+            d("basis") = "all differing lines fold away by ASCII case alone, and only for code tokens outside string literals and comments; VB6 identifiers/keywords are case-insensitive, so this is the editor's automatic case correction, not a source change"
+        End If
+    ElseIf wsCnt > 0 Then
+        d("classification") = "whitespace_only"
+        d("basis") = "all differing lines fold away by whitespace alone (indentation / spacing / blank lines) outside string literals and comments; no token changed"
+    ElseIf nonCrlf Then
+        d("classification") = "eol_only"
+        d("basis") = "the code text is identical line by line; the file uses non-CRLF line endings (the code pane always uses CRLF)"
+    Else
+        d("classification") = "identical"
+        d("basis") = "the code-pane text equals the component file's code text (header and hidden inline Attribute lines excluded); the IDE's dirty flag is set although the code text is identical. designer/layout properties are outside this comparison"
+    End If
+End Sub
+
+' Build the paneVsDisk block for one dirty component. Never raises: an unreadable file,
+' a missing file or an oversized component answers unknown + a basis, never a false real.
+Private Function WsPaneVsDisk(ByVal comp As VBIDE.VBComponent) As Object
+    Dim d As Object
+    Dim nm As String, pane As String, path As String, diskRaw As String, encUsed As String
+    Dim paneLines() As String, diskLines() As String
+    Dim paneN As Long, diskN As Long
+    Dim nonCrlf As Boolean
+    Dim pFirst As Long, i As Long, j As Long
+    Dim cands(1 To 8) As Long
+    Dim nc As Long, cand As Long
+    Dim best As Long, bestScore As Long, sc As Long, bn As Long, hn As Long
+    Dim bestBodyN As Long, bestHidden As Long
+    Set d = CreateObject("Scripting.Dictionary")
+    d("classification") = "unknown"
+    d("caseOnlyLineCount") = 0
+    d("whitespaceOnlyLineCount") = 0
+    d("caseFoldingScope") = "identifiers_only"
+    d("truncated") = False
+    Set WsPaneVsDisk = d
+    On Error Resume Next
+    nm = ""
+    nm = comp.Name
+    pane = ""
+    pane = McpCls.ComponentPaneText(Me, comp)
+    path = ""
+    path = DiskPathOf(nm, "")
+    If Len(path) = 0 Then
+        d("basis") = "the component has no file bound to it (new/unsaved component), so there is nothing to compare; unknown is reported instead of real"
+        Err.Clear
+        Exit Function
+    End If
+    If Dir$(path) = "" Then
+        d("basis") = "the component file is not on disk (" & path & "), so there is nothing to compare; unknown is reported instead of real"
+        Err.Clear
+        Exit Function
+    End If
+    diskRaw = ""
+    encUsed = ""
+    Build.ReadLogAny path, diskRaw, encUsed
+    If encUsed = "unreadable" Then
+        d("basis") = "the component file could not be decoded (read failure), so no comparison was made; unknown is reported instead of real"
+        Err.Clear
+        Exit Function
+    End If
+    If Len(pane) + Len(diskRaw) > 4000000 Then
+        d("classification") = "unknown"
+        d("truncated") = True
+        d("basis") = "not compared: pane+file text is " & CStr(Len(pane) + Len(diskRaw)) & " chars, above the 4000000-char comparison budget; truncated=true"
+        Err.Clear
+        Exit Function
+    End If
+    paneLines = WsSplitLines(pane, paneN)
+    diskLines = WsSplitLines(diskRaw, diskN)
+    ' a text that ends with a line break carries one extra empty line: drop it from the
+    ' file side only (the code pane never ends with a break)
+    If diskN > 0 Then
+        If Len(diskLines(diskN - 1)) = 0 Then diskN = diskN - 1
+    End If
+    nonCrlf = WsHasNonCrlfEol(diskRaw)
+    pFirst = -1
+    For i = 0 To paneN - 1
+        If Len(paneLines(i)) > 0 Then
+            pFirst = i
+            Exit For
+        End If
+    Next
+    If pFirst < 0 Then
+        d("classification") = "identical"
+        d("paneLineCount") = paneN
+        d("diskBodyLineCount") = 0
+        d("basis") = "the code pane carries no non-empty line; there is no code text to compare (the file header is not code). designer/layout properties are outside this comparison"
+        Err.Clear
+        Exit Function
+    End If
+    nc = 0
+    For j = pFirst To diskN - 1
+        If WsLenientEq(diskLines(j), paneLines(pFirst)) Then
+            cand = j - pFirst
+            If cand >= 0 Then
+                nc = nc + 1
+                cands(nc) = cand
+                If nc >= 8 Then Exit For
+            End If
+        End If
+    Next
+    If nc = 0 Then
+        d("classification") = "real"
+        d("firstDiffLine") = pFirst + 1
+        d("realLineCount") = 1
+        d("caseOnlyLineCount") = 0
+        d("whitespaceOnlyLineCount") = 0
+        d("paneLineCount") = paneN
+        d("basis") = "the pane's first non-empty line does not occur in the file even after case/whitespace folding, so at least that line is a real change; a line-by-line body classification is not available without an anchor"
+        Err.Clear
+        Exit Function
+    End If
+    best = 0
+    bestScore = -1
+    bestBodyN = 0
+    bestHidden = 0
+    For i = 1 To nc
+        sc = WsCandidateScore(paneLines, paneN, diskLines, diskN, cands(i), bn, hn)
+        If bestScore < 0 Then
+            bestScore = sc
+            best = cands(i)
+            bestBodyN = bn
+            bestHidden = hn
+        ElseIf sc < bestScore Then
+            bestScore = sc
+            best = cands(i)
+            bestBodyN = bn
+            bestHidden = hn
+        End If
+    Next
+    WsClassifyAt d, paneLines, paneN, diskLines, diskN, best, nonCrlf, bestHidden
+    d("anchorCandidates") = nc
+    d("mappingBasis") = "body start chosen among " & CStr(nc) & " candidate header length(s) by minimal unfoldable-line count; hidden inline Attribute lines dropped"
+    Err.Clear
+End Function
 ' FAILING components in detail. READ-ONLY.
 Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String, ByVal baselineText As String, ByVal requireCompiler As Boolean) As String
     Dim root As Object
@@ -26739,9 +27675,14 @@ Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String,
         d("foldableOnly") = foldable
         Dim provenDiff As Boolean
         provenDiff = False
-        If Not ideEq Then provenDiff = True
         Dim vd As String
         vd = JsonUnescape(JsonFieldRaw(vo, "ideDisk"))
+        If Not ideEq Then provenDiff = True
+        ' v1.16.6: NOT-ALIGNED is an UNPROVEN comparison, not a proven difference.
+        ' ideEqualsDisk is still false (the pane block was not found verbatim), but no
+        ' differing line was ever named, so the component lands in unknowns[] - never in
+        ' failures[], which is reserved for PROVEN inconsistencies.
+        If vd = "NOT-ALIGNED" Then provenDiff = False
         If (vd = "MISMATCH" Or vd = "NOT-SYNCED" Or vd = "READ-FAIL") And (Not foldable) Then provenDiff = True
         ' FIX-27 (R4.8) / FIX-28: a component whose recorded build compiled the PANE while the DISK
         ' differed has NO verdict about the disk source. That is UNPROVEN, not proven bad: it goes
@@ -26807,6 +27748,14 @@ Private Function ToolVerifyScope(ByVal comps As Object, ByVal pathArg As String,
                 failN = failN + 1
                 fails.Add d
             End If
+        ElseIf vd = "NOT-ALIGNED" Then
+            d("failBasis") = "none"
+            d("bucket") = "unknown"
+            d("reason") = "ide_disk_diff_unproven"
+            d("alignedBasis") = JsonUnescape(JsonFieldRaw(vo, "ideDiskAlignedBasis"))
+            d("howToProceed") = "save_project (or reload_component) so the FILE matches the PANE, then re-run verify; a comparison whose alignment could not be PROVEN names no differing line, so it is reported as unknown rather than as a source inconsistency"
+            unknownN = unknownN + 1
+            unknowns.Add d
         ElseIf overall = "FAIL" Or overall = "UNKNOWN" Then
             d("failBasis") = "none"
             d("bucket") = "unknown"
@@ -27986,6 +28935,15 @@ Private Function ToolMcpInfo() As String
     Set d("registration") = Util.RegistrationInfo()
     mcpRegUs = WinOps.WoProfNow() - mcpTmp
     Set d("build") = b
+
+    ' v1.16.9 ADDITIVE (the 2026-10-20 loaded-image incident): the RUNNING image, re-derived from this
+    ' process's OWN module handle and re-hashed against the file on disk NOW. build{} above
+    ' keeps its existing load-time semantics byte for byte; this block is the second,
+    ' independent fact the 2026-10-20 incident needed (an IDE kept executing a replaced DLL
+    ' while every receipt still named the old sha as "the build").
+    mcpTmp = WinOps.WoProfNow()
+    Set d("loadedModule") = LoadedModuleJson()
+    mcpShaUs = mcpShaUs + (WinOps.WoProfNow() - mcpTmp)
     mcpTmp = WinOps.WoProfNow()
     If m_miBreaking Is Nothing Or mcpNoCache Then
         Set m_miBreaking = BreakingList()
@@ -28091,6 +29049,127 @@ Private Function ToolMcpInfo() As String
     Util.LogLine mcpLine
 End Function
 
+' =====================================================================
+' v1.16.9: WHAT IS THE RUNNING PROCESS EXECUTING?
+' mcp_info.build{} is the LOAD-TIME record (path + hash captured when the module was
+' loaded). It answers "which file did we start from", and by design it does NOT change
+' when that file is replaced under a live IDE. The 2026-10-20 incident is exactly that
+' gap: every receipt named a build sha while the IDE kept executing a different image.
+' This block answers the OTHER question, from the process itself:
+'   path   <- GetModuleHandleW("VB6MCP.dll") + GetModuleFileNameW on THAT handle, i.e. the
+'             module this process has loaded (re-derived on every call, not memoized);
+'   sha256 <- the hash captured when the module was loaded (memoized), so it keeps naming
+'             the RUNNING image after the file on disk is replaced;
+'   disk{} <- the SAME path re-hashed NOW, so a redeploy under a running IDE is visible as
+'             mismatch:true with a one-line note.
+' build.sha256 / build.path are NOT touched - they keep their existing semantics. When an
+' API fails, the block answers available:false + reason and never a fabricated value.
+' =====================================================================
+Private Function LoadedModuleJson() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("available") = False
+    On Error Resume Next
+    Dim modName As String, hMod As Long, handleErr As Long, handleBasis As String
+    modName = "VB6MCP.dll"
+    hMod = 0
+    handleErr = 0
+    hMod = OwnModuleHandleW(StrPtr(modName))
+    If hMod = 0 Then
+        handleErr = Err.LastDllError
+        hMod = App.hInstance
+        handleBasis = "GetModuleHandleW(VB6MCP.dll) returned 0 in THIS process (Err.LastDllError=" & CStr(handleErr) & "), so the handle the add-in got for its own module (App.hInstance) was used instead"
+    Else
+        handleBasis = "GetModuleHandleW(VB6MCP.dll) in THIS process"
+    End If
+    Dim p As String, buf As String, n As Long, fnErr As Long
+    p = ""
+    buf = String$(1024, Chr$(0))
+    n = 0
+    fnErr = 0
+    n = OwnModuleFileNameW(hMod, StrPtr(buf), 1024)
+    If n <= 0 Then
+        fnErr = Err.LastDllError
+        d("reason") = "GetModuleFileNameW failed for the loaded module handle (Err.LastDllError=" & CStr(fnErr) & "), so the loaded module path is UNKNOWN and no path or hash is claimed"
+        d("handleBasis") = handleBasis
+        d("moduleHandle") = hMod
+        Err.Clear
+        Set LoadedModuleJson = d
+        Exit Function
+    End If
+    If n >= 1024 Then n = 1023
+    p = Left$(buf, n)
+    d("available") = True
+    d("path") = p
+    d("moduleHandle") = hMod
+    d("handleBasis") = handleBasis
+    ' the RUNNING image's file identity. It MUST be the hash captured at add-in INITIALIZE:
+    ' hashing on the FIRST mcp_info call would hash whatever is on disk at that moment - and a
+    ' DLL replaced before that first call would then look "equal", which is exactly the
+    ' confusion this block exists to remove. CodeTools.Init seeds OwnDllPath + BuildSha256 on
+    ' connection and BuildSha256 stamps m_buildShaAtText, so the age of the value is auditable.
+    ' When that initialize-time basis is missing the block answers basis_unavailable instead of
+    ' presenting a current-file hash as the loaded image.
+    Dim loadedSha As String, shaBasis As String
+    Dim shaReliable As Boolean
+    loadedSha = ""
+    shaBasis = ""
+    shaReliable = False
+    If StrComp(p, OwnDllPath(), vbTextCompare) <> 0 Then
+        d("pathMismatch") = True
+        d("pathMismatchNote") = "the loaded module path differs from the load-time record build.path, so no load-time hash exists for it; THIS path was hashed now"
+        loadedSha = Encoding.Sha256HexFile(p)
+        shaBasis = "hashed now: the loaded module path differs from build.path"
+        d("shaBasisReliable") = False
+    ElseIf Len(m_buildShaAtText) = 0 Or Len(m_buildSha) = 0 Then
+        d("available") = False
+        d("reason") = "basis_unavailable: no initialize-time module identity was captured (the add-in seeds it in Init on connection), so a LOAD-TIME hash cannot be told apart from the CURRENT file; no sha256 and no mismatch is claimed"
+        shaBasis = "unavailable: the initialize-time hash memo is empty"
+    Else
+        loadedSha = m_buildSha
+        shaReliable = True
+        d("hashCapturedAt") = m_buildShaAtText
+        d("shaBasisReliable") = True
+        shaBasis = "load-time: captured at add-in INITIALIZE (" & m_buildShaAtText & "), before any receipt was produced, so it names the RUNNING image even after the file on disk is replaced"
+    End If
+    If Len(loadedSha) > 0 Then
+        d("sha256") = loadedSha
+        d("shaBasis") = shaBasis
+    End If
+    ' the DISK / deployed side: the same path, hashed NOW.
+    Dim disk As Object, diskSha As String, diskErr As Long
+    Set disk = CreateObject("Scripting.Dictionary")
+    disk("available") = False
+    disk("path") = p
+    disk("basis") = "the file at loadedModule.path, re-hashed NOW (the disk/deployed side)"
+    diskSha = ""
+    diskErr = 0
+    diskSha = Encoding.Sha256HexFile(p)
+    If Len(diskSha) > 0 Then
+        disk("available") = True
+        disk("sha256") = diskSha
+        disk("hashedAt") = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    Else
+        diskErr = Err.LastDllError
+        If diskErr = 0 Then diskErr = Err.Number
+        disk("reason") = "the file could not be read for hashing (Err.LastDllError/Err.Number=" & CStr(diskErr) & "); no disk hash is claimed"
+    End If
+    Set d("disk") = disk
+    If disk("available") Then
+        If Len(loadedSha) > 0 Then
+            If shaReliable Then
+                d("mismatch") = (StrComp(loadedSha, diskSha, vbTextCompare) <> 0)
+                If d("mismatch") Then
+                    d("mismatchNote") = "the DLL ON DISK is not the image THIS PROCESS IS RUNNING: loadedModule.sha256 names the loaded image, loadedModule.disk.sha256 names the file now. The IDE keeps executing the old image until it is restarted."
+                End If
+            End If
+        End If
+    End If
+    d("basis") = "path: " & handleBasis & " + GetModuleFileNameW - the module this process actually loaded, NOT a deployment record; sha256: " & shaBasis & "; disk{}: the same path re-hashed now. build{} keeps its own load-time semantics."
+    Err.Clear
+    Set LoadedModuleJson = d
+End Function
+
 Private Function BreakingEntry(ByVal since As String, ByVal what As String, ByVal instead As String) As Object
     Dim e As Object
     Set e = CreateObject("Scripting.Dictionary")
@@ -28165,6 +29244,9 @@ Private Function BreakingList() As Object
     c.Add BreakingEntry("v1.16.0", _
         "ADD-IN face, purely ADDITIVE: breakpoints gains the action value probe (behavioural breakpoint verification) and verify / verify_scope gain ONE OPTIONAL boolean parameter, requireCompiler (default false)", _
         "no parameter was removed or retyped and no receipt changes when the new action/parameter is absent. breakpoints{action:probe} REALLY STARTS the program (design state + no modal box required, bounded by timeout_ms, always ended, never saved) and answers probeResult=stopped_at_target|stopped_elsewhere|did_not_stop|timeout|run_failed plus target/position/stateBefore/stateAfter/probeCleanup. verify/verify_scope{requireCompiler:true} REFUSE with reason=compiler_not_configured + compilerProbe{resolved,path,why} when no compiler is available (a lint verdict is never substituted) and otherwise answer authority=compiler + compiler{path,logPath,errorCount,artifactChanged}. Tool count unchanged: add-in 120 -> 120; hub and DSH-facing counts are unaffected by this add-in-face change.")
+    c.Add BreakingEntry("v1.16.7", _
+        "the add-in git tool was REMOVED (status / diff / log) and workspace_status no longer has a git half", _
+        "drop every git tool call; workspace_status now returns only the IDE half (dirtyComponents / dirtyCount / ideOpenComponents / readOnly) and accepts no arguments, so remove its repo argument and stop reading workspace_status.git / .diffStat / .branch")
     Set BreakingList = c
 End Function
 
@@ -28188,6 +29270,7 @@ Private Function MigrationsList() As Object
     c.Add "v1.14.0: ide_restart is a CONTINUABLE operation - it waits at most wait_ms (default 25000, env VB6MCP_HUB_RESTART_WAIT_MS, clamped 1500..300000) and then answers ok:false + pending:true + state=""in_progress"" + opId + currentStep + lastKnownState (this is NOT a failure; do NOT start a second restart). Continue it with ide_restart{opId:""...""} - that reads the in-process registry (30 minute TTL, forgotten by a hub restart) and starts NOTHING. A second restart while one is in flight answers reason=restart_in_progress + inProgress{opId}. The content channel is now ONE document for array/scalar bodies: {singleDocument:true, data, receipt}; an empty result is data:[]; VB6MCP_LEGACY_TEXTBODY=1 restores the old two-part form for one version"
     c.Add "v1.15.0: run_project(observe) is bounded by observe_max_wait_ms (default timeout_ms, clamped 1000..120000) and can end at done_marker:{path,contains} (path on the IDE machine; first 65536 bytes read as bytes; contains is case-sensitive; non-ASCII tried as UTF-8 and as ANSI); state is a CLOSED FIVE-value set: done-by-marker (ONLY when marker.matched:true), exited (the program ended normally), break, error, timeout - and a requested-but-unmatched marker reports marker.unmet:true - with observedState/elapsedMs/marker{...}/pipeReleasedByReturn. The budget is enforced INSIDE the wait loop, so a timeout is a real early return: ok:true + timeout:true + retrySafe:true + suggestedAction=observe_again, elapsedMs measured (a parsed-but-unused budget let the live build run to program exit). observe in BREAK is " & _
         "refused with observe_in_break_not_supported. get_locals in BREAK is refused with break_eval_requires_opt_in unless allowUnsafeInBreak:true (informed consent: it does NOT guarantee no hang; recover with the hub-side ide_kill_and_relaunch, not taskkill); every failure receipt carries gateReleased + howToRecover"
+    c.Add "v1.16.7: the add-in git tool is GONE - no status/diff/log queries from the tool face; workspace_status lost its repo argument and its git{} block (dirtyComponents/dirtyCount/ideOpenComponents/readOnly remain). Remove git tool calls and the workspace_status repo argument from callers; use your own VCS tooling for repository state."
     Set MigrationsList = c
 End Function
 
@@ -28222,6 +29305,10 @@ Private Function ChangelogList() As Object
     c.Add "v1.14.0 hub face only (add-in 120 -> 120, hub 11 -> 11, DSH-facing 131 -> 131): ide_restart gains OPTIONAL wait_ms + opId (continuable operation: bounded wait, pending receipt with opId, ide_restart{opId} status query that starts nothing, one restart at a time with restart_in_progress); every path carries opId/state/currentStep/lastKnownState/elapsedMs; content[0].text is ONE JSON document for array/scalar bodies ({singleDocument:true, data, receipt}; empty = data:[]), a non-JSON body becomes a structured content_not_json document, object bodies are unchanged, and VB6MCP_LEGACY_TEXTBODY=1 keeps the old two-part form for one version; the bridge transport-failure envelope gains peerState=peer_dead when the peer process is provably gone (lostContext + howToRecover pointing at the hub-side reset)"
     c.Add "v1.15.0 add-in face (add-in 120 -> 120, hub 11 -> 11, DSH-facing 131 -> 131): run_project +observe_max_wait_ms/+done_marker (bounded observe, decidable five-value state - done-by-marker implies marker.matched:true, marker.unmet:true when a requested marker never matched - and no held gate after a timeout), observe in BREAK refused, #32770 precheck/classification (an IDE Find/Replace dialog is ide_own_dialog, never a program error), the observe budget enforced INSIDE the wait loop (state=timeout is ok:true + timeout:true + retrySafe + observe_again with measured elapsedMs), get_locals +allowUnsafeInBreak (BREAK refused by default, gateReleased/howToRecover on failures, recovery via the hub-side ide_kill_and_relaunch); ToolBudgetMs gains a run_project branch so the observe budget no longer falls through the generic 120 s ceiling"
     c.Add "v1.16.0 ADD-IN face, purely additive (no tool added or removed: add-in 120 -> 120, hub and DSH-facing counts unchanged): breakpoints{action:probe} is exposed on the tool face as the BEHAVIOURAL breakpoint verifier - it really starts the program (design state, no modal box, bounded by timeout_ms, always ended, never saved) and reports probeResult stopped_at_target/stopped_elsewhere/did_not_stop/timeout/run_failed plus target/position/stateBefore/stateAfter/probeCleanup/diskWrites; verify and verify_scope gain the OPTIONAL requireCompiler (default false = byte-identical receipt) which demands a REAL isolated VB6.EXE /make verdict (authority=compiler + compiler{path,logPath,errorCount,artifactChanged}) and refuses with reason=compiler_not_configured + compilerProbe{resolved,path,why} instead of ever letting lint stand in for the compiler; contract v1.15.0 -> v1.16.0"
+    c.Add "v1.16.6 HONESTY/criterion batch (add-in 120 -> 120, hub 11 -> 11, DSH-facing 131 -> 131; no tool, parameter or description changed, so tools/list and the frozen schema are UNCHANGED): (1) verify/verify_scope no longer answer MISMATCH on a pane/disk pair they could not ALIGN - the new verdict NOT-ALIGNED publishes ideDiskAligned:false + ideDiskAlignedBasis and names NO differing line, and overall becomes UNKNOWN (uncertainty is not a proven inconsistency; verify_scope puts it in unknowns[] with reason=ide_disk_diff_unproven, never failures[]); when an alignment IS proven by content anchors the differing-line list is computed at the proven offset and MISMATCH keeps its meaning. (2) " & _
+          "get_component_code now reports startLineDisk/endLineDisk from the ACCUMULATED pane->disk map (hidden inline Attribute lines included) with startLineDiskExact/endLineDiskExact saying which basis was used - previously the scalar headerOffset could disagree with the number the same receipt printed. (3) build cache hits publish the subprocess-budget group (timedOut:false, budgetEnforced:false, budgetMs:0, budgetSource:not_applicable, childPid:0, childLeftover:false) instead of omitting it; every non-cache and timeout path is byte-identical. (4) contract v1.16.5 -> v1.16.6. Already-true behaviours verified live and documented rather than changed: check_public_api{membersOnly:true,baseline} " & _
+          "compares and publishes counts, check_component{baseline} publishes baseline_diff counts, unknown arguments answer reason=unknown_argument with acceptedArguments, a missing component answers component_not_found with availableComponents, no project answers target_has_no_project, and the trailing-line-break matrix (add_code preserves a submitted trailing CRLF; replace_code set/insert/append/replace normalise it) is documented as measured."
+    c.Add "v1.16.7 GIT REMOVAL (add-in 120 -> 119, hub 11 -> 11, DSH-facing 131 -> 130): the read-only add-in git tool (status / diff / log) is DELETED and workspace_status loses its git half - it no longer accepts repo and no longer starts git.exe, returning only the IDE component model (dirtyComponents / dirtyCount / ideOpenComponents / readOnly). todo_status is unchanged. The tool face change is a REMOVAL, so tools/list and the frozen schema are re-frozen; contract v1.16.6 -> v1.16.7."
     Set ChangelogList = c
 End Function
 
@@ -28332,62 +29419,6 @@ Private Function JsonUnescape(ByVal s As String) As String
         End If
     Loop
     JsonUnescape = Left$(buf, o)
-End Function
-
-Private Function ParsePorcelain(ByVal text As String) As Object
-    Dim arr As Object
-    Set arr = New Collection
-    Dim lines() As String, i As Long, ln As String
-    text = Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf)
-    lines = Split(text, vbLf)
-    For i = 0 To UBound(lines)
-        ln = lines(i)
-        If Len(ln) > 3 Then
-            If Left$(ln, 3) <> "## " Then
-                Dim d As Object
-                Set d = CreateObject("Scripting.Dictionary")
-                d("status") = Left$(ln, 2)
-                d("path") = Trim$(Mid$(ln, 4))
-                arr.Add d
-            End If
-        End If
-    Next
-    Set ParsePorcelain = arr
-End Function
-
-Private Function BranchOfPorcelain(ByVal text As String) As String
-    BranchOfPorcelain = ""
-    Dim lines() As String, i As Long, b As String
-    Dim p As Long
-    text = Replace(Replace(text, vbCrLf, vbLf), vbCr, vbLf)
-    lines = Split(text, vbLf)
-    For i = 0 To UBound(lines)
-        If Left$(lines(i), 3) = "## " Then
-            b = Mid$(lines(i), 4)
-            p = InStr(b, "...")
-            If p > 0 Then b = Left$(b, p - 1)
-            BranchOfPorcelain = Trim$(b)
-            Exit Function
-        End If
-    Next
-End Function
-
-Private Function CountTag(ByVal text As String, ByVal tag As String) As Long
-    CountTag = 0
-    Dim p As Long, i As Long, s As String, ch As String
-    p = InStr(1, text, tag, vbBinaryCompare)
-    If p = 0 Then Exit Function
-    i = p + Len(tag)
-    Do While i <= Len(text)
-        ch = Mid$(text, i, 1)
-        If InStr("0123456789", ch) > 0 Then
-            s = s & ch
-            i = i + 1
-        Else
-            Exit Do
-        End If
-    Loop
-    If Len(s) > 0 Then CountTag = CLng(s)
 End Function
 
 ' delta-3 helper: read every .md in a folder and pull the status: line + the H1.
@@ -28930,11 +29961,25 @@ End Function
 ' A MODAL compile-error dialog blocks the whole IDE (end/remove_trace included),
 ' so inject_trace refuses - structurally - to emit a block that cannot compile.
 ' The decision is purely lexical (TraceGen symbol scan + Vb6Lint procedure map).
-Private Function TraceExprRefusal(ByVal name As String, ByVal text As String, ByVal proc As String, ByVal exprs As String) As String
+' v1.17.0 logpoint: this is the ONE shared gate - a single VisibleSymbolsAt scan feeds
+' BOTH the expression check (existing) and the condition check, so there is exactly ONE
+' visible-symbol set and ONE refusal shape. A refusal happens BEFORE EnsureTraceModule,
+' so it attaches nothing and writes nothing (no pane/disk/sha change, no modal dialog).
+Private Function TraceVisibilityRefusal(ByVal name As String, ByVal text As String, ByVal proc As String, ByVal exprs As String, ByVal cond As String) As String
     Dim vis As String, em As String
     Dim insIdx As Long, afterIde As Long
     vis = TraceGen.VisibleSymbolsAt(text, proc, insIdx, afterIde, em)
     If Len(em) > 0 Then Exit Function
+    ' condition structural rules FIRST (the spec rules 1..6); rule 7 (first
+    ' identifier visible at the injection point) uses the SAME set below.
+    Dim condReason As String, condWhy As String
+    If Len(cond) > 0 Then
+        condReason = TraceGen.CondLexicalRefusal(cond, condWhy)
+        If Len(condReason) > 0 Then
+            TraceVisibilityRefusal = TraceCondRefusal(name, proc, afterIde, cond, condReason, condWhy)
+            Exit Function
+        End If
+    End If
     Dim ok As Object
     Set ok = CsvKeySet(vis)
     AddCsvKeys ok, ComponentNamesCsv()
@@ -28960,6 +30005,24 @@ Private Function TraceExprRefusal(ByVal name As String, ByVal text As String, By
             End If
         End If
     Next
+    ' rule 7 for the logpoint condition: its FIRST identifier must be visible at the
+    ' injection point, exactly like an expression (same set, same offender shape).
+    If Len(cond) > 0 Then
+        Dim cex As String, ctok As String
+        cex = Trim$(cond)
+        ctok = TraceGen.LeadingIdent(cex)
+        If Len(ctok) > 0 Then
+            If Not ok.Exists(LCase$(ctok)) Then
+                Dim co As Object
+                Set co = CreateObject("Scripting.Dictionary")
+                co("expression") = cex
+                co("token") = ctok
+                co("source") = "condition"
+                co("why") = "the first identifier of the condition is not a parameter of " & proc & ", not declared above the injection point, and not a module-level or project-level symbol"
+                bad.Add co
+            End If
+        End If
+    End If
     If bad.Count = 0 Then Exit Function
     Dim d As Object
     Set d = CreateObject("Scripting.Dictionary")
@@ -28968,13 +30031,38 @@ Private Function TraceExprRefusal(ByVal name As String, ByVal text As String, By
     d("tool") = "inject_trace"
     d("component") = name
     d("procedure") = proc
+    If Len(cond) > 0 Then d("condition") = cond
     d("insertAfterIdeLine") = afterIde
     Set d("offenders") = bad
     Set d("visibleSymbols") = CsvToCollection(vis, 40)
-    d("rule") = "each expression may reference only a parameter of the procedure, a local/Static declared at or above the injection point, or a module-level/project-level symbol; the check is lexical (VB6 is never asked to compile)"
+    d("rule") = "each expression may reference only a parameter of the procedure, a local/Static declared at or above the injection point, or a module-level/project-level symbol (the first identifier of the logpoint condition is checked with the SAME set); the check is lexical (VB6 is never asked to compile)"
     d("advice") = "move the declaration above the injection point, inject at a later point in the procedure, or drop that expression. Emitting the block unchanged would make the project fail to compile and VB6 would raise a MODAL compile-error dialog that also blocks end and remove_trace."
     d("note") = "the component was NOT modified (the IDE pane, the disk and the pane sha256 are unchanged)"
-    TraceExprRefusal = JsonStringify(d)
+    TraceVisibilityRefusal = JsonStringify(d)
+End Function
+
+' Structural (rules 1..6) condition refusal: the SAME family as the visibility
+' refusal (ok:false + reason + component/procedure/insertAfterIdeLine + the
+' not-modified note), produced BEFORE EnsureTraceModule - nothing is attached
+' and nothing is written.
+Private Function TraceCondRefusal(ByVal name As String, ByVal proc As String, ByVal afterIde As Long, ByVal cond As String, ByVal reason As String, ByVal why As String) As String
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d("ok") = False
+    d("reason") = reason
+    d("tool") = "inject_trace"
+    d("component") = name
+    d("procedure") = proc
+    d("insertAfterIdeLine") = afterIde
+    d("condition") = cond
+    d("conditionChecked") = "lexical"
+    d("conditionGuarantee") = "necessary_not_sufficient"
+    d("conditionRisk") = "a condition that raises or has side effects CHANGES the behaviour of the program when tracing is ON; keep conditions pure/side-effect-free"
+    d("why") = why
+    d("rule") = "the condition must be ONE physical line, at most 512 characters, contain no control character, no colon and no apostrophe (statement separator / comment), balanced double quotes and parentheses, and no standalone block keyword (Then/Else/ElseIf/End); the check is lexical (VB6 is never asked to compile)"
+    d("advice") = "simplify the condition to a single pure expression such as n > 5; a rejected condition writes NOTHING (the IDE pane, the disk and the pane sha256 are unchanged)"
+    d("note") = "the component was NOT modified (the IDE pane, the disk and the pane sha256 are unchanged)"
+    TraceCondRefusal = JsonStringify(d)
 End Function
 
 Private Function CsvKeySet(ByVal csv As String) As Object
@@ -29449,6 +30537,7 @@ Private Function BpProbeJson(ByVal args As Object, ByRef root As Object) As Stri
     Dim hitModule As String
     Dim posObj As Object
     Dim hitText As String
+    Dim targetTextLive As String
     Dim pv As Variant
     Dim textHit As Boolean
     Dim mtAfter As String
@@ -29631,6 +30720,28 @@ Private Function BpProbeJson(ByVal args As Object, ByRef root As Object) As Stri
         tgtObj("paneLine") = lineN
         Set root("target") = tgtObj
         Set cls = McpBpPane.BpClassifyPaneLine(Me, comp, lineN)
+        ' D-B4a fix: in RUN/BREAK the VBIDE project lookup raises and BpClassifyPaneLine's
+        ' On Error Resume Next swallows it into lineClass="component_not_found" + lineText=""
+        ' even though the component IS present (measured B4_044_probe_observe: the same target
+        ' classified statement_line in DESIGN at phase=start). Only in a NON-DESIGN state (the
+        ' debugger owns the IDE: EbMode 1=run / 2=break) and only for the SAME component+pane
+        ' line THIS live probeId measured at phase=start, report THAT design-state
+        ' classification instead. No receipt key and no ledger field is added. The behavioural
+        ' verdict is NOT touched: textHit compares against the LIVE text captured in
+        ' targetTextLive below, and stopped_at_target still keys on the live hitLine only.
+        targetTextLive = CStr(cls("lineText"))
+        If CStr(cls("lineClass")) = "component_not_found" Then
+            If Len(m_bpProbeLiveLineClass) > 0 Then
+                If IdeEbMode() <> 0 Then
+                    If StrComp(m_bpProbeLiveComp, comp, vbTextCompare) = 0 And m_bpProbeLiveLine = lineN Then
+                        cls("lineClass") = m_bpProbeLiveLineClass
+                        cls("lineText") = m_bpProbeLiveLineText
+                        cls("breakable") = m_bpProbeLiveBreakable
+                        cls("reason") = "pane_read_restricted_in_run_or_break: lineClass/lineText are the classification phase=start MEASURED in design for this same component/pane line"
+                    End If
+                End If
+            End If
+        End If
         root("lineClass") = cls("lineClass")
         st = GetIdeState()
         root("stateBefore") = st
@@ -29718,8 +30829,12 @@ Private Function BpProbeJson(ByVal args As Object, ByRef root As Object) As Stri
             root("hitLineText") = hitText
             root("targetLineText") = cls("lineText")
             textHit = False
+            ' D-B4a fix: compare with the LIVE classification text captured in targetTextLive
+            ' BEFORE the start-time fallback above, so a cached target text can never turn a
+            ' line-number mismatch into stopped_at_target (the verdict still keys on the live
+            ' hitLine first and is unchanged).
             If Len(Trim$(hitText)) > 0 Then
-                If LCase$(Trim$(hitText)) = LCase$(Trim$(CStr(cls("lineText")))) Then textHit = True
+                If LCase$(Trim$(hitText)) = LCase$(Trim$(targetTextLive)) Then textHit = True
             End If
             If hitLine = lineN Or textHit Then
                 root("probeResult") = "stopped_at_target"
@@ -29938,6 +31053,13 @@ Private Function BpProbeJson(ByVal args As Object, ByRef root As Object) As Stri
     m_bpProbeLiveAt = Util.TickMs()
     m_bpProbeLiveComp = comp
     m_bpProbeLiveLine = lineN
+    ' D-B4a fix: cache the classification measured ABOVE in DESIGN (the read the pane gave
+    ' phase=start), so phase=observe can still answer lineClass/targetLineText for the SAME
+    ' target when the restricted VBIDE lookup in RUN/BREAK is swallowed. Written only together
+    ' with the live probe id, so a REFUSED start can never clobber the previous probe's cache.
+    m_bpProbeLiveLineClass = CStr(cls("lineClass"))
+    m_bpProbeLiveLineText = CStr(cls("lineText"))
+    m_bpProbeLiveBreakable = CBool(cls("breakable"))
     m_bpProbeLiveLedger = McpBpReg.BpProbeLedgerCount(Me)
     m_bpProbeAwaitEnd = False
     m_bpProbePendingResult = ""
@@ -31682,6 +32804,36 @@ Private Function ToolLastError(ByVal args As Object) As String
     End If
     On Error GoTo LE_ERR
     Set root("errorDialog") = blk
+    ' D2 (OPEN-42 section 4 D2, ADDITIVE ONLY): the dismiss path CLICKS the box
+    ' (McpRe.ReCaptureRuntimeError) BEFORE H3DialogBlock reads it, so once DEBUG has been
+    ' clicked the dialog may already be gone and errorDialog.buttons[] came out EMPTY, while
+    ' the SAME receipt's error{} still carried the full PRE-CLICK button list. Fill ONLY a
+    ' missing list from that snapshot so both blocks of one receipt describe the same box;
+    ' every existing field, key and order is left untouched (no reordering, no new keys).
+    On Error Resume Next
+    If JsonGetBool(args, "dismiss", False) Then
+        If Not blk Is Nothing Then
+            If blk.Exists("buttons") Then
+                If IsObject(blk("buttons")) Then
+                    If blk("buttons").Count = 0 Then
+                        If Not reRes Is Nothing Then
+                            If reRes.Exists("error") Then
+                                Dim d2ErrBlk As Object
+                                Dim d2Btns As Object
+                                Set d2ErrBlk = reRes("error")
+                                If d2ErrBlk.Exists("buttons") Then
+                                    Set d2Btns = d2ErrBlk("buttons")
+                                    If d2Btns.Count > 0 Then Set blk("buttons") = d2Btns
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Err.Clear
+    On Error GoTo LE_ERR
     root("stopped_at") = IIf(present, "error_dialog", "no_error_dialog")
     Dim body As String
     body = ""
@@ -34127,7 +35279,7 @@ End Function
 Private Function MiKeyList() As Variant
     MiKeyList = Array("ok", "modalGuard", "product", "contract", "toolCount", _
         "environment", "errorDecoding", "errorTableEntries", "shaKernel", _
-        "shaFallbackForced", "registration", "build", "breaking", "migrations", _
+        "shaFallbackForced", "registration", "build", "loadedModule", "breaking", "migrations", _
         "changelog", "readOnlyTools", "writeTools", "readOnlyCoverage", _
         "readOnlySource", "callBudgets", "callBudgetInvariants", "ctlTools", "diagnostics")
 End Function

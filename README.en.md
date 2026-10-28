@@ -58,9 +58,9 @@ fills that gap.
 **The approach**: rather than building another editor, **turn the VB6 IDE itself into an MCP
 server**. Load one add-in and the IDE exposes 120 tools: read/search/edit code, static
 checking, anchor-based editing with safe transactions, compilation, run and single-step,
-dialog handling, form and project metadata, snapshots and rollback, packaging. Ten more
+dialog handling, form and project metadata, snapshots and rollback, packaging. Eleven more
 **hub-face** tools (IDE instance management plus the lesson store) run outside the IDE
-process, so a client sees 130 tools in total. **Because the tools live inside the IDE process**,
+process, so a client sees 131 tools in total. **Because the tools live inside the IDE process**,
 they can do what an out-of-process approach cannot: actually click that dialog, actually press
 Run, actually read the local variables at a breakpoint.
 
@@ -206,7 +206,7 @@ Extensibility and Microsoft Add-In Designer; if compilation reports anything abo
 - **Non-loopback binding is impossible**: binding to a non-loopback address is refused and the process
   exits with **code 6** - there is **no override switch**.
 - MCP clients come in through the **hub** `bridge/vb6mcp_hub.mjs` (Node, zero dependencies, stdio): the
-  hub serves the 10 `ide_*` and lesson tools and forwards the add-in face (120 tools) to the middle
+  hub serves the 11 `ide_*` and lesson tools and forwards the add-in face (120 tools) to the middle
   service; it finds the service through `VB6MCP_BRIDGE_URL` (source default `http://127.0.0.1:8767`).
 - The add-in accepts only a **named pipe** (one per IDE instance; a single pipe **does not allow
   concurrent connections**) => clients should multiplex by request id **on one connection** or
@@ -408,7 +408,7 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `remove_project` | Close a project from the IDE workspace | `name` |
 | `save_project` | Save the project and every dirty component | `path` |
 | `vbg_group` | Read or edit a .vbg project group: list, add, remove | `action`, `path`, `project` |
-| `workspace_status` | Show unsaved components beside the git working tree | `repo` |
+| `workspace_status` | List the IDE components that are changed but not yet saved, classified pane-vs-disk (`case_only` / `real` / ...; no VCS access, no parameters) | - |
 
 ### 2. Component lifecycle
 
@@ -509,8 +509,9 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 
 | Tool | What it does | Key parameters |
 |------|--------------|----------------|
-| `inject_trace` | Insert a runtime-guarded McpTrace call, generating the module if absent | `name`, `procedure`, `id` |
+| `inject_trace` | Insert a runtime-guarded McpTrace call, generating the module if absent; optional `condition`/`recordCondition` logpoint | `name`, `procedure`, `id` |
 | `remove_trace` | Remove an injected trace block, keeping the generated module | `name`, `id`, `expected_sha256` |
+| `trace_query` | Read the McpTrace JSONL sink: filter by id/pid/prefix, resume by byte cursor, strict UTF-8, read-only (the read half of `inject_trace`) | `path`, `id_prefix`, `since_offset`, `format` |
 | `project_changes` | Poll the IDE change journal: component and control churn | `since`, `clear` |
 | `get_callstack` | Read the engine's own call stack with per-frame procedure names | `max_frames` |
 | `vba6_probe` | Probe the VBA6 debug engine in-process: mode, callstack, execute | `exec_probe`, `exec_line`, `run_break_probes` |
@@ -560,7 +561,6 @@ To check the whole chain: `python tests/smoke_test.py --port <middle-service por
 | `list_files` | List files under a directory by wildcard, recursively | `path`, `pattern`, `recursive` |
 | `search_in_files` | Search text or regex across files, returning file and line | `query`, `path`, `pattern` |
 | `project_meta` | Read or write .vbp version resources and build metadata | `action`, `path`, `major` |
-| `git` | Read-only Git: status, diff --stat and commit log | `action`, `repo`, `file` |
 
 ### 14. Snapshots, rollback & test host
 
@@ -826,7 +826,7 @@ sha256) - they are not injected into IDE memory.
 
 ## Hub-side recovery primitives and reliability switches (v1.13 - v1.16)
 
-> This section is **user-facing**: what failure each capability fixes, when to use it, and which words in the receipt matter. Field-level contracts are in the v1.13.0 ~ v1.16.5 rows of `docs/CONTRACTS.md`.
+> This section is **user-facing**: what failure each capability fixes, when to use it, and which words in the receipt matter. Field-level contracts are in the v1.13.0 ~ v1.16.7 rows of `docs/CONTRACTS.md`.
 
 1. **`ide_kill_and_relaunch` (v1.13.0, hub-side, does not depend on the add-in pipe)** - the **only** recovery primitive when a pipe is busy/wedged: it stops an instance **this hub owns**, clears its registration, relaunches on the same `.vbp` and polls for readiness. It never touches port 8766, remote instances, or an IDE someone else started. Read `ready` / `threeWay{http,mcpInfo,project}` / `ownership`; `ready:false` only means "the process is up but the add-in has not answered yet" - poll `ide_list` as `howToProceed` says, do not retry the kill.
    **Why**: the add-in is single-threaded; while the pipe is busy even `ide_state{release_inflight:true}` cannot be delivered. The old exit was a manual `Stop-Process` plus restarting the IDE; now one call does it without touching anyone else's instance.

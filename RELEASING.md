@@ -31,6 +31,13 @@ Record `build.status` and the produced `VB6MCP.dll` SHA-256. **The SHA is the id
 release** - every verification item in a release report must name the DLL SHA it was
 measured against.
 
+**Public-tree builds use `CompatibleMode="0"`.** `tools/make_public_export.ps1` rewrites the
+exported `.vbp` to `CompatibleMode="0"` and deletes its `CompatibleEXE32` line (`dist/compat/` is
+maintainer-only). Every public build mints a fresh CLSID - that is normal; `register.reg` registers
+by ProgID, so the add-in still loads. `build.bat` reads the mode from the `.vbp`: mode 2 keeps the
+strict binary-compatibility reference guard, mode 0 prints `Binary-compatibility guard SKIPPED`
+and continues instead of failing on the absent reference.
+
 ## 3. Re-register the add-in (mandatory)
 
 Every build creates a new typelib/GUID, and VB6 rewrites its own `LoadBehavior` on teardown.
@@ -115,6 +122,13 @@ scenarios **against the exact DLL you are shipping**, each labelled with that SH
 * `ide_restart` stops and restarts only this project's own instance (port >= 8767) and proves
   three-way readiness afterwards.
 
+**Transport vs execution (test-box discipline).** File copies to the remote test boxes go over
+Windows file sharing (UNC, e.g. `\\<host>\C$\...`), **never through WinRM**. WinRM is used to
+EXECUTE commands only and is bounded by `MaxShellsPerUser`: parallel batches exhaust it and fail
+with "maximum number of concurrent operations for this user exceeded", so executions are
+serialised/throttled and judged by the command's RETURN, not by retrying. Verify copy integrity
+with `Get-FileHash` on the share side; do not drive that check through remote execution.
+
 ## 7. Machine hygiene
 
 Release only from an idle machine: every VB6 IDE closed, no listener left on the ports you
@@ -130,7 +144,8 @@ git push origin main --tags
 
 Then package the source-only distribution with the export script. It copies the allow-list in
 `PUBLIC_TREE.md` and audits the result (75 files at the time of writing; no build products, no
-backups, no logs, no internal working directories). The output folder's leaf name must start with
+backups, no logs, no internal working directories). Client samples ship too:
+`mcp_config.example.json` (Claude Desktop) and `dsh_mcp.example.yml` (DSH). The output folder's leaf name must start with
 `vb6mcp_pub` - the script refuses anything else, and it refuses a folder inside the repository:
 
 ```bat

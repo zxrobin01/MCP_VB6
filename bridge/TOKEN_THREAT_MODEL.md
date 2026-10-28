@@ -1,4 +1,4 @@
-﻿# Token authentication - threat model and mechanism decision 
+# Token authentication - threat model and mechanism decision 
 
 Status: **threat model FIRST, by author ruling** (ADR sec 0.5 clause 3 and the Lead's card).
 This document decides WHO we defend against and WHAT they can reach; the mechanism at the end is
@@ -23,7 +23,7 @@ is the binding text, and the default tier is unchanged.  The surfaces today:
 
 | # | asset | why it matters |
 |---|---|---|
-| A-1 | the 120-tool face | it is arbitrary code execution *inside the user's VB6 IDE* and arbitrary file write in their project tree - `write_file`, `save_project`, `make_project`, `control_execution`, `quit_ide`, `add_component`, `git` |
+| A-1 | the 119-tool face | it is arbitrary code execution *inside the user's VB6 IDE* and arbitrary file write in their project tree - `write_file`, `save_project`, `make_project`, `control_execution`, `quit_ide`, `add_component` (the read-only `git` tool was removed in contract v1.16.7) |
 | A-2 | the user's source tree and build outputs | read AND write through the same face |
 | A-3 | the running IDE session | can be driven, broken, or closed; unsaved work can be lost |
 | A-4 | the instance registry `instances\*.json` | pipe names, nonces, project paths, DLL sha - enough to attempt impersonation |

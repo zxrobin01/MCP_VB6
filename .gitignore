@@ -44,8 +44,13 @@ fix/
 # Runtime state / editor snapshots (never shipped)
 # .vb6mcp/  = add-in runtime configuration + its logs (written next to the project while the add-in runs)
 # _undo/    = pre-edit pane snapshots written by undo_edit/replace_code/apply_edits
+# bridge/hub_face_cache.json = the hub's OWN runtime face cache (timestamps/fingerprints/instance
+# records). Every hub run rewrites it, so tracking it keeps the worktree permanently dirty and
+# pollutes any "matches HEAD" expectation; it is a live artifact (RELEASING.md section 5) that is
+# regenerated on demand. It must stay on disk untracked, never be committed.
 .vb6mcp/
 _undo/
+bridge/hub_face_cache.json
 
 # Local build intermediates / artifact records (never shipped)
 build/
@@ -57,3 +62,9 @@ dist/*.sha256
 # is just not part of the tree). Tracked files that already live under dist/ stay tracked - this
 # rule only stops NEW build output from showing up as untracked noise.
 dist/
+
+# Stray MSVC object files from local native/RE driver compiles, AT THE REPO ROOT ONLY.
+# There is no tracked .obj anywhere (`git ls-files '*.obj'` is empty) and no build step here
+# produces one, so this hides only leftovers from throwaway driver spikes.  Root-scoped on
+# purpose: a blanket *.obj could mask a real artifact inside a subdirectory.
+/*.obj

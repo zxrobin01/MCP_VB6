@@ -1197,7 +1197,64 @@ const LESSONS_RETRY_MS = 30000;     // a FAILED instructions read is retried, no
 // The add-in's instructions banner is fetched from /mcp, which can take seconds
 // on a busy add-in - so it is BEST EFFORT and never on the discovery critical path.  The
 // first discovery returns without it (the hub then labels the downgrade), later ones carry it.
-const instructionsCache = {};
+//
+// OPEN-27: the banner belongs to ONE add-in binary/instance, NOT to a port.  A pipe-only instance
+// PUBLISHES PORT 0 ON PURPOSE (the named pipe IS its transport; readRegistry turns 0 into null), so
+// a port-keyed cache collapsed EVERY pipe-only IDE onto one key and the hub process replayed the
+// FIRST DLL's banner to every later pipe IDE - a dead DLL's v1.16.4 banner kept answering for a new
+// v1.16.5 DLL until the hub PROCESS was restarted.  A TCP port can be recycled the same way, so a
+// port is never an identity.
+//   key  = endpoint/transport + pid/port/project + the identity the add-in itself reports
+//          (mcp_info contract + build.sha256)
+//   slot = the instance part of the key; a CHANGED dllSha256/addinContract invalidates (and prunes)
+//          the banner cached for the SAME slot, instead of keeping the old one as a second answer.
+// The cache is bounded; evicting an entry only costs one more background /mcp initialize.
+const BANNER_CACHE_MAX = 64;
+const bannerCache = {};               // key -> { at, text, slot, identity }
+function bannerIdentity(fields) {
+  const f = fields || {};
+  const rawPort = f.port;
+  const hasPort = !(rawPort === undefined || rawPort === null || rawPort === '' || Number(rawPort) === 0);
+  return {
+    endpoint: String(f.endpoint === undefined || f.endpoint === null ? '' : f.endpoint),
+    endpointUrl: String(f.endpointUrl === undefined || f.endpointUrl === null ? '' : f.endpointUrl),
+    transport: String(f.transport === undefined || f.transport === null ? '' : f.transport),
+    pid: (f.pid === undefined || f.pid === null) ? null : String(f.pid),
+    port: hasPort ? String(rawPort) : null,
+    project: String(f.project === undefined || f.project === null ? '' : f.project).toLowerCase(),
+    addinContract: String(f.addinContract === undefined || f.addinContract === null ? '' : f.addinContract),
+    dllSha256: String(f.dllSha256 === undefined || f.dllSha256 === null ? '' : f.dllSha256).toUpperCase()
+  };
+}
+function bannerCacheKey(scope, id) {
+  return scope + '|' + JSON.stringify([id.endpoint, id.endpointUrl, id.transport, id.pid, id.port, id.project, id.addinContract, id.dllSha256]);
+}
+function bannerCacheSlot(scope, id) {
+  return scope + '|' + JSON.stringify([id.endpoint, id.endpointUrl, id.transport, id.pid, id.port, id.project]);
+}
+// Drop every banner cached for the same instance SLOT under a DIFFERENT banner identity: the add-in
+// reported a new dllSha256/addinContract, so the old banner is invalid rather than a second answer.
+function bannerCachePruneOther(slot, keepKey) {
+  for (const k of Object.keys(bannerCache)) {
+    const e = bannerCache[k];
+    if (e && e.slot === slot && k !== keepKey) delete bannerCache[k];
+  }
+}
+function bannerCacheGet(key) {
+  const e = bannerCache[key];
+  return (e && typeof e.text === 'string') ? e.text : null;
+}
+function bannerCachePut(key, slot, identity, text) {
+  if (typeof text !== 'string' || !text.length) return null;
+  bannerCachePruneOther(slot, key);
+  bannerCache[key] = { at: Date.now(), text: text, slot: slot, identity: identity };
+  const keys = Object.keys(bannerCache);
+  if (keys.length > BANNER_CACHE_MAX) {
+    keys.sort(function (a, b) { return ((bannerCache[a] && bannerCache[a].at) || 0) - ((bannerCache[b] && bannerCache[b].at) || 0); });
+    for (const k of keys.slice(0, keys.length - BANNER_CACHE_MAX)) delete bannerCache[k];
+  }
+  return bannerCache[key];
+}
 // Instrumentation: VB6MCP_HUB_DEBUG=1 traces every discovery decision to stderr
 // (stderr is never the MCP channel, so this cannot corrupt a response).
 const DEBUG = process.env.VB6MCP_HUB_DEBUG === '1';
@@ -1764,7 +1821,18 @@ function faceFingerprintNow() {
 }
 function saveFaceCache(d) {
   try {
-    const rec = { at: Date.now(), faceFingerprint: faceFingerprintNow(), instances: d.instances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir };
+    // OPEN-27 (second half): the banner is NOT part of the persisted FACE.  initialize.instructions
+    // belongs to the add-in BINARY that answered (contract + build.sha256), and a cache keyed only by
+    // the frozen tool face cannot prove that identity; persisting the text let a matching fingerprint
+    // replay a dead DLL's banner after a hub restart.  Only the FACE is persisted - the banner is
+    // always re-fetched from the live add-in in THIS process (or the frozen snapshot banner is used
+    // with the honest "add-in sent no instructions" wording).
+    const persistedInstances = (Array.isArray(d.instances) ? d.instances : []).map(function (i) {
+      const c = Object.assign({}, i);
+      delete c.instructions;
+      return c;
+    });
+    const rec = { at: Date.now(), faceFingerprint: faceFingerprintNow(), instances: persistedInstances, conflicts: d.conflicts, staleRegistry: d.staleRegistry, registryDir: d.registryDir };
     const prev = readJson(FACE_CACHE, null);
     if (prev && prev.faceNotify) rec.faceNotify = prev.faceNotify;   // the change record outlives a discovery write
     fs.writeFileSync(FACE_CACHE, JSON.stringify(rec, null, 2), 'utf8');
@@ -2862,16 +2930,33 @@ async function probe(port, knownProject, pids, transport) {
       if (txt) { try { const j = JSON.parse(txt); project = j.project || j.name || null; } catch (e2) { } }
     } catch (e) { }
   }
-  // Best-effort banner from the MCP face; /rpc does not implement initialize.  Fetched in the
-  // BACKGROUND so a slow /mcp cannot keep the instance "pending".
-  const instructions = instructionsCache[port] || null;
-  if (!instructions) {
-    instanceRpc(port, transport, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
-      .then(function (init) { const v = init && init.result && init.result.instructions; if (v) { instructionsCache[port] = v; dbg('instructions cached for port ' + port); } })
-      .catch(function () { dbg('instructions fetch failed for port ' + port); });
-  }
   const build = (info && info.build) || {};
   const ide = (info && info.ide) || null;
+  // Best-effort banner from the MCP face; /rpc does not implement initialize.  Fetched in the
+  // BACKGROUND so a slow /mcp cannot keep the instance "pending".  Cached by the INSTANCE identity
+  // (endpoint/transport + pid/project + the LIVE DLL identity mcp_info just reported), NEVER by the
+  // port: a pipe-only instance has port=null and used to share ONE banner with every other pipe IDE.
+  const bannerId = bannerIdentity({
+    endpoint: LOCAL_ENDPOINT,
+    transport: transport || (port ? 'tcp' : 'pipe'),
+    pid: pids[0], port: port, project: project,
+    addinContract: (info && info.contract) || null,
+    dllSha256: (build && build.sha256) || null
+  });
+  const bannerKey = bannerCacheKey('local', bannerId);
+  bannerCachePruneOther(bannerCacheSlot('local', bannerId), bannerKey);
+  const instructions = bannerCacheGet(bannerKey);
+  if (!instructions) {
+    instanceRpc(port, transport, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
+      .then(function (init) {
+        const v = init && init.result && init.result.instructions;
+        if (v) {
+          bannerCachePut(bannerKey, bannerCacheSlot('local', bannerId), bannerId, v);
+          dbg('instructions cached for instance pid=' + bannerId.pid + ' dll=' + (bannerId.dllSha256 || '-') + ' contract=' + (bannerId.addinContract || '-'));
+        }
+      })
+      .catch(function () { dbg('instructions fetch failed for instance pid=' + bannerId.pid); });
+  }
   return { port: port, pid: pids[0], pids: pids, project: project,
            liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools, instructions: instructions,
            // ---- the ONE liveness evidence -------------------------------------
@@ -2895,7 +2980,6 @@ async function probe(port, knownProject, pids, transport) {
 // Keyed per endpoint: local discovery NEVER waits on this map, so a slow or dead remote cannot
 // stall a local call, while two concurrent calls to the SAME endpoint share one probe.
 const remoteProbe = new Map();   // label -> { at, data, promise }
-const remoteInstructionsCache = {};
 function remoteCacheGet(label) {
   const st = remoteProbe.get(label);
   if (!st || !st.data) return null;
@@ -2906,11 +2990,28 @@ function firstText(resp) {
   const c = resp && resp.result && resp.result.content;
   return (Array.isArray(c) && c[0] && typeof c[0].text === 'string') ? c[0].text : null;
 }
-// Best effort, BACKGROUND: the /mcp banner of a remote endpoint (never on a critical path).
-function remoteInstructions(ep, url) {
-  if (remoteInstructionsCache[ep.label]) return remoteInstructionsCache[ep.label];
+// Best effort, BACKGROUND: the /mcp banner of a remote endpoint (never on a critical path).  Keyed
+// by the endpoint + the instance/DLL identity the probe just read, for the same reason the local
+// cache is: an endpoint LABEL alone would keep serving the banner of an IDE/DLL that has since
+// changed behind the same URL (the remote counterpart of OPEN-27).
+function remoteInstructions(ep, url, facts) {
+  facts = facts || {};
+  const id = bannerIdentity({
+    endpoint: ep.label, endpointUrl: url, transport: 'remote',
+    pid: facts.pid, port: facts.port, project: facts.project,
+    addinContract: facts.addinContract, dllSha256: facts.dllSha256
+  });
+  const key = bannerCacheKey('remote', id);
+  const hit = bannerCacheGet(key);
+  if (hit) return hit;
   rpcAt(url, 'initialize', { protocolVersion: LATEST, capabilities: {}, clientInfo: { name: 'vb6mcp-hub', version: SERVER.version } }, null, 3000, '/mcp')
-    .then(function (init) { const v = init && init.result && init.result.instructions; if (v) { remoteInstructionsCache[ep.label] = v; dbg('remote instructions cached for ' + ep.label); } })
+    .then(function (init) {
+      const v = init && init.result && init.result.instructions;
+      if (v) {
+        bannerCachePut(key, bannerCacheSlot('remote', id), id, v);
+        dbg('remote instructions cached for ' + ep.label + ' pid=' + id.pid + ' dll=' + (id.dllSha256 || '-'));
+      }
+    })
     .catch(function () { dbg('remote instructions fetch failed for ' + ep.label); });
   return null;
 }
@@ -2926,10 +3027,18 @@ async function probeRemoteEndpoint(ep, timeoutMs) {
   }
   const tools = (tl && tl.result && tl.result.tools) || [];
   let ide = null, project = null, rawPath = '';
+  // the LIVE DLL identity the remote add-in reported: part of the banner cache key (OPEN-27)
+  let liveContract = null, liveDllSha256 = null;
   try {
     const mi = await rpcAt(url, 'tools/call', { name: 'mcp_info', arguments: {} }, null, timeoutMs);
     const txt = firstText(mi);
-    if (txt) { const j = JSON.parse(txt); if (j && j.ide) ide = j.ide; if (j && j.fileName) rawPath = String(j.fileName); if (j && j.name) project = String(j.name); }
+    if (txt) {
+      const j = JSON.parse(txt);
+      if (j && j.ide) ide = j.ide;
+      if (j && j.fileName) rawPath = String(j.fileName);
+      if (j && j.name) project = String(j.name);
+      if (j) { liveContract = j.contract || null; liveDllSha256 = (j.build && j.build.sha256) || null; }
+    }
   } catch (e) { dbg('remote ' + ep.label + ' mcp_info failed: ' + (e && e.message)); }
   if (!ide || !ide.project || !rawPath) {
     try {
@@ -2950,7 +3059,8 @@ async function probeRemoteEndpoint(ep, timeoutMs) {
     targetKey: ep.label + ':' + (cp.path || ('pid=' + pid)),
     discoveredBy: 'remote_probe', probeStatus: 'ok', pending: false,
     liveTools: tools.map(function (t) { return t.name; }), liveToolDefs: tools,
-    instructions: remoteInstructions(ep, url)
+    instructions: remoteInstructions(ep, url, { pid: pid, port: port, project: project,
+                                                addinContract: liveContract, dllSha256: liveDllSha256 })
   };
   if (MULTI_BRIDGE) candidate.bridge = ep.label;
   return { ok: true, endpoint: ep.label, endpointUrl: url, remote: true, candidate: candidate,
@@ -3971,7 +4081,13 @@ async function cachedDiscovery() {
     // TCP-only: no netstat on a response path.  Transport aware: a pipe-only entry has no port
     // and used to be re-validated as dead here.
     const okp = await instanceAlive(i, null);
-    if (okp) checked.push(localCandidate(i));
+    if (okp) {
+      // OPEN-27: a face cache file written before the banner was excluded may still carry
+      // `instructions`; that text cannot be tied to the DLL running NOW, so it is never replayed.
+      const clean = Object.assign({}, i);
+      delete clean.instructions;
+      checked.push(localCandidate(clean));
+    }
   }
   dbg('cachedDiscovery: file instances=' + c.instances.length + ' still-alive=' + checked.length);
   if (!checked.length) return null;
@@ -4807,21 +4923,53 @@ function offlineResolveLaa(args, vbpSections) {
 // ---- (4) VB6.EXE /make ---------------------------------------------------------------
 const OFFLINE_BUILD_DEFAULT_TIMEOUT_MS = 180000;
 const OFFLINE_BUILD_MAX_TIMEOUT_MS = 600000;
-const COMPILE_ERR_RE = /(?:编译错误|翻译错误|compile error)/i;
+// EXACTLY the add-in's marker set (Build.IsCompileErrorLine): 编译错误 or the English
+// 'compile error'.  翻译错误 is NOT a VB6 marker and must not be accepted here (parity).
+const COMPILE_ERR_RE = /(?:编译错误|compile error)/i;
 const COMPILE_FAIL_RE = /(?:编译失败|生成失败|build failed|failed)/i;
 const COMPILE_BANNER_RE = /(?:Microsoft \(R\) Visual Basic|Copyright \(C\))/i;
+// PARITY with the add-in (Build.BetweenQuotes / Build.LineAfter / Build.FileLineFrom):
+// a file name AND a line number are taken only when BOTH exist, and the number must sit
+// behind the localized 行 / English "line" marker.  Without that requirement a quoted token
+// inside an error sentence plus ANY later digit became a fabricated file/line (measured trap:
+// "变量 'Foo' 未定义 (位于 Form1.frm)" -> file=Foo line=1, while the add-in reports file='').
+function compileLogQuoted(text) {
+  let a = text.indexOf("'");
+  if (a < 0) a = text.indexOf('"');
+  if (a < 0) return '';
+  let b = text.indexOf("'", a + 1);
+  if (b < 0) b = text.indexOf('"', a + 1);
+  if (b < 0) return '';
+  return text.slice(a + 1, b);
+}
+function compileLogLineAfter(text) {
+  // Build.LineAfter: 行 N first, then English "line N"; the FIRST digit run after the
+  // marker wins.  A bare "(N)" grouping is NOT a line number for the add-in.
+  let p = text.indexOf('行 ');
+  let off = 2;
+  if (p < 0) {
+    p = text.toLowerCase().indexOf('line ');
+    if (p < 0) return 0;
+    off = 5;
+  }
+  let num = '';
+  for (let i = p + off; i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (ch >= '0' && ch <= '9') num += ch;
+    else if (num) break;
+  }
+  return num ? Number(num) : 0;
+}
 function compileLogFileLine(text) {
-  const m1 = /['"]([^'"]+?)['"][^\d\r\n]{0,32}?(\d+)/.exec(text);
-  if (m1) return { file: m1[1], line: Number(m1[2]) };
+  const file = compileLogQuoted(text);
+  const line = compileLogLineAfter(text);
+  if (file && line > 0) return { file: file, line: line };
+  // HUB-ONLY EXTENSION (intentional, documented): the unquoted CLI shape `Form1.frm(7)`
+  // that the add-in's parser does not cover.  It only fires when the add-in-compatible rule
+  // above found nothing, so it never contradicts the product rule for the quoted shapes.
   const m2 = /((?:[A-Za-z]:)?[^\s()'"\r\n]+?\.(?:bas|cls|frm|ctl|pag|dsr))\((\d+)\)/i.exec(text);
   if (m2) return { file: m2[1], line: Number(m2[2]) };
   return { file: '', line: 0 };
-}
-function compileLogLineAfter(text) {
-  let m = /(?:行|line)\s*(\d+)/i.exec(text);
-  if (m) return Number(m[1]);
-  m = /\((\d+)\)/.exec(text);
-  return m ? Number(m[1]) : 0;
 }
 function compileLogMsgAfter(line) {
   let p = line.indexOf(' : ');
@@ -4866,8 +5014,9 @@ function parseCompilerLog(raw) {
   if (rawLine) {
     if (matchRule === 'err-marker') { message = compileLogMsgAfter(rawLine) || String(rawLine).trim(); }
     else { message = String(rawLine).trim(); }
+    // file and reportedLine stay BOTH-OR-NEITHER, exactly like Build.FileLineFrom: a line
+    // number without a file name must never be published as a location.
     const fl = compileLogFileLine(rawLine);
-    if (!fl.line) fl.line = compileLogLineAfter(rawLine);
     file = fl.file; reportedLine = fl.line;
   }
   const errorCount = markerCount > 0 ? markerCount : (failAnchor ? 1 : 0);

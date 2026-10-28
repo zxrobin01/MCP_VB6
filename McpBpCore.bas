@@ -232,6 +232,14 @@ Public Function H3ParseErrDescription(Owner As CodeTools, ByVal body As String) 
     ' by zero" / "ÊµÊ±´íÎó '11': ..."), so take the text AFTER the number on the SAME line
     ' first; only then fall back to a following line. Returning "" here means "no description
     ' was parsed", and the caller keeps errDescription=null (never an empty string).
+    ' D1 (OPEN-42 section 4): a VB6 runtime-error header QUOTES the error number, so the
+    ' text after the digits starts with the CLOSING QUOTE and only then with the colon:
+    '   <zh> '5':      /      Run-time error '5':
+    ' The previous code stripped only the colon, so the quote survived and the punctuation
+    ' fragment "':" was returned as the description. The quote is now stripped BEFORE the colon
+    ' (ASCII apostrophe U+0027, LEFT/RIGHT single quotation marks U+2018/U+2019), and a candidate
+    ' with no word character is rejected, so the caller honestly keeps errParsed.description
+    ' false instead of faking a parsed description.
     Dim lines() As String
     lines = Split(Replace(Replace(body, vbCrLf, vbLf), vbCr, vbLf), vbLf)
     Dim i As Long
@@ -265,21 +273,21 @@ Public Function H3ParseErrDescription(Owner As CodeTools, ByVal body As String) 
                 Next
                 Dim rest As String
                 rest = ""
-                If numEnd > 0 Then rest = Trim$(Mid$(t, numEnd + 1))
+                If numEnd > 0 Then rest = H3StripErrHeaderTail(Trim$(Mid$(t, numEnd + 1)))
                 If Len(rest) > 0 Then
-                    If Left$(rest, 1) = ":" Then rest = Trim$(Mid$(rest, 2))
-                    If Left$(rest, 1) = ChrW$(&HFF1A) Then rest = Trim$(Mid$(rest, 2))
-                End If
-                If Len(rest) > 0 Then
-                    H3ParseErrDescription = rest
-                    Exit Function
+                    If H3ErrDescLooksReal(rest) Then
+                        H3ParseErrDescription = rest
+                        Exit Function
+                    End If
                 End If
                 Dim k As Long
                 For k = i + 1 To UBound(lines)
                     rest = Trim$(lines(k))
                     If Len(rest) > 0 Then
-                        H3ParseErrDescription = rest
-                        Exit Function
+                        If H3ErrDescLooksReal(rest) Then
+                            H3ParseErrDescription = rest
+                            Exit Function
+                        End If
                     End If
                 Next
             End If
@@ -287,6 +295,69 @@ Public Function H3ParseErrDescription(Owner As CodeTools, ByVal body As String) 
     Next
 End Function
 
+Private Function H3StripErrHeaderTail(ByVal s As String) As String
+    ' D1 helper: strip the header punctuation that follows the quoted error number, in the
+    ' ORDER the box writes it - closing quote(s) FIRST, then colon(s), then surrounding blanks.
+    ' Quotes handled: ASCII apostrophe (U+0027), LEFT (U+2018) and RIGHT (U+2019) single quote.
+    ' Colons handled: ASCII ':' and FULLWIDTH COLON U+FF1A.
+    H3StripErrHeaderTail = ""
+    Dim ch As String
+    Do While Len(s) > 0
+        ch = Left$(s, 1)
+        If ch = "'" Or ch = ChrW$(&H2018) Or ch = ChrW$(&H2019) Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    s = Trim$(s)
+    Do While Len(s) > 0
+        ch = Left$(s, 1)
+        If ch = ":" Or ch = ChrW$(&HFF1A) Then
+            s = Mid$(s, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    H3StripErrHeaderTail = Trim$(s)
+End Function
+
+Private Function H3ErrDescLooksReal(ByVal s As String) As Boolean
+    ' D1 helper: TRUE only when s carries at least one WORD character (ASCII letter/digit or a
+    ' non-ASCII character that is not punctuation). A punctuation-only fragment such as "':" is
+    ' NOT a description: returning it would make errParsed.description=true on a failed parse.
+    H3ErrDescLooksReal = False
+    Dim j As Long
+    Dim ch As String
+    Dim w As Long
+    For j = 1 To Len(s)
+        ch = Mid$(s, j, 1)
+        w = AscW(ch)
+        If w < 0 Then w = w + 65536
+        If Not H3IsErrPunctChar(ch, w) Then
+            H3ErrDescLooksReal = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Function H3IsErrPunctChar(ByVal ch As String, ByVal w As Long) As Boolean
+    ' D1 helper: TRUE when ONE character is punctuation/whitespace, FALSE when it is a word
+    ' character. The ranges below are the Unicode blocks that only carry punctuation/symbols in
+    ' the languages VB6 localizes its dialogs to; anything else >= 0x80 counts as a word char.
+    H3IsErrPunctChar = True
+    If (ch >= "0" And ch <= "9") Or (ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Then
+        H3IsErrPunctChar = False
+        Exit Function
+    End If
+    If w < &H80 Then Exit Function
+    If w = &H2018 Or w = &H2019 Or w = &H201C Or w = &H201D Then Exit Function
+    If w = &H2013 Or w = &H2014 Or w = &H2026 Or w = &HAB Or w = &HBB Then Exit Function
+    If w >= &H3000 And w <= &H303F Then Exit Function
+    If w >= &HFE30 And w <= &HFE4F Then Exit Function
+    If w >= &HFF00 And w <= &HFFEF Then Exit Function
+    H3IsErrPunctChar = False
+End Function
 Public Function H3ParseErrNumber(Owner As CodeTools, ByVal body As String) As String
     H3ParseErrNumber = ""
     On Error Resume Next

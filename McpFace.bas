@@ -62,7 +62,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pUi = CreateObject("Scripting.Dictionary")
     Set pUi("hwnd") = Prop("integer", "Window handle to read (0 or omitted = resolve the first window of this process whose class matches cls)")
     Set pUi("cls") = Prop("string", "Window class name used when hwnd is 0")
-    Set pUi("depth") = Prop("integer", "How many child-window levels to include (default 3)")
+    Set pUi("depth") = Prop("integer", "How many child-window levels to include (default 3, silently clamped to a MAX of 5; the receipt's depth field reports the value actually used)")
     tools.Add MakeTool("ui_text", _
         "Read the accessible text of a window and its subtree. Tries UI Automation first, then MSAA (AccessibleObjectFromWindow), then WM_GETTEXT. Returns {ok:true, source:'uia|msaa|wm_gettext', text:'...'} or {ok:false, reason:'no_accessible_text', evidence:'...'} plus a channels object with each channel's raw return code/error. A negative result is a legitimate delivery: it is reported with reproducible evidence and never fabricated.", _
         SchemaWith(pUi))
@@ -93,7 +93,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pOpt("read_only_mode") = Prop("boolean", "New read-only mode")
     Set pOpt("read_only_mode_set") = Prop("boolean", "Set true to apply read_only_mode")
     tools.Add MakeTool("set_project_options", _
-        "Change project/IDE options: description, help file/context, startup object, startup project, build output path, active project, read-only mode. startup_object is best-effort: on this build the VBIDE StartUpObject put is rejected for every value, so the response carries startupObjectError + startupObjectWorkaround (edit Startup in the .vbp and reopen) instead of failing the whole call.", _
+        "Change project/IDE options: description, help file/context, startup object, startup project, build output path, active project, read-only mode. startup_object is best-effort: on this build the VBIDE StartUpObject put is rejected for every value, so the response carries startupObjectError + startupObjectWorkaround (edit Startup in the .vbp and reopen) instead of failing the whole call. Each option is applied only when it is supplied as a NON-EMPTY value (help_context_id only when non-zero), so an empty string does NOT clear an existing option - the applied[] array names what actually took effect. The property puts make the IDE persist the project file: the receipt carries diskWrites[{file,beforeBytes,afterBytes,beforeSha,afterSha}] + touchedFiles[] (both EMPTY arrays when this call wrote nothing).", _
         SchemaWith(pOpt))
 
     Dim pOpen As Object
@@ -103,7 +103,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pOpen("allowHostWrite") = Prop("boolean", "33b: only meaningful with exclusive:true. false (default) = REFUSE to close a DIRTY UNTITLED project (would make VB6 write it into the IDE current directory); true = allow the host write and report it (hostWrites/sideEffects.filesWritten). Named dirty projects are unaffected.")
     tools.Add MakeTool("open_project", _
         "Open a project file (.vbp) in the IDE (VBProjects.AddFromFile). Without exclusive it is added to the current workspace. " & _
-        "SAME FILE, SEVERAL SPELLINGS: when the target .vbp is already open - including through an 8.3 short name, forward slashes, different case or a directory alias - the call SHORT-CIRCUITS: it returns alreadyOpen:true with the diskVsMemory comparison and does NOT close or re-add the project. " & _
+        "SAME FILE, SEVERAL SPELLINGS: when the target .vbp is already open - including through an 8.3 short name, forward slashes, different case or a directory alias - the call SHORT-CIRCUITS: it returns alreadyOpen:true with the diskVsMemory comparison and does NOT close or re-add the project. When the on-disk .vbp no longer describes the in-memory project the call still answers alreadyOpen:true but with ok:false + reason=unsaved_changes_would_be_lost | disk_vs_memory_mismatch | project_saved_flag_unreadable + reloadRefused:true: the disk copy is NOT loaded and the in-memory project stays in use (remove_project then open_project to take the disk copy). " & _
         "33b: a SUCCESSFUL open always carries ok:true; IDE API errors that did not stop the open are reported in apiWarnings[] (code/message/raw/phase), never in apiError. With exclusive:true, a DIRTY UNTITLED project would be written into the IDE current directory by the close path (measured); the call REFUSES by default with ok:false + reason=dirty_untitled_would_write + dirtyComponents/cwdCandidateFiles/zeroWriteBasis/... and writes nothing - pass allowHostWrite:true to allow that write and get it reported. The refusal depends ONLY on the project-level evidence (VBProject.Saved=false and no file on disk), never on the component list: dirtyComponents is an ARRAY of {name,isDirty,lines?} when the component flags are readable, and null when they are not - dirtyUnknown:true + componentProbe:""unreadable"" + componentSavedReadErrors[] then carry that fact. zeroWriteBasis names the basis of the zero-write claim (normally pre_cwd_scan_equals_post_cwd_scan). ", _
         SchemaWith(pOpen, Req("path")))
 
@@ -126,7 +126,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRemProj("allowDirty") = Prop("boolean", "false (default) = REFUSE to remove a project with unsaved changes (dirty project or component) because removal discards them; true = discard deliberately. With true, a DIRTY UNTITLED project is still REFUSED unless allowHostWrite:true, because VB6 writes it into the IDE current directory.")
     Set pRemProj("allowHostWrite") = Prop("boolean", "33b: false (default) = REFUSE to close a DIRTY UNTITLED project (VB6 would write it into the IDE current directory); true = allow the host write and report it (hostWrites/sideEffects.filesWritten). Named dirty projects are unaffected.")
     tools.Add MakeTool("remove_project", _
-        "Close (remove) a project from the IDE workspace. 33b: a DIRTY UNTITLED project (no file on disk) would be written into the IDE current directory by VB6 while closing (measured: 工程1.vbp/.vbw + component files, same-named files overwritten) and VBProject.Saved is read-only, so the call REFUSES by default with ok:false + reason=dirty_untitled_would_write + dirtyComponents/cwdCandidateFiles/zeroWriteBasis/... and writes NOTHING; pass allowHostWrite:true to allow the write and get it reported in hostWrites/sideEffects.filesWritten. The refusal depends ONLY on the project-level evidence (VBProject.Saved=false and no file on disk): dirtyComponents is an ARRAY of {name,isDirty,lines?} when the component flags are readable and null when they are not - dirtyUnknown:true + componentProbe:""unreadable"" + componentSavedReadErrors[] then carry that fact, and zeroWriteBasis names the basis of the zero-write claim.", _
+        "Close (remove) a project from the IDE workspace. 33b: with allowDirty:true a DIRTY UNTITLED project (no file on disk) would be written into the IDE current directory by VB6 while closing (measured: 工程1.vbp/.vbw + component files, same-named files overwritten) and VBProject.Saved is read-only, so that call REFUSES unless allowHostWrite:true with ok:false + reason=dirty_untitled_would_write + dirtyComponents/cwdCandidateFiles/zeroWriteBasis/... (allowHostWrite:true then allows the write and reports it in hostWrites/sideEffects.filesWritten). With the default allowDirty:false a dirty project is refused EARLIER as ok:false + reason=unsaved_changes_would_be_discarded, so allowHostWrite:true ALONE does not permit the close. The refusal depends ONLY on the project-level evidence (VBProject.Saved=false and no file on disk): dirtyComponents is an ARRAY of {name,isDirty,lines?} when the component" & _
+        " flags are readable and null when they are not - dirtyUnknown:true + componentProbe:""unreadable"" + componentSavedReadErrors[] then carry that fact, and zeroWriteBasis names the basis of the zero-write claim.", _
         SchemaWith(pRemProj))
 
     ' ---- components ----
@@ -165,7 +166,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         " replace and delete REQUIRE expected_sha256. The chosen remedy is the SHA PIN, not a proc: address space: a whole-pane sha detects ANY drift (a proc-relative address only detects drift across procedure boundaries within the same pane, and it would have to be re-derived from the very text it is meant to pin) - so a drifted pane is refused with sha256_mismatch + the current sha in one retry, and the receipt additionally echoes procBefore/procAfter{proc,startLine,endLine,firstLine,lastLine} so the targeted procedure is visible on both sides." & _
         " (MEASURED; this is NOT an operation property - do not classify by op): whether the pane's final line break survives depends on (a) whether the BASE text already ended with one and (b) WHERE you insert. An insertion in the MIDDLE never touches the tail, so the result INHERITS the base's tail; an insertion at the END rebuilds the tail and normalises it. Measured: same operation (insert, exactly one trailing CRLF submitted) yields result ends_with_crlf=true on a base that already ended with CRLF (middle) and false on a base that did not. Never infer the outcome; the receipt's trailingBlankLine reports what actually happened and newTotalLines counts the way the caller's splitlines() does (a trailing break is not an extra line)." & _
         " the submitted block is checked BEFORE the write - a redundant trailing End <Sub|Function|Property> is refused as extra_procedure_end (with block line numbers, the header/End pairs it did match and a suggestedText), set/append must be self-contained (missing_procedure_end), and any edit that would leave the pane unbalanced is refused as predicted_procedure_imbalance instead of becoming a compile-time E105." & _
-        " Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default). requestedRange has ONE shape per mode: {mode:""range"", operation, start_line, end_line} here and in add_code / guard refusals, {mode:""anchor"", anchor, occurrence, match, scope?} in edit_by_anchor, {mode:""anchor-batch"", ops, match} in apply_edits - branch on mode instead of guessing which shape arrived.", _
+        " Two further PRE-WRITE refusals replace the old silent clamping: an out-of-range replace/delete is refused as reason=range_beyond_end (it is NEVER downgraded to an insert, and deletedLines:0 is no longer a success signal), and an edit that would split a VB line continuation is refused as reason=inside_continuation. Text the ANSI code pane cannot represent is refused as reason=unencodable_text instead of being written with substituted characters. Component is marked unsaved; use save_project. Pass snapshot=true to write a pre-edit pane snapshot that undo_edit can restore (default false = no extra file write; set already snapshots by default). requestedRange has ONE shape per mode: {mode:""range"", operation, start_line, end_line} here and in add_code / guard refusals, {mode:""anchor"", anchor, occurrence, match, scope?} in edit_by_anchor, {mode:""anchor-batch"", ops, match} in" & _
+        " apply_edits (a multi-component batch answers {mode:""anchor-batch-multi"", ops, components, match}) - branch on mode instead of guessing which shape arrived.", _
         SchemaWith(pRep, Req("name", "operation")))
 
     Dim pAddComp As Object
@@ -181,9 +183,9 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pMv("from_component") = Prop("string", "Source component name")
     Set pMv("proc") = Prop("string", "Procedure name to move (exact, case-insensitive)")
     Set pMv("to_component") = Prop("string", "Target component name")
-    Set pMv("insert_anchor") = Prop("string", "Optional exact line in the target after which the block is inserted; omit to APPEND at the end of the target")
+    Set pMv("insert_anchor") = Prop("string", "Optional line in the target after which the block is inserted (matched TRIMMED, first match wins); omit to APPEND at the end of the target")
     tools.Add MakeTool("move_procedure", _
-        "Move a WHOLE procedure block between components in ONE transaction: take the block from the SOURCE pane, insert it into the TARGET (after insert_anchor, or appended), then delete it from the SOURCE. Any failure rolls BOTH panes back (rolledBack:true, restoreVerified proves the read-back). .vbp is never touched. Receipt: moved{from,to,proc,lineCount,insertAfterLine}, sourceSha256Before/After, targetSha256Before/After, rolledBack, restoreVerified, snapshots[], encoding/roundtrip_ok/bom, vbpTouched:false.", _
+        "Move a WHOLE procedure block between components in ONE transaction: take the block from the SOURCE pane, insert it into the TARGET (after insert_anchor, or appended), then delete it from the SOURCE. A failure AFTER the first pane write rolls BOTH panes back (rolledBack:true, restoreVerified proves the read-back); a failure BEFORE any write (reason=proc_not_found / proc_range_out_of_bounds / insert_anchor_not_found) answers rolledBack:false + restoreVerified:false because nothing was written. insert_anchor is matched against TRIMMED target lines and the FIRST match wins. .vbp is never touched. Receipt: moved{from,to,proc,lineCount,insertAfterLine}, sourceSha256Before/After, targetSha256Before/After, rolledBack, restoreVerified, snapshots[], encoding/roundtrip_ok/bom, vbpTouched:false.", _
         SchemaWith(pMv, Req("from_component", "proc", "to_component")))
 
     Dim pDp As Object
@@ -191,7 +193,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pDp("procedures") = Prop("array", "Procedure list: either [{component,proc}, ...] or plain proc names (then component names the single component)")
     Set pDp("component") = Prop("string", "Component used for plain proc-name entries")
     tools.Add MakeTool("delete_procedures", _
-        "Delete SEVERAL procedures in ONE transaction: a pre-edit _undo pane snapshot is written for every touched component (undo_edit can restore it); if any deletion fails every touched pane is restored. Receipt: deleted[]{component,proc,fromLine,toLine,lineCount}, snapshotId, rolledBack, restoreVerified, shas[].", _
+        "Delete SEVERAL procedures in ONE transaction: a pre-edit _undo pane snapshot is written for every touched component (undo_edit can restore it); if any deletion fails every touched pane is restored. Receipt: deleted[]{component,proc,fromLine,toLine,lineCount}, snapshotId (a FIXED marker string, not a snapshot handle - list the real snapshots with undo_edit{action:'list'} and restore one by its ts), rolledBack, restoreVerified, shas[].", _
         SchemaWith(pDp, Req("procedures")))
 
     Dim pBa As Object
@@ -205,25 +207,27 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         SchemaWith(pBa, Req("path", "old_bytes_b64", "new_bytes_b64")))
 
     tools.Add MakeTool("add_component", _
-        "Create a new component in the active project with optional name and initial code. Standard forms fall back to a generated .frm + AddFile when VBComponents.Add(vbext_ct_MSForm) fails with E_FAIL.", _
+        "Create a new component in the active project with optional name and initial code. type=form is ALWAYS built through the synthesized .frm + AddFile route (the IDE's Add Form menu is never used): it writes <ProjectDir>\<name>.frm, is refused with reason=project_dir_unavailable when the project has no file on disk yet, and refused with reason=project_dir_write_not_allowed when project-directory writes are disabled. On success the component file is written and the .vbp is updated atomically (vbpChanged / vbpSha256Before / vbpSha256After / vbpBackupPath / rolledBack). For the designer types form / mdiform / usercontrol the component IS created (the paired .frm and the .vbp are in sync), but this atomic path cannot manage the paired binary: the receipt carries pairedBinaryUnsupported:true + pairedBinaryReason whose text says ""nothing was changed"" - that statement is WRONG, something WAS" & _
+        " changed - and its howToProceed says to call add_component again. Do NOT retry: a second add_component creates a DUPLICATE component. Materialise the paired binary with save_project instead.", _
         SchemaWith(pAddComp, Req("type")))
 
     Dim pRemComp As Object
     Set pRemComp = CreateObject("Scripting.Dictionary")
     Set pRemComp("name") = Prop("string", "Component name to remove")
     tools.Add MakeTool("remove_component", _
-        "Remove a component from the project (VBComponents.Remove). Cannot be undone; the IDE will ask about the file.", _
+        "Remove a component from the project (VBComponents.Remove). Cannot be undone. Two disk side effects are REPORTED, not hidden: VBComponents.Remove leaves <ProjectDir>\<name><ext> in place (removedFile + removedFileNote say so and the file is NOT deleted), and the .vbp is updated atomically (vbpChanged / vbpSha256Before / vbpSha256After / vbpBackupPath / rolledBack / removedVbpLines).", _
         SchemaWith(pRemComp, Req("name")))
 
     Dim pImp As Object
     Set pImp = CreateObject("Scripting.Dictionary")
     Set pImp("path") = Prop("string", "Source file (.bas/.cls/.frm/.ctl/.dsr) or template path")
     Dim pImp_mode As Object
-    Set pImp_mode = Prop("string", "file (AddFile) or template (AddFromTemplate)")
+    Set pImp_mode = Prop("string", "file (AddFile; DEFAULT) or template (AddFromTemplate)")
     Set pImp_mode("enum") = EnumList("file", "template")
     Set pImp("mode") = pImp_mode
     tools.Add MakeTool("import_component", _
-        "Add an existing source file (or a template) to the project as a component. mode=file COPIES the source into the project directory and binds the component to that COPY (the file you pass is not linked and is verified byte-identical on return): edit the copy, not the original. componentFile and projectDirWrites name the bound copy.", _
+        "Add an existing source file (or a template) to the project as a component. mode=file COPIES the source into the project directory and binds the component to that COPY (the file you pass is not linked and is verified byte-identical on return): edit the copy, not the original. componentFile and projectDirWrites name the bound copy. mode defaults to ""file"". A project-LOCAL copy needs the project to have a file on disk: an unsaved project is refused with reason=project_dir_unavailable BEFORE any side effect. The call is also refused with reason=name_collision when the incoming file declares an Attribute VB_Name that already exists, and with reason=import_path_is_member when the path is already the source of a component. Receipt: sourceFileSha256Before/After, sourceWritable, snapshotFile (.mcpimport.bak, only for a writable source), componentFile, componentsRebound, componentsCreated," & _
+        " codeFromFile, projectDirWrites.", _
         SchemaWith(pImp, Req("path")))
 
     Dim pExp As Object
@@ -231,7 +235,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pExp("name") = Prop("string", "Component name")
     Set pExp("path") = Prop("string", "Target file path (default: component's current file path)")
     tools.Add MakeTool("export_component", _
-        "Save a component's source to a file. Designer components (forms/usercontrols) are exported whole via VBComponent.Export (.frm/.frx); other components write their code text.", _
+        "Save a component's source to a file. Designer components (forms/usercontrols) are exported whole via VBComponent.Export (.frm/.frx); when that call is unavailable in this VBE build (error 438, measured), the component's last SAVED project file is copied instead (unsaved edits are NOT included) and a designer with no saved file gets the code section only - the receipt's note/copiedFrom say which path was taken. Other components write their code text.", _
         SchemaWith(pExp, Req("name")))
 
     Dim pRen As Object
@@ -246,21 +250,22 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRel = CreateObject("Scripting.Dictionary")
     Set pRel("name") = Prop("string", "Component name to reload from disk")
     tools.Add MakeTool("reload_component", _
-        "Reload a component from THE FILE IT IS BOUND TO on disk (VBComponent.Reload of FileNames(1)) - not necessarily the file you edited: import_component mode=file binds the project-local COPY, so editing the import source then reloading reports success while the code pane keeps the old text. The receipt reports reloaded (the component's real name) plus file (the bound path actually reloaded): compare file with the path you edited. Or edit in-IDE with replace_code / edit_by_anchor / apply_edits.", _
+        "Reload a component from THE FILE IT IS BOUND TO on disk (VBComponent.Reload of FileNames(1)) - not necessarily the file you edited: import_component mode=file binds the project-local COPY, so editing the import source then reloading reports success while the code pane keeps the old text. The receipt reports reloaded (the component's real name) plus file (the bound path actually reloaded): compare file with the path you edited. It also PROVES the reload landed: ready/readBackSha256/readBackLines (an EMPTY read-back is never evidence - then ready:false + readyUnavailableReason + howToProceed), the possibly-renamed identity (resolvedNameAfter/componentRenamedByReload) and whether the Reload moved the component inside the project (inMemoryOrderMoved/inMemoryOrderChanges + vbpOrder*). Or edit in-IDE with replace_code / edit_by_anchor / apply_edits.", _
         SchemaWith(pRel, Req("name")))
 
     ' ---- code module ----
     Dim pAddCode As Object
     Set pAddCode = CreateObject("Scripting.Dictionary")
     Set pAddCode("component") = Prop("string", "Component name")
-    Set pAddCode("code") = Prop("string", "Code text to append (CodeModule.AddFromString). Supply code or file - at least one of the two is required")
+    Set pAddCode("code") = Prop("string", "Code text to append at the END of the module (InsertLines(CountOfLines+1); the string branch no longer uses AddFromString). Supply code or file - at least one of the two is required")
     ' item 2, discipline 84: the description MUST stop naming
     ' AddFromFile - the file branch no longer uses it, and the observable behaviour changed
     ' (the designer head is stripped, and the target component is no longer renamed).
     Set pAddCode("file") = Prop("string", "Source file whose BODY is appended: the designer head (VERSION/BEGIN..END or Begin..End, plus the leading Attribute lines) is stripped first, so the code pane never receives a header and the target component is never renamed. Supply code or file - at least one of the two is required")
     Set pAddCode("validate") = PropValidate()
     tools.Add MakeTool("add_code", _
-        "Append code to a component's code module from a string or a file. Requires code or file. (MEASURED BEHAVIOUR): whether the module's final line break survives is NOT a property of this tool or of the operation - it depends on the base text's tail and, for an insertion, on the position (middle inherits the tail, end rebuilds it). Do not infer it: the receipt's trailingBlankLine reports the ACTUAL result, and newTotalLines counts as the caller's splitlines does. inDeclarationArea is the DECLARATION-AREA verdict, DEFINED as ""the block landed BEFORE the first procedure header line"" (where Option Explicit / module-level Dim/Const/Type live) - NOT ""outside an unclosed procedure body"": on a module that already has procedures an END append is therefore false, and an insert above the first procedure header is true. insertedAt{ide,disk} is the MEASURED landing in both line spaces.", _
+        "Append code to a component's code module from a string or a file. Requires code or file. (MEASURED BEHAVIOUR): whether the module's final line break survives is NOT a property of this tool or of the operation - it depends on the base text's tail and, for an insertion, on the position (middle inherits the tail, end rebuilds it). Do not infer it: the receipt's trailingBlankLine reports the ACTUAL result, and newTotalLines counts as the caller's splitlines does. inDeclarationArea is the DECLARATION-AREA verdict, DEFINED as ""the block landed BEFORE the first procedure header line"" (where Option Explicit / module-level Dim/Const/Type live) - NOT ""outside an unclosed procedure body"": on a module that already has procedures an END append is therefore false, and an insert above the first procedure header is true. insertedAt{ide,disk} is the MEASURED landing in both line spaces. Refusals" & _
+        " BEFORE any write: reason=file_not_found (a missing file= is NEVER treated as an empty block and no file is created), reason=unreadable_source_encoding, reason=unencodable_text (the block must survive an ANSI round trip), and - with validate:""strict"" - reason=duplicate_option_explicit / duplicate_declaration from the pre-write duplicate-declaration scan (warn/off write anyway and report each finding as a WARNING diagnostic).", _
         SchemaWith(pAddCode, Req("component")))
 
     Dim pEvt As Object
@@ -278,7 +283,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pFind("target") = Prop("string", "Text to find")
     Set pFind("start_line") = Prop("integer", "Search from line (1-based, default 1). ADVANCE SEMANTICS: to read the next hit of the same target, pass the previous receipt's nextStartLine (= the matched line + 1). A start_line past the last line is the END of the walk and answers found:false + reason=no_more_hits; the search NEVER wraps back to line 1, so a page cannot silently return a hit above start_line.")
     Set pFind("start_col") = Prop("integer", "Search from column (1-based, default 1)")
-    Set pFind("end_line") = Prop("integer", "Search up to line (default: last line)")
+    Set pFind("end_line") = Prop("integer", "Search up to line (default: last line; an explicit value beyond CountOfLines is refused as end_line_beyond_end, not clamped)")
     Set pFind("end_col") = Prop("integer", "Search up to column (default: last column)")
     Set pFind("whole_word") = Prop("boolean", "Whole word match only")
     Set pFind("match_case") = Prop("boolean", "Case sensitive")
@@ -286,7 +291,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pFind("include_procedure") = Prop("boolean", "ADDITIVE, default false. When true every hit also carries the IDE's own procedure mapping for the hit line: proc (the enclosing procedure; an empty string when the line belongs to no procedure), procBodyLine and procStartLine (IDE code-pane lines) plus procSource=ide.ProcOfLine. With the flag absent the receipt is key-for-key unchanged.")
     Set pFind("include_leading_comment") = Prop("boolean", "ADDITIVE, default false. When true every hit also carries leadingComment: the contiguous block of single-quote comment lines DIRECTLY ABOVE the hit's procedure header (no blank line between the block and the header) plus leadingCommentLines. Implies the procedure mapping. With the flag absent the receipt is key-for-key unchanged.")
     tools.Add MakeTool("find_in_component", _
-        "Find text inside one component using CodeModule.Find. Returns the match position (start/end line/column) plus hits[] (0 or 1 element), count and nextStartLine. PAGINATION: pass the previous nextStartLine as start_line; when there is no further hit the receipt answers found:false with reason=no_more_hits (start_line>1, i.e. a continuation page) or reason=not_found (a first page) and hits[]=[] / count=0. A start_line past the last line is not an error: it is the end of the walk. The result never falls back to a hit before start_line and never invents a hit in another procedure - a hit reported outside the requested window is discarded and the receipt says so.", _
+        "Find text inside one component using CodeModule.Find. Returns the match position (start/end line/column) plus hits[] (0 or 1 element), count and nextStartLine. PAGINATION: pass the previous nextStartLine as start_line; when there is no further hit the receipt answers found:false with reason=no_more_hits (start_line>1, i.e. a continuation page) or reason=not_found (a first page) and hits[]=[] / count=0. A start_line past the last line is not an error: it is the end of the walk. The result never falls back to a hit before start_line and never invents a hit in another procedure - a hit reported outside the requested window is discarded and the receipt says so. Coordinates are never clamped: an EXPLICIT out-of-range or inverted value is refused with ok:false + reason=start_line_below_one | start_col_below_one | end_line_below_one | end_col_below_one | end_line_beyond_end | range_inverted," & _
+        " and target_empty / component_has_no_code are refused the same way; omit an argument to get its default.", _
         SchemaWith(pFind, Req("component", "target")))
 
     ' ---- code pane / selection ----
@@ -344,7 +350,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRead("path") = Prop("string", "File path; relative to the project directory when not absolute")
     Set pRead("max_lines") = Prop("integer", "Return only the first N lines (0 = all, default)")
     tools.Add MakeTool("read_file", _
-        "Read a text file from disk (UTF-8 / UTF-16 / ANSI auto-detected) and return its content.", _
+        "Read a text file from disk (UTF-8 BOM, UTF-16LE BOM, else UTF-8, else ANSI - a UTF-16BE BOM file is not detected and comes back as ANSI mojibake) and return its content as PLAIN TEXT, not a JSON envelope. max_lines>0 returns the first N lines and appends a synthetic ... (truncated at N lines; total M) line. A path that does not exist answers a JSON {ok:false,reason:file_not_found,...} instead of text.", _
         SchemaWith(pRead, Req("path")))
 
     Dim pWrite As Object
@@ -367,14 +373,14 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pSearch = CreateObject("Scripting.Dictionary")
     Set pSearch("query") = Prop("string", "Text or regular expression to search for")
     Set pSearch("path") = Prop("string", "Directory to search; relative to the project directory when not absolute (default: project directory)")
-    Set pSearch("pattern") = Prop("string", "Semicolon-separated file patterns (default: VB source files)")
+    Set pSearch("pattern") = Prop("string", "Semicolon-separated file patterns (default: *.bas;*.frm;*.cls;*.vbp;*.ctl;*.pag;*.dsr;*.dob;*.dox;*.inc;*.txt;*.md)")
     Set pSearch("is_regex") = Prop("boolean", "Treat query as a regular expression (default: false)")
     Set pSearch("case_sensitive") = Prop("boolean", "Case-sensitive matching (default: false)")
     Set pSearch("max_results") = Prop("integer", "Maximum number of matches (default: 200)")
     Set pSearch("include_procedure") = Prop("boolean", "ADDITIVE, default false. When true every result also carries a LEXICAL procedure mapping for the hit line: proc (the enclosing procedure; empty when the line is outside every procedure), procBodyLine (header line in the FILE), procLineSpace=file and procSource=text_scan - search_in_files has no IDE CodeModule for an arbitrary file, so this is a text scan, not the IDE's ProcOfLine. With the flag absent the receipt is key-for-key unchanged.")
     Set pSearch("include_leading_comment") = Prop("boolean", "ADDITIVE, default false. When true every result also carries leadingComment: the contiguous block of single-quote comment lines directly above the enclosing procedure's header (no blank line between) plus leadingCommentLines. Implies the procedure mapping. With the flag absent the receipt is key-for-key unchanged.")
     tools.Add MakeTool("search_in_files", _
-        "Search text or regex across files below a directory. Returns file, line number and line text for each match.", _
+        "Search text or regex across files below a directory; returns ONE result per matching LINE (multiple hits on the same line are not repeated, and text is the TRIMMED line) with file/line/text. It scans at most 2000 matching files: when that cap or max_results is hit the receipt sets truncated:true (filesScanned/resultsCount say how far it got).", _
         SchemaWith(pSearch, Req("query")))
 
     ' ---- build / run ----
@@ -382,7 +388,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pSave = CreateObject("Scripting.Dictionary")
     Set pSave("path") = Prop("string", "Optional .vbp path: an unsaved project is saved there and unsaved components are saved next to it (bas/cls/frm/res by type).")
     tools.Add MakeTool("save_project", _
-        "Save the project and all modified components to disk.", _
+        "Save the project and all modified components to disk. It REFUSES (raised error) when the .vbp references component files that do not exist on disk, because saving that state crashes VB6. It writes the .vbp, then rewrites it ONCE more when VB6 reordered the lines or a relative Reference= path was repaired (vbpOrder*/refs*/refsRewritePasses), so projectDirWrites lists every file written; a component with no file name cannot be saved and appears in skippedComponents; ok is false with reason=vbp_order_restore_failed when the saved .vbp's original line order could not be restored.", _
         SchemaWith(pSave))
 
     Dim pMake As Object
@@ -393,20 +399,20 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pMake("project") = Prop("string", "Optional ABSOLUTE path of ANY .vbp to compile (route=cli only). When set, that project is compiled even if a DIFFERENT project is open in the IDE; a CLI build registers a CLSID snapshot around the /make and restores/ reports it. route=ide refuses this parameter (the IDE route compiles whatever the IDE holds).")
     Set pMake("timeout_ms") = Prop("integer", "route=cli: bounds ONLY the VB6.EXE /make subprocess (default 180000)")
     Set pMake("allow_host_modal") = Prop("boolean", "Default false. When VB6's own Make Project box is already up, confirming it starts a long host-modal compile that this single-threaded add-in cannot interrupt - every later write tool would then answer reason=busy until the IDE is restarted. false = leave the box alone and report modal_blocked=true with its hwnd/title/controls instead of clicking it.")
-    Set pMake("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default (plus laaProjectFile). An unreadable/invalid sidecar is NOT silently defaulted: the step is skipped and laaError/laaSource=project-file-error is returned." & _
-            " WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section.")
+    Set pMake("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp (LAA=1, optional LAANote=...) > the optional sidecar <vbpDir>\.vb6mcp.json {""laa"": true|false} > the environment variable VB6MCP_LAA > the global default (ON). The receipt reports laaSource as param | vb-project | project-file | env | global-default, plus vb-project-error | project-file-error | env-error when a configuration source EXISTS but is unusable; such a source is NOT silently defaulted -" & _
+        " the step is skipped and laaError names the problem (laaProjectFile names the sidecar tried). WHERE the switch is stored: the named section [VB6MCP] of the .vbp is the PRIMARY source (level 2). Survival rule: a named section present WHEN THE PROJECT IS LOADED is re-emitted by VB6 on every save and survives; a section APPENDED externally WHILE the project is open is overwritten by that save - so write the .vbp with the IDE CLOSED, or use the sidecar file, which can be written at any time. It is the ROOT-area keys that the in-memory model overwrites (CondComp is that class), NOT a named section.")
     Set pMake("wait_for_build") = Prop("integer", "Milliseconds this call waits for the artifact to land before reporting buildState=pending (default 0 = the historical 15000 ms; a smaller value is raised to 15000; cap 120000). The wait is what makes buildState trustworthy: a pending build is NEVER reported as completed. After clearing a host modal box you must re-read output{exists,size,mtime,sha256} - clearing the box is not completion.")
     Set pMake("diagnose") = Prop("boolean", "default false. Run an ISOLATED VB6.EXE /make over a COPY of the .vbp plus its component files in a temp directory and return the real compiler log plus firstError{file,line,text}. This is the only route that can diagnose a project the IDE holds (an isolated /make on the HELD project exits 0 and writes no log). It runs AUTOMATICALLY when the in-IDE Make returns compiled=true but artifactChanged=false, because that verdict is otherwise indistinguishable from a compile failure.")
     tools.Add MakeTool("make_project", _
-        "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}." & _
+        "Compile the project. NEVER deletes an existing artifact: the previous output is moved aside first and restored if the build fails or if the host deletes it (output{exists,size,mtime,sha256} + artifact_restored report every case, so a failed build can no longer leave you with no artifact). It also SAVES a dirty project before compiling (autoSaved/autoSavedComponents/autoSaveVia/autoSaveReceipt report it), so a build can WRITE every dirty component to disk; a failed pre-compile save refuses with buildState=refused_dirty_project and does not compile. compiled:true alone is NOT evidence that anything was built - read compiled_means, artifactChanged and verdict. The default ide route writes NO compiler log, so log/logPath/errorCount/firstError are always present with logAvailable=false plus the reason; route=cli returns the build tool's receipt, which carries the real log, errorCount and firstError{file,line,text}." & _
         " After a successful compile the artifact's PE header gets IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) written by this add-in itself (laa, default true; no external EditBin.exe is needed) and the receipt reports laaBefore/laaAfter/laaSet; diagnose=true compiles a COPY of the project in a temp directory with an isolated VB6.EXE /make and returns a real log plus firstError (it also runs automatically when the in-IDE Make says compiled=true but artifactChanged=false, a verdict that is otherwise indistinguishable from a compile failure)." & _
-        " the receipt carries ONE queryable build state - buildState (blocked_by_host_modal | pending | completed | completed_without_artifact_change | failed | no_artifact), derived from the same facts as verdict. pending means the compile started but the artifact had not landed inside this call's wait window: re-read output{exists,size,mtime,sha256} (and confirm MZ) before treating it as done - compiled/ok are never completion evidence, and clearing a host modal box is not either. wait_for_build=<ms> extends this call's own wait (default 0 = 15000 ms, cap 120000); the receipt reports waitRequestedMs/waitUsedMs.", _
+        " the receipt carries ONE queryable build state - buildState (blocked_by_host_modal | pending | completed | completed_without_artifact_change | failed | no_artifact | refused_dirty_project), derived from the same facts as verdict. pending means the compile started but the artifact had not landed inside this call's wait window: re-read output{exists,size,mtime,sha256} (and confirm MZ) before treating it as done - compiled/ok are never completion evidence, and clearing a host modal box is not either. wait_for_build=<ms> extends this call's own wait (default 0 = 15000 ms, cap 120000); the receipt reports waitRequestedMs/waitUsedMs.", _
         SchemaWith(pMake))
 
     Dim pExec As Object
     Set pExec = CreateObject("Scripting.Dictionary")
     Dim pExec_mode As Object
-    Set pExec_mode = Prop("string", "run (start, or continue when already broken) | full_compile | break (pause) | continue | resume (= continue) | step_into | step_over | step_out | run_to_cursor | end | stop (= end) | restart (end then run). Aliases accepted for compatibility: stepinto, stepover, stepout, runtocursor, fullcompile.")
+    Set pExec_mode = Prop("string", "run (start, or continue when already broken) | full_compile | break (pause) | continue | resume (= continue) | step_into | step_over | step_out | run_to_cursor | end | stop (= end) | restart (end then run). The implementation ALSO accepts the aliases stepinto, stepover, stepout, runtocursor and fullcompile, but they are NOT in this schema's enum - use the canonical spellings, or a client that validates the enum will reject the call before it is sent.")
     Set pExec_mode("enum") = EnumList("run", "full_compile", "break", "continue", "resume", "stop", "step_into", "step_over", "step_out", "run_to_cursor", "end", "restart")
     Set pExec("mode") = pExec_mode
     Dim pExec_allow As Object
@@ -415,7 +421,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     tools.Add MakeTool("control_execution", _
         "Control program execution in the VB6 IDE: start/continue, start with full compile, break, single-step (into/over/out), run to cursor, end or restart. Locale independent: menu items are matched by caption, ignoring the localized bar name, across English and Chinese IDEs - including the Continue item that replaces Start while the program runs or is broken. " & _
         "An end/stop that finds NOTHING running (EbMode=0 and design) returns ok:true + state_not_changed:true + alreadyNotRunning:true instead of ok:false: in the post-run suspended CommandBars window the End item is disabled precisely because the program has already ended." & _
-        " R-1021-02: every receipt carries diskWrites[{file,beforeBytes,afterBytes,beforeSha,afterSha,reason,attribution}] + touchedFiles[] + diskSnapshot{hashMode,budgetBytes,checkedFiles,snapshotMs,taken} + saveOnRun + ideAutoSaveHint (the IDE-wide option Tools > Options > Environment > 'When a program starts' may save the in-memory edits on any Start; this tool never changes it). A Start from DIRTY memory is refused unless allowDiskMutation:true." & _
+        " R-1021-02: the Start / full_compile / step / restart receipts carry diskWrites[{file,beforeBytes,afterBytes,beforeSha,afterSha,reason,attribution}] + touchedFiles[] + diskSnapshot{hashMode,budgetBytes,checkedFiles,snapshotMs,taken} + saveOnRun + ideAutoSaveHint. These keys are ABSENT on (a) the RUN-state end/stop path, which issues ONE DbClickEnd command and performs no project-disk bookkeeping (it carries diskNote instead), and (b) the pre-execution refusals commandbars_unavailable_while_running / host-not-answering / menu_control_not_found, which send nothing. (the IDE-wide option Tools > Options > Environment > 'When a program starts' may save the in-memory edits on any Start; this tool never changes it). A Start from DIRTY memory is refused unless allowDiskMutation:true." & _
         " END/STOP while the program RUNS is supported (measured path: the End commandbar returns true in RUN state and really stops the program; the old reason=commandbars_unavailable_while_running refusal for end/stop was a FALSE rejection). Such a receipt carries endCommandDelivered / endPending / stateAfterVerifiedBy=ide_state / stateAfterReadBack / programEnded / deliveryVsStateNote, and programEnded=true appears ONLY after a design read-back - an issued-but-not-yet-observable End answers ok:false + endPending=true + howToContinue.", _
         SchemaWith(pExec, Req("mode")))
 
@@ -426,15 +432,15 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pTh_action = Prop("string", "generate (write the host .vbp) or results (score PASS/FAIL from a result file)")
     Set pTh_action("enum") = EnumList("generate", "results")
     Set pTh("action") = pTh_action
-    Set pTh("vbp_path") = Prop("string", "Output .vbp of the generated test host (action=generate)")
-    Set pTh("module_name") = Prop("string", "Component name in the generated vbp; defaults to the Attribute VB_Name of the module under test")
-    Set pTh("module_under_test") = Prop("string", "Path of the module under test (action=generate)")
-    Set pTh("assertions_path") = Prop("string", "Path of the assertions module (action=generate)")
-    Set pTh("runner_path") = Prop("string", "Path of the test runner module (action=generate)")
+    Set pTh("vbp_path") = Prop("string", "Output .vbp of the generated test host (required for action=generate)")
+    Set pTh("module_name") = Prop("string", "Component name in the generated vbp; defaults to the Attribute VB_Name of the module under test; falls back to the constant PlanFactLite when Attribute VB_Name cannot be read")
+    Set pTh("module_under_test") = Prop("string", "Path of the module under test (required for action=generate)")
+    Set pTh("assertions_path") = Prop("string", "Path of the assertions module (required for action=generate)")
+    Set pTh("runner_path") = Prop("string", "Path of the test runner module (required for action=generate)")
     Set pTh("exe_name") = Prop("string", "ExeName32 for the generated host (default vb6testhost.exe)")
-    Set pTh("result_path") = Prop("string", "Result file to score (action=results)")
+    Set pTh("result_path") = Prop("string", "Result file to score (required for action=results)")
     tools.Add MakeTool("test_host", _
-        "Generate and score the offline test host (T5): writes a host .vbp around the module under test plus an assertions/runner module, or counts PASS/FAIL from the result file of the host. Closes the generate / build / run / score loop that had no tool entry point.", _
+        "Generate and score the offline test host (T5): writes a host .vbp around the module under test plus an assertions/runner module, or counts PASS/FAIL from the result file of the host. Closes the generate / build / run / score loop that had no tool entry point. action=generate REQUIRES vbp_path, module_under_test, assertions_path and runner_path (a missing one raises an error naming it); action=results REQUIRES result_path. module_name defaults to the file's Attribute VB_Name and falls back to the constant PlanFactLite when that line cannot be read. A generated host that cannot be read back from disk answers ok:false + reason=vbp_not_readable_back.", _
         SchemaWith(pTh, Req("action")))
 
     ' ---- references ----
@@ -482,7 +488,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pMem = CreateObject("Scripting.Dictionary")
     Set pMem("component") = Prop("string", "Component name (class module)")
     tools.Add MakeTool("list_members", _
-        "List the public members of a class component (CodeModule.Members) with type, scope, static flag and code location.", _
+        "List the members of a class component (CodeModule.Members - ALL scopes, Private and Friend included; filter on the returned scope field) with type, scope, static flag and code location.", _
         SchemaWith(pMem, Req("component")))
 
     Dim pSetMem As Object
@@ -497,12 +503,12 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
 
     ' ---- windows ----
     tools.Add MakeTool("list_windows", _
-        "List all IDE windows with caption, kind, visibility, state, position and size.", _
+        "List all IDE windows as {count, windows[]{caption, type, visible, windowState, left, top, width, height, hwnd}} - type is the window kind (WindowTypeName) and windowState is normal/minimize/maximize.", _
         SchemaWith(Nothing))
 
     Dim pWin As Object
     Set pWin = CreateObject("Scripting.Dictionary")
-    Set pWin("window") = Prop("string", "Window caption (substring) or 1-based index")
+    Set pWin("window") = Prop("string", "Window to address: a caption substring, a 1-based index, or a locale-independent TYPE name (CodeWindow, ProjectWindow, Immediate, Locals, Watch, Toolbox, ObjectBrowser, PropertyWindow, Designer, Find, Preview, ColorPalette, MainWindow, LinkedWindowFrame)")
     Dim pWin_action As Object
     Set pWin_action = Prop("string", "activate, close, show, hide, minimize, maximize, restore, move, resize, set_caption")
     Set pWin_action("enum") = EnumList("activate", "close", "show", "hide", "minimize", "maximize", "restore", "move", "resize", "set_caption")
@@ -513,7 +519,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pWin("width") = Prop("integer", "New width (action=resize)")
     Set pWin("height") = Prop("integer", "New height (action=resize)")
     tools.Add MakeTool("control_window", _
-        "Control an IDE window: focus, close, show/hide, minimize/maximize/restore, move, resize, rename.", _
+        "Control an IDE window: activate (focus), close, show/hide, minimize/maximize/restore, move, resize. There is NO rename: VB6 exposes Window.Caption as READ-ONLY, so action=set_caption is accepted but the window is NOT renamed (the receipt reports ignoredArgs).", _
         SchemaWith(pWin, Req("window", "action")))
 
     ' ---- form designer ----
@@ -521,7 +527,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pForm = CreateObject("Scripting.Dictionary")
     Set pForm("form") = Prop("string", "Form component name")
     Dim pForm_action As Object
-    Set pForm_action = Prop("string", "info, select_all, clear_selection, cut, copy, paste")
+    Set pForm_action = Prop("string", "info, props, menu_nest, select_all, clear_selection, cut, copy, paste")
     Set pForm_action("enum") = EnumList("info", "props", "menu_nest", "select_all", "clear_selection", "cut", "copy", "paste")
     Set pForm("action") = pForm_action
     Set pForm("control") = Prop("string", "Control NAME (action=props or menu_nest; preferred over index)")
@@ -547,21 +553,21 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Dim pRemCtl As Object
     Set pRemCtl = CreateObject("Scripting.Dictionary")
     Set pRemCtl("form") = Prop("string", "Form component name")
-    Set pRemCtl("index") = Prop("integer", "1-based index of the control (see form_designer info)")
-    Set pRemCtl("control") = Prop("string", "Control NAME (preferred over index; see form_designer info)")
+    Set pRemCtl("index") = Prop("integer", "1-based index of the control (see form_designer info) required unless the other one is supplied (one-of).")
+    Set pRemCtl("control") = Prop("string", "Control NAME (preferred over index; see form_designer info) required unless the other one is supplied (one-of).")
     tools.Add MakeTool("remove_control", _
-        "Remove a control from a form at design time (VBControls.Remove). Address it by control name (preferred) or by 1-based index.", _
+        "Remove a control from a form at design time (VBControls.Remove). Address it by control name (preferred) or by 1-based index - ONE of the two is REQUIRED (the schema's required list cannot express this one-of): a call that names neither is refused with reason=control_not_found and empty requestedControl/requestedIndex, which means the REQUEST was incomplete, not that the control is missing.", _
         SchemaWith(pRemCtl, Req("form")))
 
     Dim pSetCtl As Object
     Set pSetCtl = CreateObject("Scripting.Dictionary")
     Set pSetCtl("form") = Prop("string", "Form component name")
-    Set pSetCtl("index") = Prop("integer", "1-based index of the control")
-    Set pSetCtl("control") = Prop("string", "Control NAME (preferred over index; see form_designer info)")
+    Set pSetCtl("index") = Prop("integer", "1-based index of the control required unless the other one is supplied (one-of).")
+    Set pSetCtl("control") = Prop("string", "Control NAME (preferred over index; see form_designer info) required unless the other one is supplied (one-of).")
     Set pSetCtl("property") = Prop("string", "Design-time property name (e.g. Caption)")
-    Set pSetCtl("value") = Prop("string", "New value; numbers/booleans parsed, otherwise string")
+    Set pSetCtl("value") = Prop("string", "New value; numbers/booleans parsed, otherwise a string. EXCEPTION: for Picture/Icon the value is a FILE PATH - it is resolved (project-relative allowed) and loaded with LoadPicture; a missing file, or a build that refuses the assignment, fails the whole call (pictureApplied is reported on success).")
     tools.Add MakeTool("set_control_property", _
-        "Change a design-time property of a control on a form. Address it by control name (preferred) or by 1-based index; the response echoes the resolved control and index.", _
+        "Change a design-time property of a control on a form. Address it by control name (preferred) or by 1-based index - ONE of the two is REQUIRED (the schema's required list cannot express this one-of): a call that names neither fails before any property is read and does not answer a structured reason. The response echoes the resolved control and index.", _
         SchemaWith(pSetCtl, Req("form", "property", "value")))
 
     ' ---- property bag ----
@@ -603,7 +609,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pCb("control") = Prop("string", "Required for action=execute. A menu command caption (prefix search allowed), or an id as ""#746"" / ""id:746"" / a bare number, optionally ""#746 <caption>"" to disambiguate.")
     tools.Add MakeTool("command_bars", _
         "List the IDE menus (CommandBars) or execute a menu command. action=list returns every bar and control with its language-independent identity (id, tag, type, shortcutText, enabled, visible, path) AND TWO EXECUTABILITY FIELDS per control: executable (whether action=execute would actually run a command for that caption right now) and enabledReason (why not, or why a disabled control is still executable). Never infer executability from enabled alone: captions repeat across bars and toolbar buttons, and execute matches by caption and takes the first ENABLED match, so a listed enabled=false control can still be executable through an enabled twin and a listed enabled=true one can be unreachable when every twin of its caption is disabled." & _
-        " List the IDE menus (CommandBars) or execute a menu command. action=list returns every bar and control with its language-independent identity (id, tag, type, shortcutText, enabled, visible, path). action=execute runs one command, addressed either by caption or by id as ""#746"" / ""id:746"" / a bare number; because VB6 ids are NOT unique, an id-only lookup executes only when EXACTLY ONE ENABLED control matches and otherwise returns a structured id_ambiguous failure with idCandidates - disambiguate with bar= or by appending the caption (""#746 <caption>""). The CommandBars model is suspended while a program runs, so use this in design or break state.", _
+        " action=execute runs EXACTLY ONE command, addressed by caption (prefix search allowed) or by id as ""#746"" / ""id:746"" / a bare number, optionally ""#746 <caption>"". Because VB6 ids are NOT unique, an id-only lookup executes only when EXACTLY ONE ENABLED control matches; otherwise the call fails with reason=""menu_control_ambiguous"" and the matching candidates are listed in the error message (idCandidates is only published on the success path) - disambiguate with bar= or by appending the caption. DESIGN state only: while a program runs the CommandBars model is suspended (reason=commandbars_unavailable_while_running) and in break the debugger owns the frame (reason=commandbars_unavailable_while_in_break) - both are refused before anything is sent.", _
         SchemaWith(pCb, Req("action")))
 
     ' ---- contract v1.5.0: message-only dialog primitives ----
@@ -660,7 +666,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pVal("name") = Prop("string", "Component name (kind inference + reporting)")
     Set pVal("code") = Prop("string", "Code text to validate (NOT written to the IDE)")
     Set pVal("kind") = Prop("string", "bas|cls|frm (optional; inferred from name)")
-    Set pVal("mode") = Prop("string", "off|warn|strict (default warn)")
+    Set pVal("mode") = Prop("string", "off = skip linting entirely and return {ok:true,mode:'off'} with NO diagnostics; warn (default) = report diagnostics; strict = the same diagnostics PLUS rejected:true when a severity=error diagnostic exists. ok is (lintErrors=0) in both warn and strict - branch on rejected for a gate.")
     Set pVal("baseline") = Prop("string", "a previous run to diff against - either the stableKey lines or the WHOLE previous receipt text (both are scanned for stableKey values). The receipt then reports baseline_diff{added[],removed[]} matched on stableKey = ruleId|message|proc, so inserting lines and shifting every line number does NOT make a pre-existing diagnostic look new.")
     tools.Add MakeTool("validate_code", _
         "Validate VB6 code (lexical + structural + agent-habit rules) before writing; returns diagnostics with stable keys, line numbers and sha256. Every diagnostic carries proc + procOffset + fingerprint + stableKey, and baseline_diff{added[],removed[],unchangedCount} is always present (enabled=false unless baseline is given)." & _
@@ -671,7 +677,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRs = CreateObject("Scripting.Dictionary")
     Set pRs("path") = Prop("string", "Source file path (relative paths resolve against the project dir)")
     tools.Add MakeTool("read_source", _
-        "Read a VB6 source file with encoding detection (utf-8/ansi/utf-16le), byte-level sha256 and decoded text.", _
+        "Read a VB6 source file with encoding detection (utf-8/ansi/utf-16le), byte-level sha256 and decoded text. KNOWN GAP: a file with a UTF-16BE BOM (FE FF) is DETECTED as utf-16be but DECODED as ANSI - the decoder handles only utf-16le - so the receipt says encoding:""utf-16be"" while text is mojibake; convert such a file (or read it as bytes) instead of trusting text. A 0-byte or unreadable file answers ok:false + reason=file_unreadable instead of text.", _
         SchemaWith(pRs, Req("path")))
 
     Dim pCc As Object
@@ -689,16 +695,17 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pB("defines") = Prop("string", "Comma-separated /d defines, e.g. TESTING=1")
     Set pB("out_path") = Prop("string", "Build log path (optional)")
     Set pB("timeout_ms") = Prop("integer", "Timeout in ms (default 180000)")
-    Set pB("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | project-file | global-default | env) and laaProjectFile, and an invalid sidecar is reported as project-file-error instead of being silently defaulted.")
+    Set pB("laa") = Prop("boolean", "default TRUE. After the compile, set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header. The add-in rewrites the PE header ITSELF, in place, and re-reads it to verify; an external EditBin.exe is NOT required. The receipt always reports laaBefore/laaAfter/laaSet (+ laa{} with the detail); an artifact that already carries the flag is left untouched (laaSet=false, laaAlready=true). The decision PRECEDENCE is: this per-call laa argument > the [VB6MCP] section of the project .vbp > the optional sidecar <vbpDir>\.vb6mcp.json > the environment variable VB6MCP_LAA > the global default (ON); the receipt reports laaSource (param | vb-project | project-file | env | global-default, where 'vb-project' is the project .vbp [VB6MCP] section and 'project-file' is the sidecar <vbpDir>\.vb6mcp.json) and laaProjectFile, and an unusable source is reported as vb-project-error | project-file-error | env-error instead of being silently defaulted.")
     tools.Add MakeTool("build", _
-        "Compile the project with an isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal) - the reliable command-line route. Returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.", _
+        "Compile the project and report which route answered (receipt route: 'make' = isolated VB6.EXE /make <vbp> /out <log> subprocess (no modal); 'make_project' = the in-IDE Make, used when THIS IDE holds the project - that route has NO compiler log and NO compiler exit code (logAvailable:false, exitCodeApplies:false, errorCount:0, firstError comes from the IDE probe or firstErrorUnavailable:true); 'cache' = the fingerprint matches the last successful build so nothing was compiled (errorCount 0 from an empty log, firstError absent, ok:false by design - read artifactChanged); a project held by ANOTHER IDE is refused with reason=project_held_by_ide). On the routes that do compile it returns log (the compiler log TEXT), logPath proven readable via logAvailable/logBytes, errorCount, firstError{file,line,lineSpace,text}, output{exists,size,mtime,sha256}, and artifact_locked + artifact_holder_pid" & _
+        " when the artifact was not rewritten because a running process holds it (instead of a bare permission-denied). Note: only the FIRST error is reported per build. laa (default true) makes the add-in set IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) in the artifact's PE header itself (no external EditBin.exe) and the receipt reports laaBefore/laaAfter/laaSet.", _
         SchemaWith(pB))
 
     Dim pEba As Object
     Set pEba = CreateObject("Scripting.Dictionary")
     Set pEba("name") = Prop("string", "Component name")
-    Set pEba("anchor") = Prop("string", "Exact line to replace (must match uniquely)")
-    Set pEba("new_text") = Prop("string", "Replacement line")
+    Set pEba("anchor") = Prop("string", "Line or multi-line block to replace: every line must match consecutively (normalized by default) and the WHOLE matched block is replaced. Must be unique unless occurrence is given.")
+    Set pEba("new_text") = Prop("string", "Replacement text; it replaces the whole matched block (may be several lines).")
     Set pEba("expected_sha256") = Prop("string", "Optional optimistic-concurrency guard")
     Set pEba("occurrence") = Prop("integer", "1-based index of the hit to use when the anchor repeats; omitted = the anchor must be unique (A-batch rule)")
     Set pEba("match") = Prop("string", "normalized (default: ignore indentation and case) or exact (raw line)")
@@ -720,7 +727,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pAe("edits") = Prop("array", "Array of {op:R|I|D, anchor, text, component?, match?, occurrence?}. MULTI-COMPONENT: each item may name its own component; the tool-level name is the default. Ops apply in edits[] order and each anchor is resolved against ITS OWN component UPDATED text (earlier ops may move later anchors); components are independent. Nothing is written unless every op resolves and every touched component writes (see rolledBack/restoreVerified).")
     Set pAe("expected_sha256") = Prop("string", "Optional guard for the DEFAULT/single component; the whole batch is all-or-nothing")
     Set pAe("expected_shas") = Prop("array", "Optional pre-write guard for multi-component batches: [{component, sha256}]. ANY mismatch REFUSES the whole batch with guards[{component,expected,actual,ok}] and writes nothing; the legacy expected_sha256 still guards the default/single component.")
-    Set pAe("max_ops") = Prop("integer", "Batch size limit (default 200, capped at 1000); a batch with more ops, or more than 40 distinct components, is refused with ok:false reason=batch_too_large + limits{ops,components,max_ops} and writes nothing.")
+    Set pAe("max_ops") = Prop("integer", "Batch size limit (default 200, capped at 1000); a batch with more ops, or more than 40 distinct components, is refused with ok:false reason=batch_too_large + limits{ops,components,max_ops} and writes nothing. The O(ops x pane lines) work budget can refuse an otherwise small batch: its receipt names workEstimate / workBudget / suggestedMaxOps.")
     Set pAe("match") = Prop("string", "normalized (default) or exact")
     Set pAe("validate") = PropValidate()
     ' same opt-in knob as replace_code (this tool already snapshots through the
@@ -728,27 +735,30 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     ' second file).
     Set pAe("snapshot") = Prop("boolean", "true = guarantee a PRE-EDIT pane snapshot exists in the project's _undo store (this tool already writes one by default through the write funnel); default false = unchanged. The JSON boolean true is expected; the strings on/yes/1 are also accepted")
     tools.Add MakeTool("apply_edits", _
-        "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). Every op takes the same multi-line block anchors as edit_by_anchor (a block match replaces the whole matched block), and a failing op answers with failedOpIndex + hits[] {line, proc, text} for candidate selection (occurrence/scope, or per-op match). Each op's new text is checked for a redundant trailing End <Sub|Function|Property> before anything is written, and a batch that would leave the pane unbalanced is refused as predicted_procedure_imbalance. The receipt echoes procBefore/procAfter for the affected procedure. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here). requestedRange here is {mode:""anchor-batch"", ops, match}; the same field name carries {mode:""range"", operation, start_line, end_line} on replace_code/add_code and {mode:""anchor"", ...} on edit_by_anchor - branch on mode." & _
+        "Apply a batch of anchor edits atomically (any failure leaves the component unchanged). Every op takes the same multi-line block anchors as edit_by_anchor (a block match replaces the whole matched block), and a failing op answers with failedOpIndex + hits[] {line, proc, text} for candidate selection (occurrence/scope, or per-op match). Each op's new text is checked for a redundant trailing End <Sub|Function|Property> before anything is written, and a batch that would leave the pane unbalanced is refused as predicted_procedure_imbalance. The receipt echoes procBefore/procAfter for the affected procedure. snapshot=true is accepted (a pre-edit pane snapshot for undo_edit is written by default here). requestedRange here is {mode:""anchor-batch"", ops, match} (when the batch spans more than one component the mode is ""anchor-batch-multi"" and the shape is {mode:""anchor-batch-multi"", ops," & _
+        " components, match}); the same field name carries {mode:""range"", operation, start_line, end_line} on replace_code/add_code and {mode:""anchor"", ...} on edit_by_anchor - branch on mode." & _
         " MULTI-COMPONENT BATCH (v1.16.0): one call can carry ops across up to 40 components (edits[].component, default = name) - ONE pre-edit _undo snapshot per touched component, ONE rollback unit, and NO new tool. Order semantics: ops apply in edits[] order and every anchor is resolved on its own component UPDATED text (earlier ops may move later anchors); components are independent. " & _
-        " All-or-nothing: on ANY failure every component already written is restored to its pre-batch pane text and the restore is PROVEN by read-back (rolledBack + restoreVerified + restoredComponents[]), then ok:false + failedOpIndex (GLOBAL index) + hits[]. A successful multi-component receipt adds appliedOps / totalOps / components[{component,ops,shaBefore,shaAfter,snapshotId,verified}] / batchElapsedMs / guards / limits; a single-component call keeps the legacy receipt key-for-key. Pre-write guards: expected_shas[{component,sha256}] (and the legacy expected_sha256) refuse the batch with guards[] and write nothing. Limits: max_ops (default 200, capped 1000) and 40 components -> reason=batch_too_large.", _
+        " All-or-nothing: on ANY failure every component already written is restored to its pre-batch pane text and the restore is PROVEN by read-back (rolledBack + restoreVerified + restoredComponents[]), then ok:false + failedOpIndex (GLOBAL index) + hits[]. A successful multi-component receipt adds appliedOps / totalOps / components[{component,ops,shaBefore,shaAfter,snapshotId,verified}] / batchElapsedMs / guards / limits; a single-component call keeps the legacy receipt key-for-key UNLESS expected_shas or max_ops is supplied (either one routes the call through the multi-component shape); expected_sha256 with no tool-level name on a multi-component batch is refused as expected_sha256_without_target_component. Pre-write guards: expected_shas[{component,sha256}] (and the legacy expected_sha256) refuse the batch with guards[] and write nothing. Limits: max_ops (default 200, capped 1000), 40" & _
+        " components, and an O(ops x pane lines) work budget (VB6MCP_ANCHOR_MAX_WORK, default 2000000) -> reason=batch_too_large; the work-budget refusal carries ops / ideTotalLines / workEstimate / workBudget / suggestedMaxOps instead of limits.", _
         SchemaWith(pAe, Req("edits")))
 
     Dim pPe As Object
     Set pPe = CreateObject("Scripting.Dictionary")
     Set pPe("name") = Prop("string", "DEFAULT component name (optional when every edits[] item carries its own component)")
     Set pPe("edits") = Prop("array", "Array of {op:R|I|D, anchor, text, component?, match?, occurrence?}. MULTI-COMPONENT: each item may name its own component; the tool-level name is the default. Hunks are reported GROUPED PER COMPONENT. Nothing is written.")
-    Set pPe("max_ops") = Prop("integer", "Preview batch size limit (default 200, capped at 1000); more than 40 components is refused with reason=batch_too_large.")
-    Set pPe("match") = Prop("string", "Batch matching mode: normalized (default) or exact - the SAME top-level switch apply_edits honours. A per-op match overrides it for that op.")
+    Set pPe("max_ops") = Prop("integer", "Preview batch size limit (default 200, capped at 1000); more than 40 components is refused with reason=batch_too_large. The O(ops x pane lines) work budget can refuse an otherwise small batch: its receipt names workEstimate / workBudget / suggestedMaxOps.")
+    Set pPe("match") = Prop("string", "Batch matching mode: normalized (default) or exact. WARNING (single-component path): the top-level value is accepted, reported in ignoredArgs and NOT applied - only a per-op match takes effect there; the multi-component path DOES apply it. A per-op match overrides it for that op.")
     tools.Add MakeTool("preview_edit", _
-        "Return a unified-style diff for a batch of anchor edits without writing anything. It walks the SAME resolution as apply_edits (per-op match/occurrence, MULTI-LINE block anchors that replace the whole matched block) and applies the same structural refusals, so previewing and then writing the same batch cannot disagree. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written." & _
-        " MULTI-COMPONENT PREVIEW (v1.16.0): the same edits[] shape as apply_edits (edits[].component, default = name) across up to 40 components in ONE call; the answer groups hunks per component (components[{component,ops,hunks,hunkCount,algorithm,...}] + totalHunks) and it still writes NOTHING. Order semantics match the write: ops in edits[] order, each anchor resolved on its component UPDATED text. Limits: max_ops (default 200, capped 1000) / 40 components -> reason=batch_too_large.", _
+        "Return a unified-style diff for a batch of anchor edits without writing anything. It walks the SAME resolution as apply_edits (per-op match/occurrence, MULTI-LINE block anchors that replace the whole matched block) and applies the same structural refusals, so previewing and then writing the same batch cannot disagree - with ONE known gap: on the SINGLE-component path the top-level match switch is accepted but NOT applied (the receipt lists it in ignoredArgs), so a single-component preview taken with match:""exact"" can still disagree with the write; pass a per-op match instead. B+C batch (contract invariant 8): the algorithm is a LINE-LEVEL LCS with hunk grouping, so an insertion in the middle renders as ONE hunk of +N (not a delete block plus an add block); contextLines (default 3) of context are emitted around each hunk. hunks[] carries" & _
+        " {kind,start,count,oldStart,oldCount,newStart,newCount,contextLines}; 'algorithm' reports lcs | fallback-too-large | none, and the fallback is stated instead of silently degrading. Still a preview: nothing is written." & _
+        " MULTI-COMPONENT PREVIEW (v1.16.0): the same edits[] shape as apply_edits (edits[].component, default = name) across up to 40 components in ONE call; the answer groups hunks per component (components[{component,ops,sha256Before,sha256After,hunks,algorithm,contextLines,lineDelta}] + totalHunks) and it still writes NOTHING. Order semantics match the write: ops in edits[] order, each anchor resolved on its component UPDATED text. Limits: max_ops (default 200, capped 1000), 40 components, and an O(ops x pane lines) work budget (VB6MCP_ANCHOR_MAX_WORK, default 2000000) -> reason=batch_too_large; the work-budget refusal carries ops / ideTotalLines / workEstimate / workBudget / suggestedMaxOps instead of limits.", _
         SchemaWith(pPe, Req("edits")))
 
     Dim pWs As Object
     Set pWs = CreateObject("Scripting.Dictionary")
     Set pWs("path") = Prop("string", "Target file path")
     Set pWs("text") = Prop("string", "Text to write (ASCII string literals only for VB files)")
-    Set pWs("encoding") = Prop("string", "auto|ansi|utf-8|utf-16le (default auto: VB files -> ansi)")
+    Set pWs("encoding") = Prop("string", "auto|ansi|utf-8|utf-16le. auto is applied ONLY when the parameter is OMITTED: VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp/.vbg/.res/.inc) are written ansi, everything else utf-8. Passing ""auto"" EXPLICITLY (or any other unrecognised value) is encoded as ansi (CP_ACP) - the encoder recognises only utf-8 and utf-16le, so a non-ASCII non-VB file would be written in the project's ANSI code page with no warning. Prefer omitting the parameter. utf-16 is NOT an accepted alias here (only utf-16le).")
     Set pWs("validate") = PropValidate()
     Set pWs("confirm_truncate") = Prop("boolean", "default false. An EXISTING NON-EMPTY target plus empty/blank text is REFUSED with reason=empty_content_would_truncate; VB source files (.bas/.cls/.frm/.ctl/.pag/.dsr/.vbp) are ALWAYS refused even with confirm_truncate:true (an empty VB source cannot compile).")
     tools.Add MakeTool("write_source", _
@@ -763,14 +773,14 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pVf("requireCompiler") = Prop("boolean", "false (default) keeps this receipt byte-for-byte. true DEMANDS COMPILER evidence: an isolated VB6.EXE /make over a COPY of the project on disk must produce a real log. When the compiler cannot be resolved, cannot be started, writes no log or is killed at the budget, the call is REFUSED (ok:false, structured reason, compilerProbe{resolved,path,why}, howToProceed) and a lint verdict is NEVER substituted. On success the receipt adds authority=compiler + compiler{path,logPath,errorCount,artifactChanged,compiledFrom}. This path never saves the project and never touches the real artifact.")
     tools.Add MakeTool("verify", _
         "Aggregate verdict for one component: IDE==DISK + lint diagnostics + optional baseline filter. " & _
-        "requireCompiler:true demands COMPILER authority instead of the cached/lint answer: an isolated VB6.EXE /make over a COPY of the project on disk must produce a real log; when no compiler is available the call is REFUSED (ok:false + reason=compiler_not_configured + compilerProbe{resolved,path,why} + howToProceed) and a lint verdict is NEVER substituted. A successful compile adds authority=compiler + compiler{path,logPath,errorCount,artifactChanged}. Default false keeps the receipt exactly as before.", _
+        "requireCompiler:true demands COMPILER authority instead of the cached/lint answer: an isolated VB6.EXE /make over a COPY of the project on disk must produce a real log; when no compiler evidence can be obtained the call is REFUSED (ok:false + reason=compiler_not_configured | project_not_on_disk | compiler_timeout + compilerProbe{resolved,path,why,...} + howToProceed) and a lint verdict is NEVER substituted. A successful compile adds authority=compiler + compiler{path,logPath,errorCount,artifactChanged}. Default false keeps the receipt exactly as before.", _
         SchemaWith(pVf, Req("name")))
     ' W-H4: ONE-call debug session (face 110 -> 111; refreeze deferred to the window).
     Dim pDs As Object
     Set pDs = CreateObject("Scripting.Dictionary")
-    Set pDs("runArgs") = Prop("string", "Command line arguments passed to the started program (optional)")
-    Set pDs("env") = Prop("object", "{NAME: value} environment variables for the started program (optional)")
-    Set pDs("breakpoints") = Prop("array", "Array of {component, line (PANE line space), condition?, hitCount?, enabled?}")
+    Set pDs("runArgs") = Prop("string", "Echoed back in the receipt ONLY (runArgs). A Standard EXE started from the IDE does not receive Command$, so this value is NEVER delivered to the program - build the EXE to pass real arguments.")
+    Set pDs("env") = Prop("object", "NOT APPLIED. debug_session does not set environment variables (only run_project does, because it can set them BEFORE the Start command) - use run_project, or start the program outside this tool.")
+    Set pDs("breakpoints") = Prop("array", "Array of {component, line (PANE line space), hitCount?}. condition and enabled are IGNORED - VB6 has no conditional breakpoints; use hitCount to stop on the Nth hit (the driver auto-continues the earlier ones).")
     Set pDs("actions") = Prop("array", "Array of {op: step_over|step_into|step_out|eval|continue|stop, expr? (eval only)}")
     Set pDs("timeout_ms") = Prop("integer", "Hard budget for the WHOLE session in ms (default 60000)")
     Set pDs("attach") = Prop("boolean", "true = drive an ALREADY running/broken IDE (no Start click); false (default) = arm + start and return startedPending")
@@ -778,7 +788,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     tools.Add MakeTool("debug_session", _
         "Drive ONE whole VB6 debug session inside a SINGLE call: arm the given breakpoints, START the program WITHOUT saving the project, " & _
         "wait for a breakpoint hit, then execute the ordered actions (step_over/step_into/step_out/eval/continue/stop) and return transcript[] " & _
-        "{seq,kind,position{module,proc,paneLine,diskLine},proc,callstack,locals,output,err} plus stopReason/wedged. The VB6 IDE is single-threaded " & _
+        "{seq,kind,position{module,proc,line,positionSource},callstack,locals,output,err} (position is exactly current_position's shape - read proc from position.proc; it carries no paneLine/diskLine) plus stopReason/wedged. The VB6 IDE is single-threaded " & _
         "(STA), so a debug session cannot be driven by concurrent calls - it is compressed into this one call. This tool NEVER saves the project " & _
         "(preRunSave=false: the run path deliberately bypasses control_execution, whose run does a pre-run flush); call save_project first if the " & _
         "project must be on disk. The session REQUESTS control_execution(end) and then waits a BOUNDED 3 s inside the call; because End is a QUEUED command in a single-threaded IDE, that wait cannot observe it - a state that still reads break/run is reported as endQueued=true + howToFinish, NOT as wedged. " & _
@@ -809,7 +819,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     ' ---- W-H1: breakpoints (face 112 -> 113; refreeze deferred to the window) ----
     Dim pBp As Object
     Set pBp = CreateObject("Scripting.Dictionary")
-    Set pBp("action") = Prop("string", "list | set | clear | enable | disable | clear_all | probe (default list). probe is the BEHAVIOURAL verifier and it is TWO-PHASE: phase=start only STARTS the program (a start command is QUEUED in the STA IDE and takes effect AFTER the call returns), phase=observe (same probeId) waits for the stop, reads position/callstack, ends the program and PROVES the state by read-back. It never saves the project and never writes the source.")
+    Set pBp("action") = Prop("string", "list | set | clear | enable | disable | clear_all | prune | probe (default list). prune drops stale ledger records and touches no source. probe is the BEHAVIOURAL verifier and it is TWO-PHASE: phase=start only STARTS the program (a start command is QUEUED in the STA IDE and takes effect AFTER the call returns), phase=observe (same probeId) waits for the stop, reads position/callstack, ends the program and PROVES the state by read-back. It never saves the project and never writes the source.")
     Set pBp("component") = Prop("string", "Component name (set/clear/enable/disable/probe)")
     Set pBp("anchor") = Prop("string", "For mode=injected: the source line to break before (must match uniquely inside a procedure body)")
     Set pBp("line") = Prop("integer", "PANE line number (1-based) for mode=native (and the position to clear); for probe it is the TARGET line whose breakpoint effectiveness is observed")
@@ -818,7 +828,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pBp("clearStale") = Prop("boolean", "false (default). mode=native: when a STALE ledger record exists for this component+line (paneSha changed), clear it and proceed with the F9 post instead of refusing with stale_native_record.")
     Set pBp("timeout_ms") = Prop("integer", "breakpoints{action:probe}: bounded observation budget in ms (default 15000, capped 120000); for mode=native it is the bound of the async F9 channel observation. Ignored by other actions.")
     Set pBp("phase") = Prop("string", "probe only: start (default) = run the preconditions, START the program and return probeId + probeResult=started_pending (a start command is QUEUED in the STA IDE, so the run begins AFTER this call returns); observe = with that probeId, wait up to timeout_ms for the stop, read position/callstack, END the program and PROVE stateAfter=design by read-back (unknown/expired probeId => structured refusal reason=probe_not_found); auto = explicit alias of start (NOT both phases in one call - a single call cannot observe the run it starts).")
-    Set pBp("probeId") = Prop("string", "probe phase=observe: the probeId returned by THIS instance phase=start. Single-use; unknown or older than 600000 ms => ok:false + reason=probe_not_found + howToProceed.")
+    Set pBp("probeId") = Prop("string", "probe phase=observe: the probeId returned by THIS instance phase=start. It is cleared after a CONFIRMED end, but it deliberately STAYS VALID for ONE re-read of the same phase=observe when the previous observe answered endPending=true (that confirm call is the only place programEnded=true can appear). Unknown or older than 600000 ms => ok:false + reason=probe_not_found + howToProceed.")
     Set pBp("hitCount") = Prop("integer", "Stop on the Nth hit (default 1). Enforced by run_until_break / debug_session, not by the engine; a conditional EXPRESSION is not supported (VB6 has no conditional breakpoints)")
     tools.Add MakeTool("breakpoints", _
         "Manage REAL IDE breakpoints by component + source anchor / PANE line: set (injected source marker OR native Debug-menu toggle), clear, enable, disable, list, clear_all. " & _
@@ -829,18 +839,18 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         "action=probe is the only BEHAVIOURAL verifier and it is TWO-PHASE. phase=start (default) checks design state / no modal box / breakable line, STARTS the program (never saves it), then returns probePhase=start, probeResult=started_pending, probeId, startedPending=true and howToContinue. phase=observe (same probeId) waits up to timeout_ms for the stop and reports probeResult=stopped_at_target | stopped_elsewhere (with position{component,proc,paneLine} + callstack), or timeout | did_not_stop | did_not_stop_unobserved (with programStillRunning measured), and it ENDS the program and PROVES stateAfter=design by read-back (stateAfterVerifiedBy=ide_state) - it never claims an end it did not observe. A start command is QUEUED in the STA IDE, so a single call cannot observe the run it starts: phase=auto is an explicit alias of start and a positive result can only come from start + observe." & _
         " The observe HIT path can be a TWO-STAGE wrap-up: when the End command is delivered but its teardown is not observable inside the call, the receipt answers endPending=true + howToContinue and the SAME phase=observe with the SAME probeId re-reads the state; programEnded=true appears ONLY in that confirm receipt. phase=start always carries startQueued=true (the Start command is queued - a measured fact, not a promise that the program is already running). " & _
         "THREE RULES stated explicitly: (1) paneLine is the coordinate space EVERY edit tool takes (diskLine = paneLine + SharedHeaderOffset is DISK space); " & _
-        "(2) breakpoints can only be set in DESIGN or BREAK state - while the program RUNS the CommandBars model is suspended, so action=set cannot reach the Debug menu; " & _
+        "(2) breakpoints can only be set in DESIGN state: mode=native needs the Debug menu, so a break context (reason=commandbars_unavailable_while_in_break) or a running program (reason=commandbars_unavailable_while_running) is refused before any menu command is sent; " & _
         "(3) action=probe does NOT read the anchor parameter - it needs component + line (anchor belongs to mode=injected action=set only).", _
         SchemaWith(pBp, Req()))
 
     ' ---- W-H2: get_locals / eval_at_frame (face 113 -> 115; refreeze deferred) ----
     Dim pGl As Object
     Set pGl = CreateObject("Scripting.Dictionary")
-    Set pGl("frame_index") = Prop("integer", "0 = innermost frame (default). frame_set binds the VBA6 evaluation frame before every read.")
+    Set pGl("frame_index") = Prop("integer", "0 = the IDE's current (innermost) frame (default). ANY other value is REFUSED: reaching an outer frame needs the engine frame-set thunk, which is forbidden here because it terminated the IDE in a measured run. No frame binding happens for frame 0 either - values come from the immediate context.")
     Set pGl("allowUnsafeInBreak") = Prop("boolean", "default false. In BREAK state get_locals is REFUSED with reason=break_eval_requires_opt_in: the value reads evaluate identifiers in the IDE immediate context and a raising evaluation can wedge the single-threaded pipe (measured). true is INFORMED CONSENT - it does NOT guarantee the statement will not hang, and a hang is recovered with the hub-side ide_kill_and_relaunch (NOT taskkill). A refusal never arms the gate; every failure receipt carries gateReleased + howToRecover.")
     tools.Add MakeTool("get_locals", _
         "Read the CURRENT procedure parameters and declared locals in BREAK mode, with their engine values. " & _
-        "SOURCE DECLARATION: variable NAMES come from the SOURCE of the current procedure (parameter list plus Dim/Static declarations in its body); the VALUES are read by binding the VBA6 evaluation frame (vba6_probe frame_set path) and evaluating each name in the IDE immediate context - localsSource is echoed on every receipt. " & _
+        "SOURCE DECLARATION: variable NAMES come from the SOURCE of the current procedure (parameter list plus Dim/Static declarations in its body); the VALUES are read in the IDE immediate context, which is NOT the break frame: frameBinding is always ""ideImmediateContext"" (the engine frame-set thunk is deliberately NOT used - measured: it terminated the IDE), so every value carries valueTrust=""unverified (ideImmediateContext is not the break frame)"" and localsSource says the same - localsSource is echoed on every receipt. " & _
         "Nothing is invented: when no value can be read the receipt returns localsUnavailable:true + localsUnavailableReason + the raw frame diagnostics. " & _
         "Each value carries typeName + value (or error) and, for arrays/Dictionary/objects, a SHALLOW inspection with explicit depthLimit=2 / widthLimit=20, truncatedDepth, truncatedWidth and cycleDetected (ObjPtr identity). VB6 has no reflection, so a custom class reports its TypeName/ObjPtr and fieldsUnavailable:true rather than guessed fields. " & _
         "The per-value shape is the SAME one transcript[].watch uses (one helper).", _
@@ -889,11 +899,11 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
 
     Dim pLe As Object
     Set pLe = CreateObject("Scripting.Dictionary")
-    Set pLe("dismiss") = Prop("boolean", "true = dismiss the runtime-error box by clicking its End button with send_window_message (the ONLY working channel: close_active_dialogs refuses it by the safe whitelist - measured). Nothing is clicked when false.")
+    Set pLe("dismiss") = Prop("boolean", "true = read the box, then click DEBUG (or OK when the box has no Debug caption) so the IDE enters a measured break context; dismissedVia reports which caption was used. The End caption is never clicked. Nothing is clicked when false.")
     tools.Add MakeTool("last_error", _
         "Return the UNHANDLED-ERROR context WITHOUT evaluating in the break frame: {errorDialog{present,title,body,buttons[]}, errNumber/errDescription/errSource + errParsed{...}, callstack, localsNames[] (the names an earlier get_locals enumerated), position, proc, module, stopped_at, howToRecover}. " & _
-        "SOURCE DECLARATION: the error text comes from the runtime-error dialog BODY (Win32 window channel), the stack from the VBA6 callstack probe, and the NAME list from get_locals' source-declaration scan; NOTHING is read by break-frame evaluation. Fields that cannot be parsed are returned as null with parsed:false - never guessed. " & _
-        "The box is MODAL: dismiss it with dismiss:true (send_window_message click on the End button) or the IDE stays blocked." & _
+        "SOURCE DECLARATION: the error text comes from the runtime-error dialog BODY (Win32 window channel), the stack from the VBA6 callstack probe, and the NAME list from get_locals' source-declaration scan; NOTHING is read by break-frame evaluation. Fields that cannot be parsed are returned as null with parsed:false - never guessed. When NO box is up the tool does not fail: it returns the CACHED capture of the previous runtime error (cached:true, source_=""cached_runtime_error"", cachedAt, plus cacheInvalidatedBy/cacheInvalidatedAt; a new Start / Start With Full Compile / Restart, or a run that ends normally, invalidates it). " & _
+        "The box is MODAL: dismiss it with dismiss:true, which READS the body first and then clicks DEBUG; when the box has no Debug caption (the IDE expression evaluator's shape: OK + Help only) it clicks OK instead and dismissedVia says which caption was used. The box's End caption is NEVER clicked (End can leave the IDE unstable). If neither caption exists the box is left untouched and the receipt carries runtimeErrorDialogDismissFailed + runtimeErrorDismiss." & _
         "RE-1 (v1.16.3, ADDITIVE): the receipt ALSO carries a STRUCTURED error block read from the VBA6 exception record by pure in-process memory reads (GetModuleHandleW + CopyMemory; NO engine call): err{number,description,source,hresult,numberBasis}, errBasis (vb6map | dialog | none | unavailable), errChannel{readOk,recordUsed,selector,fields,bstrReads,why}, errCrossCheck{available,number,description,relation,note} and errLocation{line,column,file,basis,why}. This ADDS fields WHILE THE RUNTIME-ERROR BOX IS STILL THERE: it does not suppress the box, does not auto-dismiss it, and does not read errors without a box - automatic dismissal and box-less reading are NOT part of this batch." & _
         " It also removes the old dependence on the localized dialog TEXT for number/description/source (the dialog body is still read and still feeds the unchanged errNumber/errDescription/errSource/errParsed keys). Unreadable fields are null with errBasis/errChannel.why naming the reason - never guessed, and errLocation is always null with basis=not_attempted (no line/column is invented). errChannel.selector.basis=unavailable means the SELECTOR DID NOT PARTICIPATE in choosing the record (record A is the live record, measured in BOTH the modal and the settled state) - it is NOT a read failure, and no new enum value is added.", _
         SchemaWith(pLe, Req()))
@@ -905,8 +915,12 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pIt("expressions") = Prop("string", "Comma-separated expressions, e.g. x,y")
     Set pIt("id") = Prop("string", "Trace id (also the removal handle)")
     Set pIt("expected_sha256") = Prop("string", "Optional guard")
+    Set pIt("condition") = Prop("string", "OPTIONAL logpoint condition (a VB expression evaluated at the injection point on every call). Non-empty means the injected block becomes 7 lines: the runtime guard If McpTraceOn() Then wraps If (<condition>) Then McpTrace ... End If. The condition is validated LEXICALLY only (necessary, not sufficient): a condition that raises or has side effects CHANGES the behaviour of the program whenever tracing is ON, so keep it pure. Omitted/empty keeps the current 5-line block, byte-identical.")
+    Set pIt("recordCondition") = Prop("boolean", "default true. When a condition is given, record its SOURCE TEXT as the @cond key of each emitted event (the exact text supplied by the caller is never rewritten). A condition that contains a double quote cannot be embedded in the VB string literal without changing it, so @cond is then NOT recorded (conditionRecorded:false + conditionRecordNote) and the injection still proceeds.")
     tools.Add MakeTool("inject_trace", _
-        "Insert a McpTrace call at the start of a procedure. The guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen; inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints).", _
+        "Insert a McpTrace call at the start of a procedure. The guard is a RUNTIME 'If McpTraceOn() Then' (not '#If MCP_TRACE'), because a compile-time condition only applies when the project is loaded with that CondComp - so this needs no CondComp and no reopen; inject_trace now GENERATES AND ATTACHES the module modMcpTrace itself when the project does not have it (nothing to import by hand) and verifies the attachment before answering; the generated header comment language is chosen UI-FIRST (the IDE's own UI language when it can be read, else the VB6.EXE version resource, else English) and the receipt reports all three signals. The sink is enabled by the MCP_TRACE_ON / MCP_TRACE_FILE environment variables of the VB6 process (see the response hints). " & _
+        "condition (OPTIONAL) turns the block into a logpoint: the runtime guard wraps `If (<condition>) Then McpTrace ... End If`, so an event is written ONLY when the condition is true (hits are counted by `trace_query`; VB6 has no conditional breakpoints). The condition is checked LEXICALLY before anything is written (single line, <=512 chars, no control characters/statement separator/comment, balanced quotes+parentheses, no block keywords, first identifier visible at the injection point) " & _
+        "- that check is NECESSARY, NOT SUFFICIENT: a condition that raises or has side effects changes the behaviour of the program while tracing is ON, so keep it pure. `recordCondition` (default true) records the condition text as the `@cond` event key; a condition containing a double quote is not recorded (conditionRecorded:false) and the text supplied by the caller is never rewritten. Omitting `condition` keeps the current 5-line block byte-for-byte.", _
         SchemaWith(pIt, Req("name", "procedure", "id")))
 
     Dim pRt As Object
@@ -915,7 +929,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRt("id") = Prop("string", "Trace id to remove")
     Set pRt("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("remove_trace", _
-        "Remove a previously injected trace block; sha256 returns to the pre-injection value. The modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=""kept_by_design"" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains, then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists.", _
+        "Remove a previously injected trace block; sha256 returns to the pre-injection value. It FLUSHES the whole project (it calls save_project), so the file on disk is written and any other dirty component is saved with it; when the file still differs after the flush the receipt is ok:false + reason=disk_not_flushed | disk_still_differs (saved:false, diskStillHasMarker, diskAfterRemoveSha256). The modMcpTrace component is NEVER removed automatically - the receipt always reports moduleRemoved=false, moduleLeftInPlace=true and moduleRemoveReason=""kept_by_design"" (moduleRemoveReason is module_absent when no such component exists), because (a) you may have added your own code to it and (b) other @mcp-trace blocks elsewhere may still call McpTrace/McpTraceOn, so the project would stop compiling without it. moduleRemoveNote carries the manual removal steps (verify no '@mcp-trace' block remains," & _
+        " then call remove_component yourself). The old automatic removal (removed_autogen_module) no longer exists. If no '@mcp-trace' block remains anywhere in the project, consider removing the auto-generated modMcpTrace component yourself (`remove_component{name:""modMcpTrace""}`) once you no longer need tracing.", _
         SchemaWith(pRt, Req("name", "id")))
 
     Dim pFi As Object
@@ -927,7 +942,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pFi("id") = Prop("string", "Fault id (removal handle)")
     Set pFi("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("fault_inject", _
-        "Inject a guarded fault (raise/return/delay) at the start of a procedure (#If MCP_FAULT).", _
+        "Inject a guarded fault (raise/return/delay) at the start of a procedure, inside a COMPILE-TIME block #If MCP_FAULT Then ... #End If. The block is compiled OUT unless the project is loaded with the conditional-compilation argument MCP_FAULT defined (see project_meta cond_comp) - set it and reload the project, or the injected fault never fires. clear_faults removes the block by id regardless.", _
         SchemaWith(pFi, Req("name", "procedure", "mode", "id")))
 
     Dim pCf As Object
@@ -953,7 +968,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pSbp("id") = Prop("string", "Breakpoint id (removal handle)")
     Set pSbp("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("set_breakpoint", _
-        "Inject a persistent Debug.Assert False breakpoint before a uniquely-matched line (auto-omitted in compiled builds). The anchor must be a statement INSIDE a procedure body: a module-level line or a procedure declaration is refused with ok:false, reason:'anchor_outside_procedure' (injecting there puts executable code outside every procedure and the project stops compiling).", _
+        "Inject a persistent Debug.Assert False breakpoint before a uniquely-matched line (auto-omitted in compiled builds). The anchor must be a statement INSIDE a procedure body: a module-level line or a procedure declaration is refused with ok:false, reason:'anchor_outside_procedure' (injecting there puts executable code outside every procedure and the project stops compiling). NOTE: after writing the pane this tool FLUSHES the whole project to disk (the same save path save_project uses), so unsaved edits elsewhere in the project are written too - unlike replace_code / apply_edits, which leave the module dirty.", _
         SchemaWith(pSbp, Req("name", "anchor", "id")))
 
     Dim pCbp As Object
@@ -962,13 +977,13 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pCbp("id") = Prop("string", "Breakpoint id")
     Set pCbp("expected_sha256") = Prop("string", "Optional guard")
     tools.Add MakeTool("clear_breakpoints", _
-        "Remove an injected breakpoint block by id.", _
+        "Remove an injected breakpoint block by id. Like set_breakpoint this FLUSHES the whole project to disk after the edit (the same save path save_project uses), so unrelated unsaved edits are written too.", _
         SchemaWith(pCbp, Req("name", "id")))
 
     Dim pDc As Object
     Set pDc = CreateObject("Scripting.Dictionary")
     tools.Add MakeTool("debug_commands", _
-        "Catalog of the VB6 debug commands this server knows, for use with the CommandBars path. Per entry: id (this server's stable command NAME, e.g. step_into - NOT a CommandBar id), keys (shortcut), english (English caption), menuId (the live CommandBar Control.Id, or the measured table value when the control cannot be resolved live), shortcutText, caption (LOCALIZED - the Chinese IDE returns Chinese) and idSource (live|table). It is a FIXED list, not a live probe of the IDE: it carries no menu path and no enabled/visible state. For ids, captions, paths and enabled flags call command_bars action=list.", _
+        "Catalog of the VB6 debug commands this server knows, for use with the CommandBars path. Per entry: id (this server's stable command NAME, e.g. step_into - NOT a CommandBar id), keys (shortcut), english (English caption), executableVia (control_execution = a real control_execution mode | native_breakpoint | command_bars:open_only - the entry only OPENS a debug window), viaNote when the entry is NOT reachable through control_execution (e.g. set_next_statement), menuId (the live CommandBar Control.Id, or the measured table value when the control cannot be resolved live), shortcutText, caption (LOCALIZED - the Chinese IDE returns Chinese; ABSENT when idSource=""table"") and idSource (live|table). It is a FIXED list, not a live probe of the IDE: it carries no menu path and no enabled/visible state. For ids, captions, paths and enabled flags call command_bars action=list.", _
         SchemaWith(pDc))
 
     Dim pEs As Object
@@ -1022,22 +1037,23 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pDg("char_quota") = Prop("integer", "Optional character quota for THIS call (overrides VB6MCP_CHAR_QUOTA and the default). With budget_ms this is how a caller requests a COMPLETE graph for a large project; the receipt reports edgesComplete + componentsUnscanned/edgeComponentsUnscanned so completeness is decidable, never guessed.")
     Set pDg("budget_ms") = Prop("integer", "Optional WALL-CLOCK budget for THIS call (overrides VB6MCP_BUDGET_MS and the 30 s default). The wall clock is a separate last-resort cutoff reported as timingTruncated; a large project needs both this and char_quota raised for a complete graph (measured: about 35 s for a 41,637-line project).")
     tools.Add MakeTool("dependency_graph", _
-        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount). v1.11.3: the build is bounded by a DETERMINISTIC character quota (env VB6MCP_CHAR_QUOTA, default 900000), so the SAME input always returns the SAME receipt; every phase keeps a reserved share of that quota, so a default run reports nodes AND some procedure edges. Large projects are PARTIALLY covered by default - read partial, budgetExhausted (the deterministic quota fired) vs timingTruncated (the wall clock fired - the LAST resort, and NOT reproducible), componentsScanned/componentsTotal, procEdgesFound and the *StageCompleted flags (a stage that was cut reports false; a stage whose input was itself cut reports false too). Raise VB6MCP_CHAR_QUOTA (and VB6MCP_BUDGET_MS, since the clock is what would stop it first) for a complete graph; a complete run is reproducible.", _
+        "Text level dependency graph of the active project: nodes, edges (component name references), cycles, and a purity classification per component: plus a PROCEDURE-level caller/callee graph (procNodes / procEdges / procCount). v1.11.3: the build is bounded by a DETERMINISTIC character quota (env VB6MCP_CHAR_QUOTA, default 900000), so the SAME input always returns the SAME receipt; every phase keeps a reserved share of that quota, so a default run reports nodes AND some procedure edges. Large projects are PARTIALLY covered by default - read partial, budgetExhausted (ANY cutoff fired) and timingTruncated (true = the WALL CLOCK was the cutoff - the LAST resort, and NOT reproducible; false = the deterministic quota was), componentsScanned/componentsTotal, procEdgesFound and the *StageCompleted flags (a stage that was cut reports false; a stage whose input was itself cut reports false too)." & _
+        " Raise VB6MCP_CHAR_QUOTA (and VB6MCP_BUDGET_MS, since the clock is what would stop it first) for a complete graph; a complete run is reproducible.", _
         SchemaWith(pDg))
 
     Dim pPu As Object
     Set pPu = CreateObject("Scripting.Dictionary")
-    Set pPu("name") = Prop("string", "Component name")
+    Set pPu("name") = Prop("string", "Component name (required; an omitted name answers component_not_found)")
     tools.Add MakeTool("purity_check", _
-        "Purity classification of one component (can it go into an offline test host): reasons such as new / createobject / fileio / apideclare / shell / gui.", _
-        SchemaWith(pPu))
+        "Purity classification of one component (can it go into an offline test host): reasons such as new / createobject / fileio / apideclare / shell / gui. name is REQUIRED (an omitted name answers component_not_found). The receipt is the dependency-graph object: purity[]{name,pure,reasons} carries the classification while nodes/edges/cycles/procNodes/procEdges carry the graph; purity is computed under a character budget, so check purityStageCompleted/partial before reading a missing entry as clean.", _
+        SchemaWith(pPu, Req("name")))
 
     Dim pGs As Object
     Set pGs = CreateObject("Scripting.Dictionary")
     Set pGs("name") = Prop("string", "Component name")
     tools.Add MakeTool("generate_stub", _
-        "Generate a compilable stub module from a component: public declarations kept verbatim, public bodies emptied, private members dropped.", _
-        SchemaWith(pGs))
+        "Generate a compilable stub module from a component (name is required): public declarations and public procedure headers are kept with whitespace collapsed and comments stripped (not byte-verbatim; line continuations are joined onto one line), public bodies emptied, private members dropped.", _
+        SchemaWith(pGs, Req("name")))
 
     Dim pRf As Object
     Set pRf = CreateObject("Scripting.Dictionary")
@@ -1050,9 +1066,9 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Dim pKf As Object
     Set pKf = CreateObject("Scripting.Dictionary")
     Set pKf("path") = Prop("string", "Fixture file path")
-    Set pKf("text") = Prop("string", "Current text to compare against the recorded fixture")
+    Set pKf("text") = Prop("string", "Current text to compare against the recorded fixture (optional: omitting it compares an empty current text)")
     tools.Add MakeTool("compare_fixture", _
-        "Compare text against a recorded fixture: same / added / removed / firstDiffLine.", _
+        "Compare text against a recorded fixture: same / added / removed / firstDiffLine. added and removed are line COUNTS (set membership), not lists; exists:false means no fixture was found at path (the comparison then runs against EMPTY stored text).", _
         SchemaWith(pKf, Req("path")))
 
     ' ---- extension library (扩展库): declarative tool packs ----
@@ -1065,12 +1081,12 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Dim pXe As Object
     Set pXe = CreateObject("Scripting.Dictionary")
     Set pXe("name") = Prop("string", "Extension pack name")
-    tools.Add MakeTool("ext_enable", "Enable an extension pack; its tools appear in tools/list.", SchemaWith(pXe))
+    tools.Add MakeTool("ext_enable", "Enable an extension pack; its tools appear in tools/list.", SchemaWith(pXe, Req("name")))
 
     Dim pXd As Object
     Set pXd = CreateObject("Scripting.Dictionary")
     Set pXd("name") = Prop("string", "Extension pack name")
-    tools.Add MakeTool("ext_disable", "Disable an extension pack; its tools disappear from tools/list.", SchemaWith(pXd))
+    tools.Add MakeTool("ext_disable", "Disable an extension pack; its tools disappear from tools/list.", SchemaWith(pXd, Req("name")))
 
     Dim pXr As Object
     Set pXr = CreateObject("Scripting.Dictionary")
@@ -1084,7 +1100,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Dim pXu As Object
     Set pXu = CreateObject("Scripting.Dictionary")
     Set pXu("name") = Prop("string", "Extension pack name")
-    tools.Add MakeTool("ext_uninstall", "Remove an extension pack (file renamed to .removed).", SchemaWith(pXu))
+    tools.Add MakeTool("ext_uninstall", "Remove an extension pack (file renamed to .removed).", SchemaWith(pXu, Req("name")))
 
     ' merge the enabled extension tools into the advertised list
     Dim extSpecs As Collection, ei As Long, eItem As Object
@@ -1166,15 +1182,15 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     ' Declared so an existing caller keeps working now that undeclared keys are refused:
     ' the probe body does not read them in this build, and the receipt reports the engine's
     ' OWN stepMode / callstack values instead of an echo of these arguments.
-    Set pVb("step") = Prop("string", "Accepted for compatibility with the probe plan; this build's probe body does not read it (the receipt reports the engine's own stepMode)")
-    Set pVb("frame_index") = Prop("integer", "Accepted for compatibility with the probe plan; this build's callstack probe reports the engine's own frames (use cs_fn for one explicit frame)")
+    Set pVb("step") = Prop("string", "Break-probe STEP selector, READ by the default probe path: ""count"" returns early with only the frame count (so a crash cannot hide what was already collected); ""frame"" restricts the callstack walk to frame_index; any other value walks every frame 0..count-1.")
+    Set pVb("frame_index") = Prop("integer", "0-based frame index used when step=""frame"" (clamped to 0..count-1 - passing count used to crash inside EbGetCallstackFunction). Ignored when step is not ""frame""; use cs_fn for a callback-free single-frame probe.")
     ' ---- project change journal (IDE event sinks) ----
     Dim pChg As Object
     Set pChg = CreateObject("Scripting.Dictionary")
     Set pChg("since") = Prop("integer", "Return only changes with rev > since (0 = everything retained)")
     Set pChg("clear") = Prop("boolean", "Reset the dropped-events counter after reading")
     tools.Add MakeTool("project_changes", _
-        "Poll the IDE change journal instead of re-reading the whole model: project/component/control add, remove and rename plus component reload, each with a monotonically increasing revision. Keep the last revision and pass it as since on the next call.", _
+        "Poll the IDE change journal instead of re-reading the whole model: project/component/control add, remove and rename plus component reload, each with a monotonically increasing revision. Keep the last revision and pass it as since on the next call. The journal is a BOUNDED 500-event ring per IDE process: when it wraps the oldest events are lost and the receipt's dropped counter (with events[]/returned) says how many - pass clear:true once you have consumed dropped. The journal starts empty when the add-in is (re)started, so a since carried over from a previous process returns nothing.", _
         SchemaWith(pChg))
 
     ' ---- call stack (G1): per-frame module + procedure, straight from the engine ----
@@ -1186,7 +1202,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         SchemaWith(pCs))
 
     tools.Add MakeTool("vba6_probe", _
-        "Call the VBA6.DLL debug engine from inside the IDE process: EbMode / EbGetStepMode / callstack / current function / EbIsValidIdent, or (exec_probe=true) the Immediate-window executor EbExecuteLine. Read-only probes run by default; break-only probes and the executor are gated.", _
+        "Call the VBA6.DLL debug engine from inside the IDE process: EbMode / EbGetStepMode / callstack / current function / EbIsValidIdent, or (exec_probe=true) the Immediate-window executor EbExecuteLine. Read-only probes run by default; break-only probes and the executor are gated. MULTI-MODE dispatcher: the FIRST matching flag wins, in this order - hosted_expr_srv, wnd_probe, mem_scan, export_rvas, engine_items, cs_fn, mem_dump, worker_call, rva_call, frame_set, frame_probe, exec_probe - and only when NONE is set does the standard read-only probe set (EbMode / EbGetStepMode / callstack / current function / EbIsValidIdent) run. Pass ONE mode flag per call; a second flag is silently ignored.", _
         SchemaWith(pVb))
 
     ' ---- project metadata / version resource (text-level .vbp) ----
@@ -1211,7 +1227,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pPm("exe_name") = Prop("string", "ExeName32 (output file name)")
     Set pPm("cond_comp") = Prop("string", "CondComp (conditional compilation arguments, e.g. TESTING=1)")
     tools.Add MakeTool("project_meta", _
-        "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading).", _
+        "Read or write the .vbp version resource and build metadata (MajorVer/MinorVer/RevisionVer/AutoIncrementVer/CompanyName/FileDescription/ProductName/legal notices/Comments/Title/ExeName32/CondComp). These keys are not exposed by the VBIDE object model, so they are edited as text: component and reference lines are never touched and a .bak is kept. VB project/source files (.vbp/.frm/.cls/.bas/.ctl) are written ANSI without BOM; never hand-write them as UTF-8-with-BOM (VB6 reads a mangled first keyword and the project stops loading). When the .vbp belongs to a project that is OPEN in the IDE the text edit will be LOST if the IDE saves the project afterwards (the receipt repeats this as a hint; close the project first, or reopen it after the edit). action=""set"" needs at least one field. cond_comp is written when PRESENT (an empty value clears CondComp); every other field is written only" & _
+        " when non-empty.", _
         SchemaWith(pPm, Req("action")))
 
     ' ---- application manifest (UAC / DPI) ----
@@ -1262,7 +1279,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pSn("path") = Prop("string", "The .vbp to snapshot. Required for action=create and action=list; NOT used by action=restore")
     Set pSn("dir") = Prop("string", "Snapshot directory. Used by action=create as an override (default <project>\_vb6mcp_snapshots\<timestamp>); REQUIRED by action=restore (the directory to restore from)")
     tools.Add MakeTool("project_snapshot", _
-        "Project-level checkpoint and rollback: copy the .vbp plus every component file into a timestamped folder with a snapshot.json manifest (path, sha256, size per file), then restore any snapshot later. Every overwritten file is backed up as .bak. This is the project-wide counterpart of the component-level snapshot/verify tools.", _
+        "Project-level checkpoint and rollback: copy the .vbp plus every component file into a timestamped folder with a snapshot.json manifest whose entries are {name, src, bytes, sha256, srcSha256} (a component file missing from disk at snapshot time is skipped and does not appear), then restore any snapshot later. Every overwritten file is backed up as .bak. This is the project-wide counterpart of the component-level snapshot/verify tools.", _
         SchemaWith(pSn, Req("action")))
 
     ' ---- delivery packaging ----
@@ -1275,21 +1292,6 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     tools.Add MakeTool("package_app", _
         "Assemble a delivery folder for a project: the built exe, an external manifest (UAC + per-monitor DPI), dependencies.txt built from the .vbp Reference= lines (with sha256 and MISSING flags), an install.bat that regsvr32s the OCX/DLL dependencies, and a README. Pure file level, so it works while the IDE is closed.", _
         SchemaWith(pPk, Req("path")))
-
-    ' ---- read-only VCS ----
-    Dim pGt As Object
-    Set pGt = CreateObject("Scripting.Dictionary")
-    Dim pGt_action As Object
-    Set pGt_action = Prop("string", "status (porcelain + branch), diff (--stat, optional file filter) or log (oneline)")
-    Set pGt_action("enum") = EnumList("status", "diff", "log")
-    Set pGt("action") = pGt_action
-    Set pGt("repo") = Prop("string", "Repository directory; defaults to the active project folder")
-    Set pGt("file") = Prop("string", "Optional path filter for action=diff")
-    Set pGt("max") = Prop("integer", "Number of commits for action=log (default 20)")
-    Set pGt("exe") = Prop("string", "Path to git.exe (default: resolved from PATH)")
-    tools.Add MakeTool("git", _
-        "Read-only Git integration: status (porcelain v1 plus branch header), diff (--stat, optionally for one file) and log (oneline). Runs git.exe and returns its captured stdout, so an agent can see what changed before editing or committing. No write commands are exposed.", _
-        SchemaWith(pGt, Req("action")))
 
     ' ---- offline VB tooling (VbFmt.bas) ----
     Dim pFc As Object
@@ -1322,16 +1324,13 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pNb("component") = Prop("string", "Component whose code pane holds the line (action=toggle)")
     Set pNb("line") = Prop("integer", "1-based IDE line to place the caret on before toggling (action=toggle)")
     tools.Add MakeTool("native_breakpoint", _
-        "Toggle a REAL IDE breakpoint (or clear all) through the Debug menu without touching any source file - unlike set_breakpoint, which injects Debug.Assert False into the code. Places the code pane caret first. Captions are matched for English and Chinese IDEs; note that the CommandBars model is suspended while the program runs, so use this in design or break state.", _
+        "Toggle a REAL IDE breakpoint (or clear all) through the Debug menu without touching any source file - unlike set_breakpoint, which injects Debug.Assert False into the code. Places the code pane caret first. Captions are matched for English and Chinese IDEs; note that a break context refuses every command-bar tool and the CommandBars model is suspended while the program runs, so this works in DESIGN state ONLY: break answers reason=commandbars_unavailable_while_in_break, run answers reason=commandbars_unavailable_while_running, and any other non-design state answers reason=not_in_design - all refused BEFORE a menu command is sent.", _
         SchemaWith(pNb, Req("action")))
 
     Set root("tools") = tools
-    Dim pWss As Object
-    Set pWss = CreateObject("Scripting.Dictionary")
-    Set pWss("repo") = Prop("string", "Repository directory for the git half (default: the active project folder)")
     tools.Add MakeTool("workspace_status", _
-        "Read-only: list the IDE components that are UNSAVED and the git working tree (branch/ahead/behind/files/diffStat) side by side. Runs only read-only git subcommands and never writes.", _
-        SchemaWith(pWss))
+        "Read-only: list the IDE components that are UNSAVED (dirtyComponents: [{name,file,isDirty,paneVsDisk}], dirtyCount) beside how many components the IDE has open (ideOpenComponents). Each dirty component is classified pane-vs-disk (paneVsDisk.classification: identical | case_only | whitespace_only | eol_only | real | unknown, with firstDiffLine / caseOnlyLineCount / whitespaceOnlyLineCount / basis) and the receipt adds realDirtyCount / caseOnlyCount / whitespaceOnlyCount / identicalCount / eolOnlyCount / unknownCount: VB6 automatically corrects identifier and keyword CASE while editing, so case_only is NOT a real source change and needs no action. String-literal and comment text is compared exactly, so case folding never hides a literal edit. Reads the component model, the code pane text and the component file on disk; starts no process and writes nothing.", _
+        SchemaWith(Nothing))
 
     Dim pVs As Object
     Set pVs = CreateObject("Scripting.Dictionary")
@@ -1340,17 +1339,19 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pVs("baseline") = Prop("string", "Optional lint baseline (a previous verify/check_component receipt text or its stableKey lines). Diagnostics matching the baseline are filtered, so pre-existing lint noise cannot inflate the numbers; the pass/fail/unknown counters keep pass+fail+unknown==checked.")
     Set pVs("requireCompiler") = Prop("boolean", "false (default) keeps this receipt byte-for-byte. true obtains ONE project-level COMPILER verdict (an isolated VB6.EXE /make over a COPY of the project on disk) before the sweep, and REFUSES structurally when no compiler is available (ok:false + reason=compiler_not_configured + compilerProbe{resolved,path,why} + howToProceed) instead of letting lint stand in for the compiler. The pass+fail+unknown==checked invariant is unchanged; on success the receipt adds authority=compiler + compiler{path,logPath,errorCount,artifactChanged}.")
     tools.Add MakeTool("verify_scope", _
-        "Read-only: for a set of components report {component, ideEqualsDisk, lintErrors, lintWarnings, firstDiagnostic} with pass/fail/unknown counters; only failing (and unknown) components are listed in detail. COUNT SEMANTICS (v1.11.9): the three counters are mutually exclusive - pass = verify answered PASS, fail = verify answered FAIL (a PROVEN inconsistency), unknown = the verdict could not be proven either way (e.g. only the build evidence is missing) and is NOT a fail. SCALE OF THE BUILD EVIDENCE: it is PROJECT-level - buildOk/buildSource/buildNote are read from a project-wide build cache, so no single component can be the only one missing it (on a never-built project every consistent component is UNKNOWN and pass is unreachable). INVARIANT: pass + fail + unknown == checked on every receipt, failures[] holds proven inconsistencies only, unknowns[] holds the unknowns only, and no component appears in both; countsConsistent publishes the check. " & _
-        "requireCompiler:true obtains ONE project-level COMPILER verdict before the sweep and refuses with reason=compiler_not_configured instead of letting lint stand in for the compiler; the counters and countsConsistent keep their documented meaning.", _
+        "Read-only: for a set of components report {component, ideEqualsDisk, lintErrors, lintWarnings, firstDiagnostic} with pass/fail/unknown counters; only failing (and unknown) components are listed in detail. COUNT SEMANTICS (v1.11.9): the three counters are mutually exclusive - pass = verify answered PASS, fail = verify answered FAIL (a PROVEN inconsistency), unknown = the verdict could not be proven either way (e.g. only the build evidence is missing) and is NOT a fail. SCALE OF THE BUILD EVIDENCE: it is PROJECT-level - buildOk/buildSource/buildNote are read from a project-wide build cache, so no single component can be the only one missing it (on a never-built project every consistent component is UNKNOWN and pass is unreachable). INVARIANT: pass + fail + unknown == checked on every receipt, failures[] holds proven inconsistencies only, unknowns[] holds the unknowns only, and no" & _
+        " component appears in both; countsConsistent publishes the check. The sweep also publishes caseOnly and identical (both SUBSETS of pass: differences VB6 folds away / a diffKind:none match); an UNPROVEN comparison lands in unknowns[] with reason=pane_not_settled | build_from_pane | ide_disk_diff_unproven (readBackRetried says a second read was used) and NEVER in failures[]. " & _
+        "requireCompiler:true obtains ONE project-level COMPILER verdict before the sweep and refuses with reason=compiler_not_configured | project_not_on_disk | compiler_timeout (the refusal carries checked/pass/fail/unknown=0 and countsConsistent:true) instead of letting lint stand in for the compiler; the counters and countsConsistent keep their documented meaning.", _
         SchemaWith(pVs))
 
     tools.Add MakeTool("todo_status", _
-        "READ-ONLY task-board snapshot. Scans an OPTIONAL in-repo task folder (tasks/ + reports/ Markdown) and returns {taskCount, openTasks, tasks[], reportCount, reports[], readOnly}. A missing task folder is a normal result (0 tasks), not an error.", _
+        "READ-ONLY task-board snapshot. Scans an OPTIONAL task folder and returns {taskCount, openTasks, tasks[], reportCount, reports[], readOnly}: with VB6MCP_TASKS_DIR set it reads <that dir>\tasks + <that dir>\reports; otherwise it walks up from the project directory to the first ancestor holding a literal tasks folder and reads <root>\tasks\P1 + <root>\reports\P1 (only *.md files in that ONE directory, no recursion). A missing task folder is a normal result (0 tasks), not an error.", _
         SchemaWith(Nothing))
+
 
     ' ---- contract v1.3.0: machine-readable version identity ----
     tools.Add MakeTool("mcp_info", _
-        "Read-only version stamp for this server: {ok, product, contract, toolCount, build:{sha256, builtAt}, breaking[], migrations[], changelog[]}. build.sha256 is the SHA-256 of the DLL file on disk, read at call time (never a compile-time literal), so an independent Get-FileHash can be compared with it; builtAt is that file's LastWriteTime. breaking[] lists the contract changes that alter how existing calls must be made. Call this once after initialize to learn which contract the server implements.", _
+        "Read-only version stamp for this server: {ok, product, contract, toolCount, build:{sha256, builtAt}, breaking[], migrations[], changelog[]}. build.sha256/builtAt describe the DLL AS IT WAS LOADED (a load-time constant, not re-hashed per call), so an independent Get-FileHash matches until that file is replaced under the running IDE - after a redeploy the running build keeps its truthful sha256 until the IDE restarts; build.onDiskChanged/build.onDiskSignature (size+mtime) and build.path report the redeploy. breaking[] lists the contract changes that alter how existing calls must be made. Call this once after initialize to learn which contract the server implements.", _
         SchemaWith(Nothing))
 
     ' ---- contract v1.6.0: cross-component replace + component undo ----
@@ -1365,7 +1366,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pRif("validate") = Prop("string", "off|warn|strict (default warn) - lint gate applied before each write, as in the other write tools")
     Set pRif("max_files") = Prop("integer", "Optional cap on components scanned (default 200, cap 1000) so a large project cannot hang the IDE")
     tools.Add MakeTool("replace_in_files", _
-        "Cross-component literal/regex replace over the components of the OPEN project. Defaults to dry_run=true: nothing is written and the receipt lists every matching component with its hit count and the shas it WOULD produce. With dry_run=false each component is rewritten through one minimal text transaction (per-component atomic) and the receipt reports per-component shaBefore/shaAfter plus a summary. expected_shas[] guards each component: a mismatch makes that component SKIPPED and reported, never written. Failure semantics are honest: on the first failure the tool STOPS, ROLLS BACK the components it already applied to their pre-run text (rolledBack=true) or reports the exact applied set when a rollback is not possible - it never claims atomicity across components.", _
+        "Cross-component literal/regex replace over the components of the OPEN project. Defaults to dry_run=true: nothing is written and the receipt lists every matching component with its hit count and the shas it WOULD produce. With dry_run=false each component is rewritten through one minimal text transaction (per-component atomic) and the receipt reports per-component shaBefore/shaAfter plus a summary. The rewrite lands in the IDE CODE PANES, not on disk (verifiedOnDisk:false, writeTarget:""ide-code-pane"", verifiedInIdePane:true): the files change only when save_project runs or the IDE auto-saves. expected_shas[] guards each component: a mismatch makes that component SKIPPED and reported, never written. Failure semantics are honest: on the first failure the tool STOPS, ROLLS BACK the components it already applied to their pre-run text (rolledBack=true) or reports the exact applied set when" & _
+        " a rollback is not possible - it never claims atomicity across components.", _
         SchemaWith(pRif, Req("path", "query", "replacement")))
 
     Dim pUnd As Object
@@ -1378,7 +1380,7 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pUnd("ts") = Prop("string", "Optional exact snapshot timestamp (see action=list); omit for the most recent")
     Set pUnd("to_disk") = Prop("boolean", "Default FALSE: restore changes the component's PANE text only, the file on disk is NEVER touched by default. true is not supported yet and is refused with reason=to_disk_not_supported - use save_project to flush the project.")
     tools.Add MakeTool("undo_edit", _
-        "Component-level undo of the LAST edit, from snapshots taken before every text write (the pre-write PANE text is stored as UTF-8 in <project>_undo<component>.<timestamp>.txt). Explicit and single-step: it never rolls back automatically and never touches a file on disk. action=list shows the available snapshots; action=restore (default) restores one through the same minimal-write path and reports the sha before/after plus diskUntouched.", _
+        "Component-level undo of the LAST edit, from snapshots taken before every text write (the pre-write PANE text is stored as UTF-8 in <ProjectDir>\_undo\<component>.<timestamp>.txt; snapshots are skipped entirely while project-directory writes are disabled by VB6MCP_ALLOW_PROJECTDIR_WRITES=0). Explicit and single-step: it never rolls back automatically and never touches a file on disk. action=list shows the available snapshots; action=restore (default) restores one through the same minimal-write path and reports the sha before/after plus diskUntouched.", _
         SchemaWith(pUnd))
 
     ' ---- contract v1.9.0 (A B): foreground safety + immediate execution ----
@@ -1392,8 +1394,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         "Object/array EXPRESSIONS (CreateObject(/GetObject(/New/Array() are REFUSED BEFORE EXECUTION with reason=object_expression_unsupported: the immediate channel does not support them (measured: a plain object assignment hangs the call). " & _
         "Assign the object to a PROJECT variable first and read scalar members; scalar results are unchanged. The value is carried out through a private temp file the tool reads back, so no Immediate-window pane read is involved. " & _
         "An unparseable sink is reported as {ok:false, reason:""value_not_parsed""} together with the RAW output - nothing is guessed. A statement that RAISES still blocks the IDE (VB6 refuses On Error on this channel with ret=40036, measured), so timeout_ms is a gate-age threshold rather than a hard timeout; ide_state{release_inflight:true} forces the gate open afterwards. The expression may also be supplied through expression_file (mutually exclusive with expression).", _
-        SchemaWith(pImE, Req("expression")), _
-        "Sink failures are typed: a rejected expression is reason=""engine_refused_line""; a SINK line failure (file number/path/permission) is reason=""eval_sink_error"" with errNumber/errDescription/lineText - never reported as an expression refusal.")
+        SchemaWith(pImE), _
+        "Failure kinds are typed and mutually distinct: reason=""engine_refused_line"" means EbExecuteLine returned non-zero and the line was NOT executed; reason=""statement_raised"" means the line raised and was caught, with error{vbaErrNumber,description} carrying the real VB error; reason=""exec_error"" means the add-in call itself raised or the probe answered nothing; reason=""value_not_parsed"" means it completed but printed nothing (output/outputTrimmed hold the RAW sink text - nothing is guessed). lineText always carries the executed line.")
 
     Dim pImR As Object
     Set pImR = CreateObject("Scripting.Dictionary")
@@ -1402,8 +1404,8 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
     Set pImR("timeout_ms") = Prop("integer", "Gate-age threshold in ms; if this call never returns, the ARMED release frees the single-flight gate on the next tool call (default 5000). It is NOT a hard timeout.")
     tools.Add MakeTool("immediate_run", _
         "RUN VB statements in the VB6 IDE's own immediate context and return what they PRINTED, with the caller NOT having to write Open/Print/Close: {ok, output, outputTrimmed, outputLines, debugPrintRewrites, elapsedMs}. Each statement-boundary Debug.Print is redirected into a private temp file, and only the text produced by THIS call is returned. The ? shorthand and _ line continuations are not supported. A statement that RAISES still blocks the IDE - see immediate_eval; timeout_ms arms a self-healing release and ide_state{release_inflight:true} forces the gate open. The statement body may also be supplied through code_file (mutually exclusive with code).", _
-        SchemaWith(pImR, Req("code")), _
-        "Sink failures are typed: a rejected statement is reason=""engine_refused_line""; a SINK line failure (file number/path/permission) is reason=""run_sink_error"" with errNumber/errDescription/lineText - never reported as a statement refusal.")
+        SchemaWith(pImR), _
+        "Failure kinds are typed and mutually distinct: reason=""engine_refused_line"" means the line was NOT executed; reason=""statement_raised"" means it raised and was caught (error{vbaErrNumber,description} carries the real VB error); reason=""exec_error"" means the add-in call itself raised or the probe answered nothing; reason=""value_not_parsed"" means it completed but printed nothing (output/outputTrimmed hold the RAW sink text). lineText always carries the executed line.")
 
     Dim pQm As Object
     Set pQm = CreateObject("Scripting.Dictionary")
@@ -1413,6 +1415,38 @@ Public Function BuildToolsListResult(ByRef cacheOff As Long, ByRef cacheRoot As 
         "Turn the SESSION-LEVEL quiet mode on or off. While ON the add-in does not call Window.SetFocus for control_window{action:""activate""} (that receipt reports quietModeSuppressedFocus:true plus the action that was still performed) and it gives the user's foreground back after a menu-driven action (native_breakpoint); EVERY tools/call receipt then carries quiet{quietMode,since,ttlMs,quietExpiresAt,suppressedFocusCount,advisory}. The advisory asks the human not to type into this IDE" & _
         " while an agent drives it, because keystrokes aimed at another window can land in the IDE when it is raised. quiet OFF is byte-for-byte the previous behaviour. The foreground/desktop state is reported as a LIVE structured value (see desktop_probe): the handle can be 0 on a non-interactive or locked desktop and that is reported as-is, so foregroundReadable=false means the handle could not be read - never read that as ""the focus was left alone"". This tool is read-only: it changes only the add-in's own state, so it is still served while a write is in flight.", _
         SchemaWith(pQm, Req("on")))
+
+    ' ---- v1.17.0 batch: trace_query (READ-ONLY trace reader; add-in face 119 -> 120) ----
+    ' The read side of inject_trace / logpoint: it reads the McpTrace JSONL sink
+    ' from THIS machine and never creates, appends to or deletes anything.
+    Dim pTq As Object
+    Set pTq = CreateObject("Scripting.Dictionary")
+    Set pTq("path") = Prop("string", "Local ABSOLUTE path of the McpTrace JSONL sink. Omit to use the sink resolution this VB6 process itself would use: MCP_TRACE_FILE, else %TEMP%" & Chr$(92) & "mcp_trace.jsonl. UNC/network paths (two leading backslashes, e.g. a server-share path), // paths and relative paths are refused with refused_path; the extension is NOT checked (the sink path is user-configurable).")
+    Set pTq("id") = Prop("string", "Exact match on the JSONL id field (the same id inject_trace returned).")
+    Set pTq("id_prefix") = Prop("string", "Prefix match on the JSONL id field.")
+    Set pTq("proc") = Prop("string", "Convenience filter, exactly equivalent to id_prefix = proc + '.' (the JSONL format has NO proc field; this is only an id convention). Mutually exclusive with id_prefix.")
+    Set pTq("pid") = Prop("integer", "Exact match on the JSONL pid field. The sink appends across runs, so pid (or archiving the file) is the only way to isolate one run.")
+    Set pTq("since_offset") = Prop("integer", "Byte cursor to resume at; it must be a line boundary (0, or right after LF) or the call is refused with bad_cursor. cursor.nextOffset from a previous call is the ONLY persistent cursor.")
+    Set pTq("limit") = Prop("integer", "Max decoded events emitted AND max matching events consumed (default 100, range 1..1000). A limit stop resumes exactly at the next matching line.")
+    Set pTq("max_bytes") = Prop("integer", "Scan window in bytes (default 1048576 = 1 MiB, minimum 4096, hard cap 8388608 = 8 MiB). A value above the cap is refused with too_large with no silent clamp; a window stop reports truncatedBy=max_bytes.")
+    Set pTq("include_fields") = Prop("array", "Keep only these keys in events[].fields. id and pid are always returned; names that never occur produce a fields_missing warning. Also accepts one comma separated string, like the A form script.")
+    Set pTq("count_only") = Prop("boolean", "true = count only: events[] stays empty and counts.hits is the window match count (limit is ignored). Use it for a full-file count by looping on nextOffset.")
+    Set pTq("strict") = Prop("boolean", "true = fail at the FIRST bad line with bad_jsonl_line (or encoding_unsupported when that line is not valid UTF-8) instead of skipping and counting it (default false). The default value must never be changed to true.")
+    Dim pTqFormat As Object
+    Set pTqFormat = Prop("string", "json (default) = the structured receipt document; jsonl = the raw matched JSONL line text only (no envelope, one line each), so it can be piped into another tool. No other format exists (no csv/text/html). When count_only is also true the structured receipt is returned and format is ignored, because an empty text body is indistinguishable from a transport failure.")
+    Set pTqFormat("enum") = EnumList("json", "jsonl")
+    Set pTq("format") = pTqFormat
+    Set pTq("expect_head_sha256") = Prop("string", "File identity guard: it must equal fileInfo.sha256Head64KiB (64 lowercase hex characters, case-insensitive), otherwise bad_cursor.")
+    tools.Add MakeTool("trace_query", _
+        "Structured, filterable, resumable reader for the McpTrace JSONL file sink (the read side of inject_trace / logpoint). READ-ONLY: it never creates, truncates, appends to or deletes any file, never creates the sink when it is missing, and never touches the VBIDE project or the IDE state - it only reads bytes from a file on THIS machine (the machine that runs the IDE, where the sink is written)." & _
+        " Sink resolution: an explicit path wins; otherwise the SAME precedence the traced program uses - environment MCP_TRACE_FILE, else %TEMP%" & Chr$(92) & "mcp_trace.jsonl - and pathFrom reports which one was used (param | env:MCP_TRACE_FILE | env:TEMP). path must be a LOCAL ABSOLUTE path: UNC and // paths and relative paths are refused with refused_path (the extension is NOT checked; the sink path is user-configurable). A missing sink answers file_not_found - that is a normal state before the traced program has run, and nothing is created." & _
+        " Line format: one JSON object per line, fixed keys id (string) and pid (number); every other key is an expression text and every value is a STRING (never assume a value is numeric/boolean; {""n"":""3""}, not {""n"":3}). The format has NO timestamp, NO line number and NO process name, so there are no time filters and no since_ts; proc is only a convenience for the id convention <proc>.<stage>. The sink appends across runs: filter by pid or archive the file." & _
+        " Result semantics that are easy to misread: hits is WINDOW-scoped (hitsScope:""window"") - a full-file count needs a nextOffset loop or count_only. cursor.nextOffset is the ONLY persistent cursor (no since_seq); events[].seq is a CALL-LOCAL 1-based physical line number inside this window, not a cursor. A trailing half line is never parsed and never consumed (cursor.partialLineBytes). Bad lines are skipped and counted by default (counts.badLines, badLines[] with lineOffset/excerpt/sampleHex); strict:true fails at the FIRST bad line with bad_jsonl_line (or encoding_unsupported). A file that does not contain a trace-shaped line in its first 64 non-empty lines is refused with not_a_trace_file instead of being reported as 0 hits." & _
+        " Evidence: fileInfo.sha256Head64KiB is the file identity (pass it back as expect_head_sha256 to prove it is the same file) and range.sha256 hashes exactly the bytes this call consumed; there is NO whole-file hash." & _
+        " Budgets: limit default 100 / max 1000; max_bytes default 1 MiB, minimum 4096, hard cap 8 MiB (above the cap: too_large, never a silent clamp); a file larger than 256 MiB is too_large and is NOT read at all. truncatedBy is limit, max_bytes or null; this add-in form additionally cuts a body above about 1 MiB down to fit the transport frame and then reports truncatedBy:""bytes_budget"" with cursor.nextOffset REWOUND to the first unreturned event (nothing is silently lost)." & _
+        " Failures use a CLOSED, mutually exclusive 8-value set (ok:false + reason): file_not_found, refused_path, too_large, io_error, bad_cursor, bad_jsonl_line, not_a_trace_file, encoding_unsupported. Non-fatal notes use a CLOSED 7-value set in warnings[].code: file_shrank, cursor_aligned_forward, bad_lines_skipped, partial_tail, duplicate_keys, fields_missing, head_sha_absent. An argument outside its declared domain is NOT one of these receipts (it is refused before any read, like any other tool's invalid argument)." & _
+        " format:""jsonl"" prints the raw matched JSONL lines only (no receipt envelope) for piping; on failure the structured receipt is returned instead. count_only:true takes precedence over format (an empty text body would be indistinguishable from a transport failure).", _
+        SchemaWith(pTq, Req()))
 
     Set BuildToolsListResult = root
     If cacheOff = 1 Then Set cacheRoot = root

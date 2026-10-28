@@ -202,11 +202,82 @@ Private Const VK_SHIFT As Long = &H10
 Private Const VK_CONTROL As Long = &H11
 
 Private Const WO_MAX As Long = 1200
-Private Const WO_KIDS_MAX As Long = 80
+' D-6 (OPEN-42 D-E6a): the child cap WAS 80, and that silently truncated every dialog with
+' more than 80 descendants. The Project Properties sheet reaches 90 descendants after 4 page
+' switches and its frame buttons then sit at index 85-89, so close_active_dialogs could not
+' even find its own Cancel button (measured clickedCount=0; only an external GetDlgItem/BMCK
+' closed it). 512 is a HARD cap, not a target: the TRUE descendant count is reported per dialog
+' (childCountTotal / childrenTruncated), so a cap hit is visible and never a silent truncation.
+Private Const WO_KIDS_MAX As Long = 512
 Private Const WHEEL_MAX As Long = 32
 
 Private m_woHwnd(0 To WO_MAX - 1) As Long
 Private m_woCount As Long
+' D-6: dedicated CHILD buffer for the two-pass enumeration in WoDialogsJson. The old code
+' reused the top-level buffer and applied the 80 cap in the CALLER, which made a policy cap
+' look like a buffer limit. Dynamic (ReDim per pass), bounded by WO_KIDS_MAX.
+Private m_woKid() As Long
+Private m_woKidCount As Long
+Private m_woKidSeen As Long
+' P1: INDEPENDENT descendant buffer for the ACTIVE PAGE's controls. Reusing m_woKid here
+' would clobber the flat dialog enumeration that is running one frame up in WoDialogsJson.
+Private m_psKid() As Long
+Private m_psKidCount As Long
+Private m_psKidSeen As Long
+' P1: the property-sheet frame's DIRECT-CHILD page frames (#32770). Pages are materialised
+' lazily and KEPT (hidden, visible=false) after navigation, so this is the materialised set.
+' Bounded by WO_PS_PAGE_KIDS_MAX; the number of DIRECT children is never large.
+Private m_psPage() As Long
+Private m_psPageVis() As Boolean
+Private m_psPageCount As Long
+
+' ---- property-sheet domain (READ-ONLY; docs/PROPERTY_SHEET_DOMAIN_DESIGN_20261028.md) ----
+' A VB6 tabbed property sheet (Project Properties / Options) is identified STRUCTURALLY, not by
+' text: a #32770 whose DIRECT child SysTabControl32 carries the comctl32 internal id 12320 AND
+' whose four frame buttons {1 OK, 2 Cancel, 9 Help, 12321 Apply} all exist and are buttons.
+' The title is only corroboration; page titles are never a criterion. Fail-closed: any missing
+' condition means "not a property sheet" (classification=unknown, policy unchanged).
+' Every Win32 call in this domain is a READ (GetDlgItem/GetWindow/GetParent/GetClassNameW/
+' GetWindowTextA + TCM_* through SendMessageTimeoutW). There is NO click/close/tab-switch path.
+Private Const WO_PS_ID_TAB As Long = 12320
+Private Const WO_PS_ID_APPLY As Long = 12321
+Private Const WO_PS_ID_OK As Long = 1
+Private Const WO_PS_ID_CANCEL As Long = 2
+Private Const WO_PS_ID_HELP As Long = 9
+Private Const WO_PS_TABS_MAX As Long = 32
+Private Const WO_PS_PAGE_KIDS_MAX As Long = 512
+Private Const WO_PS_MSG_TIMEOUT_MS As Long = 250
+Private Const WO_PS_TAB_TEXT_MAX As Long = 128
+Private Const WO_GW_CHILD As Long = 5
+Private Const WO_GW_HWNDNEXT As Long = 2
+Private Const TCM_GETITEMCOUNT As Long = &H1304
+Private Const TCM_GETCURSEL As Long = &H130B
+' Honesty note (ps-impl-a, measured locally on 32-bit comctl32 5.82): the design doc pinned
+' "TCM_GETITEMTEXTW(0x1373)". commctrl.h defines TCM_GETITEMW = TCM_FIRST+60 = 0x133C, and a
+' 32-bit runtime probe returned the tab text for 0x133C while 0x1373 returned FALSE. The
+' readable-text message is therefore 0x133C; a failed read still degrades to textReadable=false.
+Private Const TCM_GETITEMW As Long = &H133C
+' P1 (ps-impl-b; measured locally: a 32-bit comctl32 5.82 probe plus the local commctrl.h):
+' the ANSI sibling of TCM_GETITEMW is TCM_GETITEMA = TCM_FIRST+5 = 0x1305 - NOT
+' 0x133C+1=0x133D (0x133D returned TRUE but wrote NOTHING in the same probe, so it is not a
+' valid item message). TCM_GETITEMA is the FALLBACK for a control that rejects the Unicode
+' form; when both forms fail the caption is reported textReadable=false - never a guess.
+Private Const TCM_GETITEMA As Long = &H1305
+Private Const TCIF_TEXT As Long = &H1
+
+' TCITEM (TCM_GETITEMW): 7 Longs = 28 bytes on Win32, passed by VarPtr.
+Private Type WO_TCITEMW
+    mask As Long
+    dwState As Long
+    dwStateMask As Long
+    pszText As Long
+    cchTextMax As Long
+    iImage As Long
+    lParam As Long
+End Type
+
+' GetDlgItem is the only API this domain adds; every other read is already declared above.
+Private Declare Function WoGetDlgItem Lib "user32" Alias "GetDlgItem" (ByVal hDlg As Long, ByVal nIDDlgItem As Long) As Long
 
 ' ---- wheel state (module-level, so it MUST live here: VB6 puts
 ' every module-level declaration before the first procedure) ----
@@ -731,6 +802,54 @@ Private Sub WoScanKids(ByVal h As Long)
     WoEnumChildWindows h, AddressOf WoCollect, 0&
 End Sub
 
+' D-6 (OPEN-42 D-E6a): TWO-PASS child enumeration for WoDialogsJson.
+' Pass 1 COUNTS every descendant (nothing is stored, so the count is exact even beyond the
+' cap); pass 2 stores up to WO_KIDS_MAX into the dedicated array. The return value is the TRUE
+' total, which the caller reports as childCountTotal / childrenTruncated.
+' Why two passes: the single pass over the shared buffer was capped at 80 by the caller, so a
+' 90-descendant dialog lost its last 10 controls (the frame buttons). The hard cap stays on
+' purpose - an unbounded array is not an option in VB6 and a pathological window tree must not
+' stall the IDE - but it is now 512 and any hit is REPORTED, never silent.
+Private Function WoKidCountCollect(ByVal h As Long, ByVal lp As Long) As Long
+    m_woKidSeen = m_woKidSeen + 1
+    WoKidCountCollect = 1
+End Function
+
+Private Function WoKidStoreCollect(ByVal h As Long, ByVal lp As Long) As Long
+    If m_woKidCount < WO_KIDS_MAX Then
+        m_woKid(m_woKidCount) = h
+        m_woKidCount = m_woKidCount + 1
+    End If
+    WoKidStoreCollect = 1
+End Function
+
+Private Function WoScanKidsEx(ByVal h As Long) As Long
+    WoScanKidsEx = 0
+    On Error Resume Next
+    m_woKidSeen = 0
+    m_woKidCount = 0
+    If h = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    WoEnumChildWindows h, AddressOf WoKidCountCollect, 0&
+    Dim total As Long
+    total = m_woKidSeen
+    WoScanKidsEx = total
+    If total <= 0 Then
+        Erase m_woKid
+        Err.Clear
+        Exit Function
+    End If
+    If total > WO_KIDS_MAX Then
+        ReDim m_woKid(0 To WO_KIDS_MAX - 1)
+    Else
+        ReDim m_woKid(0 To total - 1)
+    End If
+    WoEnumChildWindows h, AddressOf WoKidStoreCollect, 0&
+    Err.Clear
+End Function
+
 Private Function WoClassMatch(ByVal cls As String, ByVal want As String) As Boolean
     If Len(want) = 0 Then
         WoClassMatch = (LCase$(cls) = "#32770")
@@ -773,8 +892,545 @@ Private Sub WoControlEntry(ByVal h As Long, ByRef e As Object)
     On Error GoTo 0
 End Sub
 
+
+' =====================================================================
+' property-sheet domain (READ-ONLY): recogniser + minimal descriptor.
+' Recogniser order is fixed: #32770 visible of this process, SysTabControl32(id=12320) as a
+' DIRECT child, then the four frame buttons {1,2,9,12321}. A miss returns Nothing and the
+' dialog keeps its existing shape (no key is added). Policy for a hit is still HOLD.
+' =====================================================================
+
+' Success = the SendMessageTimeoutW RETURN VALUE (a message result may legitimately be 0, e.g.
+' curSel=0, so the out-parameter cannot decide success). One shot: no retry.
+Private Function WoPsMsg(ByVal h As Long, ByVal msg As Long, ByVal wp As Long, ByVal lp As Long, ByRef result As Long) As Boolean
+    WoPsMsg = False
+    On Error Resume Next
+    result = 0
+    Dim f As Long
+    f = WoSendMessageTimeoutW(h, msg, wp, lp, SMTO_ABORTIFHUNG Or SMTO_BLOCK, WO_PS_MSG_TIMEOUT_MS, result)
+    WoPsMsg = (f <> 0)
+    Err.Clear
+End Function
+
+' One tab caption. TCITEMW is 7 Longs; pszText points at an IN-PROCESS VB String buffer (the
+' same StrPtr discipline WoText uses). A failed/timeout read answers textReadable=False and an
+' empty text - never a guess.
+' One tab caption. TWO read forms, in this order: TCM_GETITEMW (Unicode control) then
+' TCM_GETITEMA (ANSI control). TCITEM/TCITEMA is 7 Longs; pszText points at an IN-PROCESS
+' buffer (the same StrPtr discipline WoText uses). Success requires BOTH SendMessageTimeoutW
+' returning non-zero AND the message returning TRUE (an out-of-range index returns FALSE
+' without timing out). When both forms fail: textReadable=False and an empty text - no guess.
+Private Function WoPsTabText(ByVal tabH As Long, ByVal idx As Long, ByRef ok As Boolean) As String
+    WoPsTabText = ""
+    ok = False
+    On Error Resume Next
+    If tabH = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    Dim res As Long
+    Dim n As Long
+    Dim got As Boolean
+    got = False
+    Dim buf As String
+    buf = String$(WO_PS_TAB_TEXT_MAX, vbNullChar)
+    Dim it As WO_TCITEMW
+    it.mask = TCIF_TEXT
+    it.dwState = 0
+    it.dwStateMask = 0
+    it.pszText = StrPtr(buf)
+    it.cchTextMax = WO_PS_TAB_TEXT_MAX
+    it.iImage = 0
+    it.lParam = 0
+    ' (1) Unicode form.
+    If WoPsMsg(tabH, TCM_GETITEMW, idx, VarPtr(it), res) Then
+        If res <> 0 Then
+            n = WoLstrlenW(StrPtr(buf))
+            If n > 0 Then WoPsTabText = Left$(buf, n)
+            ok = True
+            got = True
+        End If
+    End If
+    ' (2) ANSI fallback: the control wrote ANSI bytes into an in-process Byte buffer; decode ONCE
+    ' with MultiByteToWideChar(CP_ACP) - the SAME decode WoText uses. A failed message still means
+    ' textReadable=false - no encoding repair is invented.
+    If Not got Then
+        Dim ab() As Byte
+        ReDim ab(0 To WO_PS_TAB_TEXT_MAX - 1)
+        it.pszText = VarPtr(ab(0))
+        it.cchTextMax = WO_PS_TAB_TEXT_MAX
+        If WoPsMsg(tabH, TCM_GETITEMA, idx, VarPtr(it), res) Then
+            If res <> 0 Then
+                Dim s As String
+                s = String$(WO_PS_TAB_TEXT_MAX, vbNullChar)
+                n = WoMultiByteToWideChar(0&, 0&, VarPtr(ab(0)), -1, StrPtr(s), WO_PS_TAB_TEXT_MAX)
+                If n > 1 Then WoPsTabText = Left$(s, n - 1)
+                ok = True
+            End If
+        End If
+    End If
+    Err.Clear
+End Function
+
+' TCM_GETITEMCOUNT / TCM_GETCURSEL are pointer-free messages. Success comes from the
+' SendMessageTimeoutW return value, never from the out-parameter (curSel 0 and "no selection"
+' are different facts). Unreadable => stateReadable=False, tabCount=0/curSel=-1 + reason.
+Private Sub WoPsTabState(ByVal tabH As Long, ByRef tabCount As Long, ByRef curSel As Long, ByRef stateOk As Boolean, ByRef stateReason As String)
+    tabCount = 0
+    curSel = -1
+    stateOk = False
+    stateReason = "tcm_unreadable"
+    On Error Resume Next
+    If tabH = 0 Then
+        stateReason = "tab_control_missing"
+        Err.Clear
+        Exit Sub
+    End If
+    Dim r As Long
+    r = 0
+    If Not WoPsMsg(tabH, TCM_GETITEMCOUNT, 0, 0, r) Then
+        stateReason = "tcm_getitemcount_failed"
+        Err.Clear
+        Exit Sub
+    End If
+    tabCount = r
+    If tabCount < 0 Then
+        tabCount = 0
+    End If
+    Dim c As Long
+    c = 0
+    If Not WoPsMsg(tabH, TCM_GETCURSEL, 0, 0, c) Then
+        stateReason = "tcm_getcursel_failed"
+        Err.Clear
+        Exit Sub
+    End If
+    curSel = c
+    stateOk = True
+    stateReason = ""
+    Err.Clear
+End Sub
+
+Private Function WoPsButtonSemantic(ByVal id As Long) As String
+    Select Case id
+        Case WO_PS_ID_OK
+            WoPsButtonSemantic = "ok"
+        Case WO_PS_ID_CANCEL
+            WoPsButtonSemantic = "cancel"
+        Case WO_PS_ID_HELP
+            WoPsButtonSemantic = "help"
+        Case WO_PS_ID_APPLY
+            WoPsButtonSemantic = "apply"
+    End Select
+End Function
+
+' ONE frame-button snapshot. Pure DATA: it is never used as a click target anywhere.
+Private Function WoPsFrameButton(ByVal hDlg As Long, ByVal id As Long) As Object
+    Set WoPsFrameButton = Nothing
+    On Error Resume Next
+    Dim h As Long
+    h = WoGetDlgItem(hDlg, id)
+    If h = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    Dim e As Object
+    Set e = CreateObject("Scripting.Dictionary")
+    e("semantic") = WoPsButtonSemantic(id)
+    e("id") = id
+    e("hwnd") = h
+    e("text") = WoText(h)
+    e("visible") = (WoIsWindowVisible(h) <> 0)
+    e("enabled") = (WoIsWindowEnabled(h) <> 0)
+    Set WoPsFrameButton = e
+    Err.Clear
+End Function
+
+' P1: the materialised page frames in window order. A property sheet's pages are #32770
+' DIRECT children of the frame (measured: parent = frame, not the tab control). Lazily created
+' pages are KEPT (hidden, visible=false), so the list only grows with navigation. TWO passes
+' over the direct children (count, then store) keep the arrays exact and bounded by
+' WO_PS_PAGE_KIDS_MAX. READ-ONLY: GetWindow(GW_CHILD/GW_HWNDNEXT) + GetClassNameW + IsWindowVisible.
+Private Sub WoPsCollectPages(ByVal hDlg As Long)
+    m_psPageCount = 0
+    Erase m_psPage
+    Erase m_psPageVis
+    On Error Resume Next
+    If hDlg = 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    Dim x As Long, n As Long
+    x = WoGetWindow(hDlg, WO_GW_CHILD)
+    n = 0
+    Do While x <> 0
+        n = n + 1
+        If n > WO_PS_PAGE_KIDS_MAX Then Exit Do
+        If LCase$(WoCls(x)) = "#32770" Then m_psPageCount = m_psPageCount + 1
+        x = WoGetWindow(x, WO_GW_HWNDNEXT)
+    Loop
+    If m_psPageCount > WO_PS_PAGE_KIDS_MAX Then m_psPageCount = WO_PS_PAGE_KIDS_MAX
+    If m_psPageCount <= 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    ReDim m_psPage(0 To m_psPageCount - 1)
+    ReDim m_psPageVis(0 To m_psPageCount - 1)
+    Dim k As Long
+    k = 0
+    x = WoGetWindow(hDlg, WO_GW_CHILD)
+    n = 0
+    Do While x <> 0
+        n = n + 1
+        If n > WO_PS_PAGE_KIDS_MAX Then Exit Do
+        If LCase$(WoCls(x)) = "#32770" Then
+            If k < m_psPageCount Then
+                m_psPage(k) = x
+                m_psPageVis(k) = (WoIsWindowVisible(x) <> 0)
+                k = k + 1
+            End If
+        End If
+        x = WoGetWindow(x, WO_GW_HWNDNEXT)
+    Loop
+    Err.Clear
+End Sub
+
+' P1: how many page frames are materialised RIGHT NOW, read through the ONE collector above
+' (so the count and the pages[] list can never disagree).
+Private Function WoPsCountPages(ByVal hDlg As Long) As Long
+    WoPsCountPages = 0
+    Call WoPsCollectPages(hDlg)
+    WoPsCountPages = m_psPageCount
+End Function
+
+' P1: INDEPENDENT two-pass descendant enumeration for the ACTIVE PAGE's controls (same
+' discipline as WoScanKidsEx, on m_psKid, so the flat dialog enumeration is never clobbered).
+' The return value is the TRUE total; the stored set is bounded by WO_PS_PAGE_KIDS_MAX.
+Private Function WoPsKidCountCollect(ByVal h As Long, ByVal lp As Long) As Long
+    m_psKidSeen = m_psKidSeen + 1
+    WoPsKidCountCollect = 1
+End Function
+
+Private Function WoPsKidStoreCollect(ByVal h As Long, ByVal lp As Long) As Long
+    If m_psKidCount < WO_PS_PAGE_KIDS_MAX Then
+        m_psKid(m_psKidCount) = h
+        m_psKidCount = m_psKidCount + 1
+    End If
+    WoPsKidStoreCollect = 1
+End Function
+
+Private Function WoPsScanKids(ByVal h As Long) As Long
+    WoPsScanKids = 0
+    On Error Resume Next
+    m_psKidSeen = 0
+    m_psKidCount = 0
+    If h = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    WoEnumChildWindows h, AddressOf WoPsKidCountCollect, 0&
+    Dim total As Long
+    total = m_psKidSeen
+    WoPsScanKids = total
+    If total <= 0 Then
+        Erase m_psKid
+        Err.Clear
+        Exit Function
+    End If
+    If total > WO_PS_PAGE_KIDS_MAX Then
+        ReDim m_psKid(0 To WO_PS_PAGE_KIDS_MAX - 1)
+    Else
+        ReDim m_psKid(0 To total - 1)
+    End If
+    WoEnumChildWindows h, AddressOf WoPsKidStoreCollect, 0&
+    Err.Clear
+End Function
+
+Private Function WoPsTitleCorroborated(ByVal ttl As String) As Boolean
+    WoPsTitleCorroborated = False
+    Dim t As String
+    t = UCase$(ttl)
+    If InStr(1, ttl, ChrW$(&H5DE5) & ChrW$(&H7A0B) & ChrW$(&H5C5E) & ChrW$(&H6027)) > 0 Then
+        WoPsTitleCorroborated = True
+        Exit Function
+    End If
+    If InStr(1, t, "PROJECT PROPERTIES") > 0 Then
+        WoPsTitleCorroborated = True
+    ElseIf InStr(1, t, "PROPERTIES") > 0 Then
+        WoPsTitleCorroborated = True
+    End If
+End Function
+
+' P1: the ONE structural recogniser (fail-closed), shared by the descriptor AND by the
+' entry-path blocking-box detector, so the two can never disagree. MESSAGE-FREE and TITLE-FREE:
+' GetDlgItem/GetClassNameW/GetParent + IsWindow/IsWindowVisible only, which is what makes it
+' safe to run while a modal box blocks the IDE.
+Private Function WoPsRecognize(ByVal h As Long) As Boolean
+    WoPsRecognize = False
+    On Error Resume Next
+    If h = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If WoIsWindow(h) = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If WoIsWindowVisible(h) = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    ' condition 1: SysTabControl32 with the comctl32 internal id 12320, DIRECT child of the frame.
+    Dim tabH As Long
+    tabH = WoGetDlgItem(h, WO_PS_ID_TAB)
+    If tabH = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If LCase$(WoCls(tabH)) <> "systabcontrol32" Then
+        Err.Clear
+        Exit Function
+    End If
+    If WoGetParent(tabH) <> h Then
+        Err.Clear
+        Exit Function
+    End If
+    ' condition 2: ALL FOUR frame buttons exist and are buttons. Apply (12321) starts hidden
+    ' and/or disabled until a page changes - that is its normal state and is reported as data.
+    Dim hOk As Long, hCancel As Long, hHelp As Long, hApply As Long
+    hOk = WoGetDlgItem(h, WO_PS_ID_OK)
+    hCancel = WoGetDlgItem(h, WO_PS_ID_CANCEL)
+    hHelp = WoGetDlgItem(h, WO_PS_ID_HELP)
+    hApply = WoGetDlgItem(h, WO_PS_ID_APPLY)
+    If hOk = 0 Or hCancel = 0 Or hHelp = 0 Or hApply = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not WoButtonish(WoCls(hOk)) Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not WoButtonish(WoCls(hCancel)) Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not WoButtonish(WoCls(hHelp)) Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not WoButtonish(WoCls(hApply)) Then
+        Err.Clear
+        Exit Function
+    End If
+    WoPsRecognize = True
+    Err.Clear
+End Function
+
+' Structural recognition + READ-ONLY descriptor. Nothing is returned when ANY condition fails.
+' detail=False is the cheap block used by the guard/close/entry paths; detail=True
+' (read_active_dialogs) adds tab captions, pages[], activePageState, activePage and the active
+' page's controls[] (P1). Recognition is delegated to WoPsRecognize - ONE recogniser.
+Private Function WoPropertySheetOf(ByVal d As Object, Optional ByVal detail As Boolean = False) As Object
+    Set WoPropertySheetOf = Nothing
+    On Error Resume Next
+    If d Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    If Not d.Exists("hwnd") Then
+        Err.Clear
+        Exit Function
+    End If
+    Dim h As Long
+    h = CLng(d("hwnd"))
+    If h = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If d.Exists("cls") Then
+        If LCase$(CStr(d("cls"))) <> "#32770" Then
+            Err.Clear
+            Exit Function
+        End If
+    End If
+    If Not WoPsRecognize(h) Then
+        Err.Clear
+        Exit Function
+    End If
+    Dim tabH As Long
+    tabH = WoGetDlgItem(h, WO_PS_ID_TAB)
+    ' ---- recognised: report ONLY (additive keys) ------------------------------
+    Dim ps As Object
+    Set ps = CreateObject("Scripting.Dictionary")
+    ps("readOnly") = True
+    ps("basis") = "structural: #32770 + SysTabControl32(12320) + frame ids 1/2/9 + apply 12321"
+    ps("titleCorroborated") = False
+    If d.Exists("title") Then
+        ps("titleCorroborated") = WoPsTitleCorroborated(CStr(d("title")))
+    End If
+    Dim tabCount As Long, curSel As Long, stateOk As Boolean, stateReason As String
+    tabCount = 0
+    curSel = -1
+    stateOk = False
+    stateReason = ""
+    Call WoPsTabState(tabH, tabCount, curSel, stateOk, stateReason)
+    Dim tc As Object
+    Set tc = CreateObject("Scripting.Dictionary")
+    tc("hwnd") = tabH
+    tc("id") = WO_PS_ID_TAB
+    tc("tabCount") = tabCount
+    tc("curSel") = curSel
+    tc("stateReadable") = stateOk
+    tc("stateBasis") = "tcm_getitemcount+tcm_getcursel"
+    tc("stateReason") = stateReason
+    Set ps("tabControl") = tc
+    Dim fbs As Object
+    Set fbs = New Collection
+    Dim fb As Object
+    Set fb = WoPsFrameButton(h, WO_PS_ID_OK)
+    If Not fb Is Nothing Then fbs.Add fb
+    Set fb = WoPsFrameButton(h, WO_PS_ID_CANCEL)
+    If Not fb Is Nothing Then fbs.Add fb
+    Set fb = WoPsFrameButton(h, WO_PS_ID_HELP)
+    If Not fb Is Nothing Then fbs.Add fb
+    Set fb = WoPsFrameButton(h, WO_PS_ID_APPLY)
+    If Not fb Is Nothing Then fbs.Add fb
+    Set ps("frameButtons") = fbs
+    Dim lim As Object
+    Set lim = CreateObject("Scripting.Dictionary")
+    lim("tabsMax") = WO_PS_TABS_MAX
+    lim("pageKidsMax") = WO_PS_PAGE_KIDS_MAX
+    Set ps("limits") = lim
+    ps("mappingNote") = "only the ACTIVE page carries a tab index; lazy-created hidden pages have no stored tab index (G5 sec 4.4/5 R5) - no page-to-tab mapping is invented"
+    ps("readOnlyBasis") = "GetDlgItem/GetWindow/GetParent/GetClassNameW/GetWindowTextA + TCM_GETITEMCOUNT/TCM_GETCURSEL/TCM_GETITEMW/TCM_GETITEMA + EnumChildWindows via SendMessageTimeoutW(250 ms); no BM_CLICK/WM_COMMAND/TCM_SETCURSEL/focus/input"
+    If detail Then
+        Dim tabs As Object
+        Set tabs = New Collection
+        If tabCount > WO_PS_TABS_MAX Then
+            ps("tabsTruncated") = True
+        Else
+            ps("tabsTruncated") = False
+        End If
+        If stateOk Then
+            Dim shown As Long
+            shown = tabCount
+            If shown > WO_PS_TABS_MAX Then
+                shown = WO_PS_TABS_MAX
+            End If
+            Dim ti As Long
+            For ti = 0 To shown - 1
+                Dim tOk As Boolean
+                Dim tTxt As String
+                tTxt = WoPsTabText(tabH, ti, tOk)
+                Dim te As Object
+                Set te = CreateObject("Scripting.Dictionary")
+                te("index") = ti
+                te("text") = tTxt
+                te("selected") = (ti = curSel)
+                te("textReadable") = tOk
+                tabs.Add te
+            Next
+        End If
+        Set ps("tabs") = tabs
+        ps("materializedPages") = WoPsCountPages(h)
+        ' ---- P1: pages[] + activePage + the ACTIVE PAGE's controls ----
+        ' pages[] lists ONLY the materialised page frames; visible=true marks the page frame the
+        ' sheet is currently showing (lazy-created hidden pages are kept and are listed too).
+        Dim pages As Object
+        Set pages = New Collection
+        Dim visN As Long
+        Dim actIdx As Long
+        visN = 0
+        actIdx = -1
+        Dim pi As Long
+        For pi = 0 To m_psPageCount - 1
+            Dim pge As Object
+            Set pge = CreateObject("Scripting.Dictionary")
+            pge("hwnd") = m_psPage(pi)
+            pge("visible") = m_psPageVis(pi)
+            pge("active") = False
+            pge("title") = WoText(m_psPage(pi))
+            pge("depth") = 1
+            pages.Add pge
+            If m_psPageVis(pi) Then
+                visN = visN + 1
+                If actIdx < 0 Then actIdx = pi
+            End If
+        Next
+        Dim apState As String
+        If visN = 1 Then
+            apState = "one_visible"
+        ElseIf visN = 0 Then
+            apState = "none_visible"
+        Else
+            apState = "ambiguous_visible"
+        End If
+        ps("activePageState") = apState
+        Set ps("pages") = pages
+        ps("activePage") = Null
+        If actIdx >= 0 Then
+            ' The ACTIVE page is the unique VISIBLE page frame. pages[].active is marked only when
+            ' that is provable (exactly one visible page); an ambiguous set claims NOTHING.
+            Dim actPg As Object
+            Set actPg = pages.Item(actIdx + 1)
+            If visN = 1 Then actPg("active") = True
+            Dim ap As Object
+            Set ap = CreateObject("Scripting.Dictionary")
+            ap("hwnd") = m_psPage(actIdx)
+            ap("title") = CStr(actPg("title"))
+            ' The page -> tab mapping is PROVABLE only when exactly ONE page frame is visible AND
+            ' the tab control answered TCM_GETITEMCOUNT/TCM_GETCURSEL. Otherwise tabIndex stays
+            ' -1 with tabIndexBasis="unresolved": no mapping is invented.
+            If visN = 1 And stateOk And curSel >= 0 Then
+                If tabCount <= 0 Or curSel < tabCount Then
+                    ap("tabIndex") = curSel
+                    ap("tabIndexBasis") = "tcm_getcursel+visible_page"
+                Else
+                    ap("tabIndex") = -1
+                    ap("tabIndexBasis") = "unresolved"
+                End If
+            Else
+                ap("tabIndex") = -1
+                ap("tabIndexBasis") = "unresolved"
+            End If
+            ap("visible") = True
+            ' The active page's OWN descendants, enumerated into an INDEPENDENT buffer. Same
+            ' control shape as dialogs[].controls[] (WoControlEntry); a cap hit is STATED.
+            Dim ctlTotal As Long
+            ctlTotal = WoPsScanKids(m_psPage(actIdx))
+            Dim ctl As Object
+            Set ctl = New Collection
+            Dim ci As Long
+            For ci = 0 To m_psKidCount - 1
+                Dim ce As Object
+                WoControlEntry m_psKid(ci), ce
+                ctl.Add ce
+            Next
+            ap("controlCount") = ctl.Count
+            ap("controlCountTotal") = ctlTotal
+            ap("controlsTruncated") = (ctlTotal > m_psKidCount)
+            Set ap("controls") = ctl
+            Set ps("activePage") = ap
+        End If
+    End If
+    Set WoPropertySheetOf = ps
+    Err.Clear
+End Function
+
+' Additive annotation at the ONE dialogs-dict build point: a recognised property sheet gets
+' classification + propertySheet; every other dialog gets NO new key (its shape is unchanged).
+Private Sub WoPsAnnotate(ByVal d As Object, ByVal detail As Boolean)
+    On Error Resume Next
+    Dim ps As Object
+    Set ps = WoPropertySheetOf(d, detail)
+    If Not ps Is Nothing Then
+        d("classification") = "property_sheet"
+        Set d("propertySheet") = ps
+    End If
+    Err.Clear
+End Sub
+
 ' Array (Collection) of visible matching dialogs of THIS process.
-Private Function WoDialogsJson(ByVal cls As String, ByVal wantHwnd As Long, ByVal withChildren As Boolean) As Object
+Private Function WoDialogsJson(ByVal cls As String, ByVal wantHwnd As Long, ByVal withChildren As Boolean, Optional ByVal psDetail As Boolean = False) As Object
     Dim out As Object
     Set out = New Collection
     Dim tops() As Long, nTops As Long, i As Long
@@ -855,20 +1511,32 @@ Private Function WoDialogsJson(ByVal cls As String, ByVal wantHwnd As Long, ByVa
                             Dim kids As Object, btns As Object
                             Set kids = New Collection
                             Set btns = New Collection
-                            WoScanKids h
-                            Dim kn As Long, j As Long
-                            kn = m_woCount
-                            If kn > WO_KIDS_MAX Then kn = WO_KIDS_MAX
+                            ' D-6: two-pass enumeration (count, then store up to the hard cap).
+                            ' kidTotal is the TRUE descendant count; controls[] is the capped view.
+                            ' A cap hit is stated in the receipt (childrenTruncated + childLimit)
+                            ' instead of being silently dropped.
+                            Dim kidTotal As Long
+                            Dim kn As Long
+                            Dim j As Long
+                            kidTotal = WoScanKidsEx(h)
+                            kn = m_woKidCount
                             For j = 0 To kn - 1
                                 Dim ke As Object
-                                WoControlEntry m_woHwnd(j), ke
+                                WoControlEntry m_woKid(j), ke
                                 kids.Add ke
                                 If CBool(ke("buttonish")) Then btns.Add ke
                             Next
                             d("childCount") = kids.Count
+                            d("childCountTotal") = kidTotal
+                            d("childrenTruncated") = (kidTotal > kn)
+                            If kidTotal > kn Then d("childLimit") = WO_KIDS_MAX
                             Set d("buttons") = btns
                             Set d("controls") = kids
                         End If
+                        ' property-sheet domain (READ-ONLY): additive annotation at the ONE
+                        ' dialogs-dict build point. A miss adds NO key, so every non-property-sheet
+                        ' dialog keeps its existing shape.
+                        Call WoPsAnnotate(d, psDetail)
                         out.Add d
                     End If
                 End If
@@ -888,7 +1556,9 @@ Public Function ReadActiveDialogsJson(ByVal cls As String, ByVal withChildren As
     root("clsFilter") = cls
     root("readOnly") = True
     Dim ds As Object
-    Set ds = WoDialogsJson(cls, 0, withChildren)
+    ' P0: the read-only tool asks for the property-sheet DETAIL block (tab captions +
+    ' materialised-page count). Every other WoDialogsJson caller keeps detail=False.
+    Set ds = WoDialogsJson(cls, 0, withChildren, True)
     Dim arr As Object
     Set arr = New Collection
     Dim i As Long
@@ -899,6 +1569,17 @@ Public Function ReadActiveDialogsJson(ByVal cls As String, ByVal withChildren As
         arr.Add ds.Item(i)
     Next
     root("count") = arr.Count
+    ' P0 additive count: how many entries of dialogs[] carry the read-only propertySheet
+    ' block (0 on every ordinary message box - stated, never omitted).
+    Dim psN As Long
+    Dim psI As Long
+    Dim psD As Object
+    psN = 0
+    For psI = 1 To arr.Count
+        Set psD = arr.Item(psI)
+        If psD.Exists("propertySheet") Then psN = psN + 1
+    Next
+    root("propertySheetCount") = psN
     ' A dialog whose body could not be read is still REPORTED (hwnd/cls/thread), not
     ' dropped: dialogTextUnreadable says the text is missing, count is never a silent 0.
     Dim unreadable As Long
@@ -1014,6 +1695,35 @@ End Function
 ' hatch the body guard suggests. Only the exact captions No / Chinese No qualify.
 Private Function WoButtonExplicitNo(ByVal norm As String) As Boolean
     WoButtonExplicitNo = WoExactHit("NO|" & ChrW$(&H5426), norm)
+End Function
+
+' D-8 (OPEN-42 D-E5b, SAFETY): the captions a dry_run PREVIEW must never advertise as its
+' target. This is NOT the click whitelist: the real click path is unchanged and may still
+' press OK when the caller names it or the measured ID table selects it. The restriction is
+' on the PLAN only - a preview that points at the box's confirm button is a dangerous
+' promise-shaped claim (the measured defect planned the OK button, id=1, while a Cancel
+' button, id=2, was present in the same box).
+Private Function WoButtonOkLike(ByVal norm As String) As Boolean
+    WoButtonOkLike = False
+    On Error Resume Next
+    WoButtonOkLike = WoExactHit("OK|OKAY|YES|APPLY|" & ChrW$(&H786E) & ChrW$(&H5B9A) & "|" & _
+                                ChrW$(&H597D) & ChrW$(&H7684) & "|" & ChrW$(&H662F) & "|" & _
+                                ChrW$(&H5E94) & ChrW$(&H7528), norm)
+    Err.Clear
+End Function
+
+' D-8 (OPEN-42 D-E5b): dry_run plan-target verdict. "" means the preview may name THIS button
+' (the caller named its caption explicitly and it is not an OK/confirm caption). Otherwise the
+' returned reason is written to skipped[].reason and NO plan is produced.
+Private Function WoDryPlanRefuse(ByVal want As String, ByVal norm As String) As String
+    WoDryPlanRefuse = ""
+    On Error Resume Next
+    If WoButtonOkLike(norm) Then
+        WoDryPlanRefuse = "dry_plan_never_ok_or_confirm"
+    ElseIf Len(Trim$(Replace(want, "&", ""))) = 0 Then
+        WoDryPlanRefuse = "dry_plan_requires_explicit_button"
+    End If
+    Err.Clear
 End Function
 
 
@@ -1566,7 +2276,20 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     Set clicked = New Collection
     Set skipped = New Collection
     Set riskDialogs = New Collection
+    ' D-7 (OPEN-42 D-E5a / 232-A D-U3a): dry_run sends NOTHING, so its preview must NOT be
+    ' counted as a click. Real clicks go to clicked[]; dry-run plans go to planned[] only, so
+    ' EVERY dry path keeps clickedCount=0 with clicked=[] (the old code added the plan to
+    ' clicked and reported clickedCount=1 on a path that sent no message at all).
+    Dim planned As Object
+    Set planned = New Collection
+    ' D-9: actual settle time before dialogsAfter was sampled (0 = dry_run / nothing clicked).
+    Dim settleMs As Long
+    settleMs = 0
     Dim refusedN As Long, refusedHostN As Long
+    Dim unknownRefusedN As Long
+    ' R-1: property-sheet refusals are counted separately so the note/advice can name the
+    ' cause instead of the generic 'nothing matched'.
+    Dim sheetRefusedN As Long
     Dim worstRisk As String, worstReason As String, worstClass As String
     worstRisk = "none"
     worstReason = ""
@@ -1604,6 +2327,19 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
         re("riskClass") = dlgRiskClass
         re("riskReason") = dlgRiskReason
         riskDialogs.Add re
+        ' D-3 (U5): classify BEFORE a target is selected. An UNRECOGNISED #32770 gets NO
+        ' clickable plan at all (HOLD): a dry_run must never preview a dangerous default
+        ' target such as the box's È·¶¨/OK, and a real call must not press anything either.
+        Dim dlgCat As String, dlgAct As String
+        dlgCat = "unknown"
+        dlgAct = "hold"
+        WoMgClassify d, dlgCat, dlgAct
+        Dim dlgUnknown As Boolean
+        dlgUnknown = (LCase$(dlgCat) = "unknown")
+        ' R-1 (RED LINE): a structurally recognised property sheet joins the SAME zero-click
+        ' gate as unknown. Classification LABELS the box; it never opens a click path.
+        Dim dlgSheet As Boolean
+        dlgSheet = (LCase$(dlgCat) = "property_sheet")
         Dim btns As Object
         Set btns = btnsOf(d)
         ' FIX-9: the SAME selector as the modal guard: caption whitelist first, then
@@ -1716,6 +2452,28 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                     If StrComp(Trim$(Replace(t, "&", "")), want, vbTextCompare) <> 0 Then isTarget = False
                 End If
                 If isTarget Then
+                    If dlgUnknown Or dlgSheet Then
+                        If dlgSheet Then
+                            ' R-1: property sheet => report + HOLD only. Nothing is sent
+                            ' and no click target is planned (an explicit button=, a real
+                            ' call and dry_run all take THIS branch before the safe-whitelist
+                            ' / ID-fallback / BM_CLICK code below).
+                            sk("reason") = "property_sheet_hold"
+                            sk("dialogTitle") = d("title")
+                            sk("advice") = "refused: this #32770 is a VB6 property sheet (property_sheet domain is READ-ONLY in this release): nothing was sent and NO click target was planned (dry_run included) - inspect it with read_active_dialogs and dismiss it yourself"
+                            skipped.Add sk
+                            sheetRefusedN = sheetRefusedN + 1
+                            Exit For
+                        End If
+                        ' U5: never a plan target, never a click - not for Cancel, not on
+                        ' dry_run. read_active_dialogs shows the box; the caller dismisses it.
+                        sk("reason") = "unknown_class_hold"
+                        sk("dialogTitle") = d("title")
+                        sk("advice") = "refused: this #32770 could not be classified (unknown), so the U5 policy sends NOTHING and produces NO click target (dry_run included); inspect it with read_active_dialogs and dismiss it yourself, or use send_window_message on a caption you have verified"
+                        skipped.Add sk
+                        unknownRefusedN = unknownRefusedN + 1
+                        Exit For
+                    End If
                     If dlgDangerous And Len(want) = 0 Then
                         sk("reason") = "dangerous_dialog_body"
                         sk("bodyHit") = bodyHit
@@ -1742,6 +2500,26 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                         sk("reason") = "not_on_safe_whitelist"
                         skipped.Add sk
                     Else
+                        ' D-8 (OPEN-42 D-E5b, SAFETY): a dry_run PREVIEW must never name an
+                        ' OK/confirm caption as its target and must never guess a target from the
+                        ' enumeration order (the measured defect planned id=1 while a Cancel
+                        ' button existed). A plan may only repeat a caption the CALLER named
+                        ' explicitly. The real (non-dry) click selector below is UNCHANGED.
+                        If dryRun Then
+                            Dim dryRefuse As String
+                            dryRefuse = WoDryPlanRefuse(want, norm)
+                            If Len(dryRefuse) > 0 Then
+                                sk("reason") = dryRefuse
+                                sk("dialogTitle") = d("title")
+                                If dryRefuse = "dry_plan_never_ok_or_confirm" Then
+                                    sk("advice") = "refused: dry_run never previews an OK/confirm caption as its plan target (" & t & "). Pass button=<an explicit non-confirm caption> to preview a safe target, or inspect the box with read_active_dialogs."
+                                Else
+                                    sk("advice") = "refused: dry_run plans ONLY the caption the caller named explicitly (button=...). The button enumeration order is NOT a plan. Pass button=<caption> to preview exactly that button, or inspect the box with read_active_dialogs."
+                                End If
+                                skipped.Add sk
+                                Exit For
+                            End If
+                        End If
                         Dim ck As Object
                         Set ck = CreateObject("Scripting.Dictionary")
                         ck("dialog") = d("hwnd")
@@ -1801,7 +2579,14 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                             ck("stillExists") = (WoIsWindow(CLng(b("hwnd"))) <> 0)
                             ck("clicked") = True
                         End If
-                        clicked.Add ck
+                        If dryRun Then
+                            ' D-7 (OPEN-42 D-E5a / 232-A D-U3a): a dry_run plan is NOT a
+                            ' click. clickedCount/clicked[] describe messages actually SENT,
+                            ' so a plan goes to planned[] only.
+                            planned.Add ck
+                        Else
+                            clicked.Add ck
+                        End If
                         ' Exactly ONE button per dialog: clicking every safe
                         ' button in turn would press OK and then Cancel on the
                         ' same box. The first safe, enabled button in the
@@ -1811,7 +2596,132 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
                 End If
             Next
         End If
+        ' D-8 (OPEN-42 D-E5b): if a dry_run recorded NOTHING for this dialog (the named
+        ' caption is absent, disabled or otherwise unplannable), say so with a skipped[]
+        ' entry carrying the SAME key set as every other skip - a silent empty preview
+        ' would be indistinguishable from "no dialog present".
+        Dim dlgTouched As Boolean
+        dlgTouched = False
+        For j = 1 To clicked.Count
+            If CLng(clicked.Item(j)("dialog")) = CLng(d("hwnd")) Then dlgTouched = True
+        Next
+        For j = 1 To planned.Count
+            If CLng(planned.Item(j)("dialog")) = CLng(d("hwnd")) Then dlgTouched = True
+        Next
+        For j = 1 To skipped.Count
+            If CLng(skipped.Item(j)("dialog")) = CLng(d("hwnd")) Then dlgTouched = True
+        Next
+        If dryRun And Not dlgTouched Then
+            Dim skNo As Object
+            Set skNo = CreateObject("Scripting.Dictionary")
+            skNo("dialog") = d("hwnd")
+            skNo("dialogTitle") = d("title")
+            skNo("hwnd") = 0
+            skNo("text") = ""
+            skNo("id") = 0
+            skNo("normalized") = ""
+            skNo("method") = "none"
+            skNo("methodUsed") = "none (refused before any message was sent)"
+            skNo("clicked") = False
+            skNo("planned") = False
+            skNo("sent") = False
+            skNo("sendResult") = 0
+            skNo("commandFallback") = 0
+            skNo("commandFallbackUsed") = False
+            skNo("stillExists") = False
+            skNo("bodyHit") = ""
+            skNo("host_modal_risk") = dlgRisk
+            skNo("risk_reason") = dlgRiskReason
+            skNo("risk_class") = dlgRiskClass
+            If Len(want) > 0 Then
+                skNo("reason") = "dry_plan_caption_not_found"
+                skNo("advice") = "refused: dry_run planned NO click target for this dialog - no button matches the caller-named caption (button=). Nothing was sent; inspect the box with read_active_dialogs."
+            Else
+                skNo("reason") = "dry_plan_no_target"
+                skNo("advice") = "refused: dry_run planned NO click target for this dialog - a plan needs an explicitly named, non-confirm caption (button=...). Nothing was sent; inspect the box with read_active_dialogs."
+            End If
+            skipped.Add skNo
+        End If
     Next
+    ' (hostmodal-fix D1e): the unified modal ledger (the nested dialogs[] every JSON receipt
+    ' carries) must describe the SAME decision the top-level keys describe. Before this change
+    ' the ledger was filled by an automatic pass that ran BEFORE this tool and CLICKED, so the
+    ' nested block and clickedCount/dialogsBefore disagreed - the measured D1 shape. Now that
+    ' this tool owns the box state, it records its OWN observation here: read-only
+    ' bookkeeping, nothing is sent.
+    Dim iLed As Long, jLed As Long
+    Dim ledHwnd As Long, ledClickId As Long
+    Dim ledClickText As String, ledRefusedHost As Boolean, ledSkipped As Boolean
+    Dim ledCat As String, ledAct As String
+    For iLed = 1 To before.Count
+        Dim dLed As Object
+        Set dLed = before.Item(iLed)
+        ledHwnd = CLng(dLed("hwnd"))
+        ledClickId = 0
+        ledClickText = ""
+        ledRefusedHost = False
+        ledSkipped = False
+        Dim ledSkipReason As String
+        ledSkipReason = ""
+        For jLed = 1 To clicked.Count
+            If CLng(clicked.Item(jLed)("dialog")) = ledHwnd Then
+                ledClickId = CLng(clicked.Item(jLed)("clickedId"))
+                ledClickText = CStr(clicked.Item(jLed)("clickedCaption"))
+                Exit For
+            End If
+        Next
+        If ledClickId = 0 Then
+            ' D-7: on a dry_run the plan lives in planned[], so the unified ledger must read
+            ' the SAME source the top-level keys describe (click_planned, never clicked).
+            For jLed = 1 To planned.Count
+                If CLng(planned.Item(jLed)("dialog")) = ledHwnd Then
+                    ledClickId = CLng(planned.Item(jLed)("clickedId"))
+                    ledClickText = CStr(planned.Item(jLed)("clickedCaption"))
+                    Exit For
+                End If
+            Next
+        End If
+        For jLed = 1 To skipped.Count
+            If CLng(skipped.Item(jLed)("dialog")) = ledHwnd Then
+                ledSkipped = True
+                ledSkipReason = CStr(skipped.Item(jLed)("reason"))
+                If ledSkipReason = "host_modal_risk_known" Then ledRefusedHost = True
+                Exit For
+            End If
+        Next
+        ledCat = "unknown"
+        ledAct = "none"
+        WoMgClassify dLed, ledCat, ledAct
+        If ledClickId <> 0 Then
+            If dryRun Then
+                ' D-3/D-7: dry_run sends NOTHING, so the nested ledger must say planned, never
+                ' clicked. Since fix3 the plan lives in planned[] (clickedCount=0 / clicked=[]),
+                ' which is exactly the source this ledger read above.
+                WoMgRecordDialog dLed, ledCat, "click_planned", 0, "", "click", "planned"
+            Else
+                WoMgRecordDialog dLed, ledCat, "click_safe", ledClickId, ledClickText, "click", "clicked"
+            End If
+        ElseIf ledRefusedHost Then
+            WoMgRecordDialog dLed, "host_modal_risk_known", "refused", 0, "", "none", "refused_host_modal"
+        ElseIf ledSkipped Then
+            If ledSkipReason = "unknown_class_hold" Or ledSkipReason = "property_sheet_hold" Then
+                ' D-3 / R-1: the U5 unknown refusal AND the property-sheet refusal are HOLDS,
+                ' not generic skips - the nested ledger must say held=true / result=held_policy,
+                ' exactly like preExistingHandled does.
+                WoMgRecordDialog dLed, ledCat, "refused", 0, "", "hold", "held_policy"
+            Else
+                WoMgRecordDialog dLed, ledCat, "skipped", 0, "", "none", "skipped"
+            End If
+        Else
+            WoMgRecordDialog dLed, ledCat, "observed", 0, "", "observe", "observed"
+        End If
+    Next
+    ' D-9 (OPEN-42 D-E6b): the click's teardown is ASYNCHRONOUS (the Project Properties sheet
+    ' closes through a PSN notification), so an immediate rescan reported dialogsAfter=1 while
+    ' an external snapshot at the same moment found none. After a REAL click, poll the live
+    ' visible #32770 set for a bounded 1.2 s before sampling dialogsAfter. dry_run sends no
+    ' message, so it never waits; afterSettleMs reports what actually happened.
+    If (Not dryRun) And clicked.Count > 0 Then settleMs = WoPostClickSettle(clicked, 1200)
     Dim after As Object
     Set after = WoDialogsJson("", hwnd, False)
     Dim remaining As Object
@@ -1832,6 +2742,13 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     root("skippedCount") = skipped.Count
     Set root("clicked") = clicked
     Set root("skipped") = skipped
+    ' D-7: the dry_run preview keeps its own ledger so clickedCount stays 0 with clicked=[]
+    ' on EVERY dry path (232-A D-U3a / OPEN-42 D-E5a). Additive keys; existing ones unchanged.
+    root("plannedCount") = planned.Count
+    Set root("planned") = planned
+    ' D-9: how long the post-click settle waited before dialogsAfter was sampled (0 = dry_run
+    ' or nothing clicked). This is measured evidence, not a claim.
+    root("afterSettleMs") = settleMs
     root("dialogsAfter") = remaining.Count
     Set root("remaining") = remaining
     ' ---- the host-modal verdict, on EVERY path ---------
@@ -1840,16 +2757,48 @@ Public Function CloseActiveDialogsJson(ByVal hwnd As Long, ByVal onlyButton As S
     root("host_modal_risk_class") = worstClass
     Set root("riskDialogs") = riskDialogs
     root("refusedHostModalCount") = refusedHostN
+    ' P1 additive count: property sheets refused by the READ-ONLY hold gate (0 is stated on
+    ' every path, never omitted).
+    root("refusedPropertySheetCount") = sheetRefusedN
     If worstRisk = "known" Then
         root("suggested_action") = "Do NOT confirm this box unless you accept that the add-in will stop answering WRITE tools until the operation ends. For VB6's Make Project box use make_project, which pins the target itself so the box never appears, or close_active_dialogs with allow_host_modal=true when you deliberately want the compile to start inside the host."
     ElseIf worstRisk = "possible" Then
-        root("suggested_action") = "No known host-modal box is up. A custom dialog is present; if the click does not return quickly, read_active_dialogs (read-only) still answers - see recovery_hint."
+        If unknownRefusedN > 0 Then
+            root("suggested_action") = "No known host-modal box is up. The box present could not be classified (unknown), so the U5 policy sent NOTHING and planned NO click target; inspect it with read_active_dialogs and dismiss it yourself (send_window_message on a caption you have verified)."
+        Else
+            root("suggested_action") = "No known host-modal box is up. A custom dialog is present; if the click does not return quickly, read_active_dialogs (read-only) still answers - see recovery_hint."
+        End If
     Else
-        root("suggested_action") = "No host-modal risk detected; a plain message box is dismissed immediately by the click."
+        If unknownRefusedN > 0 Then
+            root("suggested_action") = "No host-modal risk detected, but the box present could not be classified (unknown): the U5 policy sent NOTHING and planned NO click target (dry_run included). Inspect it with read_active_dialogs and dismiss it yourself (send_window_message on a caption you have verified)."
+        Else
+            root("suggested_action") = "No host-modal risk detected; a plain message box is dismissed immediately by the click."
+        End If
     End If
     root("recovery_hint") = "If a write tool answers reason=busy right after this call, the host is inside a modal loop opened by the button just clicked: (1) WAIT - the write usually finishes on its own; check inflight_since_ms / inflight_tool on the busy receipt; (2) INSPECT WITHOUT WRITING - read_active_dialogs is read-only and is NOT gated by the busy check, so it still answers (ownerDisabled=true identifies the blocking box); (3) if busyMs keeps growing, restart the IDE: end the VB6 process and start it again on the same .vbp - the add-in re-attaches on load and nothing in the project directory is lost, because the click only opened a modal, it did not delete anything."
-    If clicked.Count = 0 And before.Count > 0 Then
-        root("note") = "no safe, enabled button matched; nothing was clicked"
+    ' R-1: the property-sheet HOLD is a distinct cause - name it before the generic advice.
+    If sheetRefusedN > 0 And refusedHostN = 0 Then
+        root("suggested_action") = "No known host-modal box is up. A VB6 tabbed property sheet (property_sheet domain) is present and that domain is READ-ONLY in this release: nothing was sent and NO click target was planned (dry_run included). Inspect it with read_active_dialogs (read-only) and dismiss it yourself (send_window_message on a caption you have verified)."
+    End If
+    ' D-8: a dry_run that planned NOTHING must not fall through to the ordinary-risk advice
+    ' ("a plain message box is dismissed immediately by the click") - nothing will be clicked.
+    If dryRun And planned.Count = 0 And refusedHostN = 0 And refusedN = 0 And unknownRefusedN = 0 And sheetRefusedN = 0 Then
+        root("suggested_action") = "dry_run only: NO click target was planned (a dry plan needs an explicitly named, non-confirm caption; the button enumeration order is never a plan). Nothing was sent - pass button=<caption> to preview a specific safe button."
+    End If
+    If clicked.Count = 0 And planned.Count = 0 And before.Count > 0 Then
+        ' (hostmodal-fix D1c): say WHICH guard refused instead of the generic "nothing matched":
+        ' the two causes read completely differently to a caller judging safety.
+        If refusedHostN > 0 Then
+            root("note") = "the host-modal guard refused before any message was sent (host_modal_risk=known); nothing was clicked - see hostModalGuard and skipped[].reason. dry_run previewed exactly this refusal."
+        ElseIf sheetRefusedN > 0 Then
+            root("note") = "the property-sheet domain (READ-ONLY) refused this #32770 before any message was sent: the box is a VB6 tabbed property sheet, so nothing was clicked and NO click target was planned (dry_run included) - see skipped[].reason=property_sheet_hold; inspect it with read_active_dialogs (read-only) and dismiss it yourself"
+        ElseIf unknownRefusedN > 0 Then
+            root("note") = "the UNKNOWN-class policy (U5) refused this #32770 before any message was sent: nothing was clicked and NO click target was planned (dry_run included) - see skipped[].reason=unknown_class_hold; inspect the box with read_active_dialogs and dismiss it yourself (send_window_message on a caption you have verified is the explicit escape)"
+        ElseIf dryRun Then
+            root("note") = "dry_run: the preview planned NO click target (a dry plan needs an explicitly named, non-confirm caption and none was available) - nothing was sent; see skipped[].reason (dry_plan_*) and pass button=<caption> to preview a specific safe button"
+        Else
+            root("note") = "no safe, enabled button matched; nothing was clicked"
+        End If
     End If
     If refusedHostN > 0 Then
         root("hostModalGuard") = "host_modal_risk_known: the box that was up would have started a long host-modal operation, so NOTHING was sent; pass allow_host_modal=true to click it anyway"
@@ -2382,9 +3331,11 @@ End Function
 Private Function WoMgClassify(ByVal d As Object, ByRef category As String, ByRef action As String, Optional ByVal preExisting As Boolean = False) As Boolean
     On Error Resume Next
     category = "unknown"
-    ' FIX-11: an UNRECOGNISED box must not strand the call. Press the safe CANCEL/Close
-    ' (IDCANCEL=2) when one exists; the tick releases the gate when there is nothing safe.
-    action = "click_cancel"
+    ' U5 (OPEN-42 Lead ruling): an UNRECOGNISED #32770 is HELD - report only, NEVER clicked
+    ' (was: action = "click_cancel", which auto-clicked a pre-existing unknown-class box).
+    ' Liveness is unaffected: the tick still escalates on its hard deadline / absolute cap
+    ' and can release the single-flight gate, so a HELD box cannot strand the call for ever.
+    action = "hold"
     Dim bdy As String
     bdy = UCase$(WoMgBodyOf(d))
     Dim ttl As String
@@ -2396,6 +3347,25 @@ Private Function WoMgClassify(ByVal d As Object, ByRef category As String, ByRef
         ' FIX-11: cancel-like is always safe here; the risk branch below still refuses a
         ' non-cancel button, and the tick falls back to a gate release.
         action = "click_cancel"
+        WoMgClassify = True
+        Err.Clear
+        Exit Function
+    End If
+    ' property-sheet domain (READ-ONLY): STRUCTURAL recognition placed BEFORE every TEXT
+    ' token branch. The property sheet body GROWS with every visited page, so a future page
+    ' whose text contains e.g. REFERENCE / BREAKPOINT / COMPILE ERROR would otherwise be
+    ' classified by the textual branches below as click_ok (a write-direction hazard).
+    ' Structure wins first and the box stays HOLD through the SAME policy exit (no new
+    ' click path).
+    Dim psObj As Object
+    If d.Exists("propertySheet") Then
+        Set psObj = d("propertySheet")
+    Else
+        Set psObj = WoPropertySheetOf(d, False)
+    End If
+    If Not psObj Is Nothing Then
+        category = "property_sheet"
+        action = "hold"
         WoMgClassify = True
         Err.Clear
         Exit Function
@@ -2792,10 +3762,21 @@ Public Function WoModalBlockingBox() As Object
                                 out("cls") = WoCls(h)
                                 out("title") = ""
                                 out("titleDeferred") = True
-                                out("classification") = "preexisting_modal_unknown"
+                                ' P1: report the STRUCTURAL classification when the blocking
+                                ' box is a VB6 tabbed property sheet, so the top-level
+                                ' ModalBlockedJson.classification is aligned (one key, aligned
+                                ' value). The recogniser is message/title free (GetDlgItem +
+                                ' GetClassNameW + GetParent only) and the POLICY is unchanged:
+                                ' property_sheet is still HOLD and NOTHING is sent.
+                                If WoPsRecognize(h) Then
+                                    out("classification") = "property_sheet"
+                                    out("heldUnknown") = False
+                                Else
+                                    out("classification") = "preexisting_modal_unknown"
+                                    out("heldUnknown") = True
+                                End If
                                 out("policyAction") = "hold"
                                 out("held") = True
-                                out("heldUnknown") = True
                                 out("dialogCount") = cnt
                                 Set WoModalBlockingBox = out
                                 Err.Clear
@@ -2833,10 +3814,21 @@ Public Function WoModalClearPreexisting() As Object
             ' FIX-15: the classifier is the SINGLE policy source. This entry handler must not
             ' invent its own default (that turned program_msgbox's HOLD into a Cancel click).
             pickAct = act
+            ' U5: an UNCLASSIFIED box is NEVER clicked by this automatic entry pass - not even
+            ' Cancel. It is reported (HOLD) and later tool calls are refused until it is gone.
+            If cat = "unknown" Then pickAct = "hold"
             If cat = "runtime_error" Then pickAct = "click_debug"
             If cat = "compile" Or cat = "reference" Or cat = "component_missing" Or cat = "breakpoint_refused" Then pickAct = "click_ok"
             If cat = "save_confirm" Then pickAct = "click_cancel"
             If cat = "program_msgbox" Then pickAct = "hold"
+            ' (hostmodal-fix D1b/D2b): a HOST-MODAL box (VB6's own Make Project box) that predates
+            ' this call is NEVER dismissed automatically. Pressing its Cancel aborts a build dialog
+            ' the user opened, and dismissing it here made make_project's modal_blocked=true path
+            ' unreachable (measured on t16: dialogs_before=0 while the box was up, because this
+            ' pass had already pressed Cancel). The frozen allow_host_modal text is "leave the box
+            ' alone and report modal_blocked=true ... instead of clicking it", so: HOLD, send
+            ' NOTHING, report it.
+            If cat = "host_modal_risk_known" Then pickAct = "hold"
             ' never press End/Continue, whatever the class says
             Dim btns As Object
             Set btns = btnsOf(d)
@@ -2860,8 +3852,10 @@ Public Function WoModalClearPreexisting() As Object
             pc = False
             pId = 0
             Dim mth As String, res As String
+            Dim attempted As Boolean
             mth = "none"
             res = "refused"
+            attempted = False
             Dim heldNow As Boolean
             heldNow = False
             If pickAct = "hold" Or pickAct = "click_no" Then heldNow = True
@@ -2878,8 +3872,28 @@ Public Function WoModalClearPreexisting() As Object
                     pH = WoMgPickForAction(d, "click_debug", pT, pw, pc, pId)
                 End If
                 If pH <> 0 Then
+                    attempted = True
                     Call WoMgPressVerify(d, pH, pId, pT, mth, res)
                 End If
+            End If
+            ' D-4 (U4b): MEASURE the outcome AFTER the action instead of publishing the
+            ' verifier's last sample. A close can land just after its final 300 ms recheck, and
+            ' a live-but-hidden window is not "still on screen". Membership in the live VISIBLE
+            ' #32770 enumeration is the basis for result/closedNow - never an early IsWindow
+            ' sample alone. A HOLD receipt never claims still_present (nothing was sent).
+            Dim stillUp As Boolean
+            stillUp = False
+            If heldNow Then
+                stillUp = (WoIsWindow(CLng(d("hwnd"))) <> 0)
+            ElseIf attempted Then
+                stillUp = WoPreDlgSettle(CLng(d("hwnd")), 1200)
+                If stillUp Then
+                    res = "still_present"
+                Else
+                    res = "ok"
+                End If
+            Else
+                stillUp = (WoIsWindow(CLng(d("hwnd"))) <> 0)
             End If
             Dim out As Object
             Set out = CreateObject("Scripting.Dictionary")
@@ -2891,7 +3905,7 @@ Public Function WoModalClearPreexisting() As Object
             out("clickedCaption") = pT
             out("method") = mth
             out("result") = res
-            out("closedNow") = (WoIsWindow(CLng(d("hwnd"))) = 0)
+            out("closedNow") = (Not stillUp)
             out("preExisting") = True
             If heldNow Then
                 WoMgRecordDialog d, cat, "preexisting_held", 0, "", "hold", "held_policy"
@@ -2905,6 +3919,76 @@ Public Function WoModalClearPreexisting() As Object
             Exit Function
         End If
     Next
+    Err.Clear
+End Function
+
+' D-4 (U4b): bounded, MEASURED settle after a pre-existing box was acted on. TRUE means the
+' dialog is STILL ON SCREEN when the budget expires. The basis is membership in the live,
+' VISIBLE top-level #32770 enumeration (the same reader read_active_dialogs uses), not a bare
+' IsWindow sample: a destroyed/hidden window can answer IsWindow non-zero for a moment, and a
+' close can land just after the click verifier's last recheck.
+Private Function WoPreDlgSettle(ByVal h As Long, ByVal maxMs As Long) As Boolean
+    WoPreDlgSettle = False
+    On Error Resume Next
+    If h = 0 Then Err.Clear : Exit Function
+    Dim waited As Long
+    waited = 0
+    Do
+        If Not WoDialogOnScreen(h) Then Err.Clear : Exit Function
+        If waited >= maxMs Then Exit Do
+        Call WoMgPause(100)
+        waited = waited + 100
+    Loop
+    WoPreDlgSettle = True
+    Err.Clear
+End Function
+
+' D-9 (OPEN-42 D-E6b): bounded settle after REAL clicks, before dialogsAfter is sampled.
+' Returns the milliseconds actually waited (0 when every clicked dialog was already gone on the
+' first look - the fast path). Basis: the same live, VISIBLE top-level #32770 membership test
+' WoPreDlgSettle uses, so "gone" means "not on screen any more", not "destroyed". Sends nothing.
+Private Function WoPostClickSettle(ByVal clicked As Object, ByVal maxMs As Long) As Long
+    WoPostClickSettle = 0
+    On Error Resume Next
+    If clicked Is Nothing Then
+        Err.Clear
+        Exit Function
+    End If
+    If clicked.Count = 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    Dim waited As Long, ci As Long, stillAny As Boolean
+    waited = 0
+    Do
+        stillAny = False
+        For ci = 1 To clicked.Count
+            If WoDialogOnScreen(CLng(clicked.Item(ci)("dialog"))) Then
+                stillAny = True
+                Exit For
+            End If
+        Next
+        If Not stillAny Then Exit Do
+        If waited >= maxMs Then Exit Do
+        Call WoMgPause(100)
+        waited = waited + 100
+    Loop
+    WoPostClickSettle = waited
+    Err.Clear
+End Function
+
+Private Function WoDialogOnScreen(ByVal h As Long) As Boolean
+    WoDialogOnScreen = False
+    On Error Resume Next
+    If WoIsWindow(h) = 0 Then Err.Clear : Exit Function
+    Dim ds As Object
+    Set ds = WoDialogsJson("", h, False)
+    Dim i As Long
+    If Not ds Is Nothing Then
+        For i = 1 To ds.Count
+            If CLng(ds.Item(i)("hwnd")) = h Then WoDialogOnScreen = True
+        Next
+    End If
     Err.Clear
 End Function
 
@@ -3069,11 +4153,19 @@ Public Function WoModalCancelPriorDialog() As Object
             pw = ""
             pc = False
             pId = 0
-            pH = WoMgPickForAction(d, "click_cancel", pT, pw, pc, pId)
-            If pH = 0 Then pH = WoMgPickForAction(d, "click_ok", pT, pw, pc, pId)
+            ' U5: this pre-run cancel pass is AUTOMATIC too - an UNCLASSIFIED/HOLD box is never
+            ' clicked here; it is reported so the calling tool can refuse with evidence.
+            Dim holdIt As Boolean
+            holdIt = False
+            If LCase$(cat) = "unknown" Or LCase$(act) = "hold" Then holdIt = True
+            If Not holdIt Then
+                pH = WoMgPickForAction(d, "click_cancel", pT, pw, pc, pId)
+                If pH = 0 Then pH = WoMgPickForAction(d, "click_ok", pT, pw, pc, pId)
+            End If
             Dim mth As String, res As String
             mth = "none"
             res = "refused"
+            If holdIt Then res = "held_policy"
             If pH <> 0 Then
                 Call WoMgPressVerify(d, pH, pId, pT, mth, res)
                 m_mgClickedHwnd = pH
@@ -3229,7 +4321,14 @@ Public Function WoModalSnapshot() As Object
         e("bodyHead") = Left$(CStr(d("title")), 200)
         e("ownerDisabled") = d("ownerDisabled")
         e("buttons") = d("buttons")
-        e("classification") = "unknown"
+        ' P1: carry the STRUCTURAL classification the dialog reader already made (a property
+        ' sheet no longer shows up as "unknown" in a nested receipt ledger). The key and its
+        ' default are unchanged; only a POSITIVE property_sheet classification is added.
+        If d.Exists("classification") Then
+            e("classification") = CStr(d("classification"))
+        Else
+            e("classification") = "unknown"
+        End If
         e("action") = "held"
         e("clickedId") = 0
         e("latencyMs") = IIf(m_mgAt = 0, 0, WoGetTickCount() - m_mgAt)
@@ -3376,6 +4475,32 @@ Private Sub WoMgRecordDialog(ByVal d As Object, ByVal category As String, ByVal 
         ' result=held_policy already has held=True from heldFlag; the old assignment overwrote it
         ' with False because the ACTION name ("preexisting_held") does not contain "hold".
         e("held") = CBool(e("held")) Or (InStr(1, action, "hold", vbTextCompare) > 0)
+    End If
+    ' D-12 (OPEN-42 232-A2 D-V8a): ONE ledger entry per WINDOW. The dispatch ENTRY pass
+    ' records a pre-existing box, then the in-call guard records the SAME box again when
+    ' its tick sees it; both records reached dialogs[], so one hwnd appeared twice (the
+    ' measured held receipt carried 2 hold entries for one box). Keep the FIRST record -
+    ' it says what this call did first - and only FILL MISSING fields from the later
+    ' observation. Different hwnds are never collapsed, and hwnd=0 (a window whose handle
+    ' could not be read) never acts as an identity, so no distinct box is ever dropped.
+    If CLng(e("hwnd")) <> 0 Then
+        If Not (m_mgDialogs Is Nothing) Then
+            Dim prior As Object, pi As Long, pk As Variant
+            For pi = 1 To m_mgDialogs.Count
+                If IsObject(m_mgDialogs(pi)) Then
+                    Set prior = m_mgDialogs(pi)
+                    If prior.Exists("hwnd") Then
+                        If CLng(prior("hwnd")) = CLng(e("hwnd")) Then
+                            For Each pk In e.Keys
+                                If Not prior.Exists(CStr(pk)) Then prior(CStr(pk)) = e(pk)
+                            Next
+                            Err.Clear
+                            Exit Sub
+                        End If
+                    End If
+                End If
+            Next
+        End If
     End If
     m_mgDialogs.Add e
     Err.Clear
@@ -3525,7 +4650,18 @@ Public Function WoModalGuardTick() As Boolean
             Else
             pick = WoMgPickForAction(d, mgAct, pickText, pickWhy, pickCancel, pickId)
             If pick <> 0 Then
-                If mgRisk = "known" And Not pickCancel And Not m_mgAllowHostModal Then
+                If mgRisk = "known" And WoMgIsPre(CLng(d("hwnd"))) And Not m_mgAllowHostModal Then
+                    ' (hostmodal-fix D2c): a host-modal box this call did NOT open is never dismissed
+                    ' by the AUTOMATIC guard - not even with a cancel-like caption - because the tool
+                    ' that owns the contract must still be able to OBSERVE it (make_project ->
+                    ' modal_blocked=true; close_active_dialogs -> host_modal_risk / dry_run preview;
+                    ' read_active_dialogs -> read-only listing). Nothing is sent; counting it as
+                    ' refused also stops the settle loop from pumping on it.
+                    m_mgRefused = m_mgRefused + 1
+                    m_mgRefusedReason = "preexisting_host_modal_risk_known: this box predates the call, so the automatic guard presses NOTHING (report it; dismiss it explicitly with close_active_dialogs)"
+                    m_mgMethod = "none (refused before any message was sent)"
+                    WoMgRecordDialog d, mgCat, "hold", 0, "", "hold", "held_policy"
+                ElseIf mgRisk = "known" And Not pickCancel And Not m_mgAllowHostModal Then
                     ' VB6's own Make Project box: only a cancel-like caption may be
                     ' pressed here. Pressing "the first safe button" starts a compile
                     ' inside the host's modal loop = defect #4.

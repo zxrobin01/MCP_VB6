@@ -54,6 +54,7 @@ Module=McpCls; McpCls.bas
 Module=McpRe; McpRe.bas
 Module=McpBpPane; McpBpPane.bas
 Module=McpBpReg; McpBpReg.bas
+Module=TraceQuery; TraceQuery.bas
 Form=SettingsForm.frm
 Form=IngressForm.frm
 Startup="(None)"
@@ -69,7 +70,7 @@ MinorVer=0
 RevisionVer=0
 AutoIncrementVer=0
 ServerSupportFiles=0
-VersionComments=algo=vb6src/2;src=e24036957998edec991cf3dc62ac8fba0a89cc89ba107986dc24ed0ccf4d7ff0
+VersionComments=algo=vb6src/3;src=cef99abb67b1fa7fd7aecb441d01166e2a68395af33662243d6acf07651ecc34
 VersionCompanyName="VB6MCP"
 CompilationType=0
 OptimizationType=0

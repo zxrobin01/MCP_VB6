@@ -51,9 +51,18 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     fmtFirst = ""
     Dim eqFlag As String
     eqFlag = "false"
+    ' v1.16.6: whether the pane/disk comparison could PROVE an alignment. An
+    ' unaligned comparison names no differing line and must not be read as a proven
+    ' inconsistency; the three values are published only when a disk compare ran.
+    Dim cmpAligned As Boolean
+    Dim cmpAlignBasis As String
+    Dim cmpAlignScore As Long
+    cmpAligned = False
+    cmpAlignBasis = ""
+    cmpAlignScore = 0
     If Len(diskPath) > 0 Then
         tA = GetTickCount()
-        verdict = VerifyTextVsDisk(ideText, diskPath, headerOffset, detail, ideLines, diskLines, usedOffset, fmtCount, fmtFirst)
+        verdict = VerifyTextVsDisk(ideText, diskPath, headerOffset, detail, ideLines, diskLines, usedOffset, fmtCount, fmtFirst, cmpAligned, cmpAlignBasis, cmpAlignScore)
         tmDisk = GetTickCount() - tA
     Else
         verdict = "SKIPPED"
@@ -66,6 +75,18 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     ' normalised away, and classifies every differing line.
     Dim semJson As String
     semJson = SemanticDiffJson(ideText, diskPath, usedOffset)
+    If verdict = "NOT-ALIGNED" Then
+        ' v1.16.6: the semantic classifier also aligns by content. With NO proven
+        ' alignment its line list would be a guess, so publish that fact instead.
+        semJson = "{" & SemQ("available") & ":false," & SemQ("reason") & ":" & SemS("aligned:false - no alignment between the pane and the disk file could be PROVEN, so no line-by-line classification is published") & "}"
+        m_semAvail = False
+        m_semReal = 0
+        m_semCase = 0
+        m_semWs = 0
+        m_semAttr = 0
+        m_semHeader = 0
+        m_semKind = "unproven"
+    End If
 
     ' ---- WP-22-04: fold the SEMANTIC answer into the DECISION --------------------
     ' ideEqualsDisk stays the BYTE answer and is NOT redefined below. The question a
@@ -94,6 +115,10 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     If verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL" Then
         If Not foldableOnly Then overall = "FAIL"
     End If
+    ' v1.16.6: NOT-ALIGNED is UNPROVEN, never FAIL. The pane block was not found
+    ' verbatim anywhere in the disk body and no content anchor proved an alignment,
+    ' so a differing-line list would be a guess. Report UNKNOWN with a named basis.
+    If verdict = "NOT-ALIGNED" Then overall = "UNKNOWN"
     ' item 10 (F-c): MISMATCH-FORMATTING is deliberately NOT added to the FAIL
     ' list above (a formatting-only difference is UNPROVEN, not proven bad) and it is NOT
     ' allowed to inherit PASS either: with a fresh build artifact the ladder below would
@@ -126,6 +151,13 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     ' answer; lineSpace/lineNumbersAre say which coordinate space the comparison and
     ' the counts live in; ideLineCount/diskLineCount are the normalised counts.
     sb = sb & Jq("ideEqualsDisk") & ":" & eqFlag & ","
+    ' v1.16.6: alignment is its own fact, present ONLY when a disk comparison ran
+    ' (no comparison is not the same claim as aligned:false).
+    If Len(diskPath) > 0 Then
+        sb = sb & Jq("ideDiskAligned") & ":" & LayB(cmpAligned) & ","
+        sb = sb & Jq("ideDiskAlignedBasis") & ":" & Js(cmpAlignBasis) & ","
+        If cmpAligned Then sb = sb & Jq("ideDiskAlignScore") & ":" & CStr(cmpAlignScore) & ","
+    End If
     sb = sb & Jq("lineSpace") & ":" & Js("ide") & ","
     sb = sb & Jq("lineNumbersAre") & ":" & Js("ide") & ","
     sb = sb & Jq("ideLineCount") & ":" & CStr(ideLines) & ","
@@ -156,6 +188,7 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     ' foldable-only difference cannot read as a failed layer while overall says PASS.
     lay = lay & Jq("ideDiskDiff") & ":{" & Jq("failed") & ":" & _
         LayB((verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") And (Not foldableOnly)) & "," & _
+        Jq("aligned") & ":" & LayB(cmpAligned) & "," & Jq("alignedBasis") & ":" & Js(cmpAlignBasis) & "," & _
         Jq("ideDisk") & ":" & Js(verdict) & "," & Jq("ideEqualsDisk") & ":" & eqFlag & "," & _
         Jq("foldableOnly") & ":" & LayB(foldableOnly) & "," & Jq("diffKind") & ":" & Js(diffKind) & "," & _
         Jq("detail") & ":" & Js(detail) & "},"
@@ -169,7 +202,9 @@ Public Function VerifyComponent(ByVal compKind As String, ByVal ideText As Strin
     sb = sb & Jq("failureLayers") & ":" & lay & ","
     Dim basis As String
     basis = "none"
-    If (verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") And (Not foldableOnly) Then
+    If verdict = "NOT-ALIGNED" Then
+        basis = "ideDiskDiffUnproven"
+    ElseIf (verdict = "MISMATCH" Or verdict = "NOT-SYNCED" Or verdict = "READ-FAIL") And (Not foldableOnly) Then
         basis = "ideDiskDiff"
     ElseIf errN > 0 Then
         basis = "lint"

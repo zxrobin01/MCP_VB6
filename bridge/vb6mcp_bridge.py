@@ -19,6 +19,9 @@ surface so that no existing tool changes:
                      tests/battery_test.py / tests/smoke_test.py use)
     POST /mcp        the MCP streamable-HTTP face (what tools/mcp_strict_audit.py uses)
     --stdio          line-delimited JSON-RPC on stdin/stdout (the stdio entry)
+    /ide/v1/*        the OPEN-33 management face: VERSIONED, NON-MCP, and P1 is READ-ONLY
+                     (GET|POST /ide/v1/status + GET /ide/v1/op/<id>; the write verbs are
+                     declared, policy-checked placeholders until P2)
 
     GET /health|/ping, GET /, OPTIONS, DELETE /mcp, 404/405/413        - mirrors the add-in
 
@@ -127,10 +130,12 @@ FROZEN FORM (PyInstaller onefile) AND ITS ACCEPTANCE
         python tools/mcp_strict_audit.py --url http://127.0.0.1:8791/mcp
         python tools/dump_tools_schema.py --url http://127.0.0.1:8791/rpc --out $env:TEMP\exe_dump.json
     and the source form of the same three commands; the two runs must agree on
-    snapshotFingerprint / liveFingerprint / liveTools (== 110) and the dumped tool array must
-    equal docs/tools_schema.json field for field.
+    snapshotFingerprint / liveFingerprint / liveTools (== the ADD-IN tool count DERIVED from
+    docs/tools_schema.json - this file carries no literal tool count) and the dumped tool
+    array must equal docs/tools_schema.json field for field.
 
 Exit codes: 0 ok | 2 usage | 3 refused/occupied port | 4 bind failure | 5 unreadable snapshot
+            | 8 the /ide management face is misconfigured (fail-closed)
 """
 
 from __future__ import annotations
@@ -155,6 +160,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from ctypes import wintypes
@@ -1960,6 +1966,56 @@ def read_json(path, default):
             return json.load(fh)
     except Exception:
         return default
+
+
+#: The ADD-IN face contract of record.  A frozen onefile bundle does NOT carry docs/, so the
+#: user-visible tool count is a BEST-EFFORT derivation from this file - never a literal.  When
+#: the file is unavailable the text says "the frozen add-in tool face" (fail open, OPEN-32).
+TOOLS_SCHEMA_PATH = os.path.join(REPO_ROOT, "docs", "tools_schema.json")
+
+
+def addin_tool_count():
+    """Derive the ADD-IN tool count from docs/tools_schema.json; None when unavailable.
+
+    The snapshot of record is {"tools": [...]} (it may additionally carry an explicit
+    "toolCount").  A missing/unparsable file, a non-positive non-int count, or a toolCount that
+    contradicts len(tools) all return None - callers MUST fail open and never print a guessed
+    number in user-visible text.
+    """
+    try:
+        doc = read_json(TOOLS_SCHEMA_PATH, {})
+    except Exception:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    count = doc.get("toolCount")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        count = None
+    tools = doc.get("tools")
+    n_tools = len(tools) if isinstance(tools, list) else None
+    if count is not None and n_tools is not None and count != n_tools:
+        return None
+    if count is not None:
+        return count
+    return n_tools if n_tools else None
+
+
+def addin_tool_face_phrase():
+    """'119 tools' when the snapshot is readable, else 'the frozen add-in tool face'."""
+    n = addin_tool_count()
+    return "%d tools" % n if n else "the frozen add-in tool face"
+
+
+def non_loopback_refusal_text(host):
+    """The user-visible non-loopback refusal; the tool count is DERIVED, never a literal."""
+    return (
+        "vb6mcp_bridge: REFUSED - %r is not a loopback address.\n"
+        "  This service exposes the whole tool face (%s, including WRITE tools that\n"
+        "  edit files and run code in the IDE).  The DEFAULT tier is loopback-only\n"
+        "  (ADR sec 0.5 / TOKEN_THREAT_MODEL.md M-0); remote binding requires ALL of\n"
+        "  --allow-remote <cidr> + --tls-cert/--tls-key + a token source (see\n"
+        "  docs/design/REMOTE_ACCESS.md).  Missing: --allow-remote.\n"
+        % (host, addin_tool_face_phrase()))
 
 
 def normalize_path(p):
@@ -4016,6 +4072,756 @@ def handle_jsonrpc(req_text, selector=None, peer=None):
     return _jsonrpc_error(rid, -32000, failure.get("message") or "forward failed", failure), True, out
 
 
+
+# ---------------------------------------------------------------- ide control face ----
+# OPEN-33 P1: a VERSIONED, NON-MCP management face on THIS listener.
+#
+#     GET|POST /ide/v1/status              READ-ONLY facts (superset of ide_status)
+#     GET      /ide/v1/op/<opId>           op continuation (404 shell in P1; ledger is P2)
+#     POST     /ide/v1/start|stop|restart  WRITE verbs - policy-checked, then 403/501 in P1
+#
+# It is NOT an MCP surface: /ide/* never enters LOCAL_METHODS / tools/list, every response
+# carries apiVersion=ide/1 + envelope=vb6mcp.ide/1 + localMethod=null, and the MCP routes
+# (/rpc, /mcp, /health) keep their byte-for-byte behaviour.  The design is
+# docs/OPEN33_DESIGN_20261027.md; the P1 implementation note is appended to it.
+#
+# P1 IS READ-ONLY.  The write verbs are DECLARED and policy-checked (so the mode and the
+# remote gate are observable from day one), but this build has no launcher/lock/op ledger,
+# so an ALLOWED write request answers 501 not_implemented - never 404, because a 404 would
+# be indistinguishable from a route that does not exist.
+#
+# The peer policy is the OPEN-33 P0 countermeasure: a loopback peer address alone is NOT
+# trusted, because a portproxy (measured on t16: 0.0.0.0:8796 -> 127.0.0.1:8797) makes every
+# remote caller look like 127.0.0.1.  Forwarded / X-Forwarded-For / X-Real-IP, or a Host
+# header that is not literally local, upgrade the request to REMOTE (peerBasis=proxy_hint):
+# the status face then answers with the SAME redacted view /health gives a remote caller,
+# and write verbs are refused unless --ide-control-remote was explicitly enabled (which in
+# turn requires --ide-control=full + the complete remote-mode trio).
+#
+# Write-verb precedence (Lead ruling, 2026-10-27): POLICY BEFORE CAPABILITY
+#     1. effective-remote caller and --ide-control-remote off  -> 403 ide_control_remote_forbidden
+#     2. --ide-control=status (default)                        -> 403 ide_control_disabled
+#     3. --ide-control=full, but this P1 build has no launcher -> 501 not_implemented
+# --ide-control=off removes the face entirely (/ide/* is then an ordinary 404, byte-for-byte
+# the pre-OPEN-33 behaviour).  --ide-control=full refuses to START without a token, and
+# --ide-control-remote refuses to start unless full + the remote-mode trio is complete
+# (fail-closed, exit code 8; this is NOT implied by --remote-write).
+
+IDE_API_VERSION = "ide/1"
+IDE_ENVELOPE = "vb6mcp.ide/1"
+IDE_API_HEADER = "X-VB6MCP-Api"
+IDE_CONTROL_MODES = ("off", "status", "full")
+IDE_CONTROL_VERBS = ("status", "start", "stop", "restart", "op")
+IDE_CONTROL_READ_VERBS = ("status", "op")
+IDE_CONTROL_WRITE_VERBS = ("start", "stop", "restart")
+#: What THIS build actually serves (the truth in /health.ideControl.verbs and in the 501 body).
+IDE_CONTROL_IMPLEMENTED_VERBS = ("status", "op")
+IDE_CONTROL_SUPPORTED_VERSIONS = (IDE_API_VERSION,)
+IDE_CONTROL_P1_NOTE = (
+    "P1 is the READ-ONLY management face: status + the op continuation shell are served; "
+    "start/stop/restart are declared and policy-checked but not implemented in this build "
+    "(they answer 403 when the policy blocks them, otherwise 501 not_implemented).")
+
+#: Closed reason vocabulary for the /ide face (design sec 3.8).  EVERY reason emitted by
+#: this face MUST be a key here: ide_failure() treats an unknown reason as a KeyError
+#: (a test asserts that), so an undeclared word cannot silently appear in a receipt.
+#: Tuple = (reason, httpStatus, failureKind, retrySafe, suggestedAction, reachableInP1).
+_IDE_REASON_SPECS = (
+    ("api_version_required", 404, "toolError", False, "fix_params", True),
+    ("api_version_unsupported", 400, "toolError", False, "fix_params", True),
+    ("bad_request", 400, "toolError", False, "fix_params", True),
+    ("body_too_large", 413, "toolError", False, "fix_params", True),
+    ("bad_json", 400, "toolError", False, "fix_params", True),
+    ("not_implemented", 501, "toolError", False, "none", True),
+    ("token_missing", 401, "transport", False, "fix_params", True),
+    ("token_mismatch", 401, "transport", False, "fix_params", True),
+    # the two below are the PRE-EXISTING bridge auth vocabulary (reused, not invented):
+    # a bad scheme / a credential in the URL keeps its established name.
+    ("token_bad_scheme", 401, "transport", False, "fix_params", True),
+    ("token_in_url_rejected", 401, "transport", False, "fix_params", True),
+    ("auth_locked_out", 429, "transport", False, "retry_later", True),
+    ("source_not_allowed", 403, "policyRefusal", False, "none", True),
+    ("tls_required", 403, "policyRefusal", False, "deploy_window", False),
+    ("audit_unavailable", 503, "environment", False, "fix_params", True),
+    ("ide_control_disabled", 403, "policyRefusal", False, "inspect", True),
+    ("ide_control_remote_forbidden", 403, "policyRefusal", False, "deploy_window", True),
+    ("no_interactive_session", 503, "environment", False, "start_ide", False),
+    ("unsupported_platform", 501, "environment", False, "inspect", False),
+    ("vb6_exe_not_found", 503, "environment", False, "deploy_window", False),
+    ("vb6_exe_not_allowlisted", 403, "policyRefusal", False, "fix_params", False),
+    ("launcher_strategy_unavailable", 409, "policyRefusal", False, "deploy_window", False),
+    ("task_not_allowlisted", 403, "policyRefusal", False, "fix_params", False),
+    ("task_definition_mismatch", 409, "policyRefusal", False, "fix_params", False),
+    ("project_not_found", 404, "toolError", False, "fix_params", False),
+    ("project_not_vbp", 400, "toolError", False, "fix_params", False),
+    ("project_already_open", 409, "toolError", False, "fix_params", False),
+    ("no_live_ide", 404, "toolError", False, "start_ide", False),
+    ("target_not_found", 404, "toolError", False, "fix_params", True),
+    ("ambiguous_target", 409, "toolError", False, "fix_params", True),
+    ("instance_not_owned", 403, "policyRefusal", False, "inspect", False),
+    ("foreign_instance_refused", 403, "policyRefusal", False, "inspect", False),
+    ("ownership_unknown", 403, "policyRefusal", False, "inspect", False),
+    ("op_in_progress", 409, "concurrency", True, "retry_later", False),
+    ("lock_held", 409, "concurrency", True, "retry_later", False),
+    ("restart_in_progress", 409, "concurrency", True, "retry_later", False),
+    ("restart_throttled", 429, "concurrency", True, "retry_later", False),
+    ("circuit_open", 503, "concurrency", True, "retry_later", False),
+    ("spawn_failed", 500, "environment", True, "retry_once", False),
+    ("spawn_denied", 403, "environment", False, "fix_params", False),
+    ("quit_blocked_by_dialog", 409, "toolError", False, "inspect", False),
+    ("quit_requires_force_confirmation", 409, "toolError", False, "fix_params", False),
+    ("kill_failed", 500, "toolError", True, "retry_once", False),
+    ("op_not_found", 404, "toolError", False, "fix_params", True),
+    # ADDITIVE to the design table (documented in the P1 implementation note): the routing
+    # 404 for a well-versioned but unknown /ide/v1 path, and the last-resort handler error.
+    ("endpoint_not_found", 404, "toolError", False, "fix_params", True),
+    ("internal_error", 500, "toolError", True, "retry_once", True),
+)
+IDE_CONTROL_REASONS = dict(
+    (row[0], {"http": row[1], "failureKind": row[2], "retrySafe": row[3],
+              "suggestedAction": row[4], "p1": row[5]}) for row in _IDE_REASON_SPECS)
+IDE_CONTROL_REASONS_ORDER = tuple(row[0] for row in _IDE_REASON_SPECS)
+
+IDE_REASON_MESSAGES = {
+    "api_version_required": ("the /ide face is versioned; only /ide/v1/... exists "
+                             "(no implicit compatibility)"),
+    "api_version_unsupported": ("this bridge speaks apiVersion %r; send %s: %s (or, on POST, "
+                               "a body field apiVersion=%r)"
+                               % (IDE_API_VERSION, IDE_API_HEADER, IDE_API_VERSION,
+                                  IDE_API_VERSION)),
+    "bad_request": "the request body is not a JSON object this face accepts",
+    "body_too_large": "the request body exceeds this listener's ceiling",
+    "bad_json": "the request body is not valid JSON",
+    "not_implemented": "the verb is declared by the ide/1 API but NOT implemented in this build",
+    "token_missing": ("this bridge requires a token; send Authorization: Bearer <token> "
+                      "or X-VB6MCP-Token"),
+    "token_mismatch": "the supplied token does not match",
+    "token_bad_scheme": "Authorization must be 'Bearer <token>'",
+    "token_in_url_rejected": "a credential must not travel in the URL",
+    "auth_locked_out": "too many failed authentications from this source",
+    "source_not_allowed": "this source is not inside --allow-remote",
+    "audit_unavailable": ("a remote management request requires an append-only audit log and "
+                          "it is not writable"),
+    "ide_control_disabled": ("the /ide write verbs are disabled by policy: this bridge runs "
+                             "with --ide-control=status (default; the read-only face)"),
+    "ide_control_remote_forbidden": ("remote callers never get start/stop/restart unless the "
+                                     "bridge was started with --ide-control-remote (NOT implied "
+                                     "by --remote-write)"),
+    "target_not_found": "no live instance matches the requested target",
+    "ambiguous_target": "more than one live instance matches; ambiguity is refused, never guessed",
+    "op_not_found": "unknown or expired opId",
+    "endpoint_not_found": "no such /ide/v1 endpoint",
+    "internal_error": "the /ide handler raised; the receipt is structured, the trace is in the log",
+}
+
+#: P1 process policy.  3 independent gates (mode / remote write / proxy trust) so that a
+#: mis-detected peer address (the P0 portproxy defect) can never be the only lock.
+_IDE_CONTROL = {
+    "mode": "status",
+    "remote": False,
+    "trustProxy": False,
+    "publicHosts": (),
+    "auditPath": "",
+    "auditExplicit": False,
+}
+_IDE_CONTROL_LOCK = threading.Lock()
+_IDE_AUDIT_LOCK = threading.Lock()
+
+EXIT_IDE_CONTROL_MISCONFIGURED = 8
+
+
+def _ide_default_audit_path():
+    env = (os.environ.get("VB6MCP_IDE_AUDIT") or "").strip()
+    if env:
+        return env
+    return os.path.join(tempfile.gettempdir(), "vb6mcp", "ide", "audit.jsonl")
+
+
+def ide_control_configure(mode=None, remote=None, trust_proxy=None, public_hosts=None,
+                          audit_path=None):
+    """Set the /ide policy ONCE at startup (also used by the tests).  Returns a copy."""
+    with _IDE_CONTROL_LOCK:
+        if mode is not None:
+            m = str(mode).strip().lower()
+            if m not in IDE_CONTROL_MODES:
+                raise ValueError("--ide-control must be one of %r" % (IDE_CONTROL_MODES,))
+            _IDE_CONTROL["mode"] = m
+        if remote is not None:
+            _IDE_CONTROL["remote"] = bool(remote)
+        if trust_proxy is not None:
+            _IDE_CONTROL["trustProxy"] = bool(trust_proxy)
+        if public_hosts is not None:
+            hosts = public_hosts if isinstance(public_hosts, (list, tuple)) else [public_hosts]
+            _IDE_CONTROL["publicHosts"] = tuple(str(h).strip() for h in hosts if str(h).strip())
+        explicit = bool(audit_path)
+        if audit_path is not None:
+            _IDE_CONTROL["auditPath"] = str(audit_path or "").strip()
+        if not _IDE_CONTROL["auditPath"]:
+            _IDE_CONTROL["auditPath"] = _ide_default_audit_path()
+        _IDE_CONTROL["auditExplicit"] = bool(explicit or _IDE_CONTROL["auditExplicit"])
+        return dict(_IDE_CONTROL)
+
+
+def ide_control_mode():
+    return _IDE_CONTROL["mode"]
+
+
+def ide_control_enabled():
+    return _IDE_CONTROL["mode"] != "off"
+
+
+def ide_control_missing():
+    """Every reason the CURRENT /ide policy is not allowed to start (empty list = OK).
+
+    Fail-closed, exactly like remote mode: a write-capable switch without a token, or a
+    remote-write switch without the complete remote-mode trio, refuses to start.
+    """
+    missing = []
+    mode = _IDE_CONTROL["mode"]
+    if mode == "off":
+        return missing
+    if mode == "full" and not CFG.auth_enabled():
+        missing.append("token source (VB6MCP_TOKEN / VB6MCP_TOKEN_FILE) is required by "
+                       "--ide-control=full")
+    if _IDE_CONTROL["remote"]:
+        if mode != "full":
+            missing.append("--ide-control=full (--ide-control-remote implies write verbs)")
+        if not _REMOTE["enabled"]:
+            missing.append("--allow-remote + --tls-cert/--tls-key + --audit-log "
+                           "(--ide-control-remote is NOT implied by --remote-write)")
+        else:
+            missing.extend(remote_missing())
+    return missing
+
+
+def ide_control_policy_facts():
+    mode = _IDE_CONTROL["mode"]
+    return {
+        "ideControl": mode,
+        "readOnly": mode != "full",
+        "remoteWrite": bool(_REMOTE["write"]),
+        "allowRemote": bool(_REMOTE["enabled"]),
+        "remoteIdeControl": bool(_IDE_CONTROL["remote"]),
+        "trustProxy": bool(_IDE_CONTROL["trustProxy"]),
+        "writeVerbs": ("blocked_by_mode" if mode != "full" else
+                       "not_implemented_in_this_build"),
+    }
+
+
+def ide_control_health(redact=False):
+    """The ADDITIVE /health.ideControl capability block (the hub's negotiation signal)."""
+    mode = _IDE_CONTROL["mode"]
+    block = {
+        "apiVersion": IDE_API_VERSION,
+        "envelope": IDE_ENVELOPE,
+        "enabled": mode,
+        "readOnly": mode != "full",
+        "verbs": list(IDE_CONTROL_IMPLEMENTED_VERBS),
+        "declaredVerbs": list(IDE_CONTROL_VERBS),
+        "implementedVerbs": list(IDE_CONTROL_IMPLEMENTED_VERBS),
+        "writeVerbs": {"declared": list(IDE_CONTROL_WRITE_VERBS), "implemented": False,
+                       "policy": ("blocked_by_mode" if mode != "full" else
+                                  "not_implemented_in_this_build")},
+        "policy": {"remote": bool(_REMOTE["enabled"]),
+                   "remoteWrite": bool(_REMOTE["write"]),
+                   "remoteIdeControl": bool(_IDE_CONTROL["remote"]),
+                   "trustProxy": bool(_IDE_CONTROL["trustProxy"]),
+                   "adoptPids": 0},
+        "launcher": {"default": "auto", "strategies": ["direct", "scheduled_task"],
+                     "allowlist": []},
+        "ops": {"inProgress": None, "ledger": False,
+                "note": "the operation ledger is implemented by P2"},
+        "note": IDE_CONTROL_P1_NOTE,
+    }
+    if redact:
+        # same rule as _redact_health: a non-loopback caller never learns allowlists or
+        # deployment knobs; it keeps only the capability + remote policy verdict.
+        block["launcher"] = {"redacted": True}
+        block["policy"].pop("remoteWrite", None)
+        block["redacted"] = True
+    return block
+
+
+# -- peer evidence (OPEN-33 P0 countermeasure) ----------------------------------------
+
+def _ide_split_host_port(host):
+    h = ("" if host is None else str(host)).strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        return h[1:end] if end > 0 else h.strip("[]")
+    if h.count(":") == 1:
+        return h.split(":", 1)[0]
+    return h
+
+
+def _ide_host_is_local(host):
+    """True only for a Host header that is literally this machine's loopback spelling."""
+    h = _ide_split_host_port(host)
+    if not h:
+        return True                       # no Host hint (HTTP/1.0): peer address decides
+    if is_loopback_host(h):
+        return True
+    for ph in _IDE_CONTROL["publicHosts"]:
+        if _ide_split_host_port(ph) == h:
+            return True
+    return False
+
+
+def _ide_first_forwarded_address(value):
+    """First hop of a Forwarded / X-Forwarded-For style header, or "" when unparsable.
+
+    Handles the RFC 7239 for= prefix, an optional port, a bracketed IPv6 literal and the
+    ;proto=... parameter list; anything else is returned verbatim (the caller still
+    classifies it as a REMOTE hint, so a malformed value can never become a local one).
+    """
+    raw = str(value or "").split(",", 1)[0].strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("for="):
+        raw = raw[4:].strip()
+    if ";" in raw:
+        raw = raw.split(";", 1)[0].strip()
+    raw = raw.strip().strip(chr(34)).strip()
+    if raw.startswith("[") and "]" in raw:
+        return raw[1:raw.find("]")]
+    if raw.count(":") == 1:
+        head = raw.split(":", 1)[0]
+        if head.count(".") == 3:
+            return head
+    return raw
+
+
+def _ide_header(headers, name):
+    try:
+        if headers is None:
+            return None
+        return headers.get(name)
+    except Exception:
+        return None
+
+
+def ide_peer_evidence(peer, headers):
+    """Classify the caller from the WIRE, never from the peer address alone.
+
+    peerBasis (design sec 4.3): "raw" (no proxy hint), "forwarded" (a TRUSTED loopback proxy
+    supplied X-Forwarded-For and --trust-proxy is on), "proxy_hint" (any hint present but not
+    trusted => treated as REMOTE).  A hint NEVER downgrades a remote address; it can only
+    upgrade a loopback one, which is exactly the portproxy case.
+    """
+    raw = "" if peer is None else str(peer)
+    host = _ide_header(headers, "Host") or ""
+    forwarded_raw = (_ide_header(headers, "Forwarded")
+                     or _ide_header(headers, "X-Forwarded-For")
+                     or _ide_header(headers, "X-Real-IP") or "")
+    trusted_proxy = bool(_IDE_CONTROL["trustProxy"]) and peer_is_loopback(raw)
+    basis = "raw"
+    effective = raw
+    forwarded = None
+    remote = _is_remote_peer(peer)
+    if forwarded_raw:
+        if trusted_proxy:
+            forwarded = _ide_first_forwarded_address(forwarded_raw)
+            if forwarded:
+                basis = "forwarded"
+                effective = forwarded
+                remote = _is_remote_peer(forwarded)
+            else:
+                basis = "proxy_hint"
+                remote = True
+        else:
+            basis = "proxy_hint"
+            remote = True
+    elif host and not _ide_host_is_local(host):
+        basis = "proxy_hint"
+        remote = True
+    return {"rawPeer": raw or None, "peerBasis": basis, "effectivePeer": effective or None,
+            "forwardedFor": forwarded, "trustedProxy": bool(trusted_proxy),
+            "host": host or None, "remote": bool(remote)}
+
+
+def _ide_peer_facts(ev):
+    out = {"rawPeer": ev.get("rawPeer"), "peerBasis": ev.get("peerBasis"),
+           "remote": bool(ev.get("remote"))}
+    if ev.get("forwardedFor"):
+        out["forwardedFor"] = ev.get("forwardedFor")
+    if ev.get("peerBasis") == "proxy_hint":
+        out["note"] = ("a proxy hint (Forwarded / X-Forwarded-For / X-Real-IP, or a Host that "
+                       "is not local) upgrades this request to REMOTE: a loopback peer address "
+                       "is NOT trusted on its own (OPEN-33 P0: a portproxy makes every remote "
+                       "caller look like 127.0.0.1)")
+    return out
+
+
+# -- envelope / error builders --------------------------------------------------------
+
+def ide_envelope(verb, ok=True, **extra):
+    body = {"ok": bool(ok), "apiVersion": IDE_API_VERSION, "envelope": IDE_ENVELOPE,
+            "localMethod": None, "verb": verb, "generatedAt": _iso_utc_now()}
+    body.update(extra)
+    return body
+
+
+def ide_failure(reason, verb=None, message=None, **extra):
+    """(httpStatus, body).  An UNREGISTERED reason raises KeyError on purpose - the closed
+    vocabulary is enforced at the construction site, not by review."""
+    spec = IDE_CONTROL_REASONS[reason]
+    body = ide_envelope(verb, False,
+                        reason=reason,
+                        message=message or IDE_REASON_MESSAGES.get(reason, reason),
+                        failureKind=spec["failureKind"],
+                        suggestedAction=spec["suggestedAction"],
+                        retrySafe=bool(spec["retrySafe"]))
+    if spec["retrySafe"]:
+        body.setdefault("retryAfterMs", 1000)
+    body.update(extra)
+    return spec["http"], body
+
+
+def _ide_query(payload, name, default=None):
+    if not isinstance(payload, dict):
+        return default
+    v = payload.get(name)
+    return default if v is None else v
+
+
+def _ide_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _ide_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ide_trunc(value, n=240):
+    s = "" if value is None else str(value)
+    return s if len(s) <= n else s[:n] + "..."
+
+
+# -- audit ---------------------------------------------------------------------------
+
+def ide_audit_path():
+    return _IDE_CONTROL.get("auditPath") or ""
+
+
+def ide_audit_writable():
+    p = ide_audit_path()
+    if not p:
+        return False
+    try:
+        d = os.path.dirname(os.path.abspath(p))
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write("")
+        return True
+    except OSError:
+        return False
+
+
+def ide_audit_write(event="ide_control", **fields):
+    """Append ONE JSONL line per /ide request.  Never raises, never records a credential."""
+    p = ide_audit_path()
+    if not p:
+        return False
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event}
+    for k, v in fields.items():
+        if str(k).lower() in ("token", "authorization", "x-vb6mcp-token", "secret",
+                              "credential"):
+            rec[k] = "<redacted>"
+        else:
+            rec[k] = v
+    try:
+        d = os.path.dirname(os.path.abspath(p))
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with _IDE_AUDIT_LOCK:
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + chr(10))
+        return True
+    except OSError:
+        return False
+
+
+def _ide_token_id(headers):
+    """Which configured credential (if any) this request carried - an ID, never a value."""
+    if not CFG.auth_enabled():
+        return "none"
+    provided = ""
+    try:
+        authz = _ide_header(headers, "Authorization") or ""
+        if authz:
+            parts = authz.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                provided = parts[1].strip()
+        if not provided:
+            provided = (_ide_header(headers, "X-VB6MCP-Token") or "").strip()
+    except Exception:
+        provided = ""
+    if not provided:
+        return None
+    if token_matches(provided, CFG.token):
+        return "current"
+    prev = _REMOTE["tokenPrev"]
+    if prev and token_matches(provided, prev):
+        return "previous"
+    return None
+
+
+# -- routing -------------------------------------------------------------------------
+
+def _ide_query_payload(query):
+    """GET query -> the same params dict the POST body would carry (known names only)."""
+    try:
+        q = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+    except Exception:
+        return {}
+    out = {}
+    for key in ("target", "probe", "probeTimeoutMs", "all", "requestId"):
+        if key in q and q[key]:
+            out[key] = q[key][-1]
+    if "include" in q:
+        out["include"] = q["include"]
+    return out
+
+
+def ide_verb_from_path(path):
+    p = str(path or "")
+    if p == "/ide" or p == "/ide/":
+        return None
+    if p.startswith("/ide/v1/"):
+        rest = p[len("/ide/v1/"):]
+        if rest.startswith("op/"):
+            return "op"
+        return rest.split("/", 1)[0] or None
+    if p.startswith("/ide/"):
+        return p[len("/ide/"):].split("/", 1)[0] or None
+    return None
+
+
+def _ide_version_problem(verb, header_value, body_value, has_body):
+    supplied = []
+    if isinstance(header_value, str) and header_value.strip():
+        supplied.append(("header", header_value.strip()))
+    if body_value is not None:
+        if isinstance(body_value, str) and body_value.strip():
+            supplied.append(("body", body_value.strip()))
+        else:
+            return ide_failure("api_version_unsupported", verb,
+                               "body.apiVersion must be the string %r" % (IDE_API_VERSION,),
+                               apiVersionPresent=True,
+                               supported=list(IDE_CONTROL_SUPPORTED_VERSIONS))
+    if not supplied:
+        return ide_failure("api_version_unsupported", verb,
+                           ("the /ide face requires %s: %s (POST may instead carry the body "
+                            "field apiVersion=%r)"
+                            % (IDE_API_HEADER, IDE_API_VERSION, IDE_API_VERSION)),
+                           apiVersionPresent=False,
+                           supported=list(IDE_CONTROL_SUPPORTED_VERSIONS))
+    bad = [(where, value) for where, value in supplied if value != IDE_API_VERSION]
+    if bad:
+        return ide_failure("api_version_unsupported", verb,
+                           "unsupported apiVersion %r" % (bad[0][1],),
+                           supplied=dict(bad), supported=list(IDE_CONTROL_SUPPORTED_VERSIONS))
+    if len(set(value for _where, value in supplied)) > 1:
+        return ide_failure("api_version_unsupported", verb,
+                           "the header and the body disagree about apiVersion",
+                           supplied=dict(supplied),
+                           supported=list(IDE_CONTROL_SUPPORTED_VERSIONS))
+    return None
+
+
+def _ide_selection_reason(reason, target):
+    """Map the JSON-RPC local-method refusal vocabulary onto the ide/1 closed set."""
+    explicit = isinstance(target, str) and target.strip() not in ("", "auto")
+    if reason in ("no_ide_running",):
+        return "target_not_found" if explicit else None
+    if reason in ("target_mismatch",):
+        return "target_not_found"
+    if reason in ("ambiguous_target", "target_conflict"):
+        return "ambiguous_target"
+    return "target_not_found"
+
+
+def ide_status_response(params, evidence):
+    """(httpStatus, body) for GET|POST /ide/v1/status.  READ-ONLY (no lock, no spawn)."""
+    params = params if isinstance(params, dict) else {}
+    redact = bool(evidence.get("remote"))
+    target = params.get("target")
+    if target is not None and not isinstance(target, str):
+        return ide_failure("bad_request", "status", "target must be a string",
+                           peer=_ide_peer_facts(evidence))
+    if isinstance(target, str) and len(target) > 512:
+        return ide_failure("bad_request", "status", "target is longer than 512 characters",
+                           peer=_ide_peer_facts(evidence))
+    all_flag = _ide_bool(params.get("all"))
+    probe_wanted = _ide_bool(params.get("probe"))
+    probe_timeout = max(250, min(_ide_int(params.get("probeTimeoutMs"), 3000), 3000))
+    request_id = params.get("requestId")
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        request_id = uuid.uuid4().hex
+    d = discover()
+    live = d.get("live") or []
+    counts = {"instances": len(d.get("instances") or []), "live": len(live),
+              "stale": len(d.get("stale") or [])}
+    body = ide_envelope("status", True,
+                        readOnly=True,
+                        requestId=request_id,
+                        bridge=_bridge_facts(),
+                        peer=_ide_peer_facts(evidence),
+                        policy=ide_control_policy_facts(),
+                        ideControl=ide_control_health(redact=redact),
+                        counts=counts,
+                        probeRequested=probe_wanted,
+                        ops={"inProgress": None, "ledger": False,
+                             "implementedVerbs": list(IDE_CONTROL_IMPLEMENTED_VERBS),
+                             "verbs": {"status": "read_only", "op": "404_shell",
+                                       "start": "not_implemented", "stop": "not_implemented",
+                                       "restart": "not_implemented"},
+                             "note": "P1 is read-only: no operation ledger exists yet (P2)"},
+                        addInReachableRule=ADDIN_REACHABLE_RULE,
+                        redactionRule=REDACTION_RULE)
+    if all_flag:
+        cands = [{"pid": i.pid, "port": i.port, "project": i.project} for i in live]
+        if redact:
+            cands = [{"project": c.get("project"), "port": c.get("port"), "redacted": True}
+                     for c in cands]
+        body["selection"] = {"requested": "*all*", "all": True,
+                             "rule": ("all=true returns EVERY registered instance; the selection "
+                                      "rule is not used"),
+                             "liveCount": len(live), "candidates": cands}
+        body["instances"] = [_instance_facts(i, redact) for i in (d.get("instances") or [])]
+        body["stale"] = _stale_facts(d, redact)
+        if redact:
+            body["remoteRedacted"] = True
+        return 200, body
+
+    inst, refusal = select_target(target)
+    body["selection"] = _selection_facts(d, target, redact)
+    if inst is None:
+        reason = _ide_selection_reason((refusal or {}).get("reason"), target)
+        if reason is None:
+            # an EMPTY machine with target=auto is not an error (design T1): liveCount 0.
+            body["instance"] = None
+            body["noLiveIde"] = True
+            body["liveProbe"] = {"attempted": False, "ok": None, "reason": "not_requested",
+                                 "timeoutMs": probe_timeout,
+                                 "addInReachableRule": ADDIN_REACHABLE_RULE}
+            body["stale"] = _stale_facts(d, redact)
+            if redact:
+                body["remoteRedacted"] = True
+            return 200, body
+        return ide_failure(reason, "status",
+                           (refusal or {}).get("message") or IDE_REASON_MESSAGES.get(reason),
+                           target=target if not redact else None,
+                           selection=body["selection"], counts=counts,
+                           peer=_ide_peer_facts(evidence),
+                           policy=ide_control_policy_facts(),
+                           requestId=request_id)
+    body["instance"] = _instance_facts(inst, redact)
+    body["stale"] = _stale_facts(d, redact)
+    body["liveProbe"] = {"attempted": False, "ok": None, "reason": "not_requested",
+                         "timeoutMs": probe_timeout,
+                         "addInReachableRule": ADDIN_REACHABLE_RULE}
+    if probe_wanted:
+        selector = str(inst.pid) if inst.pid else (target or "")
+        body["liveProbe"] = _probe_addin_bounded(inst, selector, probe_timeout)
+        body["liveProbe"]["addInReachableRule"] = ADDIN_REACHABLE_RULE
+    include = params.get("include")
+    if include is not None:
+        want = [include] if isinstance(include, str) else include
+        known = ("session", "launcher", "ops")
+        req = []
+        ignored = []
+        if isinstance(want, list):
+            for item in want:
+                if isinstance(item, str) and item.strip().lower() in known:
+                    req.append(item.strip().lower())
+                else:
+                    ignored.append(item)
+        else:
+            ignored.append(include)
+        body["include"] = {"requested": req, "ignored": ignored,
+                           "available": {"ops": True, "session": False, "launcher": False},
+                           "note": "session/launcher facts are P2 dimensions in this build"}
+    if redact:
+        body["remoteRedacted"] = True
+        body["redactionRule"] = REDACTION_RULE
+    return 200, body
+
+
+def _ide_write_verb_response(verb, evidence):
+    """POLICY BEFORE CAPABILITY (Lead ruling): remote gate -> mode gate -> 501 placeholder."""
+    if evidence.get("remote") and not _IDE_CONTROL["remote"]:
+        return ide_failure("ide_control_remote_forbidden", verb,
+                           peer=_ide_peer_facts(evidence),
+                           policy=ide_control_policy_facts(),
+                           howToProceed=[
+                               "run the verb on the machine itself over loopback",
+                               "or start the bridge with --ide-control=full --ide-control-remote "
+                               "plus the complete remote-mode trio (allow-remote + TLS + audit) "
+                               "in a deployment window"])
+    if _IDE_CONTROL["mode"] != "full":
+        return ide_failure("ide_control_disabled", verb,
+                           policy=ide_control_policy_facts(),
+                           howToProceed=[
+                               "the default --ide-control=status serves the READ-ONLY face only",
+                               "start the bridge with --ide-control=full to opt in to the write "
+                               "verbs (a token is then required at startup)"])
+    return ide_failure("not_implemented", verb,
+                       ("the %r verb is declared by the ide/1 API and ALLOWED by the current "
+                        "policy, but this P1 build has no launcher/lock/op ledger yet" % verb),
+                       implementedVerbs=list(IDE_CONTROL_IMPLEMENTED_VERBS),
+                       declaredVerbs=list(IDE_CONTROL_VERBS),
+                       policy=ide_control_policy_facts(),
+                       note=IDE_CONTROL_P1_NOTE,
+                       howToProceed=["use GET|POST /ide/v1/status (the P1 read-only face)",
+                                     "start/stop/restart land in P2"])
+
+
+def ide_dispatch(method, path, payload, evidence):
+    """(httpStatus, body) for one /ide request.  Pure routing + policy, no side effects."""
+    p = str(path or "")
+    verb = ide_verb_from_path(p)
+    if p in ("/ide/v1", "/ide/v1/"):
+        return ide_failure("endpoint_not_found", None, "no verb after /ide/v1/",
+                           verbs=list(IDE_CONTROL_VERBS))
+    if p in ("/ide", "/ide/") or (p.startswith("/ide/") and not p.startswith("/ide/v1/")):
+        return ide_failure("api_version_required", verb,
+                           supported=["/ide/v1"],
+                           versions=list(IDE_CONTROL_SUPPORTED_VERSIONS))
+    rest = p[len("/ide/v1/"):]
+    parts = rest.split("/")
+    head = parts[0]
+    if head == "status" and len(parts) == 1:
+        if method not in ("GET", "POST"):
+            return ide_failure("endpoint_not_found", "status",
+                               "status is GET or POST", allow=["GET", "POST"])
+        return ide_status_response(payload, evidence)
+    if head in IDE_CONTROL_WRITE_VERBS and len(parts) == 1:
+        if method != "POST":
+            return ide_failure("endpoint_not_found", head, "%s is POST only" % head,
+                               allow=["POST"])
+        return _ide_write_verb_response(head, evidence)
+    if head == "op":
+        if len(parts) == 2 and parts[1]:
+            return ide_failure("op_not_found", "op", opId=parts[1], ledger=False,
+                               note=("P1 does not persist an operation ledger; the op "
+                                     "continuation verb is a 404 shell until P2"))
+        return ide_failure("endpoint_not_found", "op",
+                           "expected /ide/v1/op/<opId>")
+    return ide_failure("endpoint_not_found", head or None, verbs=list(IDE_CONTROL_VERBS))
+
 # ---------------------------------------------------------------- health ----------
 
 def health_body():
@@ -4050,6 +4856,9 @@ def health_body():
                     "fastTools": list(CTL_FAST_TOOLS),
                     "outOfProcessFallback": bool(CFG.oop_enabled),
                     "maxMs": CFG.max_call_ms, "maxCallHardMs": CFG.max_call_hard_ms},
+        # OPEN-33 P1: ADDITIVE capability block for the /ide management face.  Existing keys
+        # are untouched; P3's hub reads ideControl.apiVersion to negotiate delegation.
+        "ideControl": ide_control_health(),
         "contractVersion": contract_version(),
         "faceTools": face,
         "snapshotTools": len(snapshot()["tools"]),
@@ -4089,6 +4898,18 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
     def _send_raw(self, status, ctype, body, extra=None, content_length=True):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        if ctype:
+            # EVERY body above is UTF-8 encoded, but a bare "application/json" does not say
+            # so.  PowerShell 5.1 does not apply the JSON default: without a charset it
+            # decodes the bytes with the SYSTEM ANSI codepage (cp936/cp1252), so a Chinese
+            # receipt from this service came back mojibake.  Declare it HERE, in the one
+            # response exit that every path (_send, refusals, health, /rpc, /mcp, 401/404/
+            # 413/429, SSE) funnels through, so a new call site cannot forget.  Only the
+            # Content-Type header changes: bodies and HTTP status codes are untouched.
+            base = ctype.split(";", 1)[0].strip().lower()
+            if base in ("application/json", "text/plain", "text/html",
+                        "text/event-stream") and "charset" not in ctype.lower():
+                ctype = ctype + "; charset=utf-8"
         self.send_response(status)
         if ctype:
             self.send_header("Content-Type", ctype)
@@ -4258,11 +5079,133 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             pass
         return self._send_raw(code, ctype, payload, headers)
 
+    # -- the /ide management face (OPEN-33 P1; versioned, NON-MCP, READ-ONLY) --------
+    def _ide_json_send(self, status, body, extra_headers=None):
+        hdrs = {"X-VB6MCP-Api": IDE_API_VERSION}
+        if extra_headers:
+            hdrs.update(extra_headers)
+        # this face audits ITSELF, exactly once, in _ide_request()'s finally block; flagging
+        # the generic per-response audit keeps "one request = one JSONL line".
+        self._audited = True
+        self._send(status, "application/json",
+                   json.dumps(body, ensure_ascii=False, indent=2), hdrs)
+
+    def _ide_request(self, method):
+        t0 = time.monotonic()
+        path = self.path.split("?", 1)[0]
+        ev = ide_peer_evidence(self.client_address[0] if self.client_address else "",
+                               self.headers)
+        payload = {}
+        state = {"code": 0, "reason": None, "sent": True, "audited": False, "pid": None,
+                 "projectPath": None, "verb": ide_verb_from_path(path)}
+
+        def _audit_now():
+            # ONE JSONL line per request, written BEFORE the response: a client that reads
+            # the answer and immediately inspects the audit log must already see it.
+            if state["audited"] or not ide_control_enabled():
+                return
+            state["audited"] = True
+            ide_audit_write(
+                source=ev.get("rawPeer"), peerBasis=ev.get("peerBasis"),
+                remote=bool(ev.get("remote")),
+                forwardedFor=ev.get("forwardedFor"), host=ev.get("host"),
+                method=method, path=path, verb=state["verb"],
+                status=state["code"], reason=state["reason"],
+                outcome=("ok" if 200 <= int(state["code"] or 0) < 300 else "error"),
+                elapsedMs=int((time.monotonic() - t0) * 1000.0),
+                tokenId=_ide_token_id(self.headers),
+                target=(payload.get("target") if isinstance(payload, dict) else None),
+                pid=state["pid"],
+                projectPath=((_ide_trunc(state["projectPath"]))
+                             if state["projectPath"] else None),
+                launch=None)
+
+        def finish(code, body, headers=None):
+            inst = body.get("instance") if isinstance(body.get("instance"), dict) else {}
+            state["code"] = int(code)
+            state["reason"] = body.get("reason")
+            state["pid"] = inst.get("pid")
+            state["projectPath"] = inst.get("projectPath")
+            _audit_now()
+            self._ide_json_send(code, body, headers)
+
+        try:
+            gate = self._remote_gate()
+            if gate is not None:
+                _st, reason, message, extra = gate
+                self.close_connection = True        # body may be undrained
+                finish(*ide_failure(reason, state["verb"], message), headers=extra)
+                return
+            problem = self._auth_problem()
+            if problem is not None:
+                reason, message = problem
+                if reason not in IDE_CONTROL_REASONS:
+                    reason = "token_mismatch"
+                self.close_connection = True
+                finish(*ide_failure(reason, state["verb"], message),
+                       headers={"WWW-Authenticate": 'Bearer realm="vb6mcp"'})
+                return
+            if not ide_control_enabled():
+                # --ide-control=off: /ide/* is an ordinary 404, byte-for-byte the old build.
+                state["sent"] = False
+                self.close_connection = True
+                self._send(404, "text/plain", "Not Found")
+                return
+            if ev["remote"] and not ide_audit_writable():
+                self.close_connection = True
+                finish(*ide_failure("audit_unavailable", state["verb"],
+                                    IDE_REASON_MESSAGES["audit_unavailable"],
+                                    peer=_ide_peer_facts(ev)))
+                return
+            if method in ("POST", "PUT", "PATCH"):
+                raw, err = self._read_body()
+                if err is not None:
+                    reason = "body_too_large" if err[0] == 413 else "bad_request"
+                    self.close_connection = True
+                    finish(*ide_failure(reason, state["verb"], str(err[2])))
+                    return
+                if raw.strip():
+                    try:
+                        payload = json.loads(raw.decode("utf-8-sig", "replace"))
+                    except Exception:
+                        finish(*ide_failure("bad_json", state["verb"]))
+                        return
+                    if not isinstance(payload, dict):
+                        finish(*ide_failure("bad_request", state["verb"],
+                                            "the body must be a JSON object"))
+                        return
+            elif "?" in self.path:
+                payload = _ide_query_payload(self.path.split("?", 1)[1])
+            problem = _ide_version_problem(
+                state["verb"], self.headers.get(IDE_API_HEADER),
+                payload.get("apiVersion") if isinstance(payload, dict) else None,
+                method in ("POST", "PUT", "PATCH"))
+            if problem is not None:
+                finish(*problem)
+                return
+            finish(*ide_dispatch(method, path, payload, ev))
+        except Exception as exc:
+            dbg("ide control failed: %r" % (exc,))
+            try:
+                finish(*ide_failure("internal_error", state["verb"],
+                                    _ide_trunc(str(exc), 300)))
+            except Exception:
+                state["sent"] = False
+                self.close_connection = True
+                self._send(500, "text/plain", "Not Found")
+        finally:
+            # safety net: every path that produced a /ide response is audited exactly once
+            _audit_now()
+
     def do_OPTIONS(self):
         # CORS preflight carries no Authorization header by design, so it is never gated.
         self._send(204, "text/plain", b"")
 
     def do_GET(self):
+        _ide_path = self.path.split("?", 1)[0]
+        if _ide_path == "/ide" or _ide_path.startswith("/ide/"):
+            self._ide_request("GET")
+            return
         gate = self._remote_gate()
         if gate is not None:
             self._reject_gate(*gate)
@@ -4296,6 +5239,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send(404, "text/plain", "Not Found")
 
     def do_DELETE(self):
+        _ide_path = self.path.split("?", 1)[0]
+        if _ide_path == "/ide" or _ide_path.startswith("/ide/"):
+            self._ide_request("DELETE")
+            return
         gate = self._remote_gate()
         if gate is not None:
             self._reject_gate(*gate)
@@ -4311,6 +5258,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self._send(404, "text/plain", "Not Found")
 
     def do_POST(self):
+        _ide_path = self.path.split("?", 1)[0]
+        if _ide_path == "/ide" or _ide_path.startswith("/ide/"):
+            self._ide_request("POST")
+            return
         gate = self._remote_gate()
         if gate is not None:
             self._reject_gate(*gate)
@@ -4666,6 +5617,8 @@ def _redact_health(body):
     """Strip discovery detail (instance paths, pipe names, pids) for a non-loopback caller."""
     try:
         out = dict(body or {})
+        if "ideControl" in out:
+            out["ideControl"] = ide_control_health(redact=True)
         insts = out.get("instances") or []
         out["instances"] = [{"project": (i or {}).get("project"), "port": (i or {}).get("port"),
                              "transport": (i or {}).get("transport"), "redacted": True} for i in insts]
@@ -4702,13 +5655,9 @@ def serve(port, host, selector):
         # any gap refuses to start and names every missing item - never a silent downgrade.
         missing = remote_missing()
         if not _REMOTE["enabled"]:
-            sys.stderr.write(
-                "vb6mcp_bridge: REFUSED - %r is not a loopback address.\n"
-                "  This service exposes the whole tool face (110 tools, including WRITE tools that\n"
-                "  edit files and run code in the IDE).  The DEFAULT tier is loopback-only\n"
-                "  (ADR sec 0.5 / TOKEN_THREAT_MODEL.md M-0); remote binding requires ALL of\n"
-                "  --allow-remote <cidr> + --tls-cert/--tls-key + a token source (see\n"
-                "  docs/design/REMOTE_ACCESS.md).  Missing: --allow-remote.\n" % (host,))
+            # User-visible text: the tool count is DERIVED from docs/tools_schema.json (never
+            # a literal) and the message fails open when the snapshot is unavailable (OPEN-32).
+            sys.stderr.write(non_loopback_refusal_text(host))
             bridge_log("bind_refused", host=host, reason="non_loopback_host")
             return EXIT_LOOPBACK_REFUSED
         if missing:
@@ -4772,6 +5721,20 @@ def serve(port, host, selector):
                  "set VB6MCP_TOKEN or VB6MCP_TOKEN_FILE." % port)
         sys.stderr.write(_warn + "\n")
         bridge_log("auth_warning", reason="no_token_configured", multiUser="configure_a_token")
+    # OPEN-33 P1: the /ide management face is a SEPARATE, versioned, NON-MCP surface; it is
+    # announced on stderr so an operator can never miss that it exists (mode=off is silent).
+    if ide_control_enabled():
+        _ic = ide_control_health()
+        sys.stderr.write("vb6mcp_bridge ide control: mode=%s verbs=%s writeVerbs=%s "
+                         "remoteIdeControl=%s trustProxy=%s audit=%s\n"
+                         % (_ic["enabled"], ",".join(_ic["verbs"]),
+                            _ic["writeVerbs"]["policy"],
+                            _ic["policy"]["remoteIdeControl"],
+                            _ic["policy"]["trustProxy"], ide_audit_path() or "(none)"))
+        bridge_log("ide_control", mode=_ic["enabled"], verbs=_ic["verbs"],
+                   writeVerbs=_ic["writeVerbs"]["policy"],
+                   remoteIdeControl=_ic["policy"]["remoteIdeControl"],
+                   trustProxy=_ic["policy"]["trustProxy"], audit=ide_audit_path())
     # ALWAYS-ON startup diagnostics (never a 0-byte log again): which registry directories were
     # read, how many entries each held, how many were live, and why the rest were dropped.
     try:
@@ -4828,6 +5791,22 @@ def main(argv=None):
                     help="previous token that stays valid during rotation (or VB6MCP_TOKEN_PREV)")
     ap.add_argument("--audit-log", default=None,
                     help="append-only JSONL audit log; REQUIRED for remote mode")
+# ---- OPEN-33 /ide management face (docs/OPEN33_DESIGN_20261027.md; P1 = READ-ONLY)
+    ap.add_argument("--ide-control", default=None, choices=list(IDE_CONTROL_MODES),
+                    help="non-MCP /ide management face: off | status (default, READ-ONLY) | "
+                         "full (write verbs are policy-checked; this P1 build still answers 501)")
+    ap.add_argument("--ide-control-remote", action="store_true",
+                    help="allow NON-loopback callers to use the /ide write verbs; requires "
+                         "--ide-control=full + the complete remote-mode trio (NOT implied by "
+                         "--remote-write)")
+    ap.add_argument("--ide-control-audit", default=None,
+                    help="append-only JSONL audit log for the /ide face (default "
+                         "%TEMP%\\vb6mcp\\ide\\audit.jsonl; env VB6MCP_IDE_AUDIT)")
+    ap.add_argument("--trust-proxy", action="store_true",
+                    help="trust X-Forwarded-For/Forwarded from a LOOPBACK proxy; OFF by default, "
+                         "so any proxy hint is treated as REMOTE (OPEN-33 P0 countermeasure)")
+    ap.add_argument("--public-host", action="append", default=None,
+                    help="extra Host header value that counts as local (repeatable)")
     ap.add_argument("--stub-addin", action="store_true",
                     help="DEV ONLY: run a stub np/1 pipe add-in in its own process "
                          "(used by --selftest; env VB6MCP_STUB_PIPE/NONCE/...)")
@@ -4837,6 +5816,9 @@ def main(argv=None):
     remote_configure(args.allow_remote, args.tls_cert, args.tls_key, args.remote_write,
                      args.token_prev or os.environ.get("VB6MCP_TOKEN_PREV", ""),
                      args.audit_log or os.environ.get("VB6MCP_AUDIT_LOG", ""))
+    ide_control_configure(args.ide_control, args.ide_control_remote, args.trust_proxy,
+                          args.public_host,
+                          args.ide_control_audit or os.environ.get("VB6MCP_IDE_AUDIT", ""))
     if args.port is not None:
         CFG.port = args.port
     if args.host:
@@ -4846,6 +5828,17 @@ def main(argv=None):
     if args.transport:
         CFG.transport = args.transport
 
+    _ide_missing = ide_control_missing()
+    if _ide_missing:
+        sys.stderr.write(
+            "vb6mcp_bridge: REFUSED - the /ide management face is MISCONFIGURED.\n"
+            "  Missing: %s\n"
+            "  The write verbs are FAIL-CLOSED: --ide-control=full needs a token source, and\n"
+            "  --ide-control-remote needs --ide-control=full plus the complete remote-mode trio\n"
+            "  (docs/OPEN33_DESIGN_20261027.md).  Nothing was started.\n"
+            % "; ".join(_ide_missing))
+        bridge_log("ide_control_refused", mode=ide_control_mode(), missing=_ide_missing)
+        return EXIT_IDE_CONTROL_MISCONFIGURED
     if args.print_config:
         print(json.dumps({
             "product": PRODUCT, "version": VERSION, "port": CFG.port, "host": CFG.host,
@@ -4867,6 +5860,9 @@ def main(argv=None):
             "auditLog": _REMOTE["auditPath"] or None,
             "tokenRotation": bool(_REMOTE["tokenPrev"]),
             "remoteMissing": remote_missing(),
+            "ideControl": ide_control_health(),
+            "ideControlMissing": ide_control_missing(),
+            "ideControlAudit": ide_audit_path() or None,
         }, ensure_ascii=False, indent=2))
         return 0
     if args.stub_addin:
@@ -5619,6 +6615,21 @@ def _tools_sha256(tools):
     return hashlib.sha256(blob).hexdigest().upper()
 
 
+def _face_names(payload):
+    """Tool NAMES from a JSON-RPC envelope (or a bare {tools:[...]} object), in order.
+
+    --selftest only.  The harness asserts the LIVE face against the face DERIVED from the
+    contract of record, never against a literal count: the old hard-coded "110" rotted when
+    the face grew to 120 and produced seven false reds that all said the same thing.
+    """
+    try:
+        doc = json.loads(payload or "{}")
+    except Exception:
+        return []
+    result = doc.get("result") if isinstance(doc.get("result"), dict) else doc
+    return [t.get("name") for t in ((result or {}).get("tools") or []) if isinstance(t, dict)]
+
+
 def _free_port_selfowned():
     """A free port inside the self-owned range (tools/mcp_strict_audit.py refuses < 8767)."""
     for _ in range(50):
@@ -5784,10 +6795,33 @@ def run_selftest(with_battery=False):
     httpd = None
     ok = False
     try:
+        # ---- ONE derived face expectation: NO literal tool count in this harness ----------
+        # The add-in face grew 110 -> 120 and EVERY literal here went stale at once, so one
+        # rotten number produced seven FAILs that all carried the same information.  The
+        # expected face is now DERIVED from the contract of record, and the derivation itself
+        # is cross-checked against the other two frozen artifacts that the repo's own gates
+        # keep aligned - a stale, empty or broken source stays a REAL failure (P0 red) instead
+        # of silently becoming the new expectation:
+        #   docs/tools_schema.json            the frozen add-in face the stub add-in serves
+        #   tools/schema_baseline.json        must equal it (freeze invariant)
+        #   bridge/hub_schema.generated.json  generated from it; toolCount + names must agree
         frozen = read_json(os.path.join(REPO_ROOT, "docs", "tools_schema.json"), {})
         tools = frozen.get("tools") or []
-        check("P0 frozen add-in face loaded", len(tools) == 110, "docs/tools_schema.json tools=%d"
-              % len(tools))
+        face_names = [t.get("name") for t in tools]
+        baseline_face = read_json(os.path.join(REPO_ROOT, "tools", "schema_baseline.json"), {})
+        baseline_names = [t.get("name") for t in (baseline_face.get("tools") or [])]
+        hub_face = read_json(os.path.join(REPO_ROOT, "bridge", "hub_schema.generated.json"), {})
+        hub_names = [t.get("name") for t in (hub_face.get("tools") or [])]
+        face_count = len(face_names)
+        check("P0 frozen add-in face loaded (DERIVED: %d tools; baseline + hub snapshot agree)"
+              % face_count,
+              face_count > 0 and len(set(face_names)) == face_count
+              and baseline_names == face_names and hub_names == face_names
+              and hub_face.get("toolCount") == face_count,
+              "docs/tools_schema.json=%d unique=%d baseline=%d hub_snapshot=%d "
+              "hub_toolCount=%s faceFingerprint=%s"
+              % (face_count, len(set(face_names)), len(baseline_names), len(hub_names),
+                 hub_face.get("toolCount"), _tools_sha256(tools)[:16]))
 
         mine = os.getpid()
         _reset_registry(regdir)
@@ -5808,9 +6842,11 @@ def run_selftest(with_battery=False):
         check("S1 tools/list result keys == {tools} (strict client)",
               set((tl.get("result") or {}).keys()) == {"tools"},
               "keys=%s" % sorted((tl.get("result") or {}).keys()))
-        check("S1 live 110-tool face over the pipe",
-              len((tl.get("result") or {}).get("tools") or []) == 110,
-              "count=%d" % len((tl.get("result") or {}).get("tools") or []))
+        live_face = _face_names(text)
+        check("S1 live %d-tool face over the pipe == the derived contract (order included)"
+              % face_count,
+              live_face == face_names,
+              "count=%d namesEqual=%s" % (len(live_face), live_face == face_names))
         check("S1 stub observed exactly 1 pipe session", s1.sessions == 1,
               "sessions=%d requests=%d" % (s1.sessions, s1.requests))
         src = open(__file__, "r", encoding="utf-8").read()
@@ -5842,7 +6878,8 @@ def run_selftest(with_battery=False):
         dumped = read_json(dumped_path, {})
         check("S2 tools/dump_tools_schema.py (UNCHANGED) rc=0", r2.returncode == 0,
               "rc=%d %s" % (r2.returncode, (r2.stdout or "").replace("\n", " | ")[:120]))
-        check("S2 the SERVICE face is byte-identical to the frozen 110-tool contract",
+        check("S2 the SERVICE face is byte-identical to the frozen %d-tool contract"
+              % face_count,
               dumped.get("tools") == tools,
               "tools=%d identical=%s" % (len(dumped.get("tools") or []),
                                          dumped.get("tools") == tools))
@@ -5873,11 +6910,12 @@ def run_selftest(with_battery=False):
         _reset_registry(regdir)
         text, iserr, meta = handle_jsonrpc(_jreq("tools/list", {}))
         tl = json.loads(text or "{}")
-        check("S13 no IDE: complete 110-tool face from bridge/hub_schema.generated.json",
-              (meta.get("faceTools") == "snapshot"
-               and len((tl.get("result") or {}).get("tools") or []) == 110),
-              "faceTools=%s count=%d degraded=%s" % (
-                  meta.get("faceTools"), len((tl.get("result") or {}).get("tools") or []),
+        snap_face = _face_names(text)
+        check("S13 no IDE: complete %d-tool face from bridge/hub_schema.generated.json"
+              % face_count,
+              meta.get("faceTools") == "snapshot" and snap_face == face_names,
+              "faceTools=%s count=%d namesEqual=%s degraded=%s" % (
+                  meta.get("faceTools"), len(snap_face), snap_face == face_names,
                   meta.get("degraded")))
         text, iserr, meta = handle_jsonrpc(_jreq("initialize", {
             "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {}}))
@@ -6094,12 +7132,14 @@ def run_selftest(with_battery=False):
         CFG.transport = "tcp"
         text, iserr, meta = handle_jsonrpc(_jreq("tools/list", {}))
         tl = json.loads(text or "{}")
-        check("S10 VB6MCP_TRANSPORT=tcp -> forced_tcp and the same 110-tool face",
+        tcp_face = _face_names(text)
+        check("S10 VB6MCP_TRANSPORT=tcp -> forced_tcp and the same %d-tool face"
+              % face_count,
               meta.get("transport") == "tcp" and meta.get("transportReason") == "forced_tcp"
-              and len((tl.get("result") or {}).get("tools") or []) == 110,
-              "transport=%s reason=%s count=%d" % (meta.get("transport"),
-                                                   meta.get("transportReason"),
-                                                   len((tl.get("result") or {}).get("tools") or [])))
+              and tcp_face == face_names,
+              "transport=%s reason=%s count=%d namesEqual=%s" % (
+                  meta.get("transport"), meta.get("transportReason"), len(tcp_face),
+                  tcp_face == face_names))
 
         # ---- S11: VB6MCP_TRANSPORT=pipe but no pipe at all -> explicit, visible error --
         CFG.transport = "pipe"
@@ -6165,23 +7205,23 @@ def run_selftest(with_battery=False):
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             env=env, timeout=60, cwd=REPO_ROOT)
         lines = [l for l in (proc.stdout or "").splitlines() if l.strip()]
-        got_tools = 0
+        got_face = []
         got_proj = None
         for line in lines:
             j = json.loads(line)
             res = j.get("result") or {}
             if isinstance(res.get("tools"), list):
-                got_tools = len(res["tools"])
+                got_face = _face_names(line)
             for c in (res.get("content") or []):
                 try:
                     got_proj = json.loads(c["text"]).get("project")
                 except Exception:
                     pass
         check("S14 the --stdio entry serves the same face (line-delimited JSON-RPC)",
-              len(lines) == 2 and got_tools == 110 and got_proj == "StdioProj",
-              "lines=%d tools=%d project=%s stdout=%s stderr=%s" % (
-                  len(lines), got_tools, got_proj, (proc.stdout or "")[:300],
-                  (proc.stderr or "")[:160]))
+              len(lines) == 2 and got_face == face_names and got_proj == "StdioProj",
+              "lines=%d tools=%d namesEqual=%s project=%s stdout=%s stderr=%s" % (
+                  len(lines), len(got_face), got_face == face_names, got_proj,
+                  (proc.stdout or "")[:300], (proc.stderr or "")[:160]))
 
         # ---- S16: server-side deny frames are surfaced, never a hang --------------------
         _reset_registry(regdir)
@@ -6555,9 +7595,10 @@ def run_selftest(with_battery=False):
         st, b1 = post28("/rpc", _jreq("tools/list", {}))
         st_h, b_h = get28("/health")
         h1 = json.loads(b_h or "{}")
+        v8_face = _face_names(b1)
         check("V8a with NO token configured the face behaves exactly as before (M-5)",
-              st == 200 and len((json.loads(b1 or "{}").get("result") or {}).get("tools") or []) == 110,
-              "status=%s tools=%d" % (st, len((json.loads(b1 or "{}").get("result") or {}).get("tools") or [])))
+              st == 200 and v8_face == face_names,
+              "status=%s tools=%d namesEqual=%s" % (st, len(v8_face), v8_face == face_names))
         check("V8b an unauthenticated /health SAYS it is unauthenticated and warns about shared machines",
               st_h == 200 and h1.get("auth", {}).get("enabled") is False
               and bool(h1.get("auth", {}).get("guidance")),
@@ -6587,9 +7628,11 @@ def run_selftest(with_battery=False):
               and SECRET not in body_url and SECRET not in body,
               "wrongBodyLen=%d urlBodyLen=%d" % (len(body_wrong), len(body_url)))
         st, body_ok = post28("/rpc", _jreq("tools/list", {}), token=SECRET)
-        check("V4 correct token -> the face is UNCHANGED (110 tools)",
-              st == 200 and len((json.loads(body_ok or "{}").get("result") or {}).get("tools") or []) == 110,
-              "status=%s tools=%d" % (st, len((json.loads(body_ok or "{}").get("result") or {}).get("tools") or [])))
+        v4_face = _face_names(body_ok)
+        check("V4 correct token -> the face is UNCHANGED (%d tools, same names/order)"
+              % face_count,
+              st == 200 and v4_face == face_names,
+              "status=%s tools=%d namesEqual=%s" % (st, len(v4_face), v4_face == face_names))
         before28 = s28.requests
         st, body_call = post28("/rpc", write_call, token=SECRET)
         check("V4b correct token -> the call DOES reach the add-in (auth is not a wall)",
@@ -7350,6 +8393,217 @@ def run_selftest(with_battery=False):
               and "peerDead" not in live_body
               and live_body.get("suggestedAction") in ("release_gate", "kill_and_restart"),
               "peerState=%s" % live_body.get("peerState"))
+
+        # ---- S38: the OPEN-33 P1 /ide management face --------------------------------
+        # A SEPARATE, versioned, NON-MCP surface on the same listener.  A second in-process
+        # listener (token + its own audit log) exercises routing/version/auth/policy/
+        # redaction/"one request = one audit line" WITHOUT an IDE and WITHOUT touching the
+        # existing MCP routes.
+        print("--- S38: /ide management face (OPEN-33 P1) ---")
+        import http.client as _http_client
+        _saved_token = (CFG.token, CFG.token_source)
+        _saved_port = CFG.port
+        _saved_ide = dict(_IDE_CONTROL)
+        _ide_audit = os.path.join(tmpdir, "ide_audit.jsonl")
+        _ide_calls = [0]
+        _reset_registry(regdir)
+        CFG.token, CFG.token_source = "selftest-ide-token-" + ("x" * 16), "env"
+        ide_control_configure("status", False, False, [], _ide_audit)
+        _AUTH_FAILS.clear()
+        _ide_port = _free_port()
+        CFG.port = _ide_port
+        _ide_srv = BridgeServer(("127.0.0.1", _ide_port), BridgeHandler)
+        threading.Thread(target=_ide_srv.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+
+        def _ide_call(method, path, body=None, token=None, api="ide/1", headers=None):
+            if token is None:
+                token = CFG.token
+            h = {}
+            if token:
+                h["Authorization"] = "Bearer " + token
+            if api is not None:
+                h["X-VB6MCP-Api"] = api
+            if headers:
+                h.update(headers)
+            data = None
+            if body is not None:
+                data = json.dumps(body).encode("utf-8")
+                h["Content-Type"] = "application/json"
+            if path.startswith("/ide") and ide_control_enabled():
+                _ide_calls[0] += 1
+            c = _http_client.HTTPConnection("127.0.0.1", _ide_port, timeout=15)
+            try:
+                c.request(method, path, body=data, headers=h)
+                r = c.getresponse()
+                raw = r.read().decode("utf-8", "replace")
+                return r.status, dict(r.getheaders()), raw
+            finally:
+                c.close()
+
+        def _ide_json(method, path, body=None, **kw):
+            st, hd, raw = _ide_call(method, path, body, **kw)
+            try:
+                return st, hd, json.loads(raw)
+            except ValueError:
+                return st, hd, {"_raw": raw}
+
+        try:
+            st, hd, j = _ide_json("GET", "/ide/v1/status")
+            check("S38a GET /ide/v1/status: 200 + ide/1 envelope; an EMPTY machine is NOT an error",
+                  st == 200 and j.get("apiVersion") == "ide/1"
+                  and j.get("envelope") == "vb6mcp.ide/1" and j.get("localMethod") is None
+                  and j.get("ok") is True and j.get("readOnly") is True
+                  and (j.get("selection") or {}).get("liveCount") == 0
+                  and hd.get("X-VB6MCP-Api") == "ide/1",
+                  "status=%s apiVersion=%s live=%s" % (st, j.get("apiVersion"),
+                                                       (j.get("selection") or {}).get("liveCount")))
+            st, hd, j = _ide_json("GET", "/ide/v1/status", api=None)
+            check("S38b missing apiVersion -> 400 api_version_unsupported (supported=[ide/1])",
+                  st == 400 and j.get("reason") == "api_version_unsupported"
+                  and j.get("supported") == ["ide/1"] and j.get("apiVersion") == "ide/1",
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("GET", "/ide/status")
+            check("S38c unversioned /ide/<verb> -> 404 api_version_required (+supported /ide/v1)",
+                  st == 404 and j.get("reason") == "api_version_required"
+                  and j.get("supported") == ["/ide/v1"],
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("POST", "/ide/v1/start", {"apiVersion": "ide/1"})
+            check("S38d default --ide-control=status blocks writes: 403 ide_control_disabled",
+                  st == 403 and j.get("reason") == "ide_control_disabled"
+                  and j.get("failureKind") == "policyRefusal",
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            ide_control_configure("full", False, False, [], _ide_audit)
+            st, hd, j = _ide_json("POST", "/ide/v1/start", {"apiVersion": "ide/1"})
+            check("S38e full mode: policy allows, capability stays honest -> 501 not_implemented",
+                  st == 501 and j.get("reason") == "not_implemented"
+                  and j.get("implementedVerbs") == ["status", "op"],
+                  "status=%s implementedVerbs=%s" % (st, j.get("implementedVerbs")))
+            ide_control_configure("status", False, False, [], _ide_audit)
+            st, hd, j = _ide_json("GET", "/ide/v1/op/6c1b9d2e")
+            check("S38f GET /ide/v1/op/<id> -> 404 op_not_found shell (no fake op ledger)",
+                  st == 404 and j.get("reason") == "op_not_found" and j.get("ledger") is False,
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("GET", "/ide/v1/nope")
+            check("S38g unknown /ide/v1 route -> 404 endpoint_not_found (envelope intact)",
+                  st == 404 and j.get("reason") == "endpoint_not_found"
+                  and j.get("envelope") == "vb6mcp.ide/1",
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("GET", "/ide/v1/status", token="")
+            check("S38h auth reused: missing token -> 401 token_missing + WWW-Authenticate",
+                  st == 401 and j.get("reason") == "token_missing"
+                  and "Bearer" in (hd.get("WWW-Authenticate") or ""),
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("GET", "/ide/v1/status", token="wrong-token-value")
+            check("S38i auth reused: wrong token -> 401 token_mismatch (value never echoed)",
+                  st == 401 and j.get("reason") == "token_mismatch"
+                  and "wrong-token-value" not in json.dumps(j),
+                  "status=%s reason=%s" % (st, j.get("reason")))
+            st, hd, j = _ide_json("GET", "/ide/v1/status",
+                                  headers={"Forwarded": "for=203.0.113.9"})
+            check("S38j proxy hint upgrades loopback to REMOTE (peerBasis=proxy_hint, redacted)",
+                  st == 200 and (j.get("peer") or {}).get("peerBasis") == "proxy_hint"
+                  and (j.get("peer") or {}).get("remote") is True
+                  and j.get("remoteRedacted") is True,
+                  "status=%s peerBasis=%s" % (st, (j.get("peer") or {}).get("peerBasis")))
+            _reset_registry(regdir)
+            _write_instance(regdir, mine, port=_free_port(), project="IdeFaceProj",
+                            project_path="C:/work/open33p1/proj.vbp", transport="tcp")
+            discover(force=True)
+            st, hd, j = _ide_json("GET", "/ide/v1/status")
+            _inst = j.get("instance") or {}
+            check("S38k live instance facts: a loopback call keeps pid + projectPath",
+                  st == 200 and _inst.get("pid") == mine and bool(_inst.get("projectPath")),
+                  "status=%s pid=%s" % (st, _inst.get("pid")))
+            st, hd, j = _ide_json("GET", "/ide/v1/status",
+                                  headers={"Forwarded": "for=203.0.113.9"})
+            _rinst = j.get("instance") or {}
+            check("S38l non-loopback status is redacted: no pid/projectPath/pipe/registrationFile",
+                  st == 200 and _rinst.get("project") == "IdeFaceProj"
+                  and not any(_k in _rinst for _k in ("pid", "projectPath", "pipe",
+                                                      "registrationFile", "registryRoot"))
+                  and j.get("stale") == [],
+                  "status=%s keys=%s" % (st, sorted(_rinst.keys())))
+            _reset_registry(regdir)
+            st, hd, j = _ide_json("GET", "/health", api=None)
+            _ic = j.get("ideControl") or {}
+            check("S38m /health ideControl is ADDITIVE (apiVersion/verbs + legacy keys intact)",
+                  st == 200 and _ic.get("apiVersion") == "ide/1"
+                  and _ic.get("enabled") == "status"
+                  and sorted(_ic.get("verbs") or []) == ["op", "status"]
+                  and j.get("server") == PRODUCT and "auth" in j
+                  and "contractVersion" in j and "instances" in j,
+                  "status=%s enabled=%s" % (st, _ic.get("enabled")))
+            _red = _redact_health(health_body())
+            check("S38n non-loopback /health redacts the new block too (launcher redacted)",
+                  (_red.get("ideControl") or {}).get("launcher") == {"redacted": True}
+                  and "remoteWrite" not in
+                  (((_red.get("ideControl") or {}).get("policy")) or {}),
+                  "launcher=%s" % ((_red.get("ideControl") or {}).get("launcher"),))
+            st, hd, j = _ide_json("POST", "/rpc",
+                                  {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                                   "params": {}}, api=None)
+            check("S38o the MCP routes are untouched: /rpc tools/list result keys == {tools}",
+                  st == 200 and set((j.get("result") or {}).keys()) == {"tools"},
+                  "status=%s keys=%s" % (st, sorted((j.get("result") or {}).keys())))
+            _lines = []
+            if os.path.isfile(_ide_audit):
+                with open(_ide_audit, "r", encoding="utf-8") as _fh:
+                    _lines = [json.loads(_x) for _x in _fh if _x.strip()]
+            check("S38p audit: ONE JSONL line per /ide request, no credential value",
+                  len(_lines) == _ide_calls[0] and _ide_calls[0] >= 12
+                  and all(_row.get("event") == "ide_control" for _row in _lines)
+                  and all(_row.get("peerBasis") for _row in _lines)
+                  and not any(("selftest-ide-token-" + ("x" * 16)) in json.dumps(_row)
+                              for _row in _lines),
+                  "lines=%d requests=%d" % (len(_lines), _ide_calls[0]))
+            _lines_before = len(_lines)
+            ide_control_configure("off", False, False, [], _ide_audit)
+            st, hd, raw = _ide_call("GET", "/ide/v1/status")
+            check("S38q --ide-control=off removes the face: legacy plain 404, no audit line",
+                  st == 404 and raw.strip() == "Not Found", "status=%s body=%r" % (st, raw[:30]))
+            ide_control_configure("status", False, False, [], _ide_audit)
+            _lines_off = 0
+            if os.path.isfile(_ide_audit):
+                with open(_ide_audit, "r", encoding="utf-8") as _fh:
+                    _lines_off = len([_x for _x in _fh if _x.strip()])
+            check("S38q2 off-mode request added NO audit line (face disabled = not audited)",
+                  _lines_off == _lines_before, "before=%d after=%d" % (_lines_before, _lines_off))
+            ide_control_configure("full", False, False, [], _ide_audit)
+            CFG.token, CFG.token_source = "", "none"
+            _miss_full = ide_control_missing()
+            ide_control_configure("status", True, False, [], _ide_audit)
+            CFG.token, CFG.token_source = _saved_token
+            _miss_remote = ide_control_missing()
+            check("S38r fail-closed switches: full w/o token AND remote-ide-control w/o trio",
+                  bool(_miss_full) and any("token" in _x for _x in _miss_full)
+                  and bool(_miss_remote) and any("allow-remote" in _x for _x in _miss_remote),
+                  "full=%s remote=%s" % (_miss_full, _miss_remote))
+            _unknown_raised = False
+            try:
+                ide_failure("not_a_registered_reason")
+            except KeyError:
+                _unknown_raised = True
+            check("S38s closed reason vocabulary (>=40) and an unregistered reason raises",
+                  len(IDE_CONTROL_REASONS) >= 40 and _unknown_raised
+                  and all(_sp["failureKind"] in ("toolError", "policyRefusal", "environment",
+                                                 "concurrency", "transport")
+                          for _sp in IDE_CONTROL_REASONS.values()),
+                  "reasons=%d kindsClosed=%s" % (len(IDE_CONTROL_REASONS), _unknown_raised))
+        finally:
+            ide_control_configure(_saved_ide.get("mode"), _saved_ide.get("remote"),
+                                  _saved_ide.get("trustProxy"),
+                                  list(_saved_ide.get("publicHosts") or []),
+                                  _saved_ide.get("auditPath"))
+            CFG.token, CFG.token_source = _saved_token
+            CFG.port = _saved_port
+            _AUTH_FAILS.clear()
+            try:
+                _ide_srv.shutdown()
+                _ide_srv.server_close()
+            except Exception:
+                pass
+            discover(force=True)
 
         ok = all(r[1] for r in results)
     finally:

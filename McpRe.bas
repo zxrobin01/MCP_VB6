@@ -933,41 +933,13 @@ Public Function ReNormCaption(Owner As CodeTools, ByVal t As String) As String
 End Function
 
 Public Function ReParseErrorDescription(Owner As CodeTools, ByVal body As String) As String
-    ReParseErrorDescription = ""
-    On Error Resume Next
-    Dim zh As String
-    zh = ChrW$(&H8FD0) & ChrW$(&H884C) & ChrW$(&H65F6) & ChrW$(&H9519) & ChrW$(&H8BEF)
-    Dim lines() As String
-    lines = Split(Replace(Replace(body, vbCrLf, vbLf), vbCr, vbLf), vbLf)
-    Dim i As Long
-    Dim t As String
-    For i = 0 To UBound(lines)
-        t = Trim$(lines(i))
-        If Len(t) > 0 Then
-            If InStr(1, t, "Run-time error", vbTextCompare) > 0 Or InStr(1, t, "Runtime error", vbTextCompare) > 0 Or InStr(1, t, zh) > 0 Then
-                Dim p As Long
-                p = InStr(t, ":")
-                If p = 0 Then p = InStr(t, ChrW$(&HFF1A))
-                If p > 0 Then
-                    Dim sameLine As String
-                    sameLine = Trim$(Mid$(t, p + 1))
-                    If Len(sameLine) > 0 Then
-                        ReParseErrorDescription = sameLine
-                        Exit Function
-                    End If
-                End If
-                Dim k As Long
-                For k = i + 1 To UBound(lines)
-                    If Len(Trim$(lines(k))) > 0 Then
-                        ReParseErrorDescription = Trim$(lines(k))
-                        Exit Function
-                    End If
-                Next
-                Exit Function
-            End If
-        End If
-    Next
-    ' other box shapes keep the generic parser
+    ' D1-r (OPEN-42 section 11 live retest): this function used to be a SECOND, weaker parser -
+    ' it split the header at the first colon and never stripped the QUOTED error number, so a
+    ' punctuation-only body produced the fragment "':" which the cached_runtime_error channel
+    ' then re-published as errDescription. There is now ONE parser: the H3 implementation
+    ' strips the closing quote BEFORE the colon and rejects a punctuation-only candidate, so a
+    ' failed parse honestly stays "". Kept as a thin wrapper because the legacy call paths
+    ' (ReMergeRuntimeError / McpRe line 96) address it by name.
     ReParseErrorDescription = McpBpCore.H3ParseErrDescription(Owner, body)
 End Function
 

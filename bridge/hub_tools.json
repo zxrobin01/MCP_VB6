@@ -13,13 +13,13 @@
     },
     {
       "name": "ide_target",
-      "description": "Set or clear the default IDE target used when a tools/call has no _target. target = pid | project name | \"auto\". Hub-local state only.",
+      "description": "Set or clear the default IDE target used when a tools/call has no _target. target = pid | project name | port | \"auto\" (any other string is stored verbatim and never matches). \"auto\" or \"\" CLEARS the default. Hub-local state only: the default is NOT a hard pin - a stored pid that is no longer live is IGNORED (receipt: staleDefaultPid/defaultIgnored/targetDiagnostic) and the documented target ladder picks instead.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "pid, project name, or auto"
+            "description": "pid, project name, port, or auto"
           }
         },
         "required": [
@@ -47,17 +47,21 @@
     },
     {
       "name": "ide_stop",
-      "description": "Stop an IDE instance. It only stops instances started by this hub; otherwise returns a structured not_allowed with the reason.",
+      "description": "Stop an IDE instance by pid. pid is REQUIRED (omitting it answers ok:false + reason=not_implemented). It only stops an instance this hub owns; otherwise it refuses with reason=not_allowed (ownershipBasis names why) or reason=foreign_instance_refused for a known port below 8767, and NOTHING is stopped.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "pid": {
-            "type": "number"
+            "type": "number",
+            "description": "the pid to stop (required; as reported by ide_list)"
           },
           "force": {
             "type": "boolean"
           }
         },
+        "required": [
+          "pid"
+        ],
         "additionalProperties": false
       }
     },
@@ -127,7 +131,7 @@
     },
     {
       "name": "add_lesson",
-      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json) with a .bak backup.",
+      "description": "Add or overwrite a lesson in the user layer (mcp_lessons/user.json), keeping a timestamped backup <user.json>.bak_<yyyymmdd_hhnnss>. scenario, trap and do are all REQUIRED (a call missing any of them fails with lesson_fields_required); id is optional (mints the first free custom-N) and an existing id is REPLACED IN PLACE. scope is stored verbatim (conventionally all | mcp | vb6; default all).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -137,43 +141,51 @@
           },
           "scenario": {
             "type": "string",
-            "description": "When this applies"
+            "description": "When this applies (required)"
           },
           "trap": {
             "type": "string",
-            "description": "The pitfall"
+            "description": "The pitfall (required)"
           },
           "do": {
             "type": "string",
-            "description": "What to do instead"
+            "description": "What to do instead (required)"
           },
           "scope": {
             "type": "string",
-            "description": "all | mcp | vb6 (optional)"
+            "description": "all | mcp | vb6 (optional; stored verbatim, default all)"
           },
           "enabled": {
             "type": "boolean",
             "description": "Enabled (default true)"
           }
-        }
+        },
+        "required": [
+          "scenario",
+          "trap",
+          "do"
+        ]
       }
     },
     {
       "name": "delete_lesson",
-      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false).",
+      "description": "Remove a user lesson, or disable a shipped one (writes enabled=false for a DEFAULT lesson). id is REQUIRED (an empty id fails with lesson_id_required; an unknown id answers ok:false + error=lesson_not_found); the receipt's action is removed | disabled(default) | not_found.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "id": {
             "type": "string",
-            "description": "Lesson id"
+            "description": "Lesson id (required)"
           }
-        }
+        },
+        "required": [
+          "id"
+        ]
       }
     },
     {
       "name": "export_lessons",
-      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md).",
+      "description": "Export the merged lesson library as Markdown (re-importable via import_lessons_md, with the loss that the scope: and enabled:false lines are ignored on import - an imported lesson is always scope=all / enabled=true).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -186,7 +198,7 @@
     },
     {
       "name": "import_lessons_md",
-      "description": "Import lessons from a Markdown file: a line '## [id] scenario' plus trap:/do: lines.",
+      "description": "Import lessons from a Markdown file: a ## [id] scenario header plus trap:/do: body lines (the Chinese markers 坑:/应: are accepted too). An id that already exists in the MERGED library (shipped defaults included) is NEVER overwritten - it is counted in conflicts and a fresh custom-N id is minted for that lesson; a section without BOTH trap and do is skipped. dryRun:true parses and reports parsed/added/skipped/idsUsed/conflicts without writing.",
       "inputSchema": {
         "type": "object",
         "properties": {

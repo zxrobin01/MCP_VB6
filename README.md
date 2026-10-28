@@ -13,7 +13,7 @@ VB6 工程，并控制编译与运行。
  MCP 客户端 (Claude Desktop / Cursor / ...)
         │  stdio (JSON-RPC, 每行一条)
         ▼
- bridge/vb6mcp_hub.mjs      (Node，零依赖；MCP 线协议 + ide_* / 经验库共 10 个工具)
+ bridge/vb6mcp_hub.mjs      (Node，零依赖；MCP 线协议 + ide_* / 经验库共 11 个工具)
         │  HTTP  http://127.0.0.1:8767  (配了凭据时需 bearer token)
         ▼
  bridge/vb6mcp_bridge.py    (Python 3，仅标准库；本机唯一的 TCP 监听者)
@@ -48,8 +48,8 @@ AI 编程助手已经能很好地处理现代语言，却**够不到 VB6**：它
 
 **做法**：不另造编辑器，而是**把 VB6 IDE 本身变成一个 MCP 服务器**——加载一个插件，IDE
 就对外提供 120 个工具：读/搜/改代码、静态检查、锚点编辑与安全事务、编译、运行与单步、
-弹窗处理、窗体与项目元数据、快照与回滚、打包。此外还有 10 个 **hub 面**工具（IDE 实例管理与
-经验库）在 IDE 进程外提供，客户端合计可见 130 个。
+弹窗处理、窗体与项目元数据、快照与回滚、打包。此外还有 11 个 **hub 面**工具（IDE 实例管理与
+经验库）在 IDE 进程外提供，客户端合计可见 131 个。
 **因为工具就住在 IDE 进程里**，它能做进程外方案做不到的事：真的去点那个对话框、真的按运行、
 真的读断点处的局部变量。
 
@@ -183,7 +183,7 @@ Microsoft Add-In Designer；若编译报 `IDTExtensibility2` 相关错误，见�
 - 客户端不再直连插件。本机由**中间服务** `bridge/vb6mcp_bridge.py` 持有**唯一一个 TCP 端口**：
   默认 `http://127.0.0.1:8767`（用 `--port` 或环境变量 `VB6MCP_BRIDGE_PORT` 改；`VB6MCP_BRIDGE_HOST` 只接受回环地址）。
 - **非回环绑定不可能**：绑定到非回环地址会被拒绝，并以**退出码 6** 结束，**没有覆盖开关**。
-- MCP 客户端经 **hub** `bridge/vb6mcp_hub.mjs`（Node，零依赖，stdio）接入：hub 提供 `ide_*` 与经验库共 10 个工具，
+- MCP 客户端经 **hub** `bridge/vb6mcp_hub.mjs`（Node，零依赖，stdio）接入：hub 提供 `ide_*` 与经验库共 11 个工具，
   并把插件面的 120 个工具转发给中间服务；hub 用环境变量 `VB6MCP_BRIDGE_URL` 找中间服务（源码默认 `http://127.0.0.1:8767`）。
 - 插件只接受**命名管道**（每个 IDE 实例一条；同一条管道**不允许并发连接**）⇒ 客户端应在**同一条连接上复用请求 id**，
   或把调用串行化；管道忙时回执给 `pipeBusy`，而不是「没有 IDE」。
@@ -367,7 +367,7 @@ DSH 的 MCP 服务器不在 Windows 注册表里，而在 **DSH profile 的 plug
 | `remove_project` | 从 IDE 工作区关闭一个工程 | `name` |
 | `save_project` | 保存工程与全部未保存组件 | `path` |
 | `vbg_group` | 读写 .vbg 工程组：列出、添加、移除工程 | `action`, `path`, `project` |
-| `workspace_status` | 对比未保存组件与 git 工作区状态 | `repo` |
+| `workspace_status` | 列出 IDE 中已改但未保存的组件，并分类 pane-vs-disk（`case_only`/`real`…；不访问 VCS，无参数） | - |
 
 ### 2. 组件生命周期
 
@@ -468,8 +468,9 @@ DSH 的 MCP 服务器不在 Windows 注册表里，而在 **DSH profile 的 plug
 
 | 工具 | 能干什么 | 关键参数 |
 |------|----------|----------|
-| `inject_trace` | 在过程入口插 McpTrace 调用，缺模块自动生成 | `name`, `procedure`, `id` |
+| `inject_trace` | 在过程入口插 McpTrace 调用，缺模块自动生成；可选 `condition`/`recordCondition` 做 logpoint | `name`, `procedure`, `id` |
 | `remove_trace` | 移除注入的追踪块，自动生成的模块保留 | `name`, `id`, `expected_sha256` |
+| `trace_query` | 读 McpTrace JSONL 采集文件：按 id/pid/前缀过滤、字节游标续读、严格 UTF-8、只读零写盘（采集侧 `inject_trace` 的读半边） | `path`, `id_prefix`, `since_offset`, `format` |
 | `project_changes` | 轮询 IDE 变更日志：组件与控件增删改名 | `since`, `clear` |
 | `get_callstack` | 读引擎自己的调用栈，逐帧给出过程名 | `max_frames` |
 | `vba6_probe` | 进程内探 VBA6 调试引擎：模式、调用栈、立即执行 | `exec_probe`, `exec_line`, `run_break_probes` |
@@ -519,7 +520,6 @@ DSH 的 MCP 服务器不在 Windows 注册表里，而在 **DSH profile 的 plug
 | `list_files` | 按通配符递归列出目录下的文件 | `path`, `pattern`, `recursive` |
 | `search_in_files` | 跨文件文本或正则搜索，回文件名与行号 | `query`, `path`, `pattern` |
 | `project_meta` | 读写 .vbp 版本资源与构建元数据 | `action`, `path`, `major` |
-| `git` | 只读 git：状态、diff --stat、提交日志 | `action`, `repo`, `file` |
 
 ### 14. 快照、回滚与测试宿主
 
@@ -744,7 +744,7 @@ DSH 的 MCP 服务器不在 Windows 注册表里，而在 **DSH profile 的 plug
 
 ## hub 侧恢复原语与可靠性开关（v1.13 ~ v1.16）
 
-> 这一节从**用户视角**说明这批能力解决什么故障、什么时候用、回执里该看哪些字。逐字段契约见 `docs/CONTRACTS.md` 的 v1.13.0 ~ v1.16.5 版本行。
+> 这一节从**用户视角**说明这批能力解决什么故障、什么时候用、回执里该看哪些字。逐字段契约见 `docs/CONTRACTS.md` 的 v1.13.0 ~ v1.16.7 版本行。
 
 1. **`ide_kill_and_relaunch`（v1.13.0，hub 侧、不依赖插件管道）** —— 管道 busy / wedged 时**唯一**的恢复原语：结束**本 hub 自有**的实例、清掉它的注册项、在原 `.vbp` 上重启并轮询就绪；只停 hub 自有实例，**绝不碰 8766、远端实例或别人启动的 IDE**。回执看 `ready` / `threeWay{http,mcpInfo,project}` / `ownership`；`ready:false` 只表示"进程已拉起但插件还没应答"，照 `howToProceed` 轮询 `ide_list`，不要重试 kill。
    **为什么要它**：插件是单线程的，管道 busy 时连 `ide_state{release_inflight:true}` 都送不进去；以前唯一出路是人工 `Stop-Process` 再重开 IDE，现在一次调用即可，而且不动别人的实例。

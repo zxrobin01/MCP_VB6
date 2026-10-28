@@ -45,20 +45,20 @@ rem .vbp carries CompatibleMode="2" + CompatibleEXE32=<reference>. If that file 
 rem MISSING or has been REPLACED, VB6 does not stop: it silently falls back to No
 rem Compatibility and mints NEW class IDs, so every registration on every machine
 rem goes stale - the exact failure this mode exists to prevent. Fail LOUDLY.
+rem -- MODE-AWARE (2026-10-27): the published tree exports MCP_VB6.vbp with CompatibleMode="0"
+rem -- and no CompatibleEXE32 (dist\compat is maintainer-only; see tools\make_public_export.ps1).
+rem -- In that tree the guard below is SKIPPED (reported, never silent): every public build mints
+rem -- a fresh CLSID and register.reg installs by ProgID, so no reference DLL is required.
+rem -- The maintainer tree (mode 2) keeps the strict guard.
+set "COMPAT_MODE="
+for /f "tokens=2 delims==" %%M in ('findstr /b /c:"CompatibleMode=" "%~dp0MCP_VB6.vbp" 2^>nul') do set "COMPAT_MODE=%%~M"
+if "%COMPAT_MODE%"=="" (
+  >&2 echo FATAL: cannot read CompatibleMode from MCP_VB6.vbp; the build mode is unknown.
+  exit /b 1
+)
+if not "%COMPAT_MODE%"=="2" goto compat_ref_skipped
 set "COMPAT_REF=%~dp0dist\compat\VB6MCP_ref.dll"
 set "COMPAT_SHA=%~dp0dist\compat\VB6MCP_ref.sha256"
-rem PUBLISHED (source-only) trees declare CompatibleMode="0" and ship NO binary
-rem compatibility reference, so this guard must not fatal there. Read the mode from
-rem the project file and only enforce the reference checks when it is 2.
-set "COMPAT_MODE=0"
-for /f "tokens=2 delims==" %%M in ('findstr /b /c:"CompatibleMode=" "%~dp0MCP_VB6.vbp"') do set "COMPAT_MODE=%%~M"
-if not "%COMPAT_MODE%"=="2" goto compat_ref_skipped
-
-:compat_ref_skipped
->&2 echo Binary-compatibility guard SKIPPED: MCP_VB6.vbp declares CompatibleMode="%COMPAT_MODE%"
->&2 echo        (a source-only tree mints its own class IDs on every build; no reference is shipped).
-goto compat_ref_done
-
 if not exist "%COMPAT_REF%" goto compat_ref_missing
 if not exist "%COMPAT_SHA%" goto compat_ref_nosha
 set "WANT_SHA="
@@ -85,6 +85,12 @@ exit /b 1
 >&2 echo        Do NOT build until that is deliberate (see dist\compat\README.md).
 exit /b 1
 :compat_ref_done
+goto :compat_guard_end
+:compat_ref_skipped
+>&2 echo Binary-compatibility guard SKIPPED: MCP_VB6.vbp CompatibleMode="%COMPAT_MODE%" (not "2").
+>&2 echo        A public-tree build uses mode 0: every build mints a fresh CLSID and
+>&2 echo        register.reg registers by ProgID, so no dist\compat reference is required.
+:compat_guard_end
 
 rem --- WHICH regsvr32 -------------------------------------------------
 rem This build registers a 32-BIT COM server, so it must use the SysWOW64 copy of THIS
